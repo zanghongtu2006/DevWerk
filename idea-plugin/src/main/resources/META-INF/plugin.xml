@@ -1,0 +1,33 @@
+<idea-plugin>
+    <id>com.zanghongtu.devwerk</id>
+    <name>DevWerk</name>
+    <vendor email="zanghongtu2006@gmail.com" url="https://zanghongtu2006.github.io">Hongtu Zang</vendor>
+
+    <description><![CDATA[
+A simple IntelliJ plugin that can traverse the project file system and generate
+predefined directory and file scaffolds, inspired by DevWerk capabilities.
+    ]]></description>
+
+    <!-- 兼容的 IDE 版本 -->
+    <idea-version since-build="241" until-build="243.*"/>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <!-- 注册一个菜单动作 -->
+    <actions>
+        <!-- 在 Tools 菜单下增加一个入口 -->
+        <action id="DevWerkFsScaffolder.GenerateScaffoldAction"
+                class="com.zanghongtu.devwerk.GenerateScaffoldAction"
+                text="DevWerk..."
+                description="Generate directory and file structure based on templates">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+    </actions>
+
+    <!-- 注册右侧 ToolWindow -->
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow id="DevWerk"
+                    anchor="right"
+                    factoryClass="com.zanghongtu.devwerk.DevWerkFsToolWindowFactory"/>
+    </extensions>
+</idea-plugin>

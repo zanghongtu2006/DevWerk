@@ -3,6 +3,8 @@ package com.zanghongtu.devwerk.client
 import com.zanghongtu.devwerk.codeEditor.AiClient
 import com.zanghongtu.devwerk.codeEditor.ChatContext
 import com.zanghongtu.devwerk.codeEditor.IdeChatResponse
+import com.zanghongtu.devwerk.prompt.CodeOpsParser
+import com.zanghongtu.devwerk.prompt.PromptTemplates
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
@@ -17,7 +19,7 @@ class OpenAiClient(
 ) : AiClient {
 
     private val http = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(10))
+        .connectTimeout(Duration.ofSeconds(300))
         .build()
 
     override fun sendChat(context: ChatContext, userMessage: String): IdeChatResponse {
@@ -28,6 +30,11 @@ class OpenAiClient(
         val url = "https://api.openai.com/v1/chat/completions"
 
         val messages = JSONArray()
+
+        // ✅ system
+        messages.put(JSONObject().put("role", "system").put("content", PromptTemplates.codeOpsSystemPrompt()))
+
+        // history
         for (m in context.history) {
             messages.put(JSONObject().put("role", m.role).put("content", m.content))
         }
@@ -39,7 +46,7 @@ class OpenAiClient(
 
         val req = HttpRequest.newBuilder()
             .uri(URI.create(url))
-            .timeout(Duration.ofSeconds(120))
+            .timeout(Duration.ofSeconds(300))
             .header("Authorization", "Bearer $apiKey")
             .header("Content-Type", "application/json")
             .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
@@ -51,17 +58,13 @@ class OpenAiClient(
         }
 
         val json = JSONObject(resp.body())
-        val reply = json
+        val raw = json
             .optJSONArray("choices")
             ?.optJSONObject(0)
             ?.optJSONObject("message")
             ?.optString("content")
             .orEmpty()
 
-        return IdeChatResponse(
-            reply = reply,
-            codeTree = null,
-            ops = emptyList()
-        )
+        return CodeOpsParser.parseToIdeChatResponse(raw)
     }
 }

@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "additionalProperties": "False",
+  "required": ["reply", "code_tree", "ops"],
+  "properties": {
+    "reply": {"type": "string"},
+    "code_tree": {"type": "string"},
+    "ops": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": "False",
+        "required": ["op", "path", "language", "content"],
+        "properties": {
+          "op": {
+            "type": "string",
+            "enum": ["create_dir", "create_file", "modify_file", "delete_path"]
+          },
+          "path": {"type": "string"},
+          "language": {"type": ["string", "null"]},
+          "content": {"type": ["string", "null"]}
+        }
+      }
+    }
+  }
+}

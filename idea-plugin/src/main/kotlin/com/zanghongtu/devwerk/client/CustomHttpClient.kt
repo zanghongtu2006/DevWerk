@@ -18,7 +18,7 @@ class CustomHttpClient(
 ) : AiClient {
 
     private val http = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(10))
+        .connectTimeout(Duration.ofSeconds(300))
         .build()
 
     override fun sendChat(context: ChatContext, userMessage: String): IdeChatResponse {
@@ -40,7 +40,7 @@ class CustomHttpClient(
 
         val builder = HttpRequest.newBuilder()
             .uri(URI.create(endpoint))
-            .timeout(Duration.ofSeconds(120))
+            .timeout(Duration.ofSeconds(300))
             .header("Content-Type", "application/json")
 
         if (token.isNotBlank()) {

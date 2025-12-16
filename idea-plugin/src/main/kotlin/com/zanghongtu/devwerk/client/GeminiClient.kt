@@ -3,6 +3,8 @@ package com.zanghongtu.devwerk.client
 import com.zanghongtu.devwerk.codeEditor.AiClient
 import com.zanghongtu.devwerk.codeEditor.ChatContext
 import com.zanghongtu.devwerk.codeEditor.IdeChatResponse
+import com.zanghongtu.devwerk.prompt.CodeOpsParser
+import com.zanghongtu.devwerk.prompt.PromptTemplates
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
@@ -17,7 +19,7 @@ class GeminiClient(
 ) : AiClient {
 
     private val http = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(10))
+        .connectTimeout(Duration.ofSeconds(300))
         .build()
 
     override fun sendChat(context: ChatContext, userMessage: String): IdeChatResponse {
@@ -25,13 +27,10 @@ class GeminiClient(
             throw RuntimeException("Gemini API key is empty. Please set Token in Settings.")
         }
 
-        // Google AI Studio: v1beta/models/{model}:generateContent?key=...
         val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
 
-        // Gemini 的内容结构：contents: [{role, parts:[{text}]}]
         val contents = JSONArray()
 
-        // 简化：把历史都塞成 user/assistant 的 text（能跑通即可）
         for (m in context.history) {
             val role = if (m.role == "assistant") "model" else "user"
             val parts = JSONArray().put(JSONObject().put("text", m.content))
@@ -43,11 +42,20 @@ class GeminiClient(
                 .put("parts", JSONArray().put(JSONObject().put("text", userMessage)))
         )
 
-        val body = JSONObject().put("contents", contents)
+        val sysText = PromptTemplates.codeOpsSystemPrompt()
+        val sysContent = JSONObject()
+            .put("role", "user") // Content 结构需要 parts，这里按文档 Content 结构组织
+            .put("parts", JSONArray().put(JSONObject().put("text", sysText)))
+
+        val body = JSONObject()
+            .put("contents", contents)
+            // ✅ 两种字段都带，提升兼容性
+            .put("systemInstruction", sysContent)
+            .put("system_instruction", JSONObject().put("parts", JSONObject().put("text", sysText)))
 
         val req = HttpRequest.newBuilder()
             .uri(URI.create(url))
-            .timeout(Duration.ofSeconds(120))
+            .timeout(Duration.ofSeconds(300))
             .header("Content-Type", "application/json")
             .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
             .build()
@@ -58,7 +66,7 @@ class GeminiClient(
         }
 
         val json = JSONObject(resp.body())
-        val reply = json
+        val raw = json
             .optJSONArray("candidates")
             ?.optJSONObject(0)
             ?.optJSONObject("content")
@@ -67,10 +75,6 @@ class GeminiClient(
             ?.optString("text")
             .orEmpty()
 
-        return IdeChatResponse(
-            reply = reply,
-            codeTree = null,
-            ops = emptyList()
-        )
+        return CodeOpsParser.parseToIdeChatResponse(raw)
     }
 }
