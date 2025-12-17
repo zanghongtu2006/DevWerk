@@ -109,7 +109,7 @@ class AiSettingsDialog : DialogWrapper(true) {
             AiProvider.TECH_ZUKUNFT -> {
                 // 你要求：默认无需配置（这里仍写入默认值，方便以后开放）
                 p.baseUrl = "https://api.techzukunft.ai/v1/ide/chat"
-                p.token = ""               // 不强制
+                p.token = realToken
                 p.model = "tz-devwerk"
             }
 
@@ -135,6 +135,18 @@ class AiSettingsDialog : DialogWrapper(true) {
                 p.baseUrl = urlField.text.trim()
                 p.token = ""               // 你目前设计 custom 不需要 token（以后要开放改这里）
                 p.model = modelCombo.selectedItem?.toString().orEmpty()
+            }
+
+            AiProvider.DEEPSEEK -> {
+                p.baseUrl = ""              // 云服务不需要 URL
+                p.token = realToken
+                p.model = modelCombo.selectedItem?.toString().orEmpty().ifBlank { "deepseek-v3.2" }
+            }
+
+            AiProvider.QWEN -> {
+                p.baseUrl = ""              // 云服务不需要 URL
+                p.token = realToken
+                p.model = modelCombo.selectedItem?.toString().orEmpty().ifBlank { "qwen3-coder" }
             }
         }
 
@@ -207,6 +219,8 @@ class AiSettingsDialog : DialogWrapper(true) {
             AiProvider.GEMINI -> listOf("gemini-1.5-flash", "gemini-1.5-pro")
             AiProvider.CUSTOM -> emptyList()
             AiProvider.TECH_ZUKUNFT -> emptyList()
+            AiProvider.DEEPSEEK -> listOf("deepseek-v3.2")
+            AiProvider.QWEN -> listOf("qwen3-coder")
         }
 
         if (models.isNotEmpty()) {

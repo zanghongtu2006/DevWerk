@@ -4,30 +4,44 @@
     <vendor email="zanghongtu2006@gmail.com" url="https://zanghongtu2006.github.io">Hongtu Zang</vendor>
 
     <description><![CDATA[
-A simple IntelliJ plugin that can traverse the project file system and generate
-predefined directory and file scaffolds, inspired by DevWerk capabilities.
+<p><b>DevWerk</b> is an AI-powered tool window for IntelliJ-based IDEs that generates and applies real project changes via structured <b>CodeOps</b> (file operations), not just chat suggestions.</p>
+<ul>
+  <li>Generate real files and folders (create/update/delete)</li>
+  <li>Structured CodeOps JSON output (reply, code_tree, ops)</li>
+  <li>Works with Ollama, OpenAI GPT, Google Gemini, and optional dedicated backend integration</li>
+  <li>Runs locally; API keys are stored locally</li>
+</ul>
     ]]></description>
 
-    <!-- 兼容的 IDE 版本 -->
+    <!-- Optional (can be overridden by Gradle patchPluginXml) -->
+    <version>0.1.0</version>
+
+    <!-- Compatibility -->
     <idea-version since-build="241" until-build="243.*"/>
 
     <depends>com.intellij.modules.platform</depends>
 
-    <!-- 注册一个菜单动作 -->
+    <!-- Actions -->
     <actions>
-        <!-- 在 Tools 菜单下增加一个入口 -->
-        <action id="DevWerkFsScaffolder.GenerateScaffoldAction"
+        <action id="DevWerk.OpenToolWindowAction"
                 class="com.zanghongtu.devwerk.GenerateScaffoldAction"
-                text="DevWerk..."
-                description="Generate directory and file structure based on templates">
+                text="Open DevWerk"
+                description="Open DevWerk tool window">
             <add-to-group group-id="ToolsMenu" anchor="last"/>
         </action>
     </actions>
 
-    <!-- 注册右侧 ToolWindow -->
+    <!-- ToolWindow -->
     <extensions defaultExtensionNs="com.intellij">
         <toolWindow id="DevWerk"
                     anchor="right"
                     factoryClass="com.zanghongtu.devwerk.DevWerkFsToolWindowFactory"/>
     </extensions>
+
+    <!-- Change notes (recommended for Marketplace) -->
+    <change-notes><![CDATA[
+<ul>
+  <li>Initial release: DevWerk tool window with provider settings and CodeOps workflow.</li>
+</ul>
+    ]]></change-notes>
 </idea-plugin>

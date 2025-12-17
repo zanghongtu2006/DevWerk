@@ -15,16 +15,16 @@ enum class AiProvider(
 ) {
 
     TECH_ZUKUNFT(
-        display = "techZukunft",
+        display = "TechZukunft",
         needsUrl = false,
-        needsToken = false,
+        needsToken = true,
         supportsModelList = false,
         defaultUrl = "https://api.techzukunft.ai/v1/ide/chat",
         defaultModel = "tz-devwerk"
     ),
 
     GPT(
-        display = "gpt",
+        display = "ChatGPT",
         needsUrl = false,
         needsToken = true,
         supportsModelList = true,
@@ -32,8 +32,26 @@ enum class AiProvider(
         tokenPlaceholder = "PLEASE_INPUT_OPENAI_API_KEY"
     ),
 
+    DEEPSEEK(
+        display = "DeepSeek",
+        needsUrl = false,
+        needsToken = true,
+        supportsModelList = true,
+        defaultUrl = "https://api.deepseek.com/v1",
+        defaultModel = "deepseek-chat"
+    ),
+
+    QWEN(
+        display = "QWEN",
+        needsUrl = true,
+        needsToken = true,
+        supportsModelList = true,
+        defaultUrl = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        defaultModel = "qwen-plus"
+    ),
+
     GEMINI(
-        display = "gemini",
+        display = "GEMINI",
         needsUrl = false,
         needsToken = true,
         supportsModelList = true,
@@ -42,7 +60,7 @@ enum class AiProvider(
     ),
 
     OLLAMA(
-        display = "ollama",
+        display = "OLLAMA",
         needsUrl = true,
         needsToken = false,
         supportsModelList = true,
@@ -51,7 +69,7 @@ enum class AiProvider(
     ),
 
     CUSTOM(
-        display = "custom",
+        display = "CUSTOM",
         needsUrl = true,
         needsToken = false,   // 你现在设计为 custom 默认不强制 token
         supportsModelList = true,
