@@ -5,6 +5,7 @@ import com.intellij.openapi.project.Project
 import com.zanghongtu.devwerk.codeEditor.ChatContext
 import com.zanghongtu.devwerk.codeEditor.ChatMessage
 import com.zanghongtu.devwerk.codeEditor.FsScaffolder
+import com.zanghongtu.devwerk.codeEditor.PatchApplier
 import com.zanghongtu.devwerk.settings.AiSettingsDialog
 import java.awt.BorderLayout
 import java.awt.Dimension
@@ -18,7 +19,6 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
     private val sendButton = JButton("Send")
     private val settingsButton = JButton("⚙")
 
-    // 聊天历史
     private val history = mutableListOf<ChatMessage>()
 
     init {
@@ -72,24 +72,32 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
 
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
-                // ✅ 每次都按“当前配置”创建 client
                 val aiClient = AiClientFactory.create(project)
                 val response = aiClient.sendChat(ctx, text)
 
                 history += ChatMessage("assistant", response.reply)
 
-                if (response.ops.isNotEmpty()) {
+                // 1) 优先 patch_ops
+                if (response.patchOps.isNotEmpty()) {
+                    PatchApplier.applyPatchOps(project, response.patchOps)
+                } else if (response.ops.isNotEmpty()) {
                     FsScaffolder.applyFileOps(project, response.ops)
                 }
 
                 SwingUtilities.invokeLater {
                     appendChatLine("Bot: ${response.reply}")
+
                     if (!response.codeTree.isNullOrBlank()) {
                         appendChatLine("=== Code Tree ===")
                         appendChatLine(response.codeTree)
                     }
-                    if (response.ops.isNotEmpty()) {
-                        appendChatLine("[System] ${response.ops.size} file operations applied to project.")
+
+                    if (response.patchOps.isNotEmpty()) {
+                        appendChatLine("[System] ${response.patchOps.size} patch operation(s) applied to project.")
+                    } else if (response.ops.isNotEmpty()) {
+                        appendChatLine("[System] ${response.ops.size} file operation(s) applied to project.")
+                    } else if (response.done) {
+                        appendChatLine("[System] done=true")
                     }
                 }
             } catch (t: Throwable) {

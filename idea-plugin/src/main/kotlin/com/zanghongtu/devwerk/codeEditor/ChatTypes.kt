@@ -9,7 +9,7 @@ data class ChatMessage(
 )
 
 /**
- * 发送给 AI 的上下文（当前只用到 projectRoot + 历史对话）
+ * 发送给 AI 的上下文（projectRoot + 历史对话）
  */
 data class ChatContext(
     val projectRoot: String?,
@@ -17,16 +17,50 @@ data class ChatContext(
 )
 
 /**
- * Web server 返回的单条文件操作
+ * agent 模式：工作区摘要（可选，但建议带）
+ */
+data class WorkspaceFile(
+    val path: String,
+    val sha1: String? = null,
+    val size: Int? = null
+)
+
+data class WorkspaceSummary(
+    val rootId: String? = null,
+    val changedFiles: List<WorkspaceFile> = emptyList(),
+    val openFiles: List<String> = emptyList(),
+    val treePreview: String? = null
+)
+
+/**
+ * agent 模式：工具请求/工具结果
+ */
+data class ToolRequest(
+    val id: String,
+    val tool: String, // list_dir | read_file | search
+    val args: Map<String, Any?> = emptyMap()
+)
+
+data class ToolResult(
+    val id: String,
+    val ok: Boolean,
+    val content: String? = null,
+    val error: String? = null
+)
+
+/**
+ * agent 模式：patch 操作
+ */
+data class PatchOp(
+    val op: String,     // apply_patch
+    val content: String // unified diff
+)
+
+/**
+ * scaffold 旧模式 / 兼容模式：文件 CRUD
  *
- * op:
- *   - create_dir
- *   - delete_dir
- *   - create_file
- *   - modify_file
- *   - delete_file
- *
- * path: 相对项目根目录的路径，比如 "my-app/src/main/java/com/example/app/App.java"
+ * 后端允许：create_dir | create_file | update_file | delete_path
+ * （插件内部会兼容旧的 modify_file/delete_file/delete_dir）
  */
 data class FileOp(
     val op: String,
@@ -36,16 +70,20 @@ data class FileOp(
 )
 
 /**
- * Web server 返回的整体响应
+ * 后端返回的整体响应（兼容 scaffold + agent）
  */
 data class IdeChatResponse(
     val reply: String,
-    val codeTree: String?,
-    val ops: List<FileOp>
+    val codeTree: String? = null,
+    val ops: List<FileOp> = emptyList(),
+    val toolRequests: List<ToolRequest> = emptyList(),
+    val patchOps: List<PatchOp> = emptyList(),
+    val done: Boolean = false
 )
 
 /**
- * AI 客户端接口（目前只有一个 Http 实现）
+ * AI 客户端接口（保持不改签名，避免影响你其它 Client）
+ * sendChat 内部可实现 agent 多轮：tool_requests -> tool_results -> 最终 ops/patch_ops/done
  */
 interface AiClient {
     fun sendChat(

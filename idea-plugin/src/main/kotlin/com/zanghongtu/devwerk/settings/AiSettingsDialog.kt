@@ -108,7 +108,7 @@ class AiSettingsDialog : DialogWrapper(true) {
         when (provider) {
             AiProvider.TECH_ZUKUNFT -> {
                 // 你要求：默认无需配置（这里仍写入默认值，方便以后开放）
-                p.baseUrl = "https://api.techzukunft.ai/v1/ide/chat"
+                p.baseUrl = "http://127.0.0.1:8001/v1/ide/chat"
                 p.token = realToken
                 p.model = "tz-devwerk"
             }

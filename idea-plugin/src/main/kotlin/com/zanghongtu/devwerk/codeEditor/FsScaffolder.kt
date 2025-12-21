@@ -9,71 +9,6 @@ import java.io.IOException
 
 object FsScaffolder {
 
-    private data class CodeNode(
-        val name: String,
-        val isDir: Boolean,
-        val children: MutableList<CodeNode> = mutableListOf()
-    )
-
-    private fun parseCodeTree(text: String): List<CodeNode> {
-        val roots = mutableListOf<CodeNode>()
-        val stack = mutableListOf<Pair<Int, CodeNode>>() // level -> node
-
-        for (rawLine in text.lines()) {
-            if (rawLine.isBlank()) continue
-            val line = rawLine.rstrip()
-            val trimmed = line.trimStart()
-            if (trimmed.isBlank()) continue
-            if (trimmed.startsWith("===")) continue
-
-            var firstNonWs = line.indexOfFirst { !it.isWhitespace() }
-            if (firstNonWs < 0) firstNonWs = 0
-            val level = firstNonWs / 2
-
-            var token = trimmed
-            if (token.startsWith("📁 ") || token.startsWith("📄 ")) {
-                token = token.substring(2).trimStart()
-            }
-
-            val isDir = token.endsWith("/")
-            val name = if (isDir) token.removeSuffix("/") else token
-            if (name.isBlank()) continue
-
-            val node = CodeNode(name = name, isDir = isDir)
-
-            while (stack.isNotEmpty() && stack.last().first >= level) {
-                stack.removeAt(stack.size - 1)
-            }
-
-            if (stack.isEmpty()) {
-                roots += node
-            } else {
-                stack.last().second.children += node
-            }
-
-            if (isDir) {
-                stack += level to node
-            }
-        }
-
-        return roots
-    }
-
-    private fun String.rstrip(): String = replace(Regex("\\s+$"), "")
-
-    private fun createFromNode(parentDir: VirtualFile, node: CodeNode) {
-        if (node.isDir) {
-            val dir = createChildDirectory(parentDir, node.name)
-            for (child in node.children) {
-                createFromNode(dir, child)
-            }
-        } else {
-            createFileWithContent(parentDir, node.name, "")
-        }
-    }
-
-    // ========== 新增：应用结构化 FileOp 指令 ==========
-
     fun applyFileOps(project: Project, ops: List<FileOp>) {
         if (ops.isEmpty()) return
 
@@ -88,83 +23,97 @@ object FsScaffolder {
     }
 
     private fun applySingleOp(baseDir: VirtualFile, op: FileOp) {
-        val normalizedPath = op.path.trim().trimStart('/', '\\')
+        val normalizedPath = normalizeRelPath(op.path)
         if (normalizedPath.isEmpty()) return
 
-        val parts = normalizedPath.split("/", "\\").filter { it.isNotBlank() }
-        if (parts.isEmpty()) return
-
-        val isDirOp = op.op == "create_dir" || op.op == "delete_dir"
-
-        val dirPathParts: List<String>
-        val fileName: String?
-
-        if (isDirOp) {
-            dirPathParts = parts
-            fileName = null
-        } else {
-            dirPathParts = parts.dropLast(1)
-            fileName = parts.last()
-        }
-
-        var current: VirtualFile = baseDir
-        for (part in dirPathParts) {
-            var child = current.findChild(part)
-            if (child == null && op.op != "delete_dir" && op.op != "delete_file") {
-                child = current.createChildDirectory(this, part)
-            }
-            if (child == null) {
-                // 删除时找不到就当作成功跳过
-                return
-            }
-            current = child
-        }
-
         when (op.op) {
-            "create_dir" -> {
-                // 目录已经通过上面的循环创建/获取，无需额外操作
-            }
-            "delete_dir" -> {
-                if (current != baseDir) {
-                    current.delete(this)
-                }
-            }
-            "create_file", "modify_file" -> {
-                val name = fileName ?: return
-                val file = current.findChild(name) ?: current.createChildData(this, name)
+            // ---- 后端标准 ----
+            "create_dir" -> ensureDir(baseDir, normalizedPath)
+
+            "create_file", "update_file" -> {
+                val file = ensureFile(baseDir, normalizedPath)
                 val text = op.content ?: ""
                 VfsUtil.saveText(file, text)
             }
+
+            "delete_path" -> {
+                val vf = findRelative(baseDir, normalizedPath)
+                if (vf != null) {
+                    vf.delete(this)
+                    return
+                }
+                // 找不到就忽略
+            }
+
+            // ---- 旧兼容：你插件原来的 op ----
+            "delete_dir" -> {
+                val vf = findRelative(baseDir, normalizedPath)
+                if (vf != null && vf.isDirectory && vf != baseDir) vf.delete(this)
+            }
+
+            "modify_file" -> {
+                val file = ensureFile(baseDir, normalizedPath)
+                val text = op.content ?: ""
+                VfsUtil.saveText(file, text)
+            }
+
             "delete_file" -> {
-                val name = fileName ?: return
-                val file = current.findChild(name) ?: return
-                file.delete(this)
+                val vf = findRelative(baseDir, normalizedPath)
+                if (vf != null && !vf.isDirectory) vf.delete(this)
             }
+
             else -> {
-                // 未知 op：先忽略
+                // unknown op -> ignore
             }
         }
     }
 
-    // ========== 基础工具方法 ==========
-
-    private fun createChildDirectory(parent: VirtualFile, name: String): VirtualFile {
-        val existing = parent.findChild(name)
-        if (existing != null && existing.isDirectory) return existing
-        return parent.createChildDirectory(this, name)
+    private fun normalizeRelPath(p: String): String {
+        var s = p.trim().replace("\\", "/")
+        while (s.startsWith("/")) s = s.substring(1)
+        val parts = s.split("/").filter { it.isNotBlank() }
+        if (parts.any { it == ".." }) return ""
+        return parts.joinToString("/")
     }
 
-    private fun createNestedDirs(parent: VirtualFile, path: String): VirtualFile {
-        var current = parent
-        val parts = path.split("/", "\\").filter { it.isNotBlank() }
-        for (part in parts) {
-            var child = current.findChild(part)
-            if (child == null) {
-                child = current.createChildDirectory(this, part)
+    private fun findRelative(base: VirtualFile, rel: String): VirtualFile? {
+        val parts = rel.split("/").filter { it.isNotBlank() }
+        return VfsUtil.findRelativeFile(base, *parts.toTypedArray())
+    }
+
+    private fun ensureDir(base: VirtualFile, relDir: String): VirtualFile {
+        val parts = relDir.split("/").filter { it.isNotBlank() }
+        var cur = base
+        for (p in parts) {
+            val existing = cur.findChild(p)
+            cur = if (existing != null && existing.isDirectory) {
+                existing
+            } else {
+                cur.createChildDirectory(this, p)
             }
-            current = child
         }
-        return current
+        return cur
+    }
+
+    private fun ensureFile(base: VirtualFile, relFile: String): VirtualFile {
+        val parts = relFile.split("/").filter { it.isNotBlank() }
+        val dirParts = parts.dropLast(1)
+        val name = parts.last()
+
+        var cur = base
+        for (p in dirParts) {
+            val existing = cur.findChild(p)
+            cur = if (existing != null && existing.isDirectory) {
+                existing
+            } else {
+                cur.createChildDirectory(this, p)
+            }
+        }
+
+        val existingFile = cur.findChild(name)
+        if (existingFile != null && !existingFile.isDirectory) return existingFile
+
+        return cur.createChildData(this, name)
     }
 
     private fun createFileWithContent(dir: VirtualFile, fileName: String, content: String): VirtualFile {

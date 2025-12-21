@@ -14,7 +14,7 @@ object AiClientFactory {
             AiProvider.TECH_ZUKUNFT -> {
                 // 只有这个走你的 server
                 TechZukunftClient(
-                    endpoint = profile.baseUrl.ifBlank { "https://api.techzukunft.ai/v1/ide/chat" },
+                    endpoint = profile.baseUrl.ifBlank { "http://127.0.0.1:8001/v1/ide/chat" },
                     authToken = profile.token.ifBlank { null }
                 )
             }

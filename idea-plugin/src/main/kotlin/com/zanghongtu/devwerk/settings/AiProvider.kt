@@ -19,7 +19,7 @@ enum class AiProvider(
         needsUrl = false,
         needsToken = true,
         supportsModelList = false,
-        defaultUrl = "https://api.techzukunft.ai/v1/ide/chat",
+        defaultUrl = "http://127.0.0.1:8001/v1/ide/chat",
         defaultModel = "tz-devwerk"
     ),
 

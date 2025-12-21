@@ -26,7 +26,7 @@ class AiSettingsService : PersistentStateComponent<AiSettingsState> {
                 AiProfile(
                     name = "TechZukunft",
                     provider = AiProvider.TECH_ZUKUNFT.name,
-                    baseUrl = "https://api.techzukunft.ai/v1/ide/chat",
+                    baseUrl = "http://127.0.0.1:8001/v1/ide/chat",
                     token = "",
                     model = "tz-devwerk"
                 ),
