@@ -17,19 +17,28 @@ import kotlin.streams.asSequence
 class DevwerkOperationRunner {
 
     /**
-     * 发送前调用：只做目录准备（1、2），并写入 header
+     * 发送前调用：做目录准备（1、2），并创建 before/after 目录
      */
     fun beginOperation(project: Project, projectRootPath: Path): DevwerkContext {
         val ctx = ensureDevwerkAndCreateOpDir(projectRootPath)
+
+        // 创建 before/after 根目录
+        Files.createDirectories(ctx.opDir.resolve("before"))
+        Files.createDirectories(ctx.opDir.resolve("after"))
+
         appendLog(ctx.opLog, "=== DevWerk Operation Started: ${ctx.opDir.fileName} ===\n")
         appendLog(ctx.opLog, "[INFO] projectRoot=${ctx.projectRoot}\n")
+
         refreshVfs(projectRootPath)
         return ctx
     }
 
     /**
-     * 拿到最终 response 后调用：做（4）备份 + 记录摘要（可选）
-     * 注意：请求/响应原样日志已经由 HttpAiClient 在发送/接收时写入了。
+     * 拿到最终 response 后调用：
+     * - 记录结构化的“本次会触及哪些文件/操作”
+     * - 做 BEFORE 备份（修改/删除 + patch 涉及的已存在文件）
+     *
+     * 注意：请求/响应原样日志已由 HttpAiClient 在发送/接收时写入。
      */
     fun recordFinalSummaryAndBackup(project: Project, ctx: DevwerkContext, response: IdeChatResponse) {
         appendLog(ctx.opLog, "\n===== FINAL SUMMARY BEGIN =====\n")
@@ -40,17 +49,35 @@ class DevwerkOperationRunner {
         appendLog(ctx.opLog, "[INFO] tool_requests_count=${response.toolRequests.size}\n")
         appendLog(ctx.opLog, "===== FINAL SUMMARY END =====\n")
 
-        // 4) 备份：ops + patch_ops 触及的文件
-        backupFilesForOps(ctx, response.ops)
-        backupFilesForPatch(ctx, response)
+        // 记录每条 op（让你一眼知道增删改哪些文件）
+        if (response.ops.isNotEmpty()) {
+            appendLog(ctx.opLog, "\n===== OPS LIST BEGIN =====\n")
+            response.ops.forEachIndexed { idx, op ->
+                appendLog(ctx.opLog, "[OP ${idx + 1}] ${op.op} ${op.path}\n")
+            }
+            appendLog(ctx.opLog, "===== OPS LIST END =====\n")
+        }
+
+        // patch 涉及的文件清单
+        val patchPaths = if (response.patchOps.isNotEmpty()) PatchApplier.collectAffectedPaths(response.patchOps) else emptySet()
+        if (patchPaths.isNotEmpty()) {
+            appendLog(ctx.opLog, "\n===== PATCH PATHS BEGIN =====\n")
+            patchPaths.sorted().forEach { p -> appendLog(ctx.opLog, "[PATCH] $p\n") }
+            appendLog(ctx.opLog, "===== PATCH PATHS END =====\n")
+        }
+
+        // BEFORE：备份“将被修改或删除”的文件 + patch 涉及的已存在文件
+        val beforeTargets = collectBeforeTargets(response.ops, patchPaths)
+        snapshotTo(ctx, beforeTargets, slot = "before", reason = "before")
 
         refreshVfs(ctx.projectRoot)
     }
 
     /**
-     * 5) 执行原来的增删改逻辑（不调用 AI）。
+     * 执行文件变更（5），并在执行后做 AFTER 快照（新增/修改 + patch）
      */
     fun applyResponse(project: Project, ctx: DevwerkContext, response: IdeChatResponse) {
+        // 应用变更
         if (response.patchOps.isNotEmpty()) {
             appendLog(ctx.opLog, "[INFO] Applying patchOps: ${response.patchOps.size}\n")
             PatchApplier.applyPatchOps(project, response.patchOps)
@@ -62,8 +89,123 @@ class DevwerkOperationRunner {
         } else {
             appendLog(ctx.opLog, "[INFO] No ops/patchOps to apply.\n")
         }
+
+        // AFTER：备份“新增/修改”的文件 + patch 涉及的文件（存在的）
+        val patchPaths = if (response.patchOps.isNotEmpty()) PatchApplier.collectAffectedPaths(response.patchOps) else emptySet()
+        val afterTargets = collectAfterTargets(response.ops, patchPaths)
+        snapshotTo(ctx, afterTargets, slot = "after", reason = "after")
+
         refreshVfs(ctx.projectRoot)
     }
+
+    // -------------------------------
+    // target collection
+    // -------------------------------
+
+    /**
+     * BEFORE 需要备份：
+     * - update/modify：备份旧文件
+     * - delete：备份被删前内容（文件或目录）
+     * - patch：备份 patch 涉及且当前存在的文件
+     */
+    private fun collectBeforeTargets(ops: List<FileOp>, patchPaths: Set<String>): List<String> {
+        val fromOps = ops.filter {
+            it.op == "update_file" ||
+                    it.op == "modify_file" ||
+                    it.op == "delete_path" ||
+                    it.op == "delete_file" ||
+                    it.op == "delete_dir"
+        }.map { it.path }
+
+        return (fromOps + patchPaths).distinct()
+    }
+
+    /**
+     * AFTER 需要备份：
+     * - create/update/modify：备份最终文件内容
+     * - patch：备份最终文件内容
+     */
+    private fun collectAfterTargets(ops: List<FileOp>, patchPaths: Set<String>): List<String> {
+        val fromOps = ops.filter {
+            it.op == "create_file" ||
+                    it.op == "update_file" ||
+                    it.op == "modify_file"
+        }.map { it.path }
+
+        return (fromOps + patchPaths).distinct()
+    }
+
+    // -------------------------------
+    // snapshot core
+    // -------------------------------
+
+    /**
+     * 将给定相对路径列表快照到 opDir/{slot}/ 下，保持目录结构。
+     * - 文件：直接 copy
+     * - 目录（常见于 delete_path/delete_dir）：递归 copy（慎用，但满足你“保持目录结构”的要求）
+     */
+    private fun snapshotTo(ctx: DevwerkContext, relPaths: List<String>, slot: String, reason: String) {
+        if (relPaths.isEmpty()) {
+            appendLog(ctx.opLog, "[INFO] No snapshot targets for $reason.\n")
+            return
+        }
+
+        val root = ctx.opDir.resolve(slot)
+        Files.createDirectories(root)
+
+        for (rel in relPaths) {
+            val safeRel = normalizeRelPath(rel)
+            if (safeRel.isBlank()) {
+                appendLog(ctx.opLog, "[WARN] Snapshot($reason) skip invalid path: $rel\n")
+                continue
+            }
+
+            val src = ctx.projectRoot.resolve(safeRel).normalize()
+            if (!src.startsWith(ctx.projectRoot)) {
+                appendLog(ctx.opLog, "[WARN] Snapshot($reason) skip (escapes root): $safeRel\n")
+                continue
+            }
+
+            if (!Files.exists(src)) {
+                appendLog(ctx.opLog, "[WARN] Snapshot($reason) not found: $safeRel\n")
+                continue
+            }
+
+            val dst = root.resolve(safeRel).normalize()
+            try {
+                if (Files.isDirectory(src)) {
+                    // 目录递归 copy
+                    copyDirectoryRecursively(src, dst)
+                    appendLog(ctx.opLog, "[OK] Snapshot($reason) dir: $safeRel -> $dst\n")
+                } else {
+                    Files.createDirectories(dst.parent)
+                    Files.copy(src, dst, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES)
+                    appendLog(ctx.opLog, "[OK] Snapshot($reason) file: $safeRel -> $dst\n")
+                }
+            } catch (e: Exception) {
+                appendLog(ctx.opLog, "[ERROR] Snapshot($reason) failed: $safeRel, ${e::class.java.simpleName}: ${e.message}\n")
+            }
+        }
+    }
+
+    private fun copyDirectoryRecursively(srcDir: Path, dstDir: Path) {
+        Files.walk(srcDir).use { stream ->
+            stream.forEach { src ->
+                val rel = srcDir.relativize(src)
+                val dst = dstDir.resolve(rel)
+                if (Files.isDirectory(src)) {
+                    Files.createDirectories(dst)
+                } else {
+                    Files.createDirectories(dst.parent)
+                    Files.copy(src, dst, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES)
+                }
+            }
+        }
+    }
+
+    // -------------------------------
+    // filesystem helpers
+    // -------------------------------
 
     private fun ensureDevwerkAndCreateOpDir(projectRoot: Path): DevwerkContext {
         val devwerkDir = projectRoot.resolve(".devwerk")
@@ -144,61 +286,6 @@ class DevwerkOperationRunner {
             StandardOpenOption.CREATE,
             StandardOpenOption.APPEND
         )
-    }
-
-    private fun backupFilesForOps(ctx: DevwerkContext, ops: List<FileOp>) {
-        val targets = ops
-            .filter {
-                it.op == "update_file" ||
-                        it.op == "modify_file" ||
-                        it.op == "delete_path" ||
-                        it.op == "delete_file"
-            }
-            .map { it.path }
-            .distinct()
-
-        backupFilesByRelPaths(ctx, targets, reason = "ops")
-    }
-
-    private fun backupFilesForPatch(ctx: DevwerkContext, response: IdeChatResponse) {
-        if (response.patchOps.isEmpty()) return
-        val targets = PatchApplier.collectAffectedPaths(response.patchOps).toList()
-        backupFilesByRelPaths(ctx, targets, reason = "patch_ops")
-    }
-
-    private fun backupFilesByRelPaths(ctx: DevwerkContext, relPaths: List<String>, reason: String) {
-        if (relPaths.isEmpty()) {
-            appendLog(ctx.opLog, "[INFO] No files to backup for $reason.\n")
-            return
-        }
-
-        for (relPath in relPaths) {
-            val safeRel = normalizeRelPath(relPath)
-            if (safeRel.isBlank()) {
-                appendLog(ctx.opLog, "[WARN] Skip backup (invalid relPath): $relPath\n")
-                continue
-            }
-
-            val src = ctx.projectRoot.resolve(safeRel).normalize()
-            val dst = ctx.opDir.resolve(safeRel).normalize()
-
-            if (!src.startsWith(ctx.projectRoot)) {
-                appendLog(ctx.opLog, "[WARN] Skip backup (path escapes root): $safeRel\n")
-                continue
-            }
-
-            try {
-                if (Files.exists(src) && Files.isRegularFile(src)) {
-                    Files.createDirectories(dst.parent)
-                    Files.copy(src, dst, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES)
-                    appendLog(ctx.opLog, "[OK] Backup($reason): $safeRel -> $dst\n")
-                } else {
-                    appendLog(ctx.opLog, "[WARN] Backup($reason) skipped (not found or not file): $safeRel\n")
-                }
-            } catch (e: Exception) {
-                appendLog(ctx.opLog, "[ERROR] Backup($reason) failed: $safeRel, ${e::class.java.simpleName}: ${e.message}\n")
-            }
-        }
     }
 
     private fun normalizeRelPath(p: String): String {
