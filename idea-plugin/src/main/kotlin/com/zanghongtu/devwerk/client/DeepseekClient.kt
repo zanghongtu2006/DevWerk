@@ -31,7 +31,7 @@ class DeepseekClient(
 
         val messages = JSONArray()
 
-        // ✅ system
+        // system
         messages.put(JSONObject().put("role", "system").put("content", PromptTemplates.codeOpsSystemPrompt()))
 
         // history

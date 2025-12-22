@@ -16,7 +16,7 @@ class AiSettingsDialog : DialogWrapper(true) {
         private const val TOKEN_PLACEHOLDER = "PLEASE_INPUT_YOUR_TOKEN"
     }
 
-    // ✅ Provider 是唯一切换入口
+    // Provider 是唯一切换入口
     private val providerCombo = ComboBox<String>().apply {
         AiProvider.entries.forEach { addItem(it.display) }
     }
@@ -40,7 +40,7 @@ class AiSettingsDialog : DialogWrapper(true) {
         val activeProfile = svc.getActiveProfile()
         currentProfile = activeProfile
 
-        // ✅ 用 activeProfile.provider 选中 providerCombo
+        // 用 activeProfile.provider 选中 providerCombo
         val activeProvider = AiProvider.fromName(activeProfile.provider)
         providerCombo.selectedItem = activeProvider.display
 
@@ -98,7 +98,7 @@ class AiSettingsDialog : DialogWrapper(true) {
         val tokenInput = tokenField.text.trim()
         val realToken = if (tokenInput == TOKEN_PLACEHOLDER) "" else tokenInput
 
-        // ✅ 取当前 provider 对应的 profile（存在则更新，不存在则创建）
+        // 取当前 provider 对应的 profile（存在则更新，不存在则创建）
         val p = currentProfile ?: AiProfile(name = provider.display).also { currentProfile = it }
 
         // 用 provider.display 作为 profile.name（稳定、好读、不会重复）
@@ -150,7 +150,7 @@ class AiSettingsDialog : DialogWrapper(true) {
             }
         }
 
-        // ✅ 保存并设为 active（全局生效）
+        // 保存并设为 active（全局生效）
         svc.upsertProfile(p, setActive = true)
 
         super.doOKAction()

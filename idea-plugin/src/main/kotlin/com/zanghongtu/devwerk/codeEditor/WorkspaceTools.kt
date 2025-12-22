@@ -54,7 +54,7 @@ object WorkspaceTools {
         val roots = if (paths.isEmpty()) listOf("src/", "app/") else paths
         val results = mutableListOf<String>()
 
-        // ✅ 如果 query 看起来像“文件名”，就走文件名精确匹配
+        // 如果 query 看起来像“文件名”，就走文件名精确匹配
         val filenameMode = looksLikeFileNameQuery(q)
 
         for (p in roots) {
@@ -69,10 +69,10 @@ object WorkspaceTools {
                 if (!filenameMode && f.length() > 1_000_000) return@scanFiles true
 
                 val hit = if (filenameMode) {
-                    // ✅ 文件名精确匹配（Windows 下不区分大小写更符合直觉）
+                    // 文件名精确匹配（Windows 下不区分大小写更符合直觉）
                     f.name.equals(q, ignoreCase = true)
                 } else {
-                    // ✅ 内容匹配（你原来的行为）
+                    // 内容匹配（你原来的行为）
                     val text = runCatching { f.readText(Charset.forName("UTF-8")) }.getOrNull() ?: return@scanFiles true
                     text.contains(q, ignoreCase = true)
                 }

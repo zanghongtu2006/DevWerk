@@ -4,11 +4,10 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.Project
 import com.zanghongtu.devwerk.codeEditor.ChatContext
 import com.zanghongtu.devwerk.codeEditor.ChatMessage
-import com.zanghongtu.devwerk.codeEditor.FsScaffolder
-import com.zanghongtu.devwerk.codeEditor.PatchApplier
 import com.zanghongtu.devwerk.settings.AiSettingsDialog
 import java.awt.BorderLayout
 import java.awt.Dimension
+import java.nio.file.Paths
 import javax.swing.*
 import javax.swing.SwingUtilities
 
@@ -65,27 +64,30 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         history += ChatMessage("user", text)
         inputField.text = ""
 
-        val ctx = ChatContext(
-            projectRoot = project.basePath,
-            history = history.toList()
-        )
-
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
+                val basePath = project.basePath
+                val runner = DevwerkOperationRunner()
+
+                // 发送前就创建 .devwerk / .gitignore / opDir（方案A核心）
+                val devCtx = if (!basePath.isNullOrBlank()) {
+                    runner.beginOperation(project, Paths.get(basePath))
+                } else null
+
+                val ctx = ChatContext(
+                    projectRoot = project.basePath,
+                    history = history.toList(),
+                    devCtx = devCtx
+                )
+
                 val aiClient = AiClientFactory.create(project)
                 val response = aiClient.sendChat(ctx, text)
 
                 history += ChatMessage("assistant", response.reply)
 
-                val basePath = project.basePath
-                if (!basePath.isNullOrBlank()) {
-                    val runner = DevwerkOperationRunner()
-                    val projectRootPath = java.nio.file.Paths.get(basePath)
-
-                    // 1~4：确保 .devwerk/.gitignore + opDir + 记录所有 AI raw response + 备份文件
-                    val devCtx = runner.prepareOperation(project, projectRootPath, response)
-
-                    // 5：执行原来的 patch/ops
+                // 拿到最终 response 后：写摘要 + 备份 + 应用（不再依赖 ops 是否为空）
+                if (devCtx != null) {
+                    runner.recordFinalSummaryAndBackup(project, devCtx, response)
                     runner.applyResponse(project, devCtx, response)
                 }
 

@@ -7,6 +7,9 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.nio.file.StandardOpenOption
 import java.util.concurrent.TimeUnit
 
 class HttpAiClient(
@@ -24,43 +27,54 @@ class HttpAiClient(
 
     override fun sendChat(context: ChatContext, userMessage: String): IdeChatResponse {
         val (mode, cleanUserMsg) = parseMode(userMessage)
+
         val messages = mutableListOf<ChatMessage>()
         messages += context.history
         messages += ChatMessage("user", cleanUserMsg)
+
         val workspace = buildWorkspaceSummary(context.projectRoot)
+
         val maxRounds = 6
         var round = 0
         var lastResp: IdeChatResponse? = null
         var pendingToolResults: List<ToolResult> = emptyList()
 
-        // 新增：收集所有轮次 raw response
+        // 收集每轮原始响应（保留原功能）
         val rawResponses = mutableListOf<String>()
+
         while (round < maxRounds) {
             round++
-            print(round)
+
             val respBody = postToServer(
+                chatContext = context,
+                round = round,
                 mode = mode,
                 projectRoot = context.projectRoot,
                 messages = messages,
                 workspace = workspace,
                 toolResults = pendingToolResults
             )
-            //  记录本轮 raw body（原样）
+
             rawResponses += respBody
+
             val resp = parseIdeChatResponse(respBody).copy(
                 rawResponses = rawResponses.toList()
             )
             lastResp = resp
+
             if (resp.toolRequests.isNotEmpty() && mode == "agent") {
                 messages += ChatMessage(
                     "assistant",
                     "tool_requests:\n" + toolRequestsToJson(resp.toolRequests)
                 )
+
                 pendingToolResults = executeTools(context.projectRoot, resp.toolRequests)
                 continue
             }
+
             return resp
         }
+
         return (lastResp ?: IdeChatResponse(reply = "No response", done = true))
             .copy(rawResponses = rawResponses.toList())
     }
@@ -86,7 +100,22 @@ class HttpAiClient(
         )
     }
 
+    private fun appendDevLog(context: ChatContext, text: String) {
+        val log = context.devCtx?.opLog ?: return
+        runCatching {
+            Files.writeString(
+                log,
+                text,
+                StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.APPEND
+            )
+        }
+    }
+
     private fun postToServer(
+        chatContext: ChatContext,
+        round: Int,
         mode: String,
         projectRoot: String?,
         messages: List<ChatMessage>,
@@ -143,6 +172,11 @@ class HttpAiClient(
 
         val bodyJson = root.toString()
 
+        // 发送前记录 REQUEST（原样）
+        appendDevLog(chatContext, "\n===== ROUND $round REQUEST BEGIN =====\n")
+        appendDevLog(chatContext, bodyJson)
+        appendDevLog(chatContext, "\n===== ROUND $round REQUEST END =====\n")
+
         val mediaType = "application/json; charset=utf-8".toMediaType()
         val requestBody = bodyJson.toRequestBody(mediaType)
 
@@ -159,6 +193,12 @@ class HttpAiClient(
 
         client.newCall(request).execute().use { response: Response ->
             val respBody = response.body?.string() ?: ""
+
+            // 收到后记录 RESPONSE（原样，不管成功失败）
+            appendDevLog(chatContext, "\n===== ROUND $round RESPONSE BEGIN =====\n")
+            appendDevLog(chatContext, respBody)
+            appendDevLog(chatContext, "\n===== ROUND $round RESPONSE END =====\n")
+
             if (!response.isSuccessful) {
                 throw RuntimeException("HTTP ${response.code} from AI server: $respBody")
             }

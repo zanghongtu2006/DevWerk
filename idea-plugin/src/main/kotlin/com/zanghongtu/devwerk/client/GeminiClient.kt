@@ -49,7 +49,7 @@ class GeminiClient(
 
         val body = JSONObject()
             .put("contents", contents)
-            // ✅ 两种字段都带，提升兼容性
+            // 两种字段都带，提升兼容性
             .put("systemInstruction", sysContent)
             .put("system_instruction", JSONObject().put("parts", JSONObject().put("text", sysText)))
 

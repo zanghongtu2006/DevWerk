@@ -21,6 +21,7 @@ object PatchApplier {
         }
     }
 
+
     /**
      * 用于 DevWerk 备份：从 patchOps 中提取会被创建/修改/删除的目标文件路径（相对路径）。
      */
@@ -37,6 +38,7 @@ object PatchApplier {
         }
         return out
     }
+
 
     private data class Hunk(val oldStart: Int, val oldCount: Int, val newStart: Int, val newCount: Int, val lines: List<String>)
     private data class FilePatch(
@@ -224,4 +226,5 @@ object PatchApplier {
         if (existingFile != null && !existingFile.isDirectory) return existingFile
         return cur.createChildData(this, name)
     }
+
 }

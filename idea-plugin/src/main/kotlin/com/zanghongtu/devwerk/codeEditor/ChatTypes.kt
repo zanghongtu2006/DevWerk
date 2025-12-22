@@ -13,7 +13,9 @@ data class ChatMessage(
  */
 data class ChatContext(
     val projectRoot: String?,
-    val history: List<ChatMessage>
+    val history: List<ChatMessage>,
+    // 新增：用于本次对话的 DevWerk 上下文（记录请求/响应/执行）
+    val devCtx: DevwerkContext? = null
 )
 
 /**
@@ -79,6 +81,7 @@ data class IdeChatResponse(
     val toolRequests: List<ToolRequest> = emptyList(),
     val patchOps: List<PatchOp> = emptyList(),
     val done: Boolean = false,
+    // 新增：本次 sendChat 内所有轮次的原始 HTTP 响应（原样字符串）
     val rawResponses: List<String> = emptyList()
 )
 
@@ -91,7 +94,6 @@ data class DevwerkContext(
 
 /**
  * AI 客户端接口（保持不改签名，避免影响你其它 Client）
- * sendChat 内部可实现 agent 多轮：tool_requests -> tool_results -> 最终 ops/patch_ops/done
  */
 interface AiClient {
     fun sendChat(

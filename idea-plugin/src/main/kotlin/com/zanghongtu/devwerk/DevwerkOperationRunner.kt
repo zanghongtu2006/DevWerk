@@ -17,45 +17,38 @@ import kotlin.streams.asSequence
 class DevwerkOperationRunner {
 
     /**
-     * ✅ 必须在“拿到 AI 最终 response 后、做任何文件操作前”调用。
-     * 做 1~4：
-     * 1) ensure .devwerk + .gitignore
-     * 2) create opDir (YYYYMMDD-0001-UUID)
-     * 3) write all AI raw responses into operation.log
-     * 4) backup files that will be modified/deleted (keep dir structure)
+     * 发送前调用：只做目录准备（1、2），并写入 header
      */
-    fun prepareOperation(project: Project, projectRootPath: Path, response: IdeChatResponse): DevwerkContext {
+    fun beginOperation(project: Project, projectRootPath: Path): DevwerkContext {
         val ctx = ensureDevwerkAndCreateOpDir(projectRootPath)
-
         appendLog(ctx.opLog, "=== DevWerk Operation Started: ${ctx.opDir.fileName} ===\n")
         appendLog(ctx.opLog, "[INFO] projectRoot=${ctx.projectRoot}\n")
+        refreshVfs(projectRootPath)
+        return ctx
+    }
 
-        // 3) 写入所有 raw responses（原样）
-        val raws = response.rawResponses
-        if (raws.isEmpty()) {
-            appendLog(ctx.opLog, "[WARN] rawResponses is empty (client didn't collect raw bodies?)\n")
-        } else {
-            raws.forEachIndexed { idx, raw ->
-                appendLog(ctx.opLog, "\n===== AI RESPONSE #${idx + 1} BEGIN =====\n")
-                appendLog(ctx.opLog, raw)
-                appendLog(ctx.opLog, "\n===== AI RESPONSE #${idx + 1} END =====\n")
-            }
-        }
+    /**
+     * 拿到最终 response 后调用：做（4）备份 + 记录摘要（可选）
+     * 注意：请求/响应原样日志已经由 HttpAiClient 在发送/接收时写入了。
+     */
+    fun recordFinalSummaryAndBackup(project: Project, ctx: DevwerkContext, response: IdeChatResponse) {
+        appendLog(ctx.opLog, "\n===== FINAL SUMMARY BEGIN =====\n")
+        appendLog(ctx.opLog, "[INFO] reply=${response.reply}\n")
+        appendLog(ctx.opLog, "[INFO] done=${response.done}\n")
+        appendLog(ctx.opLog, "[INFO] ops_count=${response.ops.size}\n")
+        appendLog(ctx.opLog, "[INFO] patch_ops_count=${response.patchOps.size}\n")
+        appendLog(ctx.opLog, "[INFO] tool_requests_count=${response.toolRequests.size}\n")
+        appendLog(ctx.opLog, "===== FINAL SUMMARY END =====\n")
 
         // 4) 备份：ops + patch_ops 触及的文件
         backupFilesForOps(ctx, response.ops)
         backupFilesForPatch(ctx, response)
 
-        // 刷新 VFS，让 IDE 立即看到 .devwerk/.gitignore（尤其 Windows）
-        refreshVfs(projectRootPath)
-
-        return ctx
+        refreshVfs(ctx.projectRoot)
     }
 
     /**
      * 5) 执行原来的增删改逻辑（不调用 AI）。
-     * - patch_ops 优先
-     * - 否则执行 ops
      */
     fun applyResponse(project: Project, ctx: DevwerkContext, response: IdeChatResponse) {
         if (response.patchOps.isNotEmpty()) {
@@ -69,7 +62,6 @@ class DevwerkOperationRunner {
         } else {
             appendLog(ctx.opLog, "[INFO] No ops/patchOps to apply.\n")
         }
-
         refreshVfs(ctx.projectRoot)
     }
 
@@ -154,9 +146,6 @@ class DevwerkOperationRunner {
         )
     }
 
-    /**
-     * 备份 ops 触及的文件：update/modify/delete 相关
-     */
     private fun backupFilesForOps(ctx: DevwerkContext, ops: List<FileOp>) {
         val targets = ops
             .filter {
@@ -171,9 +160,6 @@ class DevwerkOperationRunner {
         backupFilesByRelPaths(ctx, targets, reason = "ops")
     }
 
-    /**
-     * 备份 patch 触及的文件：从 unified diff 中提取目标文件路径
-     */
     private fun backupFilesForPatch(ctx: DevwerkContext, response: IdeChatResponse) {
         if (response.patchOps.isEmpty()) return
         val targets = PatchApplier.collectAffectedPaths(response.patchOps).toList()

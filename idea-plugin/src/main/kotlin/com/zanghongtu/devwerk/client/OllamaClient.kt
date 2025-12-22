@@ -27,7 +27,7 @@ class OllamaClient(
 
         val msgs = JSONArray()
 
-        // ✅ system prompt（只加一次：每次请求都放在最前面）
+        // system prompt（只加一次：每次请求都放在最前面）
         msgs.put(JSONObject().put("role", "system").put("content", PromptTemplates.codeOpsSystemPrompt()))
 
         // history
@@ -57,7 +57,7 @@ class OllamaClient(
         val json = JSONObject(resp.body())
         val raw = json.optJSONObject("message")?.optString("content").orEmpty()
 
-        // ✅ 解析为 CodeOps JSON：reply/code_tree/ops
+        // 解析为 CodeOps JSON：reply/code_tree/ops
         return CodeOpsParser.parseToIdeChatResponse(raw)
     }
 }
