@@ -23,24 +23,18 @@ class HttpAiClient(
         .build()
 
     override fun sendChat(context: ChatContext, userMessage: String): IdeChatResponse {
-        // 小指令：用户可用 "/scaffold xxx" 强制走: scaffold 模式
         val (mode, cleanUserMsg) = parseMode(userMessage)
-
-        // 1) 初始 messages：历史 + 当前 user
         val messages = mutableListOf<ChatMessage>()
         messages += context.history
         messages += ChatMessage("user", cleanUserMsg)
-
-        // 2) workspace：给一个轻量 tree_preview，agent 更容易少问几次
         val workspace = buildWorkspaceSummary(context.projectRoot)
-
-        // 3) 多轮 agent：tool_requests -> tool_results -> 最终 ops/patch_ops/done
         val maxRounds = 6
         var round = 0
         var lastResp: IdeChatResponse? = null
-
         var pendingToolResults: List<ToolResult> = emptyList()
 
+        // 新增：收集所有轮次 raw response
+        val rawResponses = mutableListOf<String>()
         while (round < maxRounds) {
             round++
             print(round)
@@ -51,27 +45,24 @@ class HttpAiClient(
                 workspace = workspace,
                 toolResults = pendingToolResults
             )
-
-            val resp = parseIdeChatResponse(respBody)
+            //  记录本轮 raw body（原样）
+            rawResponses += respBody
+            val resp = parseIdeChatResponse(respBody).copy(
+                rawResponses = rawResponses.toList()
+            )
             lastResp = resp
-
-            // 如果模型要求工具，就执行并继续下一轮
             if (resp.toolRequests.isNotEmpty() && mode == "agent") {
-                // 把 tool_requests 作为 assistant 可见历史（关键：否则下一轮模型不知道自己请求过什么）
                 messages += ChatMessage(
                     "assistant",
                     "tool_requests:\n" + toolRequestsToJson(resp.toolRequests)
                 )
-
                 pendingToolResults = executeTools(context.projectRoot, resp.toolRequests)
                 continue
             }
-
-            // 没有 tool_requests，直接结束（可能返回 ops 或 patch_ops 或 done）
             return resp
         }
-
-        return lastResp ?: IdeChatResponse(reply = "No response", done = true)
+        return (lastResp ?: IdeChatResponse(reply = "No response", done = true))
+            .copy(rawResponses = rawResponses.toList())
     }
 
     private fun parseMode(userMessage: String): Pair<String, String> {

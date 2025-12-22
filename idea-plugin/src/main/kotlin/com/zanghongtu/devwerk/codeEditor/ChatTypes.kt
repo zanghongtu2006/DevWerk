@@ -78,7 +78,15 @@ data class IdeChatResponse(
     val ops: List<FileOp> = emptyList(),
     val toolRequests: List<ToolRequest> = emptyList(),
     val patchOps: List<PatchOp> = emptyList(),
-    val done: Boolean = false
+    val done: Boolean = false,
+    val rawResponses: List<String> = emptyList()
+)
+
+data class DevwerkContext(
+    val projectRoot: java.nio.file.Path,
+    val devwerkDir: java.nio.file.Path,
+    val opDir: java.nio.file.Path,
+    val opLog: java.nio.file.Path
 )
 
 /**

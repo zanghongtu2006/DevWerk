@@ -77,11 +77,16 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
 
                 history += ChatMessage("assistant", response.reply)
 
-                // 1) 优先 patch_ops
-                if (response.patchOps.isNotEmpty()) {
-                    PatchApplier.applyPatchOps(project, response.patchOps)
-                } else if (response.ops.isNotEmpty()) {
-                    FsScaffolder.applyFileOps(project, response.ops)
+                val basePath = project.basePath
+                if (!basePath.isNullOrBlank()) {
+                    val runner = DevwerkOperationRunner()
+                    val projectRootPath = java.nio.file.Paths.get(basePath)
+
+                    // 1~4：确保 .devwerk/.gitignore + opDir + 记录所有 AI raw response + 备份文件
+                    val devCtx = runner.prepareOperation(project, projectRootPath, response)
+
+                    // 5：执行原来的 patch/ops
+                    runner.applyResponse(project, devCtx, response)
                 }
 
                 SwingUtilities.invokeLater {

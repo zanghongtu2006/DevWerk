@@ -21,6 +21,23 @@ object PatchApplier {
         }
     }
 
+    /**
+     * 用于 DevWerk 备份：从 patchOps 中提取会被创建/修改/删除的目标文件路径（相对路径）。
+     */
+    fun collectAffectedPaths(patchOps: List<PatchOp>): Set<String> {
+        val out = mutableSetOf<String>()
+        for (po in patchOps) {
+            if (po.op != "apply_patch") continue
+            val patches = parseUnifiedDiff(po.content)
+            for (fp in patches) {
+                val raw = (fp.newPath ?: fp.oldPath) ?: continue
+                val norm = normalizePatchPath(raw)
+                if (norm.isNotBlank()) out += norm
+            }
+        }
+        return out
+    }
+
     private data class Hunk(val oldStart: Int, val oldCount: Int, val newStart: Int, val newCount: Int, val lines: List<String>)
     private data class FilePatch(
         val oldPath: String?,
