@@ -12,7 +12,7 @@ class Settings:
 
     @staticmethod
     def from_env() -> "Settings":
-        base = os.getenv("OLLAMA_BASE_URL", "http://82.157.232.122:12434").rstrip("/")
+        base = os.getenv("OLLAMA_BASE_URL", "http://localhost:12434").rstrip("/")
         model = os.getenv("OLLAMA_MODEL", "deepseek-r1:32b")
         timeout = float(os.getenv("OLLAMA_TIMEOUT", "180"))
         return Settings(
