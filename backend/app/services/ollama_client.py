@@ -10,6 +10,7 @@ from app.core.config import Settings
 from app.core.schema import MODEL_RESPONSE_SCHEMA
 from app.services.validation import validate_model_response
 
+
 class OllamaClient:
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or Settings.from_env()
@@ -22,9 +23,11 @@ class OllamaClient:
             "stream": False,
             "messages": messages,
             "format": MODEL_RESPONSE_SCHEMA,
-            "options": {"temperature": 0.2},
+            "options": {"temperature": 0.4},
         }
+        print(payload)
         resp = http_requests.post(self.url, json=payload, timeout=self.settings.ollama_timeout)
+        print(resp.content)
         resp.raise_for_status()
         data = resp.json()
         content = (data.get("message") or {}).get("content")

@@ -1,38 +1,98 @@
 # app/services/validation.py
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, List
+
+
+ALLOWED_FILE_OPS = {"create_dir", "create_file", "update_file", "delete_path"}
+ALLOWED_TOOLS = {"list_dir", "read_file", "search"}
+ALLOWED_PATCH_OPS = {"apply_patch"}
+
+
+def _validate_rel_path(p: str, where: str) -> None:
+    if not isinstance(p, str) or not p:
+        raise ValueError(f"{where}.path invalid")
+    if p.startswith("/") or p.startswith("\\") or "://" in p:
+        raise ValueError(f"{where}.path must be relative: {p}")
+    if ".." in p.split("/"):
+        raise ValueError(f"{where}.path must not contain '..': {p}")
+
 
 def validate_model_response(obj: Dict[str, Any]) -> None:
     if not isinstance(obj, dict):
         raise ValueError("Response must be a JSON object")
-    for k in ("reply", "code_tree", "ops"):
-        if k not in obj:
-            raise ValueError(f"Missing field: {k}")
-    if not isinstance(obj["reply"], str):
-        raise ValueError("reply must be string")
-    if not isinstance(obj["code_tree"], str):
-        raise ValueError("code_tree must be string")
-    if not isinstance(obj["ops"], list):
-        raise ValueError("ops must be array")
 
-    for i, op in enumerate(obj["ops"]):
-        if not isinstance(op, dict):
-            raise ValueError(f"ops[{i}] must be object")
+    if "reply" not in obj or not isinstance(obj["reply"], str):
+        raise ValueError("Missing/invalid reply")
 
-        for k in ("op", "path", "language", "content"):
-            if k not in op:
-                raise ValueError(f"ops[{i}] missing {k}")
+    # 至少要有一种输出形态
+    has_scaffold = obj.get("code_tree") is not None or obj.get("ops") is not None
+    has_tools = obj.get("tool_requests") is not None
+    has_patch = obj.get("patch_ops") is not None
+    done = bool(obj.get("done") or False)
 
-        if op["op"] not in ("create_dir", "create_file", "update_file", "delete_path"):
-            raise ValueError(f"ops[{i}].op invalid: {op['op']}")
+    if not done and not has_scaffold and not has_tools and not has_patch:
+        raise ValueError("Must output scaffold/tools/patch or done=true")
 
-        p = op["path"]
-        if not isinstance(p, str) or not p:
-            raise ValueError(f"ops[{i}].path invalid")
+    # scaffold：ops
+    ops = obj.get("ops") or []
+    if ops is not None:
+        if not isinstance(ops, list):
+            raise ValueError("ops must be array or null")
+        for i, op in enumerate(ops):
+            if not isinstance(op, dict):
+                raise ValueError(f"ops[{i}] must be object")
+            for k in ("op", "path", "language", "content"):
+                if k not in op:
+                    raise ValueError(f"ops[{i}] missing {k}")
+            if op["op"] not in ALLOWED_FILE_OPS:
+                raise ValueError(f"ops[{i}].op invalid: {op['op']}")
+            _validate_rel_path(op["path"], f"ops[{i}]")
 
-        if p.startswith("/") or p.startswith("\\") or "://" in p:
-            raise ValueError(f"ops[{i}].path must be relative: {p}")
+    # agent：tool_requests
+    tool_requests = obj.get("tool_requests") or []
+    if tool_requests is not None:
+        if not isinstance(tool_requests, list):
+            raise ValueError("tool_requests must be array or null")
+        for i, tr in enumerate(tool_requests):
+            if not isinstance(tr, dict):
+                raise ValueError(f"tool_requests[{i}] must be object")
+            if tr.get("tool") not in ALLOWED_TOOLS:
+                raise ValueError(f"tool_requests[{i}].tool invalid")
+            if not isinstance(tr.get("id"), str) or not tr.get("id"):
+                raise ValueError(f"tool_requests[{i}].id invalid")
+            args = tr.get("args")
+            if not isinstance(args, dict):
+                raise ValueError(f"tool_requests[{i}].args must be object")
+            # 粗略约束 read_file 必须有限制范围
+            if tr["tool"] == "read_file":
+                if "path" not in args:
+                    raise ValueError(f"tool_requests[{i}].args.path missing")
+                _validate_rel_path(args["path"], f"tool_requests[{i}].args")
+                if "start_line" not in args or "end_line" not in args:
+                    raise ValueError(f"tool_requests[{i}] read_file must set start_line/end_line")
 
-        if ".." in p.split("/"):
-            raise ValueError(f"ops[{i}].path must not contain '..': {p}")
+    # agent：patch_ops
+    patch_ops = obj.get("patch_ops") or []
+    if patch_ops is not None:
+        if not isinstance(patch_ops, list):
+            raise ValueError("patch_ops must be array or null")
+        for i, po in enumerate(patch_ops):
+            if not isinstance(po, dict):
+                raise ValueError(f"patch_ops[{i}] must be object")
+            if po.get("op") not in ALLOWED_PATCH_OPS:
+                raise ValueError(f"patch_ops[{i}].op invalid")
+            content = po.get("content")
+            if not isinstance(content, str) or len(content) < 20:
+                raise ValueError(f"patch_ops[{i}].content invalid")
+            # 粗校验 unified diff 特征
+            if ("--- " not in content) or ("+++ " not in content) or ("@@ " not in content):
+                raise ValueError(f"patch_ops[{i}] must be unified diff")
+
+    ops = obj.get("ops") or []
+    tool_requests = obj.get("tool_requests") or []
+    patch_ops = obj.get("patch_ops") or []
+
+    #  强制：同一轮不能“边问边改”
+    if tool_requests and (ops or patch_ops):
+        raise ValueError("If tool_requests is non-empty, ops and patch_ops must be empty in the same response.")
