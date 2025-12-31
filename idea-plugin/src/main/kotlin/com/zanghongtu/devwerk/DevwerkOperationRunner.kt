@@ -16,13 +16,9 @@ import kotlin.streams.asSequence
 
 class DevwerkOperationRunner {
 
-    /**
-     * 发送前调用：做目录准备（1、2），并创建 before/after 目录
-     */
     fun beginOperation(project: Project, projectRootPath: Path): DevwerkContext {
         val ctx = ensureDevwerkAndCreateOpDir(projectRootPath)
 
-        // 创建 before/after 根目录
         Files.createDirectories(ctx.opDir.resolve("before"))
         Files.createDirectories(ctx.opDir.resolve("after"))
 
@@ -33,13 +29,6 @@ class DevwerkOperationRunner {
         return ctx
     }
 
-    /**
-     * 拿到最终 response 后调用：
-     * - 记录结构化的“本次会触及哪些文件/操作”
-     * - 做 BEFORE 备份（修改/删除 + patch 涉及的已存在文件）
-     *
-     * 注意：请求/响应原样日志已由 HttpAiClient 在发送/接收时写入。
-     */
     fun recordFinalSummaryAndBackup(project: Project, ctx: DevwerkContext, response: IdeChatResponse) {
         appendLog(ctx.opLog, "\n===== FINAL SUMMARY BEGIN =====\n")
         appendLog(ctx.opLog, "[INFO] reply=${response.reply}\n")
@@ -49,7 +38,6 @@ class DevwerkOperationRunner {
         appendLog(ctx.opLog, "[INFO] tool_requests_count=${response.toolRequests.size}\n")
         appendLog(ctx.opLog, "===== FINAL SUMMARY END =====\n")
 
-        // 记录每条 op（让你一眼知道增删改哪些文件）
         if (response.ops.isNotEmpty()) {
             appendLog(ctx.opLog, "\n===== OPS LIST BEGIN =====\n")
             response.ops.forEachIndexed { idx, op ->
@@ -58,56 +46,84 @@ class DevwerkOperationRunner {
             appendLog(ctx.opLog, "===== OPS LIST END =====\n")
         }
 
-        // patch 涉及的文件清单
-        val patchPaths = if (response.patchOps.isNotEmpty()) PatchApplier.collectAffectedPaths(response.patchOps) else emptySet()
+        val patchPathsRaw =
+            if (response.patchOps.isNotEmpty()) PatchApplier.collectAffectedPaths(response.patchOps) else emptySet()
+
+        val patchPaths = patchPathsRaw
+            .map { normalizeRelPath(it) }
+            .filter { it.isNotBlank() && !hasHiddenDirSegment(it) }
+            .toSet()
+
         if (patchPaths.isNotEmpty()) {
             appendLog(ctx.opLog, "\n===== PATCH PATHS BEGIN =====\n")
             patchPaths.sorted().forEach { p -> appendLog(ctx.opLog, "[PATCH] $p\n") }
             appendLog(ctx.opLog, "===== PATCH PATHS END =====\n")
+        } else if (patchPathsRaw.isNotEmpty()) {
+            // 如果全部被过滤掉，记一下
+            val blocked = patchPathsRaw.map { normalizeRelPath(it) }.filter { it.isNotBlank() && hasHiddenDirSegment(it) }
+            if (blocked.isNotEmpty()) {
+                appendLog(ctx.opLog, "\n[WARN] Patch targets contain hidden-dir paths and were blocked:\n")
+                blocked.distinct().sorted().forEach { appendLog(ctx.opLog, "[WARN] blocked patch path: $it\n") }
+            }
         }
 
-        // BEFORE：备份“将被修改或删除”的文件 + patch 涉及的已存在文件
         val beforeTargets = collectBeforeTargets(response.ops, patchPaths)
         snapshotTo(ctx, beforeTargets, slot = "before", reason = "before")
 
         refreshVfs(ctx.projectRoot)
     }
 
-    /**
-     * 执行文件变更（5），并在执行后做 AFTER 快照（新增/修改 + patch）
-     */
     fun applyResponse(project: Project, ctx: DevwerkContext, response: IdeChatResponse) {
-        // 应用变更
+        // 1) patch_ops（兜底：如果 patch 目标涉及隐藏目录，直接拒绝）
         if (response.patchOps.isNotEmpty()) {
-            appendLog(ctx.opLog, "[INFO] Applying patchOps: ${response.patchOps.size}\n")
-            PatchApplier.applyPatchOps(project, response.patchOps)
-            appendLog(ctx.opLog, "[OK] patchOps applied.\n")
+            val raw = PatchApplier.collectAffectedPaths(response.patchOps).map { normalizeRelPath(it) }.filter { it.isNotBlank() }
+            val blocked = raw.filter { hasHiddenDirSegment(it) }.distinct()
+
+            if (blocked.isNotEmpty()) {
+                appendLog(ctx.opLog, "[WARN] Refuse to apply patchOps because it targets hidden-dir paths:\n")
+                blocked.sorted().forEach { appendLog(ctx.opLog, "[WARN] blocked patch path: $it\n") }
+                appendLog(ctx.opLog, "[INFO] patchOps skipped.\n")
+            } else {
+                appendLog(ctx.opLog, "[INFO] Applying patchOps: ${response.patchOps.size}\n")
+                PatchApplier.applyPatchOps(project, response.patchOps)
+                appendLog(ctx.opLog, "[OK] patchOps applied.\n")
+            }
         } else if (response.ops.isNotEmpty()) {
-            appendLog(ctx.opLog, "[INFO] Applying file ops: ${response.ops.size}\n")
-            FsScaffolder.applyFileOps(project, response.ops)
-            appendLog(ctx.opLog, "[OK] file ops applied.\n")
+            // 2) file ops（兜底：屏蔽隐藏目录内部操作）
+            val filteredOps = response.ops.filter { op ->
+                val p = normalizeRelPath(op.path)
+                val blocked = p.isNotBlank() && hasHiddenDirSegment(p)
+                if (blocked) {
+                    appendLog(ctx.opLog, "[WARN] blocked file op on hidden-dir path: ${op.op} ${op.path}\n")
+                }
+                !blocked
+            }
+
+            if (filteredOps.isEmpty()) {
+                appendLog(ctx.opLog, "[INFO] No safe file ops to apply (all blocked or empty).\n")
+            } else {
+                appendLog(ctx.opLog, "[INFO] Applying file ops: ${filteredOps.size}\n")
+                FsScaffolder.applyFileOps(project, filteredOps)
+                appendLog(ctx.opLog, "[OK] file ops applied.\n")
+            }
         } else {
             appendLog(ctx.opLog, "[INFO] No ops/patchOps to apply.\n")
         }
 
-        // AFTER：备份“新增/修改”的文件 + patch 涉及的文件（存在的）
-        val patchPaths = if (response.patchOps.isNotEmpty()) PatchApplier.collectAffectedPaths(response.patchOps) else emptySet()
+        val patchPathsRaw =
+            if (response.patchOps.isNotEmpty()) PatchApplier.collectAffectedPaths(response.patchOps) else emptySet()
+
+        val patchPaths = patchPathsRaw
+            .map { normalizeRelPath(it) }
+            .filter { it.isNotBlank() && !hasHiddenDirSegment(it) }
+            .toSet()
+
         val afterTargets = collectAfterTargets(response.ops, patchPaths)
         snapshotTo(ctx, afterTargets, slot = "after", reason = "after")
 
         refreshVfs(ctx.projectRoot)
     }
 
-    // -------------------------------
-    // target collection
-    // -------------------------------
-
-    /**
-     * BEFORE 需要备份：
-     * - update/modify：备份旧文件
-     * - delete：备份被删前内容（文件或目录）
-     * - patch：备份 patch 涉及且当前存在的文件
-     */
     private fun collectBeforeTargets(ops: List<FileOp>, patchPaths: Set<String>): List<String> {
         val fromOps = ops.filter {
             it.op == "update_file" ||
@@ -117,14 +133,12 @@ class DevwerkOperationRunner {
                     it.op == "delete_dir"
         }.map { it.path }
 
-        return (fromOps + patchPaths).distinct()
+        return (fromOps + patchPaths)
+            .map { normalizeRelPath(it) }
+            .filter { it.isNotBlank() && !hasHiddenDirSegment(it) }
+            .distinct()
     }
 
-    /**
-     * AFTER 需要备份：
-     * - create/update/modify：备份最终文件内容
-     * - patch：备份最终文件内容
-     */
     private fun collectAfterTargets(ops: List<FileOp>, patchPaths: Set<String>): List<String> {
         val fromOps = ops.filter {
             it.op == "create_file" ||
@@ -132,18 +146,12 @@ class DevwerkOperationRunner {
                     it.op == "modify_file"
         }.map { it.path }
 
-        return (fromOps + patchPaths).distinct()
+        return (fromOps + patchPaths)
+            .map { normalizeRelPath(it) }
+            .filter { it.isNotBlank() && !hasHiddenDirSegment(it) }
+            .distinct()
     }
 
-    // -------------------------------
-    // snapshot core
-    // -------------------------------
-
-    /**
-     * 将给定相对路径列表快照到 opDir/{slot}/ 下，保持目录结构。
-     * - 文件：直接 copy
-     * - 目录（常见于 delete_path/delete_dir）：递归 copy（慎用，但满足你“保持目录结构”的要求）
-     */
     private fun snapshotTo(ctx: DevwerkContext, relPaths: List<String>, slot: String, reason: String) {
         if (relPaths.isEmpty()) {
             appendLog(ctx.opLog, "[INFO] No snapshot targets for $reason.\n")
@@ -153,10 +161,16 @@ class DevwerkOperationRunner {
         val root = ctx.opDir.resolve(slot)
         Files.createDirectories(root)
 
-        for (rel in relPaths) {
-            val safeRel = normalizeRelPath(rel)
+        for (rel0 in relPaths) {
+            val safeRel = normalizeRelPath(rel0)
             if (safeRel.isBlank()) {
-                appendLog(ctx.opLog, "[WARN] Snapshot($reason) skip invalid path: $rel\n")
+                appendLog(ctx.opLog, "[WARN] Snapshot($reason) skip invalid path: $rel0\n")
+                continue
+            }
+
+            //  关键：永远不快照隐藏目录内部文件
+            if (hasHiddenDirSegment(safeRel)) {
+                appendLog(ctx.opLog, "[WARN] Snapshot($reason) skip hidden-dir path: $safeRel\n")
                 continue
             }
 
@@ -174,7 +188,6 @@ class DevwerkOperationRunner {
             val dst = root.resolve(safeRel).normalize()
             try {
                 if (Files.isDirectory(src)) {
-                    // 目录递归 copy
                     copyDirectoryRecursively(src, dst)
                     appendLog(ctx.opLog, "[OK] Snapshot($reason) dir: $safeRel -> $dst\n")
                 } else {
@@ -202,10 +215,6 @@ class DevwerkOperationRunner {
             }
         }
     }
-
-    // -------------------------------
-    // filesystem helpers
-    // -------------------------------
 
     private fun ensureDevwerkAndCreateOpDir(projectRoot: Path): DevwerkContext {
         val devwerkDir = projectRoot.resolve(".devwerk")
@@ -294,6 +303,17 @@ class DevwerkOperationRunner {
         val parts = s.split("/").filter { it.isNotBlank() }
         if (parts.any { it == ".." }) return ""
         return parts.joinToString("/")
+    }
+
+    /**
+     * 只判断“目录段”是否包含隐藏目录：
+     * - 允许 ".gitignore" 这种顶层隐藏文件
+     * - 但拦截 ".devwerk/xxx"、".idea/xxx"、".git/xxx"
+     */
+    private fun hasHiddenDirSegment(rel: String): Boolean {
+        val parts = rel.trim().replace("\\", "/").split("/").filter { it.isNotBlank() }
+        if (parts.size <= 1) return false
+        return parts.dropLast(1).any { it.startsWith(".") }
     }
 
     private fun refreshVfs(projectRoot: Path) {

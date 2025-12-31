@@ -81,7 +81,13 @@ data class IdeChatResponse(
     val toolRequests: List<ToolRequest> = emptyList(),
     val patchOps: List<PatchOp> = emptyList(),
     val done: Boolean = false,
-    // 新增：本次 sendChat 内所有轮次的原始 HTTP 响应（原样字符串）
+    //  新增（与后端对齐）
+    val ok: Boolean = true,
+    val errorCode: String? = null,
+    val errorMessage: String? = null,
+    val retryable: Boolean = false,
+
+    // 你已有的 rawResponses 如果存在就保留
     val rawResponses: List<String> = emptyList()
 )
 

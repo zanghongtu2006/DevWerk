@@ -30,7 +30,14 @@ class HttpAiClient(
 
         val messages = mutableListOf<ChatMessage>()
         messages += context.history
-        messages += ChatMessage("user", cleanUserMsg)
+
+        // 防重复：避免 history 已经包含本次 user 又追加一次
+        val last = context.history.lastOrNull()
+        val shouldAppendUser =
+            !(last != null && last.role.equals("user", ignoreCase = true) && last.content == cleanUserMsg)
+        if (shouldAppendUser) {
+            messages += ChatMessage("user", cleanUserMsg)
+        }
 
         val workspace = buildWorkspaceSummary(context.projectRoot)
 
@@ -39,8 +46,11 @@ class HttpAiClient(
         var lastResp: IdeChatResponse? = null
         var pendingToolResults: List<ToolResult> = emptyList()
 
-        // 收集每轮原始响应（保留原功能）
         val rawResponses = mutableListOf<String>()
+
+        // 新增：跨轮累积 ops / patchOps，避免被 tool_requests 吞掉
+        val accOps = mutableListOf<FileOp>()
+        val accPatchOps = mutableListOf<PatchOp>()
 
         while (round < maxRounds) {
             round++
@@ -57,12 +67,26 @@ class HttpAiClient(
 
             rawResponses += respBody
 
-            val resp = parseIdeChatResponse(respBody).copy(
-                rawResponses = rawResponses.toList()
-            )
+            val respParsed = parseIdeChatResponse(respBody)
+            var resp = respParsed.copy(rawResponses = rawResponses.toList())
             lastResp = resp
 
+            // 如果模型违规（同一轮给了 tool_requests + ops/patch），先把 ops/patch 记下来
             if (resp.toolRequests.isNotEmpty() && mode == "agent") {
+                if (resp.ops.isNotEmpty() || resp.patchOps.isNotEmpty()) {
+                    accOps += resp.ops
+                    accPatchOps += resp.patchOps
+
+                    appendDevLog(
+                        context,
+                        "\n[WARN] Model returned tool_requests with ops/patch_ops in the same round. " +
+                                "Accumulating ops/patch_ops and continuing tool loop.\n"
+                    )
+
+                    // 清空本轮 ops/patch，避免“边问边改”的语义污染后续
+                    resp = resp.copy(ops = emptyList(), patchOps = emptyList())
+                }
+
                 messages += ChatMessage(
                     "assistant",
                     "tool_requests:\n" + toolRequestsToJson(resp.toolRequests)
@@ -72,11 +96,22 @@ class HttpAiClient(
                 continue
             }
 
-            return resp
+            // 最终返回前，把累积的 ops/patch 合并进去
+            val merged = resp.copy(
+                ops = (accOps + resp.ops),
+                patchOps = (accPatchOps + resp.patchOps),
+                rawResponses = rawResponses.toList()
+            )
+            return merged
         }
 
-        return (lastResp ?: IdeChatResponse(reply = "No response", done = true))
+        val fallback = (lastResp ?: IdeChatResponse(reply = "No response", done = true))
             .copy(rawResponses = rawResponses.toList())
+
+        return fallback.copy(
+            ops = (accOps + fallback.ops),
+            patchOps = (accPatchOps + fallback.patchOps)
+        )
     }
 
     private fun parseMode(userMessage: String): Pair<String, String> {
@@ -91,6 +126,7 @@ class HttpAiClient(
 
     private fun buildWorkspaceSummary(projectRoot: String?): WorkspaceSummary? {
         if (projectRoot.isNullOrBlank()) return null
+        //  listDir 已经会屏蔽所有 "." 开头目录，所以 tree_preview 不会泄漏 .devwerk
         val preview = runCatching { WorkspaceTools.listDir(projectRoot, "", 6) }.getOrNull()
         return WorkspaceSummary(
             rootId = null,
@@ -172,7 +208,6 @@ class HttpAiClient(
 
         val bodyJson = root.toString()
 
-        // 发送前记录 REQUEST（原样）
         appendDevLog(chatContext, "\n===== ROUND $round REQUEST BEGIN =====\n")
         appendDevLog(chatContext, bodyJson)
         appendDevLog(chatContext, "\n===== ROUND $round REQUEST END =====\n")
@@ -194,7 +229,6 @@ class HttpAiClient(
         client.newCall(request).execute().use { response: Response ->
             val respBody = response.body?.string() ?: ""
 
-            // 收到后记录 RESPONSE（原样，不管成功失败）
             appendDevLog(chatContext, "\n===== ROUND $round RESPONSE BEGIN =====\n")
             appendDevLog(chatContext, respBody)
             appendDevLog(chatContext, "\n===== ROUND $round RESPONSE END =====\n")
@@ -222,6 +256,29 @@ class HttpAiClient(
         return arr.toString()
     }
 
+    // -------------------------
+    // Hidden-dir guard helpers
+    // -------------------------
+
+    private fun normRel(p: String): String {
+        var s = (p ?: "").trim().replace("\\", "/")
+        while (s.startsWith("/")) s = s.substring(1)
+        val parts = s.split("/").filter { it.isNotBlank() }
+        if (parts.any { it == ".." }) return ""
+        return parts.joinToString("/")
+    }
+
+    private fun containsHiddenSegment(rel: String): Boolean {
+        val parts = normRel(rel).split("/").filter { it.isNotBlank() }
+        return parts.any { it.startsWith(".") }
+    }
+
+    private fun hasHiddenDirSegment(rel: String): Boolean {
+        val parts = normRel(rel).split("/").filter { it.isNotBlank() }
+        if (parts.size <= 1) return false
+        return parts.dropLast(1).any { it.startsWith(".") }
+    }
+
     private fun executeTools(projectRoot: String?, reqs: List<ToolRequest>): List<ToolResult> {
         val base = projectRoot
         if (base.isNullOrBlank()) {
@@ -235,29 +292,55 @@ class HttpAiClient(
                 when (r.tool) {
                     "list_dir" -> {
                         val path = (r.args["path"] as? String) ?: ""
+                        val rel = normRel(path)
+
+                        //  拒绝进入隐藏目录（入口只要包含隐藏 segment 就拒绝）
+                        if (rel.isNotBlank() && containsHiddenSegment(rel)) {
+                            results += ToolResult(id = id, ok = false, error = "blocked hidden directory path: $rel")
+                            continue
+                        }
+
                         val maxDepth = (r.args["max_depth"] as? Number)?.toInt() ?: 2
-                        val content = WorkspaceTools.listDir(base, path, maxDepth)
+                        val content = WorkspaceTools.listDir(base, rel, maxDepth)
                         results += ToolResult(id = id, ok = true, content = content)
                     }
+
                     "read_file" -> {
                         val path = (r.args["path"] as? String) ?: ""
+                        val rel = normRel(path)
+
+                        //  拒绝读取隐藏目录内部文件（允许 ".gitignore" 顶层文件）
+                        if (hasHiddenDirSegment(rel)) {
+                            results += ToolResult(id = id, ok = false, error = "blocked hidden directory path: $rel")
+                            continue
+                        }
+
                         val start = (r.args["start_line"] as? Number)?.toInt() ?: 1
                         val end = (r.args["end_line"] as? Number)?.toInt() ?: (start + 200)
-                        val content = WorkspaceTools.readFile(base, path, start, end)
+                        val content = WorkspaceTools.readFile(base, rel, start, end)
                         results += ToolResult(id = id, ok = true, content = content)
                     }
+
                     "search" -> {
                         val query = (r.args["query"] as? String) ?: ""
                         val maxResults = (r.args["max_results"] as? Number)?.toInt() ?: 50
                         val pathsAny = r.args["paths"]
+
                         val paths: List<String> = when (pathsAny) {
                             is List<*> -> pathsAny.filterIsInstance<String>()
                             is Array<*> -> pathsAny.filterIsInstance<String>()
                             else -> emptyList()
                         }
-                        val content = WorkspaceTools.search(base, query, paths, maxResults)
+
+                        //  过滤隐藏目录入口；允许 "" 表示根
+                        val safePaths = paths
+                            .map { normRel(it) }
+                            .filter { it.isBlank() || !containsHiddenSegment(it) }
+
+                        val content = WorkspaceTools.search(base, query, safePaths, maxResults)
                         results += ToolResult(id = id, ok = true, content = content)
                     }
+
                     else -> {
                         results += ToolResult(id = id, ok = false, error = "unknown tool: ${r.tool}")
                     }
@@ -274,11 +357,14 @@ class HttpAiClient(
 
     private fun parseIdeChatResponse(body: String): IdeChatResponse {
         val obj = JSONObject(body)
+        val ok = obj.optBoolean("ok", true)
+        val errorCode = if (obj.has("error_code") && !obj.isNull("error_code")) obj.getString("error_code") else null
+        val errorMessage = if (obj.has("error_message") && !obj.isNull("error_message")) obj.getString("error_message") else null
+        val retryable = obj.optBoolean("retryable", false)
 
         val reply = obj.optString("reply", "")
         val codeTree =
-            if (obj.has("code_tree") && !obj.isNull("code_tree")) obj.getString("code_tree")
-            else null
+            if (obj.has("code_tree") && !obj.isNull("code_tree")) obj.getString("code_tree") else null
 
         val done = obj.optBoolean("done", false)
 
@@ -291,11 +377,9 @@ class HttpAiClient(
             if (opType.isEmpty() || path.isEmpty()) continue
 
             val language =
-                if (item.has("language") && !item.isNull("language")) item.getString("language")
-                else null
+                if (item.has("language") && !item.isNull("language")) item.getString("language") else null
             val content =
-                if (item.has("content") && !item.isNull("content")) item.getString("content")
-                else null
+                if (item.has("content") && !item.isNull("content")) item.getString("content") else null
 
             ops += FileOp(op = opType, path = path, language = language, content = content)
         }
@@ -335,7 +419,11 @@ class HttpAiClient(
             ops = ops,
             toolRequests = toolReqs,
             patchOps = patchOps,
-            done = done
+            done = done,
+            ok = ok,
+            errorCode = errorCode,
+            errorMessage = errorMessage,
+            retryable = retryable
         )
     }
 }

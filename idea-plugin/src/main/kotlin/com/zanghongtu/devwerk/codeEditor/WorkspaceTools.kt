@@ -18,9 +18,18 @@ object WorkspaceTools {
 
     private fun walkDir(dir: File, sb: StringBuilder, indent: String, depth: Int, maxDepth: Int) {
         if (depth >= maxDepth) return
-        val children = dir.listFiles()?.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() })) ?: return
+        val children = dir.listFiles()
+            ?.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
+            ?: return
+
         for (c in children) {
             val name = c.name
+
+            //  关键：隐藏目录（.devwerk/.idea/.git 等）不写入 tree_preview
+            if (c.isDirectory && name.startsWith(".")) {
+                continue
+            }
+
             if (c.isDirectory) {
                 sb.append(indent).append("  ").append(name).append("/\n")
                 walkDir(c, sb, indent + "  ", depth + 1, maxDepth)
@@ -31,7 +40,14 @@ object WorkspaceTools {
     }
 
     fun readFile(basePath: String, relativePath: String, startLine: Int, endLine: Int): String {
-        val file = File(basePath, normalizeRel(relativePath))
+        val rel = normalizeRel(relativePath)
+
+        //  关键：禁止 read_file 读取隐藏目录内部文件（允许 ".gitignore" 这种顶层隐藏文件）
+        if (hasHiddenDirSegment(rel)) {
+            return "[read_file] blocked hidden directory path: $relativePath"
+        }
+
+        val file = File(basePath, rel)
         if (!file.exists()) return "[read_file] not found: $relativePath"
         if (file.isDirectory) return "[read_file] is a directory: $relativePath"
 
@@ -51,35 +67,47 @@ object WorkspaceTools {
         val q = query.trim()
         if (q.isBlank()) return "[search] empty query"
 
+        //  如果 caller 传 [""]，我们就把它当成“从项目根开始搜”
         val roots = if (paths.isEmpty()) listOf("src/", "app/") else paths
+
+        //  关键：过滤掉隐藏目录入口（允许 "" / "." 表示根）
+        val safeRoots = roots
+            .map { normalizeRel(it) }
+            .filter { it.isBlank() || it == "." || !containsHiddenSegment(it) }
+
         val results = mutableListOf<String>()
 
         // 如果 query 看起来像“文件名”，就走文件名精确匹配
         val filenameMode = looksLikeFileNameQuery(q)
 
-        for (p in roots) {
-            val root = File(basePath, normalizeRel(p))
+        for (p in safeRoots) {
+            val root = if (p.isBlank() || p == ".") File(basePath) else File(basePath, p)
             if (!root.exists()) continue
 
             scanFiles(root) { f ->
                 if (results.size >= maxResults) return@scanFiles false
                 if (!f.isFile) return@scanFiles true
 
+                // 生成相对路径
+                val rel = f.absolutePath.replace("\\", "/")
+                    .substringAfter(basePath.replace("\\", "/") + "/")
+
+                //  关键：屏蔽隐藏目录内部文件
+                if (hasHiddenDirSegment(rel)) return@scanFiles true
+
                 // 跳过超大文件
                 if (!filenameMode && f.length() > 1_000_000) return@scanFiles true
 
                 val hit = if (filenameMode) {
-                    // 文件名精确匹配（Windows 下不区分大小写更符合直觉）
                     f.name.equals(q, ignoreCase = true)
                 } else {
-                    // 内容匹配（你原来的行为）
-                    val text = runCatching { f.readText(Charset.forName("UTF-8")) }.getOrNull() ?: return@scanFiles true
+                    val text = runCatching { f.readText(Charset.forName("UTF-8")) }
+                        .getOrNull() ?: return@scanFiles true
                     text.contains(q, ignoreCase = true)
                 }
 
                 if (hit) {
-                    val rel = f.absolutePath.replace("\\", "/")
-                    results += rel.substringAfter(basePath.replace("\\", "/") + "/")
+                    results += rel
                 }
                 true
             }
@@ -92,10 +120,8 @@ object WorkspaceTools {
     }
 
     private fun looksLikeFileNameQuery(q: String): Boolean {
-        // 不含路径分隔符，且像一个文件名（带扩展名）
         if (q.contains("/") || q.contains("\\") || q.contains("\n") || q.contains("\t")) return false
         if (!q.contains(".")) return false
-        // 常见源码/配置文件扩展名：你也可以按需加
         val lower = q.lowercase()
         return lower.endsWith(".java") ||
                 lower.endsWith(".kt") ||
@@ -110,18 +136,28 @@ object WorkspaceTools {
     private fun scanFiles(root: File, onFile: (File) -> Boolean) {
         val stack = ArrayDeque<File>()
         stack.add(root)
+
         while (stack.isNotEmpty()) {
             val cur = stack.removeLast()
             val ok = onFile(cur)
             if (!ok) return
+
             if (cur.isDirectory) {
                 val children = cur.listFiles() ?: continue
                 for (c in children) {
-                    // 简单过滤一些常见目录
-                    val n = c.name.lowercase()
-                    if (c.isDirectory && (n == ".git" || n == ".idea" || n == "build" || n == "out" || n == "node_modules")) {
+                    val name = c.name
+                    val n = name.lowercase()
+
+                    //  关键：屏蔽所有 "." 开头的目录（包含 .devwerk）
+                    if (c.isDirectory && name.startsWith(".")) {
                         continue
                     }
+
+                    // 额外过滤一些常见大目录
+                    if (c.isDirectory && (n == "build" || n == "out" || n == "node_modules")) {
+                        continue
+                    }
+
                     stack.add(c)
                 }
             }
@@ -131,12 +167,28 @@ object WorkspaceTools {
     private fun normalizeRel(p: String): String {
         var s = p.trim().replace("\\", "/")
         while (s.startsWith("/")) s = s.substring(1)
-        // 不允许 ..
         val parts = s.split("/").filter { it.isNotBlank() }
-        if (parts.any { it == ".." }) {
-            return ""
-        }
+        if (parts.any { it == ".." }) return ""
         return parts.joinToString("/")
+    }
+
+    /**
+     * 任意 segment 以 "." 开头（用于 list_dir/search roots 这类“入口路径”）
+     */
+    private fun containsHiddenSegment(rel: String): Boolean {
+        val parts = rel.trim().replace("\\", "/").split("/").filter { it.isNotBlank() }
+        return parts.any { it.startsWith(".") }
+    }
+
+    /**
+     * 只判断“目录段”是否包含隐藏目录：
+     * - 允许 ".gitignore" 这种顶层隐藏文件
+     * - 但拦截 ".devwerk/xxx"、".idea/xxx"、".git/xxx"
+     */
+    private fun hasHiddenDirSegment(rel: String): Boolean {
+        val parts = rel.trim().replace("\\", "/").split("/").filter { it.isNotBlank() }
+        if (parts.size <= 1) return false
+        return parts.dropLast(1).any { it.startsWith(".") }
     }
 
     private fun File.readLinesSafe(): List<String> {
