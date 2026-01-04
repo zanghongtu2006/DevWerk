@@ -25,13 +25,12 @@ class OllamaClient:
             "format": MODEL_RESPONSE_SCHEMA,
             "options": {"temperature": 0.4},
         }
-        print(payload)
+
         resp = http_requests.post(self.url, json=payload, timeout=self.settings.ollama_timeout)
-        print(resp.content)
         resp.raise_for_status()
         data = resp.json()
-        content = (data.get("message") or {}).get("content")
 
+        content = (data.get("message") or {}).get("content")
         if isinstance(content, dict):
             obj = content
         elif isinstance(content, str):

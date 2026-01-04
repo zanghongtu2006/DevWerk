@@ -4,14 +4,14 @@ from __future__ import annotations
 import json
 from typing import Dict, List
 
-from app.core.prompt import SYSTEM_PROMPT
+from app.core.prompt_factory import build_system_prompt
 from app.core.schema import MODEL_RESPONSE_SCHEMA
 from app.models.ide import IdeChatRequest
 
 
-def build_model_messages(req: IdeChatRequest) -> List[Dict[str, str]]:
+def build_model_messages(req: IdeChatRequest, provider: str) -> List[Dict[str, str]]:
     schema_json = json.dumps(MODEL_RESPONSE_SCHEMA, ensure_ascii=False, separators=(",", ":"))
-    sys_prompt = SYSTEM_PROMPT.replace("__SCHEMA_JSON__", schema_json)
+    sys_prompt = build_system_prompt(provider=provider, schema_json=schema_json)
 
     messages: List[Dict[str, str]] = [{"role": "system", "content": sys_prompt}]
 
@@ -22,7 +22,7 @@ def build_model_messages(req: IdeChatRequest) -> List[Dict[str, str]]:
             role = "user"
         messages.append({"role": role, "content": m.content or ""})
 
-    # request_meta：让模型知道现在是什么模式
+    # request_meta
     meta = {
         "mode": req.mode,
         "project_root": req.project_root,
@@ -30,7 +30,7 @@ def build_model_messages(req: IdeChatRequest) -> List[Dict[str, str]]:
     }
     messages.append({"role": "user", "content": "request_meta:\n" + json.dumps(meta, ensure_ascii=False)})
 
-    # workspace 摘要（agent 模式时尤其重要）
+    # workspace 摘要
     if req.workspace is not None:
         messages.append(
             {
@@ -39,7 +39,7 @@ def build_model_messages(req: IdeChatRequest) -> List[Dict[str, str]]:
             }
         )
 
-    # tool_results（插件执行 tool_requests 后回传的结果）
+    # tool_results
     if req.tool_results:
         messages.append(
             {
@@ -49,7 +49,7 @@ def build_model_messages(req: IdeChatRequest) -> List[Dict[str, str]]:
             }
         )
 
-    # 额外提醒：只输出 JSON
+    # 强提醒
     if req.project_root:
         messages.append(
             {
