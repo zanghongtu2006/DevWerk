@@ -6,6 +6,7 @@ DevWerk is built to explore a practical question:
 
 **How far can we push AI to automate real software development while preserving code invariants, architectural intent, and developer trust?**
 
+![Screenshot](screenshot.png)
 ---
 
 ## 🚀 Project Status
