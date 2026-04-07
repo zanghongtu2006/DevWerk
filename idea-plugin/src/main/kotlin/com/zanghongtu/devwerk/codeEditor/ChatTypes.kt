@@ -1,3 +1,7 @@
+// =============================================================================
+// ChatTypes.kt — shared types for DevWerk frontend and backend communication
+// =============================================================================
+
 package com.zanghongtu.devwerk.codeEditor
 
 /**
@@ -14,7 +18,7 @@ data class ChatMessage(
 data class ChatContext(
     val projectRoot: String?,
     val history: List<ChatMessage>,
-    // 新增：用于本次对话的 DevWerk 上下文（记录请求/响应/执行）
+    // DevWerk 上下文（记录请求/响应/执行）
     val devCtx: DevwerkContext? = null
 )
 
@@ -55,14 +59,11 @@ data class ToolResult(
  */
 data class PatchOp(
     val op: String,     // apply_patch
-    val content: String // unified diff
+    val content: String  // unified diff
 )
 
 /**
  * scaffold 旧模式 / 兼容模式：文件 CRUD
- *
- * 后端允许：create_dir | create_file | update_file | delete_path
- * （插件内部会兼容旧的 modify_file/delete_file/delete_dir）
  */
 data class FileOp(
     val op: String,
@@ -81,13 +82,10 @@ data class IdeChatResponse(
     val toolRequests: List<ToolRequest> = emptyList(),
     val patchOps: List<PatchOp> = emptyList(),
     val done: Boolean = false,
-    //  新增（与后端对齐）
     val ok: Boolean = true,
     val errorCode: String? = null,
     val errorMessage: String? = null,
     val retryable: Boolean = false,
-
-    // 你已有的 rawResponses 如果存在就保留
     val rawResponses: List<String> = emptyList()
 )
 
@@ -98,9 +96,47 @@ data class DevwerkContext(
     val opLog: java.nio.file.Path
 )
 
+// =============================================================================
+// Plan types — returned by POST /v1/ide/plan
+// =============================================================================
+
 /**
- * AI 客户端接口（保持不改签名，避免影响你其它 Client）
+ * One file in the planner's proposed change list.
  */
+data class PlanFile(
+    val path: String,
+    val nature: String,   // "new" | "modified" | "deleted"
+    val description: String,
+    val confidence: Double = 0.8
+)
+
+/**
+ * Response from POST /v1/ide/plan.
+ */
+data class PlanResponse(
+    val ok: Boolean = true,
+    val files: List<PlanFile> = emptyList(),
+    val summary: String = "",
+    val warnings: List<String> = emptyList(),
+    val errorCode: String? = null,
+    val errorMessage: String? = null
+)
+
+/**
+ * Request body for POST /v1/ide/execute.
+ */
+data class ExecuteRequest(
+    val messages: List<ChatMessage>,
+    val projectRoot: String?,
+    val mode: String = "agent",
+    val approvedPaths: List<String> = emptyList(),
+    val approvedOps: List<FileOp> = emptyList()
+)
+
+// =============================================================================
+// AI client interface
+// =============================================================================
+
 interface AiClient {
     fun sendChat(
         context: ChatContext,

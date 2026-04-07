@@ -3,8 +3,11 @@ package com.zanghongtu.devwerk
 import com.intellij.openapi.project.Project
 import com.zanghongtu.devwerk.client.*
 import com.zanghongtu.devwerk.codeEditor.AiClient
+import com.zanghongtu.devwerk.codeEditor.HttpAiClient
 
 object AiClientFactory {
+
+    private const val DEFAULT_BASE = "http://127.0.0.1:8000"
 
     fun create(project: Project?): AiClient {
         val profile = AiSettingsService.instance().getActiveProfile()
@@ -12,9 +15,12 @@ object AiClientFactory {
 
         return when (provider) {
             AiProvider.TECH_ZUKUNFT -> {
-                // 只有这个走你的 server
-                TechZukunftClient(
-                    endpoint = profile.baseUrl.ifBlank { "http://127.0.0.1:8001/v1/ide/chat" },
+                // DevWerk backend — full client with plan/execute support
+                val base = profile.baseUrl.ifBlank { DEFAULT_BASE }.trimEnd('/')
+                HttpAiClient(
+                    chatEndpoint = "$base/v1/ide/chat",
+                    planEndpoint = "$base/v1/ide/plan",
+                    executeEndpoint = "$base/v1/ide/execute",
                     authToken = profile.token.ifBlank { null }
                 )
             }

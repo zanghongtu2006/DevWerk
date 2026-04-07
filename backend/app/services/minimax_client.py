@@ -1,10 +1,13 @@
 """
-OpenAI (and OpenAI-compatible) Responses API client.
+MiniMax Responses API client.
 
-Supports any server that implements the /v1/responses endpoint, including:
-  - OpenAI cloud
-  - xAI (Grok)
-  - Self-hosted compatible proxies
+MiniMax provides an OpenAI-compatible /v1/responses endpoint.
+Two regional entry points are supported:
+  - China mainland : https://api.minimax.chat/v1
+  - Overseas        : https://api.minimaxi.chat/v1
+
+The region is selected via the MINIMAX_REGION config field;
+the matching API key and base URL are resolved in config.get_llm_config().
 """
 
 from __future__ import annotations
@@ -18,12 +21,12 @@ from app.core.schema import MODEL_RESPONSE_SCHEMA
 from app.services.validation import validate_model_response
 
 
-class OpenAIClient:
+class MiniMaxClient:
     """
-    OpenAI Responses API client.
+    MiniMax Responses API client.
 
-    Structured Outputs via json_schema(strict) are used by default.
-    Falls back to json_object if the model/server rejects the strict schema.
+    Inherits the same request shape as OpenAIClient but targets the
+    MiniMax regional endpoint selected at startup.
     """
 
     def __init__(self, config: dict | None = None):
@@ -33,17 +36,21 @@ class OpenAIClient:
                     If None, reads from app settings (legacy behaviour).
         """
         if config:
-            self.base_url: str = config.get("base_url", "https://api.openai.com/v1").rstrip("/")
+            self.base_url: str = config.get("base_url", "https://api.minimax.chat/v1").rstrip("/")
             self.api_key: str | None = config.get("api_key")
-            self.model: str = config.get("model", "gpt-4o-mini")
+            self.model: str = config.get("model", "MiniMax-Text-01")
             self.timeout: float = float(config.get("timeout", 180.0))
         else:
             from app.core.config import settings
             cfg = settings()
-            self.base_url = cfg.openai_base_url.rstrip("/")
-            self.api_key = cfg.openai_api_key
-            self.model = cfg.openai_model
-            self.timeout = float(cfg.openai_timeout)
+            if cfg.minimax_region == "cn":
+                self.base_url = cfg.minimax_cn_base_url.rstrip("/")
+                self.api_key = cfg.minimax_cn_api_key
+            else:
+                self.base_url = cfg.minimax_overseas_base_url.rstrip("/")
+                self.api_key = cfg.minimax_overseas_api_key
+            self.model = cfg.minimax_model
+            self.timeout = float(cfg.minimax_timeout)
 
         if not self.base_url.endswith("/v1"):
             self.base_url = f"{self.base_url}/v1"
@@ -51,8 +58,10 @@ class OpenAIClient:
 
         if not self.api_key:
             raise ValueError(
-                "OPENAI_API_KEY is not set. "
-                "Set it as a real environment variable — never in a committed .env file."
+                "MiniMax API key is not set for the selected region. "
+                "Set MINIMAX_CN_API_KEY or MINIMAX_OVERSEAS_API_KEY as a real "
+                "environment variable (never in a committed .env file), "
+                "and confirm MINIMAX_REGION is correct."
             )
 
     def chat_structured(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
@@ -77,7 +86,7 @@ class OpenAIClient:
 
         resp = http_requests.post(self.url, json=payload, headers=headers, timeout=self.timeout)
 
-        # If json_schema is rejected, fallback to json_object.
+        # Fallback: if json_schema is rejected, try json_object.
         if resp.status_code == 400:
             txt = (resp.text or "").lower()
             if any(kw in txt for kw in ("json_schema", "text.format", "schema")):
@@ -96,13 +105,13 @@ class OpenAIClient:
 
         content = self._extract_output_text(data)
         if not content:
-            raise ValueError("OpenAI returned empty output text")
+            raise ValueError("MiniMax returned empty output text")
 
         try:
             obj = json.loads(content)
         except Exception as e:
             raise ValueError(
-                f"OpenAI output is not valid JSON: {e}. Raw: {content[:200]}"
+                f"MiniMax output is not valid JSON: {e}. Raw: {content[:200]}"
             )
 
         validate_model_response(obj)

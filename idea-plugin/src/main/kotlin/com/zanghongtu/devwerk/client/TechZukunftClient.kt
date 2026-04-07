@@ -10,7 +10,12 @@ class TechZukunftClient(
     private val authToken: String?
 ) : AiClient {
 
-    private val delegate = HttpAiClient(endpoint = endpoint, authToken = authToken)
+    private val delegate = HttpAiClient(
+        chatEndpoint = endpoint,
+        authToken = authToken,
+        planEndpoint = TODO(),
+        executeEndpoint = TODO()
+    )
 
     override fun sendChat(context: ChatContext, userMessage: String): IdeChatResponse {
         return delegate.sendChat(context, userMessage)
