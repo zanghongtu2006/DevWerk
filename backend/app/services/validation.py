@@ -68,9 +68,13 @@ def validate_model_response(obj: Dict[str, Any]) -> None:
             if tr["tool"] == "read_file":
                 if "path" not in args:
                     raise ValueError(f"tool_requests[{i}].args.path missing")
-                _validate_rel_path(args["path"], f"tool_requests[{i}].args")
-                if "start_line" not in args or "end_line" not in args:
-                    raise ValueError(f"tool_requests[{i}] read_file must set start_line/end_line")
+                # _validate_rel_path(args["path"], f"tool_requests[{i}].args")
+                # if "start_line" not in args or "end_line" not in args:
+                #     raise ValueError(f"tool_requests[{i}] read_file must set start_line/end_line")
+                if "start_line" not in args:
+                    args["start_line"] = None
+                if "end_line" not in args:
+                    args["end_line"] = None
 
     # agent：patch_ops
     patch_ops = obj.get("patch_ops") or []

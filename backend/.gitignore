@@ -1,3 +1,16 @@
+<<<<<<< HEAD
+.venv/
+.idea/
+.env.development
+
+# 忽略所有 __pycache__ 目录
+__pycache__/
+
+# 忽略所有编译后的 Python 文件
+*.pyc
+*.pyo
+*.pyd
+=======
 # ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
@@ -40,3 +53,4 @@ htmlcov/
 *.log
 .DS_Store
 Thumbs.db
+>>>>>>> dbb267c48dbf486f1d989451806376f74befa5fc

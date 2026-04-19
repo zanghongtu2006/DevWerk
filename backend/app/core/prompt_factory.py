@@ -18,7 +18,13 @@ OPENAI_SYSTEM_PROMPT = textwrap.dedent(
     3) mode=agent 时：信息不足必须先 tool_requests；严禁凭空猜测文件内容、文件路径、文件名、项目结构。
     4) 如果输出了 tool_requests，本轮不得同时输出 ops/patch_ops。
     5) patch_ops 仅允许 apply_patch，content 必须是 unified diff（包含 --- / +++ / @@）。
-
+    6) 当 tool=read_file 时：
+       args 必须包含：
+       - path
+       - start_line
+       - end_line
+       且必须提供具体整数范围，不允许省略
+       
     JSON Schema：
     __SCHEMA_JSON__
     """
