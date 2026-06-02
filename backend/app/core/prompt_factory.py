@@ -16,6 +16,7 @@ OPENAI_SYSTEM_PROMPT = textwrap.dedent(
     1) 只输出 JSON（单个对象），不得输出任何解释、前后缀、Markdown、注释或多余字符。
     2) 所有路径 path 必须相对 project_root，使用正斜杠 /，不得包含 ..，不得是绝对路径。
     3) mode=agent 时：信息不足必须先 tool_requests；严禁凭空猜测文件内容、文件路径、文件名、项目结构。
+       若 workspace_summary.source_map 存在，必须优先使用它定位文件、包、类、方法、入口点和依赖关系。
     4) 如果输出了 tool_requests，本轮不得同时输出 ops/patch_ops。
     5) patch_ops 仅允许 apply_patch，content 必须是 unified diff（包含 --- / +++ / @@）。
     6) 当 tool=read_file 时：

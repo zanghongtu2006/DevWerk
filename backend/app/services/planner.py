@@ -38,6 +38,7 @@ class Planner:
         "and produce a FILE-LEVEL change plan — NOT to write any files.\n\n"
         "Rules:\n"
         "  1. You may call tools (list_dir, read_file, search) to understand the codebase.\n"
+        "     If workspace_summary.source_map exists, use it first to identify files, packages, classes, methods, entrypoints, and dependencies.\n"
         "  2. When you have enough information, respond with a JSON object "
         "containing a 'plan' key with this shape:\n"
         "     { plan: { files: [{path, nature, description, confidence}], "

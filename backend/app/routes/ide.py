@@ -6,12 +6,16 @@ All routes are prefixed with /v1 in app/main.py.
 
 from __future__ import annotations
 
+import mimetypes
 import logging
+import json
+import os
 import re
 import time
+import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, File, Request, UploadFile
 
 from app.core.config import settings
 from app.models.ide import IdeChatRequest, IdeChatResponse
@@ -31,6 +35,44 @@ async def debug_raw(request: Request):
     body = await request.body()
     _log.debug("RAW BODY: %s", body)
     return {"ok": True}
+
+
+@router.post("/ide/attachments")
+async def upload_attachment(file: UploadFile = File(...)):
+    """
+    Store an IDE attachment on the local backend filesystem.
+
+    This is intentionally local-only for now. The returned local_path can be
+    referenced by later DevWerk requests, but the file content is not pushed
+    into the LLM prompt automatically.
+    """
+    upload_root = _upload_root()
+    upload_root.mkdir(parents=True, exist_ok=True)
+
+    attachment_id = uuid.uuid4().hex
+    safe_name = _safe_filename(file.filename or "attachment.bin")
+    stored_name = f"{attachment_id}-{safe_name}"
+    dst = upload_root / stored_name
+
+    size = 0
+    with dst.open("wb") as out:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            out.write(chunk)
+
+    content_type = file.content_type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
+
+    return {
+        "ok": True,
+        "id": attachment_id,
+        "filename": safe_name,
+        "content_type": content_type,
+        "size": size,
+        "local_path": str(dst),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +103,7 @@ async def ide_plan(request: Request) -> PlanResponse:
             error_code="BAD_REQUEST",
             error_message="messages must be a non-empty list",
         )
+    messages = _append_workspace_summary(messages, body.get("workspace"))
 
     if not any(m.get("role", "").lower() == "user" for m in messages):
         return PlanResponse(
@@ -169,6 +212,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
             error_code="BAD_REQUEST",
             error_message="messages must be a list",
         )
+    messages = _append_workspace_summary(messages, body.get("workspace"))
 
     approved_set = set(approved_paths)
 
@@ -251,6 +295,25 @@ def _filter_patch_ops(patch_ops: list[dict], approved: set[str]) -> list[dict]:
             continue
         result.append(po)
     return result
+
+
+def _append_workspace_summary(messages: list[dict], workspace: object) -> list[dict]:
+    if not isinstance(workspace, dict):
+        return messages
+    compact = json.dumps(workspace, ensure_ascii=False, separators=(",", ":"))
+    return messages + [{"role": "user", "content": "workspace_summary:\n" + compact}]
+
+
+def _upload_root() -> Path:
+    configured = os.environ.get("DEVWERK_UPLOAD_DIR")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return Path.home() / ".devwerk" / "uploads"
+
+
+def _safe_filename(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._ -]+", "_", Path(name).name).strip()
+    return cleaned or "attachment.bin"
 
 
 # ---------------------------------------------------------------------------

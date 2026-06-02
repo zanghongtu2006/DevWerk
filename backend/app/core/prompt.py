@@ -26,6 +26,8 @@ SYSTEM_PROMPT = textwrap.dedent(
     1) 只输出 JSON（单个对象），不得输出任何解释、前后缀、Markdown、注释或多余字符。
     2) 所有路径 path 必须相对 project_root（或工作区根），使用正斜杠 /，不得包含 ..，不得是绝对路径。
     3) mode=agent 时：信息不足必须先 tool_requests；严禁凭空猜测文件内容、文件路径、文件名、项目结构。
+       - 若 workspace_summary.source_map 存在，必须优先使用它定位文件、包、类、方法、入口点和依赖关系；
+         source_map 是 IDE 本地零 AI 扫描得到的代码地图，不代表文件内容全文。
 
     4) tool_requests 只能调用以下工具：
        - list_dir: 列目录

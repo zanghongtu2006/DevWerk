@@ -1,7 +1,6 @@
 package com.zanghongtu.devwerk
 
 import com.intellij.openapi.project.Project
-import com.zanghongtu.devwerk.client.*
 import com.zanghongtu.devwerk.codeEditor.AiClient
 import com.zanghongtu.devwerk.codeEditor.HttpAiClient
 
@@ -11,25 +10,26 @@ object AiClientFactory {
 
     fun create(project: Project?): AiClient {
         val profile = AiSettingsService.instance().getActiveProfile()
-        val provider = AiProvider.valueOf(profile.provider)
+        val base = normalizeBackendBase(profile.baseUrl.ifBlank { DEFAULT_BASE })
 
-        return when (provider) {
-            AiProvider.TECH_ZUKUNFT -> {
-                // DevWerk backend — full client with plan/execute support
-                val base = profile.baseUrl.ifBlank { DEFAULT_BASE }.trimEnd('/')
-                HttpAiClient(
-                    chatEndpoint = "$base/v1/ide/chat",
-                    planEndpoint = "$base/v1/ide/plan",
-                    executeEndpoint = "$base/v1/ide/execute",
-                    authToken = profile.token.ifBlank { null }
-                )
+        return HttpAiClient(
+            chatEndpoint = "$base/v1/ide/chat",
+            planEndpoint = "$base/v1/ide/plan",
+            executeEndpoint = "$base/v1/ide/execute",
+            attachmentEndpoint = "$base/v1/ide/attachments",
+            authToken = profile.token.ifBlank { null }
+        )
+    }
+
+    private fun normalizeBackendBase(input: String): String {
+        var s = input.trim().trimEnd('/')
+        val suffixes = listOf("/v1/ide/chat", "/v1/ide/plan", "/v1/ide/execute", "/v1/ide/attachments", "/v1/ide", "/v1")
+        for (suffix in suffixes) {
+            if (s.endsWith(suffix, ignoreCase = true)) {
+                s = s.removeSuffix(suffix)
+                break
             }
-            AiProvider.GPT -> OpenAiClient(apiKey = profile.token, model = profile.model.ifBlank { "gpt-4o-mini" })
-            AiProvider.GEMINI -> GeminiClient(apiKey = profile.token, model = profile.model.ifBlank { "gemini-1.5-pro" })
-            AiProvider.OLLAMA -> OllamaClient(baseUrl = profile.baseUrl.ifBlank { "http://localhost:11434" }, model = profile.model.ifBlank { "llama3.1" })
-            AiProvider.CUSTOM -> CustomHttpClient(endpoint = profile.baseUrl, token = profile.token, model = profile.model)
-            AiProvider.DEEPSEEK -> DeepseekClient(apiKey = profile.token, model = profile.model.ifBlank { "deepseek-v3.2" })
-            AiProvider.QWEN -> QWenClient(apiKey = profile.token, model = profile.model.ifBlank { "qwen3-coder" })
         }
+        return s.ifBlank { DEFAULT_BASE }
     }
 }

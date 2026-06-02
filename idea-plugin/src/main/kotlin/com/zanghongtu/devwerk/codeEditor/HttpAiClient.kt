@@ -1,12 +1,15 @@
 package com.zanghongtu.devwerk.codeEditor
 
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.StandardOpenOption
@@ -16,6 +19,7 @@ class HttpAiClient(
     private val chatEndpoint: String,
     private val planEndpoint: String,
     private val executeEndpoint: String,
+    private val attachmentEndpoint: String,
     private val authToken: String? = null
 ) : AiClient {
 
@@ -38,7 +42,7 @@ class HttpAiClient(
     fun sendPlan(context: ChatContext, userMessage: String): PlanResponse {
         val (mode, cleanMsg) = parseMode(userMessage)
         val messages = buildMessages(context, cleanMsg)
-        val workspace = buildWorkspaceSummary(context.projectRoot)
+        val workspace = buildWorkspaceSummary(context)
 
         val respBody = postToServer(
             endpoint = planEndpoint,
@@ -93,6 +97,51 @@ class HttpAiClient(
         }
     }
 
+    fun uploadAttachment(file: File): UploadedAttachment {
+        if (!file.exists() || !file.isFile) {
+            throw IllegalArgumentException("Attachment is not a file: ${file.absolutePath}")
+        }
+
+        val contentType = runCatching { Files.probeContentType(file.toPath()) }.getOrNull()
+            ?: "application/octet-stream"
+        val requestBody = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart(
+                name = "file",
+                filename = file.name,
+                body = file.asRequestBody(contentType.toMediaType())
+            )
+            .build()
+
+        val requestBuilder = Request.Builder()
+            .url(attachmentEndpoint)
+            .post(requestBody)
+
+        if (!authToken.isNullOrBlank()) {
+            requestBuilder.header("Authorization", "Bearer $authToken")
+        }
+
+        client.newCall(requestBuilder.build()).execute().use { response ->
+            val body = response.body?.string() ?: ""
+            if (!response.isSuccessful) {
+                throw RuntimeException("HTTP ${response.code} from attachment server: $body")
+            }
+
+            val obj = JSONObject(body)
+            if (!obj.optBoolean("ok", false)) {
+                throw RuntimeException(obj.optString("error_message", "Attachment upload failed"))
+            }
+
+            return UploadedAttachment(
+                id = obj.getString("id"),
+                filename = obj.getString("filename"),
+                contentType = obj.optString("content_type", contentType),
+                size = obj.optLong("size", file.length()),
+                localPath = obj.getString("local_path")
+            )
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
@@ -100,7 +149,7 @@ class HttpAiClient(
     private fun sendChatInternal(context: ChatContext, userMessage: String, endpoint: String): IdeChatResponse {
         val (mode, cleanUserMsg) = parseMode(userMessage)
         val messages = buildMessages(context, cleanUserMsg)
-        val workspace = buildWorkspaceSummary(context.projectRoot)
+        val workspace = buildWorkspaceSummary(context)
 
         val maxRounds = 6
         var round = 0
@@ -174,10 +223,20 @@ class HttpAiClient(
         }
     }
 
-    private fun buildWorkspaceSummary(projectRoot: String?): WorkspaceSummary? {
+    private fun buildWorkspaceSummary(context: ChatContext): WorkspaceSummary? {
+        val projectRoot = context.projectRoot
         if (projectRoot.isNullOrBlank()) return null
         val preview = runCatching { WorkspaceTools.listDir(projectRoot, "", 6) }.getOrNull()
-        return WorkspaceSummary(rootId = null, changedFiles = emptyList(), openFiles = emptyList(), treePreview = preview)
+        val sourceMap = context.project?.let { project ->
+            runCatching { SourceMapBuilder.build(project, projectRoot) }.getOrNull()
+        }
+        return WorkspaceSummary(
+            rootId = null,
+            changedFiles = emptyList(),
+            openFiles = emptyList(),
+            treePreview = preview,
+            sourceMap = sourceMap
+        )
     }
 
     private fun appendDevLog(context: ChatContext, text: String) {
@@ -226,6 +285,7 @@ class HttpAiClient(
             for (p in workspace.openFiles) open.put(p)
             w.put("open_files", open)
             w.put("tree_preview", workspace.treePreview ?: JSONObject.NULL)
+            w.put("source_map", sourceMapToJson(workspace.sourceMap))
             root.put("workspace", w)
         } else {
             root.put("workspace", JSONObject.NULL)
@@ -299,8 +359,56 @@ class HttpAiClient(
         root.put("project_root", context.projectRoot ?: JSONObject.NULL)
         root.put("approved_paths", JSONArray(approvedPaths))
         root.put("approved_ops", opsJson)
+        buildWorkspaceSummary(context)?.let { workspace ->
+            val w = JSONObject()
+            w.put("root_id", workspace.rootId ?: JSONObject.NULL)
+            w.put("changed_files", JSONArray())
+            w.put("open_files", JSONArray(workspace.openFiles))
+            w.put("tree_preview", workspace.treePreview ?: JSONObject.NULL)
+            w.put("source_map", sourceMapToJson(workspace.sourceMap))
+            root.put("workspace", w)
+        } ?: root.put("workspace", JSONObject.NULL)
 
         return root.toString()
+    }
+
+    private fun sourceMapToJson(sourceMap: SourceMap?): Any {
+        if (sourceMap == null) return JSONObject.NULL
+
+        val root = JSONObject()
+        root.put("root", sourceMap.root)
+        root.put("generated_at", sourceMap.generatedAt)
+        root.put("total_files", sourceMap.totalFiles)
+        root.put("indexed_files", sourceMap.indexedFiles)
+        root.put("skipped_files", sourceMap.skippedFiles)
+
+        val files = JSONArray()
+        for (f in sourceMap.files) {
+            val fo = JSONObject()
+            fo.put("path", f.path)
+            fo.put("kind", f.kind)
+            fo.put("language", f.language ?: JSONObject.NULL)
+            fo.put("package", f.packageName ?: JSONObject.NULL)
+            fo.put("size", f.size)
+
+            val imports = JSONArray()
+            for (imp in f.imports) imports.put(imp)
+            fo.put("imports", imports)
+
+            val symbols = JSONArray()
+            for (s in f.symbols) {
+                val so = JSONObject()
+                so.put("name", s.name)
+                so.put("kind", s.kind)
+                so.put("signature", s.signature ?: JSONObject.NULL)
+                so.put("line", s.line ?: JSONObject.NULL)
+                symbols.put(so)
+            }
+            fo.put("symbols", symbols)
+            files.put(fo)
+        }
+        root.put("files", files)
+        return root
     }
 
     private fun toolRequestsToJson(reqs: List<ToolRequest>): String {

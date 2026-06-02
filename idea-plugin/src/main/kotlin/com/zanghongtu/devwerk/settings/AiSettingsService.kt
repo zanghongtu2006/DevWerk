@@ -21,48 +21,23 @@ class AiSettingsService : PersistentStateComponent<AiSettingsState> {
 
     /** 确保 profiles 非空且 active 指向有效项 */
     private fun ensureDefaults() {
-        if (state.profiles.isEmpty()) {
-            state.profiles = mutableListOf(
-                AiProfile(
-                    name = "TechZukunft",
-                    provider = AiProvider.TECH_ZUKUNFT.name,
-                    baseUrl = "http://127.0.0.1:8001/v1/ide/chat",
-                    token = "",
-                    model = "tz-devwerk"
-                ),
-                AiProfile(
-                    name = "Ollama",
-                    provider = AiProvider.OLLAMA.name,
-                    baseUrl = "http://localhost:11434",
-                    token = "",
-                    model = "llama3.1"
-                ),
-                AiProfile(
-                    name = "GPT",
-                    provider = AiProvider.GPT.name,
-                    baseUrl = "",
-                    token = "",
-                    model = "gpt-4o-mini"
-                ),
-                AiProfile(
-                    name = "Gemini",
-                    provider = AiProvider.GEMINI.name,
-                    baseUrl = "",
-                    token = "",
-                    model = "gemini-1.5-pro"
-                )
-            )
+        val candidate = state.profiles.firstOrNull {
+            it.provider == AiProvider.TECH_ZUKUNFT.name
+        } ?: state.profiles.firstOrNull {
+            val url = it.baseUrl.lowercase()
+            "devwerk" in url || "/v1/ide" in url || url.contains(":8000") || url.contains(":8001")
         }
 
-        if (state.active.isBlank()) {
-            state.active = state.profiles.first().name
-        }
+        val backendProfile = AiProfile(
+            name = AiProvider.TECH_ZUKUNFT.display,
+            provider = AiProvider.TECH_ZUKUNFT.name,
+            baseUrl = candidate?.baseUrl?.takeIf { it.isNotBlank() } ?: AiProvider.TECH_ZUKUNFT.defaultUrl,
+            token = candidate?.token.orEmpty(),
+            model = ""
+        )
 
-        // active 指向不存在的 profile：回退到第一个
-        val exists = state.profiles.any { it.name.equals(state.active, ignoreCase = true) }
-        if (!exists) {
-            state.active = state.profiles.first().name
-        }
+        state.profiles = mutableListOf(backendProfile)
+        state.active = backendProfile.name
     }
 
     fun listProfiles(): List<AiProfile> {
@@ -77,9 +52,6 @@ class AiSettingsService : PersistentStateComponent<AiSettingsState> {
 
     fun setActiveProfile(profileName: String) {
         ensureDefaults()
-        if (state.profiles.any { it.name.equals(profileName, ignoreCase = true) }) {
-            state.active = profileName
-        }
     }
 
     /** 按 name upsert profile，并可选择是否设为 active */

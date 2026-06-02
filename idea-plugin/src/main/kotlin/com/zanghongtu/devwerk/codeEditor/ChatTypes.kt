@@ -4,6 +4,8 @@
 
 package com.zanghongtu.devwerk.codeEditor
 
+import com.intellij.openapi.project.Project
+
 /**
  * 单条对话消息
  */
@@ -18,6 +20,8 @@ data class ChatMessage(
 data class ChatContext(
     val projectRoot: String?,
     val history: List<ChatMessage>,
+    // IntelliJ Project, used for zero-token local workspace/source-map indexing.
+    val project: Project? = null,
     // DevWerk 上下文（记录请求/响应/执行）
     val devCtx: DevwerkContext? = null
 )
@@ -35,7 +39,34 @@ data class WorkspaceSummary(
     val rootId: String? = null,
     val changedFiles: List<WorkspaceFile> = emptyList(),
     val openFiles: List<String> = emptyList(),
-    val treePreview: String? = null
+    val treePreview: String? = null,
+    val sourceMap: SourceMap? = null
+)
+
+data class SourceMap(
+    val root: String,
+    val generatedAt: Long,
+    val totalFiles: Int,
+    val indexedFiles: Int,
+    val skippedFiles: Int,
+    val files: List<SourceMapFile>
+)
+
+data class SourceMapFile(
+    val path: String,
+    val kind: String,
+    val language: String? = null,
+    val packageName: String? = null,
+    val imports: List<String> = emptyList(),
+    val symbols: List<SourceMapSymbol> = emptyList(),
+    val size: Long = 0L
+)
+
+data class SourceMapSymbol(
+    val name: String,
+    val kind: String,
+    val signature: String? = null,
+    val line: Int? = null
 )
 
 /**
@@ -52,6 +83,14 @@ data class ToolResult(
     val ok: Boolean,
     val content: String? = null,
     val error: String? = null
+)
+
+data class UploadedAttachment(
+    val id: String,
+    val filename: String,
+    val contentType: String? = null,
+    val size: Long = 0L,
+    val localPath: String
 )
 
 /**

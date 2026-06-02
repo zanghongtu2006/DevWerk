@@ -17,12 +17,39 @@ class WorkspaceFile(BaseModel):
     size: Optional[int] = None
 
 
+class SourceMapSymbol(BaseModel):
+    name: str
+    kind: str
+    signature: Optional[str] = None
+    line: Optional[int] = None
+
+
+class SourceMapFile(BaseModel):
+    path: str
+    kind: str
+    language: Optional[str] = None
+    package: Optional[str] = None
+    imports: List[str] = []
+    symbols: List[SourceMapSymbol] = []
+    size: int = 0
+
+
+class SourceMap(BaseModel):
+    root: str
+    generated_at: int
+    total_files: int
+    indexed_files: int
+    skipped_files: int
+    files: List[SourceMapFile] = []
+
+
 class WorkspaceSummary(BaseModel):
     # 插件发“摘要 + 增量”，不要发全量文件内容
     root_id: Optional[str] = None
     changed_files: List[WorkspaceFile] = []
     open_files: List[str] = []
     tree_preview: Optional[str] = None
+    source_map: Optional[SourceMap] = None
 
 
 class ToolRequest(BaseModel):
