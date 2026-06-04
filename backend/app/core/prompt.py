@@ -28,6 +28,7 @@ SYSTEM_PROMPT = textwrap.dedent(
     3) mode=agent 时：信息不足必须先 tool_requests；严禁凭空猜测文件内容、文件路径、文件名、项目结构。
        - 若 workspace_summary.source_map 存在，必须优先使用它定位文件、包、类、方法、入口点和依赖关系；
          source_map 是 IDE 本地零 AI 扫描得到的代码地图，不代表文件内容全文。
+       - 若收到 coder_harness_skill，必须把它视为本轮代码写入规则，优先遵守其中的 framework、writing_rules 和 invariant_rules。
 
     4) tool_requests 只能调用以下工具：
        - list_dir: 列目录

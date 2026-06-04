@@ -39,6 +39,7 @@ class Planner:
         "Rules:\n"
         "  1. You may call tools (list_dir, read_file, search) to understand the codebase.\n"
         "     If workspace_summary.source_map exists, use it first to identify files, packages, classes, methods, entrypoints, and dependencies.\n"
+        "     If coder_harness_skill exists, use its writing rules when deciding which files belong in the plan.\n"
         "  2. When you have enough information, respond with a JSON object "
         "containing a 'plan' key with this shape:\n"
         "     { plan: { files: [{path, nature, description, confidence}], "
@@ -78,14 +79,30 @@ class Planner:
             PlanResponse with files=[], summary, warnings.
         """
         injected_messages = _inject_plan_instruction(list(messages), mode)
+        _log.debug(
+            "Planner.plan: start mode=%s input_messages=%s injected_messages=%s",
+            mode,
+            len(messages),
+            len(injected_messages),
+        )
 
         max_rounds = 4
         backoff = 0.5
 
         for attempt in range(max_rounds):
             try:
+                _log.debug("Planner.plan: attempt=%s/%s calling_llm", attempt + 1, max_rounds)
                 result = self._call_llm(injected_messages)
-                return self._extract_plan(result)
+                _log.debug("Planner.plan: attempt=%s raw_result_keys=%s", attempt + 1, sorted(result.keys()))
+                plan = self._extract_plan(result)
+                _log.debug(
+                    "Planner.plan: extracted ok=%s files=%s warnings=%s summary=%s",
+                    plan.ok,
+                    len(plan.files),
+                    len(plan.warnings),
+                    plan.summary,
+                )
+                return plan
 
             except Exception as exc:  # noqa: BLE001
                 is_timeout = (
@@ -115,6 +132,14 @@ class Planner:
         """Single LLM call — same protocol as OllamaClient.chat_structured."""
         import requests as http_requests
 
+        _log.debug(
+            "Planner.call_llm: base_url=%s model=%s enable_schema=%s messages=%s timeout=%s",
+            self.base_url,
+            self.model,
+            self.enable_schema,
+            len(messages),
+            self.timeout,
+        )
         payload: dict[str, Any] = {
             "model": self.model,
             "stream": False,
@@ -129,11 +154,14 @@ class Planner:
         resp = http_requests.post(url, json=payload, timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json()
+        _log.debug("Planner.call_llm: response_keys=%s", sorted(data.keys()))
 
         content = (data.get("message") or {}).get("content")
         if isinstance(content, dict):
+            _log.debug("Planner.call_llm: content_type=dict keys=%s", sorted(content.keys()))
             return content
         if isinstance(content, str):
+            _log.debug("Planner.call_llm: content_type=str chars=%s", len(content))
             return json.loads(content)
 
         raise ValueError(f"Ollama returned unexpected content type: {type(content).__name__}")
@@ -149,6 +177,11 @@ class Planner:
         plan_obj = raw.get("plan") or raw
 
         files_raw: list[dict] = plan_obj.get("files") or []
+        _log.debug(
+            "Planner.extract_plan: raw_files=%s plan_keys=%s",
+            len(files_raw) if isinstance(files_raw, list) else "not-list",
+            sorted(plan_obj.keys()) if isinstance(plan_obj, dict) else type(plan_obj).__name__,
+        )
         files = []
         for f in files_raw:
             if not isinstance(f, dict):

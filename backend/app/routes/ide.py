@@ -21,6 +21,7 @@ from app.core.config import settings
 from app.models.ide import IdeChatRequest, IdeChatResponse
 from app.models.plan import ExecuteRequest, PlanResponse
 from app.services.coerce import coerce_to_fileops, coerce_to_patchops, coerce_to_toolrequests
+from app.services.coder_harness import build_coder_skill
 from app.services.llm_factory import get_llm_client
 from app.services.planner import Planner as build_planner
 from app.services.prompt_builder import build_model_messages
@@ -103,7 +104,14 @@ async def ide_plan(request: Request) -> PlanResponse:
             error_code="BAD_REQUEST",
             error_message="messages must be a non-empty list",
         )
-    messages = _append_workspace_summary(messages, body.get("workspace"))
+    _log.debug(
+        "ide_plan: received mode=%s messages=%s workspace_summary=%s",
+        body.get("mode", "agent"),
+        len(messages),
+        _workspace_debug_summary(body.get("workspace")),
+    )
+    messages = _append_workspace_context(messages, body.get("workspace"))
+    _log.debug("ide_plan: messages_after_workspace_context=%s", len(messages))
 
     if not any(m.get("role", "").lower() == "user" for m in messages):
         return PlanResponse(
@@ -137,6 +145,13 @@ async def ide_plan(request: Request) -> PlanResponse:
 
     try:
         result = p.plan(messages=messages, mode=mode)
+        _log.debug(
+            "ide_plan: planner_result ok=%s files=%s warnings=%s summary=%s",
+            result.ok,
+            len(result.files),
+            len(result.warnings),
+            result.summary,
+        )
         return result
     except Exception as exc:  # noqa: BLE001
         _log.exception("Planner raised unhandled exception")
@@ -212,11 +227,19 @@ async def ide_execute(request: Request) -> IdeChatResponse:
             error_code="BAD_REQUEST",
             error_message="messages must be a list",
         )
-    messages = _append_workspace_summary(messages, body.get("workspace"))
+    _log.debug(
+        "ide_execute: received mode=%s messages=%s approved_paths=%s workspace_summary=%s",
+        body.get("mode", "agent"),
+        len(messages),
+        approved_paths,
+        _workspace_debug_summary(body.get("workspace")),
+    )
+    messages = _append_workspace_context(messages, body.get("workspace"))
+    _log.debug("ide_execute: messages_after_workspace_context=%s", len(messages))
 
     approved_set = set(approved_paths)
 
-    # Inject execution guard after the last user message.
+    # Keep the execution guard as the final instruction after workspace/coder context.
     guard_message = {
         "role": "system",
         "content": (
@@ -225,11 +248,8 @@ async def ide_execute(request: Request) -> IdeChatResponse:
             + "\nAll other paths are forbidden. Do not output ops for any path not listed above."
         ),
     }
-
-    if messages and messages[-1].get("role", "").lower() == "user":
-        messages = messages[:-1] + [guard_message, messages[-1]]
-    else:
-        messages = messages + [guard_message]
+    messages = messages + [guard_message]
+    _log.debug("ide_execute: appended_execution_guard approved_count=%s final_messages=%s", len(approved_set), len(messages))
 
     mode = str(body.get("mode", "agent")).strip().lower() or "agent"
 
@@ -241,9 +261,23 @@ async def ide_execute(request: Request) -> IdeChatResponse:
             obj = client.chat_structured(
                 build_model_messages(_ChatProxy(messages), provider=cfg.llm_provider)
             )
+            _log.debug(
+                "ide_execute: model_response keys=%s ops=%s patch_ops=%s tool_requests=%s done=%s",
+                sorted(obj.keys()) if isinstance(obj, dict) else type(obj).__name__,
+                len(obj.get("ops") or []),
+                len(obj.get("patch_ops") or []),
+                len(obj.get("tool_requests") or []),
+                bool(obj.get("done") or False),
+            )
 
             ops = _filter_ops(obj.get("ops") or [], approved_set)
             patch_ops = _filter_patch_ops(obj.get("patch_ops") or [], approved_set)
+            _log.debug(
+                "ide_execute: filtered ops=%s patch_ops=%s approved_paths=%s",
+                len(ops),
+                len(patch_ops),
+                sorted(approved_set),
+            )
 
             return IdeChatResponse(
                 ok=True,
@@ -278,7 +312,15 @@ async def ide_execute(request: Request) -> IdeChatResponse:
 
 
 def _filter_ops(ops: list[dict], approved: set[str]) -> list[dict]:
-    return [op for op in ops if isinstance(op, dict) and op.get("path", "").strip() in approved]
+    result = [op for op in ops if isinstance(op, dict) and op.get("path", "").strip() in approved]
+    dropped = [
+        op.get("path", "") if isinstance(op, dict) else type(op).__name__
+        for op in ops
+        if not (isinstance(op, dict) and op.get("path", "").strip() in approved)
+    ]
+    if dropped:
+        _log.debug("filter_ops: dropped_unapproved_or_invalid=%s", dropped)
+    return result
 
 
 def _filter_patch_ops(patch_ops: list[dict], approved: set[str]) -> list[dict]:
@@ -292,16 +334,51 @@ def _filter_patch_ops(patch_ops: list[dict], approved: set[str]) -> list[dict]:
         for m in _re.finditer(r"^\+\+\+ b/(.+)$", content, _re.MULTILINE):
             diff_paths.add(m.group(1).strip())
         if diff_paths and not diff_paths.issubset(approved):
+            _log.debug("filter_patch_ops: dropped diff_paths=%s approved=%s", sorted(diff_paths), sorted(approved))
             continue
         result.append(po)
     return result
 
 
-def _append_workspace_summary(messages: list[dict], workspace: object) -> list[dict]:
+def _append_workspace_context(messages: list[dict], workspace: object) -> list[dict]:
     if not isinstance(workspace, dict):
+        _log.debug("append_workspace_context: no workspace dict type=%s", type(workspace).__name__)
         return messages
+    _log.debug("append_workspace_context: input_messages=%s workspace=%s", len(messages), _workspace_debug_summary(workspace))
+    coder_skill = build_coder_skill(workspace)
     compact = json.dumps(workspace, ensure_ascii=False, separators=(",", ":"))
-    return messages + [{"role": "user", "content": "workspace_summary:\n" + compact}]
+    injected = list(messages)
+    if coder_skill:
+        injected.append({"role": "user", "content": coder_skill})
+        _log.debug("append_workspace_context: injected coder_harness_skill chars=%s", len(coder_skill))
+    else:
+        _log.debug("append_workspace_context: coder_harness_skill not generated")
+    injected.append({"role": "user", "content": "workspace_summary:\n" + compact})
+    _log.debug("append_workspace_context: injected workspace_summary chars=%s output_messages=%s", len(compact), len(injected))
+    return injected
+
+
+def _workspace_debug_summary(workspace: object) -> dict[str, object]:
+    if not isinstance(workspace, dict):
+        return {"type": type(workspace).__name__, "present": False}
+    source_map = workspace.get("source_map")
+    files = source_map.get("files") if isinstance(source_map, dict) else None
+    sample_paths = []
+    if isinstance(files, list):
+        for item in files[:12]:
+            if isinstance(item, dict) and item.get("path"):
+                sample_paths.append(item.get("path"))
+    return {
+        "present": True,
+        "keys": sorted(workspace.keys()),
+        "tree_preview_chars": len(workspace.get("tree_preview") or ""),
+        "source_map_present": isinstance(source_map, dict),
+        "source_map_root": source_map.get("root") if isinstance(source_map, dict) else None,
+        "source_map_total_files": source_map.get("total_files") if isinstance(source_map, dict) else None,
+        "source_map_indexed_files": source_map.get("indexed_files") if isinstance(source_map, dict) else None,
+        "source_map_files_payload": len(files) if isinstance(files, list) else 0,
+        "sample_paths": sample_paths,
+    }
 
 
 def _upload_root() -> Path:
