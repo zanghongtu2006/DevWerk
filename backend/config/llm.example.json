@@ -1,0 +1,70 @@
+{
+  "routing": {
+    "default": "minimax/m3",
+    "planner": "deepseek/deepseek-chat",
+    "product": "deepseek/deepseek-chat",
+    "design": "deepseek/deepseek-chat",
+    "architecture": "minimax/m3",
+    "coder": "minimax/m3",
+    "coding": "minimax/m3",
+    "executor": "minimax/m3",
+    "compression": "ollama/deepseek-r1:32b"
+  },
+  "llms": {
+    "minimax": {
+      "api": "anthropic",
+      "base_url": "https://api.minimaxi.com/anthropic",
+      "api_key": "API_TOKEN",
+      "timeout": 180,
+      "models": {
+        "m3": {
+          "model": "M3",
+          "temperature": 0.2,
+          "max_tokens": 4096,
+          "thinking_mode": "max",
+          "effort_level": "max"
+        }
+      }
+    },
+    "deepseek": {
+      "api": "openai",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key": "",
+      "timeout": 180,
+      "models": {
+        "deepseek-chat": {
+          "temperature": 0.2,
+          "max_tokens": 4096,
+          "thinking_mode": "balanced"
+        }
+      }
+    },
+    "openai": {
+      "api": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "",
+      "timeout": 180,
+      "models": {
+        "gpt-4o-mini": {
+          "temperature": 0.2,
+          "max_tokens": 4096,
+          "thinking_mode": "balanced"
+        }
+      }
+    },
+    "ollama": {
+      "api": "ollama",
+      "base_url": "http://127.0.0.1:11434",
+      "api_key": "",
+      "timeout": 180,
+      "enable_schema": true,
+      "models": {
+        "deepseek-r1:32b": {
+          "temperature": 0.4,
+          "max_tokens": 4096,
+          "thinking_mode": "local"
+        }
+      }
+    }
+  }
+}

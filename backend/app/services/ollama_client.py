@@ -28,13 +28,17 @@ class OllamaClient:
             self.model: str = config.get("model", "deepseek-r1:32b")
             self.timeout: float = float(config.get("timeout", 180.0))
             self.enable_schema: bool = bool(config.get("enable_schema", True))
+            self.temperature: float = float(config.get("temperature", 0.4))
+            self.top_p: float | None = config.get("top_p")
         else:
             from app.core.config import settings
-            cfg = settings()
-            self.base_url = cfg.ollama_base_url.rstrip("/")
-            self.model = cfg.ollama_model
-            self.timeout = float(cfg.ollama_timeout)
-            self.enable_schema = cfg.ollama_enable_schema
+            cfg = settings().get_llm_config("coder")
+            self.base_url = cfg.get("base_url", "http://127.0.0.1:11434").rstrip("/")
+            self.model = cfg.get("model", "deepseek-r1:32b")
+            self.timeout = float(cfg.get("timeout", 180.0))
+            self.enable_schema = bool(cfg.get("enable_schema", True))
+            self.temperature = float(cfg.get("temperature", 0.4))
+            self.top_p = cfg.get("top_p")
 
         self.url = f"{self.base_url}/api/chat"
 
@@ -48,8 +52,10 @@ class OllamaClient:
             "model": self.model,
             "stream": False,
             "messages": messages,
-            "options": {"temperature": 0.4},
+            "options": {"temperature": self.temperature},
         }
+        if self.top_p is not None:
+            payload["options"]["top_p"] = float(self.top_p)
 
         # Only send schema if the server/model is known to support it.
         # Older models (e.g. llama3 without --format flag) may reject it.

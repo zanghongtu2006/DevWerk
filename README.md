@@ -1,191 +1,312 @@
-# DevWerk — AI‑Powered IDE CodeOps Agent
+# DevWerk
 
-> An AI-assisted **Code Operations (CodeOps) backend** designed to safely generate, modify, and refactor code inside IDEs, integrating **OpenAI** and **Ollama** models with strict architectural constraints.
+DevWerk is a kanban-centered AI engineering loop for IDE-driven code generation.
 
-DevWerk is built to explore a practical question:
+The core idea is simple: AI should not be a loose text box that writes into a
+repository. Every coding action should become a visible engineering task, move
+through a small workflow, produce artifacts, and return guarded changes to the
+IDE plugin. The plugin remains responsible for snapshot-protected writes.
 
-**How far can we push AI to automate real software development while preserving code invariants, architectural intent, and developer trust?**
+DevWerk is evolving from a basic CodeOps backend into a loop engineering and
+harness system:
 
-![Screenshot](screenshot.png)
----
+- The IDE plugin collects project context, source maps, attachments, and applies
+  returned changes through its local snapshot safety layer.
+- The backend owns kanban workflow, model routing, planning artifacts, coder
+  harness rules, token accounting, and generated patch/file operations.
+- Kanban is the operating surface. `/v1/chat` is no longer just a chat endpoint;
+  it creates or advances a kanban task.
 
-## 🚀 Project Status
+## Architecture
 
-- **Current progress:** ~60% complete
-- **Core capability:** AI-driven CRUD operations on source code (create / update / delete / refactor)
-- **Supported LLMs:** OpenAI API, Ollama (local models)
-- **Target milestone:** v1.0 — Spec-driven scaffold generation (POA)
-
-This repository contains the **backend service** powering DevWerk.
-
----
-
-## 🧠 Motivation
-
-Modern AI coding tools often operate as black boxes:
-- They generate code without understanding project structure
-- They violate architectural boundaries
-- They make changes that are hard to audit or revert
-
-DevWerk takes a different approach:
-
-- Treat codebases as **structured systems**, not text blobs
-- Enforce **explicit invariants and schemas**
-- Let AI operate **within clearly defined constraints**
-- Make every AI action auditable and reversible
-
----
-
-## 🏗 High‑Level Architecture
-
-```
-IDE Plugin (Client)
-        │
-        ▼
+```text
+IntelliJ Plugin
+  - projectId from .devwerk/meta
+  - source map and selected context
+  - attachment upload
+  - snapshot-protected apply
+        |
+        v
 DevWerk Backend (FastAPI)
-        │
-        ├── Prompt Factory
-        ├── Schema & Constraint Layer
-        ├── CodeOps Engine
-        │       ├── Read / Diff
-        │       ├── Create / Update / Delete
-        │       └── Validation
-        │
-        ├── OpenAI Adapter
-        └── Ollama Adapter
+  - /v1/chat kanban workflow entry
+  - coder harness from source_map
+  - planning bundle artifacts
+  - patch/file operation generation
+  - apply-result and verification state
+  - local SQLite usage accounting
+        |
+        v
+LLM Catalog
+  - provider/model refs
+  - task routing
+  - per-model parameters
+  - cloud or local endpoints
 ```
 
----
+## Kanban Workflow
 
-## 📂 Repository Structure (Backend)
+The default workflow is intentionally short. Columns represent main task states;
+details such as requirements, design, verification checks, and rework reasons are
+stored as events or artifacts.
 
+```text
+Draft
+Context Indexed
+Planned
+Coding
+Ready To Apply
+Applied
+Verified
+Done
+Failed
 ```
+
+State meaning:
+
+- `Draft`: A user request exists. The task may have been created by `/v1/chat`.
+- `Context Indexed`: The backend received source map, selected context, and
+  attachment metadata. This phase should use as little LLM work as possible.
+- `Planned`: The backend saved a planning bundle containing requirement
+  breakdown, system design, implementation plan, and verification policy.
+- `Coding`: The coder harness is generating guarded changes from the plan.
+- `Ready To Apply`: Changes are ready for the plugin. The backend has not
+  written to the repository.
+- `Applied`: The plugin applied changes through its snapshot-protected write
+  path and reported the result.
+- `Verified`: Required verification checks passed.
+- `Done`: The task is closed.
+- `Failed`: A phase failed. Rework should move the task back to the appropriate
+  earlier state rather than adding more columns.
+
+## Planning Artifacts
+
+`Planned` is a state, not a single string. DevWerk stores a planning bundle:
+
+```json
+{
+  "requirement_breakdown": {
+    "summary": "...",
+    "goals": [],
+    "non_goals": [],
+    "acceptance_criteria": [],
+    "constraints": []
+  },
+  "system_design": {
+    "summary": "...",
+    "components": [],
+    "api_changes": [],
+    "storage_changes": [],
+    "risks": []
+  },
+  "implementation_plan": {
+    "steps": [],
+    "files_to_touch": [],
+    "warnings": []
+  },
+  "verification_policy": {
+    "required": ["compile", "smoke"],
+    "optional": ["unit", "integration"],
+    "results": {}
+  }
+}
+```
+
+For small tasks, sections may be short. For larger tasks, this artifact becomes
+the place where requirement decomposition and system design are preserved without
+turning the kanban board into a long list of micro-columns.
+
+## Coder Harness
+
+The backend builds a zero-token coder skill from the IDE-provided source map.
+It detects common project shapes such as:
+
+- DevWerk monorepo
+- IntelliJ plugin
+- FastAPI backend
+- Spring Boot
+- React or Vue
+- generic Python/JVM projects
+
+The harness tells the model which framework it is looking at, which paths are
+representative, and what writing rules should be respected. This lets the backend
+save tokens by scanning project structure locally before asking an LLM to reason.
+
+## LLM Configuration
+
+LLM configuration is stored outside `.env` because it is structured and should be
+hand-editable.
+
+```text
+backend/config/llm.example.json   committed template
+backend/config/llm.json           local ignored runtime config
+```
+
+`.env` points to the runtime config:
+
+```env
+DEVWERK_LLM_CONFIG_PATH=./config/llm.json
+```
+
+The config has two top-level sections:
+
+```json
+{
+  "routing": {
+    "default": "minimax/m3",
+    "planner": "deepseek/deepseek-chat",
+    "architecture": "minimax/m3",
+    "coding": "minimax/m3",
+    "compression": "ollama/deepseek-r1:32b"
+  },
+  "llms": {
+    "minimax": {
+      "api": "anthropic",
+      "base_url": "https://api.minimaxi.com/anthropic",
+      "api_key": "API_TOKEN",
+      "models": {
+        "m3": {
+          "model": "M3",
+          "temperature": 0.2,
+          "max_tokens": 4096,
+          "thinking_mode": "max"
+        }
+      }
+    }
+  }
+}
+```
+
+Model refs use `provider/model`. This is inspired by OpenClaw-style model refs
+and Hermes-style main/auxiliary slot routing, but DevWerk maps them to engineering
+loop roles such as planning, architecture, coding, and compression.
+
+## Main APIs
+
+### `POST /v1/chat`
+
+Kanban workflow entrypoint. If `task_id` is missing, the backend creates a task.
+It then records context, plans, codes, and returns changes in `Ready To Apply`.
+
+Important response fields:
+
+```json
+{
+  "ok": true,
+  "task_id": "...",
+  "status_key": "ready_to_apply",
+  "planning": {},
+  "ops": [],
+  "patch_ops": []
+}
+```
+
+### `POST /v1/kanban/tasks/{task_id}/apply-result`
+
+Called by the plugin after it applies returned changes. The plugin snapshot layer
+is local and atomic; the backend only records the result.
+
+```json
+{
+  "ok": true,
+  "snapshot_id": "optional-audit-id",
+  "changed_paths": ["src/..."],
+  "verification": {
+    "required": ["compile", "smoke"],
+    "results": {
+      "compile": "passed",
+      "smoke": "passed"
+    }
+  }
+}
+```
+
+### `GET/PUT /v1/settings`
+
+Reads and writes `backend/config/llm.json`. The dashboard exposes this as two
+JSON editors: `LLM Catalog` and `Routing`.
+
+### `GET /dashboard`
+
+Local web UI for:
+
+- statistics
+- projects
+- kanban
+- global model/routing settings
+- project settings
+
+## Repository Layout
+
+```text
 backend/
-├── app/
-│   ├── core/        # Prompt templates, schemas, invariants
-│   ├── models/      # Domain models (IDE, workspace, ops)
-│   ├── routes/      # FastAPI endpoints (IDE integration)
-│   ├── services/    # LLM adapters, CodeOps logic
-│   └── utils/       # Helpers and shared utilities
-├── requirements.txt
-├── startup.bat
-└── .env.example
+  app/
+    core/        configuration and schema
+    models/      IDE and planning response models
+    routes/      IDE, kanban, settings, dashboard routes
+    services/    LLM clients, kanban DB, usage DB, coder harness
+  config/
+    llm.example.json
+  tests/
+  startup.bat
+  requirements.txt
+
+idea-plugin/
+  IntelliJ plugin frontend
+  source map collection
+  attachments
+  snapshot-protected code apply
 ```
 
----
+## Running Locally
 
-## 🔑 Core Capabilities
+Backend:
 
-### 1. AI‑Driven Code Operations
-- Create new files and directories
-- Modify existing files
-- Delete paths safely
-- Generate unified diffs instead of raw overwrites
-
-### 2. Constraint‑First Design
-- Code changes must conform to predefined schemas
-- Architectural boundaries are enforced before execution
-- Prevents AI from breaking core project invariants
-
-### 3. Multi‑Model Support
-- **OpenAI** for cloud-based reasoning
-- **Ollama** for local / privacy‑friendly inference
-- Unified abstraction layer for future model expansion
-
-### 4. IDE‑Oriented Workflow
-- Designed to be driven by IDE plugins
-- Supports workspace summaries instead of full source dumps
-- Optimized for incremental, contextual changes
-
----
-
-## 🧪 Current Functionality
-
-✅ Implemented:
-- FastAPI backend service
-- Prompt factory and schema validation
-- OpenAI & Ollama API integration
-- Code CRUD via AI with validation
-- Diff‑based patch application
-
-🚧 In progress:
-- Spec‑driven project generation
-- Scaffold templates (e.g. Spring Boot, Vue, RuoYi)
-- Enhanced invariant modeling
-- Safety policies for large refactors
-
----
-
-## 🎯 v1.0 Vision
-
-The 1.0 milestone aims to support:
-
-- **Spec‑driven code generation**
-- Scaffold‑aware AI (framework‑specific knowledge)
-- POA‑level project bootstrapping
-- Significant reduction of manual boilerplate coding
-
-Ultimate goal:
-> **Free developers from repetitive scaffolding work, while keeping humans in control of architecture.**
-
----
-
-## ⚠️ Non‑Goals
-
-- Fully autonomous software development
-- Replacing human engineers
-- Unconstrained “AI writes everything” workflows
-
-DevWerk intentionally prioritizes **control, safety, and trust** over raw automation.
-
----
-
-## 🧑‍💻 Running Locally
-
-### Requirements
-- Python 3.10+
-- OpenAI API key or Ollama installed
-
-### Setup
-```bash
+```powershell
 cd backend
-pip install -r requirements.txt
-cp .env.example .env
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+copy .env.example .env
+copy config\llm.example.json config\llm.json
+startup.bat
 ```
 
-### Start Service
-```bash
-uvicorn app.main:app --reload
+Open:
+
+```text
+http://localhost:8000/dashboard
+http://localhost:8000/docs
 ```
 
----
+Plugin build:
 
-## 🧠 Why This Project Matters
+```powershell
+cd idea-plugin
+.\gradlew.bat compileKotlin
+```
 
-DevWerk demonstrates:
+`gradlew build` may fail at `prepareSandbox` if IntelliJ is currently holding the
+sandbox plugin jar open. In that case, Kotlin compilation and jar creation may
+still be valid while sandbox copy is blocked by the IDE process.
 
-- Real‑world AI integration beyond demos
-- Architectural thinking applied to AI tooling
-- Practical handling of LLM limitations
-- A senior‑level approach to developer productivity
+## Tests
 
-This is not a toy chatbot — it is an exploration of **AI‑assisted software engineering as a discipline**.
+Backend:
 
----
+```powershell
+cd backend
+.\.venv\Scripts\python.exe -m compileall app tests
+.\.venv\Scripts\python.exe -m pytest tests
+```
 
-## 👤 Author
+## Design Principles
 
-**Hongtu Zang**  
-Senior Software / Platform Engineer
+- Kanban first: AI work should be visible as workflow, not hidden as a chat turn.
+- Backend plans and generates; frontend applies through snapshots.
+- Columns stay short; details live in events, artifacts, and checklists.
+- Source maps are zero-token structure that should reduce LLM context cost.
+- Multiple models exist to optimize cost and stability by task type.
+- Rework is a transition reason, not a board column.
 
-Focus:
-- Distributed systems
-- Developer tooling
-- AI‑assisted engineering workflows
-- Platform architecture
+## License
 
----
-
-## 📄 License
-
-GNU V2.1 License
+GNU LGPL 2.1. See [LICENSE](LICENSE).

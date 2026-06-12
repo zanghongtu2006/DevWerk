@@ -21,25 +21,36 @@ from app.services.validation import validate_model_response
 class AnthropicClient:
     def __init__(self, config: dict | None = None):
         self.last_usage: dict[str, Any] | None = None
+        self.api_name: str = "anthropic"
         if config:
+            self.api_name = config.get("api_name", self.api_name)
             self.base_url: str = config.get("base_url", "https://api.minimaxi.com/anthropic").rstrip("/")
             self.api_key: str | None = config.get("api_key")
             self.model: str = config.get("model", "M3")
             self.timeout: float = float(config.get("timeout", 180.0))
             self.effort_level: str | None = config.get("effort_level")
+            self.thinking_mode: str | None = config.get("thinking_mode")
+            self.temperature: float = float(config.get("temperature", 0.2))
+            self.top_p: float | None = config.get("top_p")
+            self.max_tokens: int = int(config.get("max_tokens", 4096))
         else:
             from app.core.config import settings
             cfg = settings().get_llm_config("coder")
+            self.api_name = cfg.get("api_name", self.api_name)
             self.base_url = cfg.get("base_url", "https://api.minimaxi.com/anthropic").rstrip("/")
             self.api_key = cfg.get("api_key")
             self.model = cfg.get("model", "M3")
             self.timeout = float(cfg.get("timeout", 180.0))
             self.effort_level = cfg.get("effort_level")
+            self.thinking_mode = cfg.get("thinking_mode")
+            self.temperature = float(cfg.get("temperature", 0.2))
+            self.top_p = cfg.get("top_p")
+            self.max_tokens = int(cfg.get("max_tokens", 4096))
 
         self.url = f"{self.base_url}/v1/messages" if not self.base_url.endswith("/v1") else f"{self.base_url}/messages"
 
         if not self.api_key:
-            raise ValueError("ANTHROPIC_AUTH_TOKEN is not set.")
+            raise ValueError(f"api_key is not set for LLM provider {self.api_name!r}.")
 
     def chat_structured(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
         obj = self.chat_json(messages)
@@ -57,13 +68,20 @@ class AnthropicClient:
 
         payload: Dict[str, Any] = {
             "model": self.model,
-            "max_tokens": 4096,
-            "temperature": 0.2,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
             "system": system_text,
             "messages": user_messages,
         }
+        if self.top_p is not None:
+            payload["top_p"] = float(self.top_p)
+        metadata = {}
         if self.effort_level:
-            payload["metadata"] = {"effort_level": self.effort_level}
+            metadata["effort_level"] = self.effort_level
+        if self.thinking_mode:
+            metadata["thinking_mode"] = self.thinking_mode
+        if metadata:
+            payload["metadata"] = metadata
 
         resp = http_requests.post(self.url, json=payload, headers=headers, timeout=self.timeout)
         resp.raise_for_status()

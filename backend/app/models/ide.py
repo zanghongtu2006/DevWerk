@@ -92,6 +92,9 @@ class IdeChatRequest(BaseModel):
 
 class IdeChatResponse(BaseModel):
     reply: str = ""
+    task_id: Optional[str] = None
+    status_key: Optional[str] = None
+    planning: Optional[Dict[str, Any]] = None
 
     # scaffold（可选）
     code_tree: Optional[str] = None

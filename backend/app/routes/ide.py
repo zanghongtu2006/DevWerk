@@ -22,7 +22,7 @@ from app.models.ide import IdeChatRequest, IdeChatResponse
 from app.models.plan import ExecuteRequest, PlanResponse
 from app.services.coerce import coerce_to_fileops, coerce_to_patchops, coerce_to_toolrequests
 from app.services.coder_harness import build_coder_skill
-from app.services.kanban import add_artifact, add_event, move_task
+from app.services.kanban import add_artifact, add_event, create_task, move_task
 from app.services.llm_factory import get_llm_client
 from app.services.planner import Planner as build_planner
 from app.services.prompt_builder import build_model_messages
@@ -288,7 +288,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
     for attempt in range(max_retries + 1):
         try:
             obj = client.chat_structured(
-                build_model_messages(_ChatProxy(messages), provider=cfg.llm_provider_name)
+                build_model_messages(_ChatProxy(messages), provider=cfg.get_llm_config("executor").get("protocol", cfg.llm_provider_name))
             )
             _log.debug(
                 "ide_execute: model_response keys=%s ops=%s patch_ops=%s tool_requests=%s done=%s",
@@ -320,7 +320,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
             _kanban_artifact(task_id, "execute_response", payload=response.model_dump())
             _kanban_move(
                 task_id,
-                "verification",
+                "ready_to_apply",
                 {"ops": len(response.ops), "patch_ops": len(response.patch_ops), "done": response.done},
             )
             return response
@@ -472,6 +472,7 @@ def _kanban_move(task_id: str | None, status_key: str, payload: dict) -> None:
 @router.post("/chat", response_model=IdeChatResponse)
 def ide_chat(req: IdeChatRequest) -> IdeChatResponse:
     cfg = settings()
+    task_id = _ensure_chat_task(req)
     _log.debug(
         "ide_chat: received project_id=%s mode=%s messages=%s workspace_summary=%s tool_results=%s",
         req.project_id,
@@ -480,13 +481,36 @@ def ide_chat(req: IdeChatRequest) -> IdeChatResponse:
         _workspace_debug_summary(req.workspace.model_dump() if req.workspace else None),
         len(req.tool_results),
     )
+    _kanban_artifact(task_id, "chat_request", payload=_chat_request_artifact(req))
+    _kanban_move(task_id, "context_indexed", {"workspace": _workspace_debug_summary(req.workspace.model_dump() if req.workspace else None)})
+
+    planning = _run_chat_planning(req, task_id)
+    if planning.get("ok") is False:
+        _kanban_move(task_id, "failed", {"phase": "planning", "error": planning.get("error_message")})
+        return IdeChatResponse(
+            ok=False,
+            reply="",
+            done=True,
+            task_id=task_id,
+            status_key="failed",
+            planning=planning,
+            error_code=planning.get("error_code") or "PLAN_ERROR",
+            error_message=planning.get("error_message"),
+            retryable=True,
+        )
+    _kanban_artifact(task_id, "planning_bundle", payload=planning)
+    _kanban_move(task_id, "planned", {"files": len((planning.get("implementation_plan") or {}).get("files_to_touch") or [])})
 
     try:
         cfg.validate_provider("coder")
     except ValueError as ve:
         _log.warning("Provider validation failed: %s", ve)
+        _kanban_move(task_id, "failed", {"phase": "coding", "error": str(ve)})
         return IdeChatResponse(
             ok=False, reply="", done=True,
+            task_id=task_id,
+            status_key="failed",
+            planning=planning,
             error_code="CONFIG_ERROR", error_message=str(ve), retryable=False,
         )
 
@@ -494,12 +518,21 @@ def ide_chat(req: IdeChatRequest) -> IdeChatResponse:
         client = get_llm_client("coder")
     except (ValueError, NotImplementedError) as exc:
         _log.warning("LLM client creation failed: %s", exc)
+        _kanban_move(task_id, "failed", {"phase": "coding", "error": str(exc)})
         return IdeChatResponse(
             ok=False, reply="", done=True,
+            task_id=task_id,
+            status_key="failed",
+            planning=planning,
             error_code="CONFIG_ERROR", error_message=str(exc), retryable=False,
         )
 
-    messages = build_model_messages(req, provider=cfg.llm_provider_name)
+    messages = build_model_messages(req, provider=cfg.get_llm_config("coder").get("protocol", cfg.llm_provider_name))
+    messages.append({
+        "role": "user",
+        "content": "planning_bundle:\n" + json.dumps(planning, ensure_ascii=False, separators=(",", ":")),
+    })
+    _kanban_move(task_id, "coding", {"planning_artifact": True})
 
     max_retries = 2
     backoff = 0.8
@@ -509,15 +542,30 @@ def ide_chat(req: IdeChatRequest) -> IdeChatResponse:
             obj = client.chat_structured(messages)
             obj = _guard_delete_ops(req, obj)
 
-            return IdeChatResponse(
+            response = IdeChatResponse(
                 ok=True,
                 reply=obj.get("reply", ""),
+                task_id=task_id,
+                status_key="ready_to_apply",
+                planning=planning,
                 code_tree=obj.get("code_tree"),
                 ops=coerce_to_fileops(obj.get("ops") or [], tool_results=req.tool_results),
                 tool_requests=coerce_to_toolrequests(obj.get("tool_requests") or []),
                 patch_ops=coerce_to_patchops(obj.get("patch_ops") or []),
                 done=bool(obj.get("done") or False),
             )
+            _kanban_artifact(task_id, "coding_response", payload=response.model_dump())
+            _kanban_move(
+                task_id,
+                "ready_to_apply",
+                {
+                    "ops": len(response.ops),
+                    "patch_ops": len(response.patch_ops),
+                    "tool_requests": len(response.tool_requests),
+                    "done": response.done,
+                },
+            )
+            return response
         except Exception as exc:  # noqa: BLE001
             is_timeout = (
                 "ReadTimeout" in type(exc).__name__
@@ -528,19 +576,134 @@ def ide_chat(req: IdeChatRequest) -> IdeChatResponse:
                 continue
 
             _log.exception("LLM call failed (attempt %s/%s)", attempt, max_retries)
+            _kanban_move(task_id, "failed", {"phase": "coding", "error": f"{type(exc).__name__}: {exc}"})
             return IdeChatResponse(
                 ok=False, reply="", done=True,
+                task_id=task_id,
+                status_key="failed",
+                planning=planning,
                 error_code="MODEL_ERROR",
                 error_message=f"{type(exc).__name__}: {exc}",
                 retryable=(attempt < max_retries),
             )
 
-    return IdeChatResponse(ok=False, reply="", done=True, error_code="UNKNOWN")
+    _kanban_move(task_id, "failed", {"phase": "coding", "error": "unknown"})
+    return IdeChatResponse(ok=False, reply="", done=True, task_id=task_id, status_key="failed", planning=planning, error_code="UNKNOWN")
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _ensure_chat_task(req: IdeChatRequest) -> str:
+    if req.task_id:
+        return req.task_id
+    title = (_first_user_text(req) or "DevWerk coding task").strip().splitlines()[0][:120]
+    try:
+        result = create_task(
+            project_id=req.project_id,
+            title=title or "DevWerk coding task",
+            description=_first_user_text(req),
+            status_key="draft",
+            metadata={"entrypoint": "/v1/chat", "mode": req.mode},
+        )
+        task_id = result["task"]["id"]
+        _log.debug("ide_chat: created kanban task_id=%s project_id=%s", task_id, req.project_id)
+        return task_id
+    except Exception as exc:  # noqa: BLE001
+        fallback = str(uuid.uuid4())
+        _log.warning("ide_chat: failed to create kanban task, using ephemeral id=%s error=%s", fallback, exc)
+        return fallback
+
+
+def _chat_request_artifact(req: IdeChatRequest) -> dict:
+    workspace = req.workspace.model_dump() if req.workspace else None
+    return {
+        "project_id": req.project_id,
+        "mode": req.mode,
+        "message_count": len(req.messages),
+        "user_request": _first_user_text(req),
+        "workspace_summary": _workspace_debug_summary(workspace),
+        "tool_results": len(req.tool_results),
+    }
+
+
+def _run_chat_planning(req: IdeChatRequest, task_id: str) -> dict:
+    messages = _append_workspace_context(_message_dicts(req), req.workspace.model_dump() if req.workspace else None)
+    agent_name = "planner"
+    try:
+        settings().validate_provider(agent_name)
+    except ValueError as exc:
+        _log.warning("ide_chat: planner unavailable, falling back to coder for planning: %s", exc)
+        agent_name = "coder"
+        try:
+            settings().validate_provider(agent_name)
+        except ValueError as coder_exc:
+            return {
+                "ok": False,
+                "error_code": "CONFIG_ERROR",
+                "error_message": str(coder_exc),
+            }
+
+    _kanban_event(task_id, "planning_started", {"agent": agent_name})
+    planner = build_planner(agent_name=agent_name)
+    plan = planner.plan(messages=messages, mode=req.mode)
+    bundle = _planning_bundle(req, plan.model_dump())
+    bundle["ok"] = plan.ok
+    if not plan.ok:
+        bundle["error_code"] = plan.error_code
+        bundle["error_message"] = plan.error_message
+    return bundle
+
+
+def _planning_bundle(req: IdeChatRequest, plan: dict) -> dict:
+    user_text = _first_user_text(req)
+    files = plan.get("files") or []
+    file_paths = [f.get("path") for f in files if isinstance(f, dict) and f.get("path")]
+    warnings = plan.get("warnings") or []
+    return {
+        "requirement_breakdown": {
+            "summary": user_text[:500],
+            "goals": [plan.get("summary") or user_text[:160] or "Implement requested code change."],
+            "non_goals": [],
+            "acceptance_criteria": [
+                "Generated changes are returned to the IDE plugin as guarded file operations or patch operations.",
+                "The IDE plugin applies changes through its snapshot-protected write path.",
+            ],
+            "constraints": [
+                "Do not bypass the DevWerk kanban task lifecycle.",
+                "Do not write files directly from the backend.",
+            ],
+        },
+        "system_design": {
+            "summary": plan.get("summary") or "",
+            "components": file_paths,
+            "api_changes": [],
+            "storage_changes": [],
+            "risks": warnings,
+        },
+        "implementation_plan": {
+            "summary": plan.get("summary") or "",
+            "files_to_touch": file_paths,
+            "steps": [
+                f"{f.get('nature', 'modify')} {f.get('path')}: {f.get('description', '')}".strip()
+                for f in files
+                if isinstance(f, dict)
+            ],
+            "warnings": warnings,
+        },
+        "verification_policy": {
+            "required": ["compile", "smoke"],
+            "optional": ["unit", "integration"],
+            "results": {},
+        },
+        "raw_plan": plan,
+    }
+
+
+def _message_dicts(req: IdeChatRequest) -> list[dict]:
+    return [{"role": m.role, "content": m.content} for m in req.messages]
+
 
 def _first_user_text(req: IdeChatRequest) -> str:
     for m in reversed(req.messages):

@@ -27,6 +27,7 @@ env/
 .env.development
 .env.production
 .env.test
+config/llm.json
 
 # Test and coverage
 htmlcov/

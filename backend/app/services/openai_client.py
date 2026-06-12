@@ -19,25 +19,34 @@ from app.services.validation import validate_model_response
 class OpenAIClient:
     def __init__(self, config: dict | None = None):
         self.last_usage: dict[str, Any] | None = None
+        self.api_name: str = "openai"
         if config:
+            self.api_name = config.get("api_name", self.api_name)
             self.base_url: str = config.get("base_url", "https://api.openai.com/v1").rstrip("/")
             self.api_key: str | None = config.get("api_key")
             self.model: str = config.get("model", "gpt-4o-mini")
             self.timeout: float = float(config.get("timeout", 180.0))
+            self.temperature: float = float(config.get("temperature", 0.2))
+            self.top_p: float | None = config.get("top_p")
+            self.max_tokens: int | None = config.get("max_tokens")
         else:
             from app.core.config import settings
             cfg = settings().get_llm_config("coder")
+            self.api_name = cfg.get("api_name", self.api_name)
             self.base_url = cfg.get("base_url", "https://api.openai.com/v1").rstrip("/")
             self.api_key = cfg.get("api_key")
             self.model = cfg.get("model", "gpt-4o-mini")
             self.timeout = float(cfg.get("timeout", 180.0))
+            self.temperature = float(cfg.get("temperature", 0.2))
+            self.top_p = cfg.get("top_p")
+            self.max_tokens = cfg.get("max_tokens")
 
         if not self.base_url.endswith("/v1"):
             self.base_url = f"{self.base_url}/v1"
         self.url = f"{self.base_url}/chat/completions"
 
         if not self.api_key:
-            raise ValueError("OPENAI_API_KEY is not set.")
+            raise ValueError(f"api_key is not set for LLM provider {self.api_name!r}.")
 
     def chat_structured(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
         obj = self.chat_json(messages, schema=MODEL_RESPONSE_SCHEMA)
@@ -52,9 +61,13 @@ class OpenAIClient:
         payload: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "temperature": 0.2,
+            "temperature": self.temperature,
             "response_format": {"type": "json_object"},
         }
+        if self.top_p is not None:
+            payload["top_p"] = float(self.top_p)
+        if self.max_tokens:
+            payload["max_tokens"] = int(self.max_tokens)
         if schema is not None:
             payload["response_format"] = {
                 "type": "json_schema",

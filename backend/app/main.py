@@ -20,6 +20,7 @@ from app.core.config import settings
 from app.routes.ide import router as ide_router
 from app.routes.kanban import router as kanban_router
 from app.routes.kanban import ui_router as kanban_ui_router
+from app.routes.settings import router as settings_router
 from app.services.kanban import init_kanban_db
 from app.services.usage import clear_request, finish_request, init_usage_db, start_request
 
@@ -95,6 +96,7 @@ def create_app() -> FastAPI:
 
     app.include_router(ide_router, prefix="/v1", tags=["IDE"])
     app.include_router(kanban_router, prefix="/v1", tags=["Kanban"])
+    app.include_router(settings_router, prefix="/v1", tags=["Settings"])
     app.include_router(kanban_ui_router)
 
     return app

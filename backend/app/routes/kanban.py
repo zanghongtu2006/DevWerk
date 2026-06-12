@@ -48,7 +48,6 @@ class ProjectUpsertRequest(BaseModel):
 
 class ProjectSettingsRequest(BaseModel):
     agents: dict[str, Any] | None = None
-    models: dict[str, Any] | None = None
     parameters: dict[str, Any] | None = None
 
 
@@ -86,6 +85,14 @@ class ArtifactCreateRequest(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class ApplyResultRequest(BaseModel):
+    ok: bool = True
+    snapshot_id: str | None = None
+    changed_paths: list[str] = Field(default_factory=list)
+    verification: dict[str, Any] = Field(default_factory=dict)
+    error_message: str | None = None
+
+
 @router.get("/board")
 def kanban_board(project_id: str | None = None):
     return get_board(project_id)
@@ -116,7 +123,6 @@ def kanban_update_project_settings(project_id: str, req: ProjectSettingsRequest)
     return update_project_settings(
         project_id,
         agents=req.agents,
-        models=req.models,
         parameters=req.parameters,
     )
 
@@ -203,6 +209,27 @@ def kanban_add_artifact(task_id: str, req: ArtifactCreateRequest):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.post("/tasks/{task_id}/apply-result")
+def kanban_apply_result(task_id: str, req: ApplyResultRequest):
+    payload = req.model_dump()
+    try:
+        add_artifact(task_id, artifact_type="apply_result", payload=payload)
+        add_event(task_id, "apply_result_received", payload)
+        if not req.ok:
+            return move_task(task_id, "failed", force=True, payload={"phase": "apply", **payload})
+        applied = move_task(task_id, "applied", force=True, payload=payload)
+        required = req.verification.get("required") if isinstance(req.verification, dict) else None
+        results = req.verification.get("results") if isinstance(req.verification, dict) else None
+        if isinstance(required, list) and isinstance(results, dict):
+            passed = all(str(results.get(item)).lower() == "passed" for item in required)
+            if passed:
+                move_task(task_id, "verified", force=True, payload={"verification": req.verification})
+                return move_task(task_id, "done", force=True, payload={"reason": "verification_passed"})
+        return applied
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @ui_router.get("/kanban", response_class=HTMLResponse)
 def kanban_ui():
     return HTMLResponse(KANBAN_HTML)
@@ -221,178 +248,68 @@ DASHBOARD_HTML = r"""
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>DevWerk Dashboard</title>
   <style>
-    :root {
-      color-scheme: light dark;
-      --bg: #f4f6f8;
-      --panel: #ffffff;
-      --text: #172033;
-      --muted: #667085;
-      --line: #d6dce6;
-      --accent: #1f65d6;
-      --accent-soft: #e9f1ff;
-      --danger: #b42318;
-    }
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --bg: #1f2329;
-        --panel: #2a2f37;
-        --text: #eef2f8;
-        --muted: #aab3c2;
-        --line: #444c58;
-        --accent: #7aa7ff;
-        --accent-soft: #263852;
-        --danger: #ff9b91;
-      }
-    }
+    :root { color-scheme: light dark; --bg: #f4f6f8; --panel: #ffffff; --text: #172033; --muted: #667085; --line: #d6dce6; --accent: #1f65d6; --accent-soft: #e9f1ff; --danger: #b42318; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #1f2329; --panel: #2a2f37; --text: #eef2f8; --muted: #aab3c2; --line: #444c58; --accent: #7aa7ff; --accent-soft: #263852; --danger: #ff9b91; } }
     * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      background: var(--bg);
-      color: var(--text);
-      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-    .shell {
-      min-height: 100vh;
-      display: grid;
-      grid-template-columns: 240px 1fr;
-    }
+    body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .shell { min-height: 100vh; display: grid; grid-template-columns: 240px 1fr; }
     .shell.collapsed { grid-template-columns: 64px 1fr; }
-    aside {
-      border-right: 1px solid var(--line);
-      background: var(--panel);
-      padding: 12px;
-      overflow: hidden;
-    }
-    .brand {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      height: 36px;
-      margin-bottom: 14px;
-      font-weight: 700;
-    }
-    .shell.collapsed .brand span,
-    .shell.collapsed nav button span { display: none; }
+    aside { border-right: 1px solid var(--line); background: var(--panel); padding: 12px; overflow: hidden; }
+    .brand { display: flex; align-items: center; justify-content: space-between; height: 36px; margin-bottom: 14px; font-weight: 700; }
+    .shell.collapsed .brand span, .shell.collapsed nav button span { display: none; }
     nav { display: grid; gap: 6px; }
-    nav button, .icon-btn {
-      height: 34px;
-      border: 1px solid transparent;
-      border-radius: 7px;
-      background: transparent;
-      color: var(--text);
-      cursor: pointer;
-    }
-    nav button {
-      text-align: left;
-      padding: 0 10px;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-    nav button.active {
-      background: var(--accent-soft);
-      border-color: color-mix(in srgb, var(--accent) 35%, transparent);
-      color: var(--accent);
-    }
+    nav button, .icon-btn { height: 34px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--text); cursor: pointer; }
+    nav button { text-align: left; padding: 0 10px; display: flex; align-items: center; gap: 10px; }
+    nav button.active { background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 35%, transparent); color: var(--accent); }
     main { min-width: 0; }
-    header {
-      height: 58px;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 0 18px;
-      border-bottom: 1px solid var(--line);
-      background: var(--panel);
-    }
+    header { min-height: 58px; display: flex; align-items: center; gap: 10px; padding: 10px 18px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
     h1 { margin: 0; font-size: 18px; }
-    input, textarea, select, button {
-      font: inherit;
-      border: 1px solid var(--line);
-      border-radius: 7px;
-      background: var(--panel);
-      color: var(--text);
-    }
+    input, textarea, select, button { font: inherit; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); color: var(--text); }
     input, select { height: 34px; padding: 0 10px; }
-    textarea { width: 100%; min-height: 96px; padding: 9px 10px; resize: vertical; }
+    textarea { width: 100%; min-height: 112px; padding: 9px 10px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; font-size: 12px; }
     button { height: 34px; padding: 0 12px; cursor: pointer; }
     button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
     .project-select { min-width: 260px; margin-left: auto; }
     .content { padding: 18px; }
     .view { display: none; }
     .view.active { display: block; }
-    .toolbar {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 14px;
-      flex-wrap: wrap;
-    }
+    .toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
     .grid { display: grid; gap: 12px; }
     .stats { grid-template-columns: repeat(4, minmax(140px, 1fr)); }
-    .metric {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--panel);
-      padding: 12px;
-    }
+    .metric, .project-row, .column, .task, .settings-box { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+    .metric { padding: 12px; }
     .metric b { display: block; font-size: 22px; margin-top: 4px; }
     .muted { color: var(--muted); }
     .error { color: var(--danger); }
-    .projects { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
-    .project-row, .column, .task, .settings-box {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--panel);
-    }
+    .projects { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); margin-bottom: 14px; }
     .project-row { padding: 12px; }
     .project-row h3 { margin: 0 0 6px; font-size: 15px; }
     .project-row footer { display: flex; gap: 8px; margin-top: 10px; }
-    .board {
-      display: grid;
-      grid-auto-flow: column;
-      grid-auto-columns: minmax(250px, 1fr);
-      gap: 12px;
-      overflow-x: auto;
-      padding-bottom: 12px;
-    }
+    .board { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(250px, 1fr); gap: 12px; overflow-x: auto; padding-bottom: 12px; }
     .column { min-height: 380px; overflow: hidden; }
-    .column h2 {
-      margin: 0;
-      padding: 10px 12px;
-      font-size: 13px;
-      display: flex;
-      justify-content: space-between;
-      border-bottom: 1px solid var(--line);
-    }
+    .column h2 { margin: 0; padding: 10px 12px; font-size: 13px; display: flex; justify-content: space-between; border-bottom: 1px solid var(--line); }
     .tasks { display: grid; gap: 8px; padding: 10px; }
     .task { padding: 10px; }
     .task strong { display: block; margin-bottom: 5px; }
     .task p { margin: 0 0 8px; color: var(--muted); white-space: pre-wrap; }
     .task footer { display: flex; gap: 6px; flex-wrap: wrap; }
     .task footer button { height: 28px; padding: 0 8px; font-size: 12px; }
-    .settings-grid { grid-template-columns: repeat(3, minmax(220px, 1fr)); align-items: start; }
+    .settings-grid { grid-template-columns: repeat(2, minmax(260px, 1fr)); align-items: start; }
     .settings-box { padding: 12px; }
     .settings-box h3 { margin: 0 0 10px; font-size: 14px; }
-    @media (max-width: 900px) {
-      .shell, .shell.collapsed { grid-template-columns: 1fr; }
-      aside { position: sticky; top: 0; z-index: 2; border-right: 0; border-bottom: 1px solid var(--line); }
-      nav { grid-template-columns: repeat(4, 1fr); }
-      .stats, .settings-grid { grid-template-columns: 1fr; }
-      .project-select { min-width: 0; width: 100%; margin-left: 0; }
-      header { height: auto; padding: 12px; flex-wrap: wrap; }
-    }
+    .wide { grid-column: 1 / -1; }
+    @media (max-width: 900px) { .shell, .shell.collapsed { grid-template-columns: 1fr; } aside { position: sticky; top: 0; z-index: 2; border-right: 0; border-bottom: 1px solid var(--line); } nav { grid-template-columns: repeat(4, 1fr); } .stats, .settings-grid { grid-template-columns: 1fr; } .project-select { min-width: 0; width: 100%; margin-left: 0; } }
   </style>
 </head>
 <body>
   <div id="shell" class="shell">
     <aside>
-      <div class="brand"><span>DevWerk</span><button id="collapse" class="icon-btn" title="Toggle sidebar">☰</button></div>
+      <div class="brand"><span>DevWerk</span><button id="collapse" class="icon-btn" title="Toggle sidebar">=</button></div>
       <nav>
-        <button data-view="stats" class="active">📊 <span>Statistics</span></button>
-        <button data-view="projects">▦ <span>Projects</span></button>
-        <button data-view="kanban">☷ <span>Kanban</span></button>
-        <button data-view="settings">⚙ <span>Settings</span></button>
+        <button data-view="stats" class="active">S <span>Statistics</span></button>
+        <button data-view="projects">P <span>Projects</span></button>
+        <button data-view="kanban">K <span>Kanban</span></button>
+        <button data-view="settings">G <span>Settings</span></button>
       </nav>
     </aside>
     <main>
@@ -403,48 +320,27 @@ DASHBOARD_HTML = r"""
       </header>
       <section class="content">
         <p id="error" class="error"></p>
-
-        <section id="view-stats" class="view active">
-          <div id="statsGrid" class="grid stats"></div>
-        </section>
-
+        <section id="view-stats" class="view active"><div id="statsGrid" class="grid stats"></div></section>
         <section id="view-projects" class="view">
-          <div class="toolbar">
-            <input id="newProjectId" placeholder="projectId" />
-            <input id="newProjectName" placeholder="Project name" />
-            <button id="createProject" class="primary">Save Project</button>
-          </div>
+          <div class="toolbar"><input id="newProjectId" placeholder="projectId" /><input id="newProjectName" placeholder="Project name" /><button id="createProject" class="primary">Save Project</button></div>
           <div id="projectList" class="grid projects"></div>
-        </section>
-
-        <section id="view-kanban" class="view">
-          <div class="toolbar">
-            <input id="taskTitle" placeholder="Task title" />
-            <input id="taskDescription" placeholder="Description" />
-            <button id="createTask" class="primary">Create Task</button>
+          <div id="projectSettingsPanel" class="grid settings-grid">
+            <div class="settings-box wide"><h3 id="projectSettingsTitle">Project Settings</h3></div>
+            <div class="settings-box"><h3>Agents</h3><textarea id="projectAgentsJson"></textarea></div>
+            <div class="settings-box"><h3>Parameters</h3><textarea id="projectParametersJson"></textarea></div>
           </div>
+          <div class="toolbar" style="margin-top:12px"><button id="saveProjectSettings" class="primary">Save Project Settings</button><button id="resetColumns">Reset Demo Kanban Columns</button></div>
+        </section>
+        <section id="view-kanban" class="view">
+          <div class="toolbar"><input id="taskTitle" placeholder="Task title" /><input id="taskDescription" placeholder="Description" /><button id="createTask" class="primary">Create Task</button></div>
           <div id="board" class="board"></div>
         </section>
-
         <section id="view-settings" class="view">
           <div class="grid settings-grid">
-            <div class="settings-box">
-              <h3>Project Agents</h3>
-              <textarea id="agentsJson"></textarea>
-            </div>
-            <div class="settings-box">
-              <h3>Model Profiles</h3>
-              <textarea id="modelsJson"></textarea>
-            </div>
-            <div class="settings-box">
-              <h3>Parameters</h3>
-              <textarea id="parametersJson"></textarea>
-            </div>
+            <div class="settings-box"><h3>LLM Catalog</h3><textarea id="llmsJson" style="min-height:360px"></textarea></div>
+            <div class="settings-box"><h3>Routing</h3><textarea id="routingJson" style="min-height:360px"></textarea></div>
           </div>
-          <div class="toolbar" style="margin-top:12px">
-            <button id="saveSettings" class="primary">Save Project Settings</button>
-            <button id="resetColumns">Reset Demo Kanban Columns</button>
-          </div>
+          <div class="toolbar" style="margin-top:12px"><button id="saveGlobalSettings" class="primary">Save Global Settings</button></div>
         </section>
       </section>
     </main>
@@ -452,238 +348,79 @@ DASHBOARD_HTML = r"""
   <script>
     const $ = (id) => document.getElementById(id);
     const state = { view: "stats", projects: [], projectId: "default", board: null };
-
     async function api(path, options = {}) {
-      const res = await fetch(path, {
-        ...options,
-        headers: {
-          "Content-Type": "application/json",
-          "X-DevWerk-Project-Id": state.projectId,
-          ...(options.headers || {})
-        }
-      });
+      const res = await fetch(path, { ...options, headers: { "Content-Type": "application/json", "X-DevWerk-Project-Id": state.projectId, ...(options.headers || {}) } });
       const text = await res.text();
       const data = text ? JSON.parse(text) : {};
       if (!res.ok) throw new Error(data.detail || text || `HTTP ${res.status}`);
       return data;
     }
-
-    async function refreshAll() {
-      clearError();
-      await loadProjects();
-      await Promise.all([loadStats(), loadBoard(), loadSettings()]);
-      renderActive();
-    }
-
+    async function refreshAll() { clearError(); await loadProjects(); await Promise.all([loadStats(), loadBoard(), loadGlobalSettings(), loadProjectSettings()]); renderActive(); }
     async function loadProjects() {
       const data = await api("/v1/kanban/projects");
       state.projects = data.projects || [];
       if (!state.projects.some(p => p.id === state.projectId)) state.projectId = state.projects[0]?.id || "default";
-      const select = $("projectSelect");
-      select.innerHTML = "";
-      for (const p of state.projects) {
-        const option = document.createElement("option");
-        option.value = p.id;
-        option.textContent = `${p.name || p.id} (${p.id})`;
-        option.selected = p.id === state.projectId;
-        select.appendChild(option);
-      }
+      const select = $("projectSelect"); select.innerHTML = "";
+      for (const p of state.projects) { const option = document.createElement("option"); option.value = p.id; option.textContent = `${p.name || p.id} (${p.id})`; option.selected = p.id === state.projectId; select.appendChild(option); }
       renderProjects();
     }
-
-    async function loadStats() {
-      const usage = await api(`/v1/usage/summary?project_id=${encodeURIComponent(state.projectId)}`);
-      const project = await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}`);
-      renderStats(project.project, usage);
+    async function loadStats() { const usage = await api(`/v1/usage/summary?project_id=${encodeURIComponent(state.projectId)}`); const project = await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}`); renderStats(project.project, usage); }
+    async function loadBoard() { state.board = await api(`/v1/kanban/board?project_id=${encodeURIComponent(state.projectId)}`); renderBoard(); }
+    async function loadGlobalSettings() {
+      const data = await api("/v1/settings"); const s = data.settings || {};
+      $("llmsJson").value = JSON.stringify(s.llms || {}, null, 2);
+      $("routingJson").value = JSON.stringify(s.routing || {}, null, 2);
     }
-
-    async function loadBoard() {
-      state.board = await api(`/v1/kanban/board?project_id=${encodeURIComponent(state.projectId)}`);
-      renderBoard();
-    }
-
-    async function loadSettings() {
+    async function loadProjectSettings() {
       const data = await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/settings`);
-      $("agentsJson").value = JSON.stringify(data.settings.agents || {}, null, 2);
-      $("modelsJson").value = JSON.stringify(data.settings.models || {}, null, 2);
-      $("parametersJson").value = JSON.stringify(data.settings.parameters || {}, null, 2);
+      $("projectSettingsTitle").textContent = `Project Settings: ${state.projectId}`;
+      $("projectAgentsJson").value = JSON.stringify(data.settings.agents || {}, null, 2);
+      $("projectParametersJson").value = JSON.stringify(data.settings.parameters || {}, null, 2);
     }
-
     function renderStats(project, usage) {
-      const s = project.stats || {};
-      const rows = [
-        ["Requests", usage.request_count ?? s.request_count ?? 0],
-        ["LLM Calls", s.llm_calls ?? 0],
-        ["Input Tokens", s.input_tokens ?? 0],
-        ["Output Tokens", s.output_tokens ?? 0],
-        ["Total Tokens", s.total_tokens ?? 0],
-        ["Cached Input", s.cached_input_tokens ?? 0],
-        ["Tasks", s.tasks ?? 0],
-        ["Duration ms", s.duration_ms ?? 0]
-      ];
-      $("statsGrid").innerHTML = rows.map(([label, value]) =>
-        `<div class="metric"><span class="muted">${escapeHtml(label)}</span><b>${escapeHtml(value)}</b></div>`
-      ).join("");
+      const s = project.stats || {}; const rows = [["Requests", usage.request_count ?? s.request_count ?? 0], ["LLM Calls", s.llm_calls ?? 0], ["Input Tokens", s.input_tokens ?? 0], ["Output Tokens", s.output_tokens ?? 0], ["Total Tokens", s.total_tokens ?? 0], ["Cached Input", s.cached_input_tokens ?? 0], ["Tasks", s.tasks ?? 0], ["Duration ms", s.duration_ms ?? 0]];
+      $("statsGrid").innerHTML = rows.map(([label, value]) => `<div class="metric"><span class="muted">${escapeHtml(label)}</span><b>${escapeHtml(value)}</b></div>`).join("");
     }
-
     function renderProjects() {
-      $("projectList").innerHTML = state.projects.map(p => {
-        const s = p.stats || {};
-        return `<article class="project-row">
-          <h3>${escapeHtml(p.name || p.id)}</h3>
-          <div class="muted">${escapeHtml(p.id)}</div>
-          <p>${escapeHtml(p.description || "")}</p>
-          <div class="muted">tasks ${s.tasks || 0} · requests ${s.request_count || 0} · tokens ${s.total_tokens || 0}</div>
-          <footer>
-            <button data-project="${escapeAttr(p.id)}" data-action="open-kanban">Open Kanban</button>
-            <button data-project="${escapeAttr(p.id)}" data-action="open-settings">Settings</button>
-          </footer>
-        </article>`;
-      }).join("");
+      $("projectList").innerHTML = state.projects.map(p => { const s = p.stats || {}; return `<article class="project-row"><h3>${escapeHtml(p.name || p.id)}</h3><div class="muted">${escapeHtml(p.id)}</div><p>${escapeHtml(p.description || "")}</p><div class="muted">tasks ${s.tasks || 0} / requests ${s.request_count || 0} / tokens ${s.total_tokens || 0}</div><footer><button data-project="${escapeAttr(p.id)}" data-action="open-kanban">Open Kanban</button><button data-project="${escapeAttr(p.id)}" data-action="open-project-settings">Project Settings</button></footer></article>`; }).join("");
     }
-
     function renderBoard() {
-      const data = state.board;
-      if (!data) return;
-      $("board").innerHTML = data.columns.map(col => `
-        <article class="column">
-          <h2><span>${escapeHtml(col.title)}</span><span class="muted">${col.tasks.length}</span></h2>
-          <div class="tasks">
-            ${col.tasks.map(task => renderTask(task, col, data.columns)).join("")}
-          </div>
-        </article>
-      `).join("");
+      const data = state.board; if (!data) return;
+      $("board").innerHTML = data.columns.map(col => `<article class="column"><h2><span>${escapeHtml(col.title)}</span><span class="muted">${col.tasks.length}</span></h2><div class="tasks">${col.tasks.map(task => renderTask(task, col, data.columns)).join("")}</div></article>`).join("");
     }
-
     function renderTask(task, col, columns) {
-      const buttons = (col.transition_to || []).map(next => {
-        const target = columns.find(c => c.status_key === next);
-        return `<button data-task="${escapeAttr(task.id)}" data-status="${escapeAttr(next)}">${escapeHtml(target?.title || next)}</button>`;
-      }).join("");
-      return `<article class="task">
-        <strong>${escapeHtml(task.title)}</strong>
-        <p>${escapeHtml(task.description || "")}</p>
-        <small class="muted">${escapeHtml(task.status_key)} · ${escapeHtml(task.id)}</small>
-        <footer>${buttons}</footer>
-      </article>`;
+      const buttons = (col.transition_to || []).map(next => { const target = columns.find(c => c.status_key === next); return `<button data-task="${escapeAttr(task.id)}" data-status="${escapeAttr(next)}">${escapeHtml(target?.title || next)}</button>`; }).join("");
+      return `<article class="task"><strong>${escapeHtml(task.title)}</strong><p>${escapeHtml(task.description || "")}</p><small class="muted">${escapeHtml(task.status_key)} / ${escapeHtml(task.id)}</small><footer>${buttons}</footer></article>`;
     }
-
-    function renderActive() {
-      document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
-      document.querySelector(`#view-${state.view}`).classList.add("active");
-      document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b.dataset.view === state.view));
-      $("title").textContent = { stats: "Statistics", projects: "Projects", kanban: "Kanban", settings: "Settings" }[state.view];
-    }
-
-    async function createProject() {
-      const projectId = $("newProjectId").value.trim();
-      const name = $("newProjectName").value.trim() || projectId;
-      if (!projectId) return;
-      await api("/v1/kanban/projects", {
-        method: "POST",
-        body: JSON.stringify({ project_id: projectId, name })
-      });
-      state.projectId = projectId;
-      $("newProjectId").value = "";
-      $("newProjectName").value = "";
-      await refreshAll();
-    }
-
-    async function createTask() {
-      const title = $("taskTitle").value.trim();
-      if (!title) return;
-      await api("/v1/kanban/tasks", {
-        method: "POST",
-        body: JSON.stringify({
-          project_id: state.projectId,
-          title,
-          description: $("taskDescription").value.trim()
-        })
-      });
-      $("taskTitle").value = "";
-      $("taskDescription").value = "";
-      await refreshAll();
-    }
-
-    async function saveSettings() {
-      await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/settings`, {
-        method: "PUT",
-        body: JSON.stringify({
-          agents: JSON.parse($("agentsJson").value || "{}"),
-          models: JSON.parse($("modelsJson").value || "{}"),
-          parameters: JSON.parse($("parametersJson").value || "{}")
-        })
-      });
-      await refreshAll();
-    }
-
+    function renderActive() { document.querySelectorAll(".view").forEach(v => v.classList.remove("active")); document.querySelector(`#view-${state.view}`).classList.add("active"); document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b.dataset.view === state.view)); $("title").textContent = { stats: "Statistics", projects: "Projects", kanban: "Kanban", settings: "Settings" }[state.view]; }
+    async function createProject() { const projectId = $("newProjectId").value.trim(); const name = $("newProjectName").value.trim() || projectId; if (!projectId) return; await api("/v1/kanban/projects", { method: "POST", body: JSON.stringify({ project_id: projectId, name }) }); state.projectId = projectId; $("newProjectId").value = ""; $("newProjectName").value = ""; await refreshAll(); }
+    async function createTask() { const title = $("taskTitle").value.trim(); if (!title) return; await api("/v1/kanban/tasks", { method: "POST", body: JSON.stringify({ project_id: state.projectId, title, description: $("taskDescription").value.trim() }) }); $("taskTitle").value = ""; $("taskDescription").value = ""; await refreshAll(); }
+    async function saveGlobalSettings() { await api("/v1/settings", { method: "PUT", body: JSON.stringify({ llms: JSON.parse($("llmsJson").value || "{}"), routing: JSON.parse($("routingJson").value || "{}") }) }); await refreshAll(); }
+    async function saveProjectSettings() { await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/settings`, { method: "PUT", body: JSON.stringify({ agents: JSON.parse($("projectAgentsJson").value || "{}"), parameters: JSON.parse($("projectParametersJson").value || "{}") }) }); await refreshAll(); }
     async function resetColumns() {
-      await api("/v1/kanban/columns", {
-        method: "PUT",
-        body: JSON.stringify({
-          project_id: state.projectId,
-          columns: [
-            { status_key: "draft", title: "Draft", position: 10, transition_to: ["context_indexed", "failed"] },
-            { status_key: "context_indexed", title: "Context Indexed", position: 20, transition_to: ["planned", "failed"] },
-            { status_key: "planned", title: "Planned", position: 30, transition_to: ["approved", "draft", "failed"] },
-            { status_key: "approved", title: "Approved", position: 40, transition_to: ["snapshot_ready", "failed"] },
-            { status_key: "snapshot_ready", title: "Snapshot Ready", position: 50, transition_to: ["coding", "failed"] },
-            { status_key: "coding", title: "Coding", position: 60, transition_to: ["verification", "failed"] },
-            { status_key: "verification", title: "Verification", position: 70, transition_to: ["done", "coding", "failed"] },
-            { status_key: "done", title: "Done", position: 80, transition_to: [] },
-            { status_key: "failed", title: "Failed", position: 90, transition_to: ["draft"] }
-          ]
-        })
-      });
+      await api("/v1/kanban/columns", { method: "PUT", body: JSON.stringify({ project_id: state.projectId, columns: [ { status_key: "draft", title: "Draft", position: 10, transition_to: ["context_indexed", "failed"] }, { status_key: "context_indexed", title: "Context Indexed", position: 20, transition_to: ["planned", "failed"] }, { status_key: "planned", title: "Planned", position: 30, transition_to: ["coding", "draft", "failed"] }, { status_key: "coding", title: "Coding", position: 40, transition_to: ["ready_to_apply", "planned", "failed"] }, { status_key: "ready_to_apply", title: "Ready To Apply", position: 50, transition_to: ["applied", "coding", "failed"] }, { status_key: "applied", title: "Applied", position: 60, transition_to: ["verified", "coding", "planned", "failed"] }, { status_key: "verified", title: "Verified", position: 70, transition_to: ["done", "applied", "failed"] }, { status_key: "done", title: "Done", position: 80, transition_to: [] }, { status_key: "failed", title: "Failed", position: 90, transition_to: ["draft"] } ] }) });
       await refreshAll();
     }
-
-    document.querySelector("nav").onclick = (event) => {
-      const btn = event.target.closest("button[data-view]");
-      if (!btn) return;
-      state.view = btn.dataset.view;
-      renderActive();
-    };
+    document.querySelector("nav").onclick = (event) => { const btn = event.target.closest("button[data-view]"); if (!btn) return; state.view = btn.dataset.view; renderActive(); };
     $("collapse").onclick = () => $("shell").classList.toggle("collapsed");
     $("refresh").onclick = () => refreshAll().catch(showError);
-    $("projectSelect").onchange = async (event) => {
-      state.projectId = event.target.value;
-      await refreshAll().catch(showError);
-    };
+    $("projectSelect").onchange = async (event) => { state.projectId = event.target.value; await refreshAll().catch(showError); };
     $("createProject").onclick = () => createProject().catch(showError);
     $("createTask").onclick = () => createTask().catch(showError);
-    $("saveSettings").onclick = () => saveSettings().catch(showError);
+    $("saveGlobalSettings").onclick = () => saveGlobalSettings().catch(showError);
+    $("saveProjectSettings").onclick = () => saveProjectSettings().catch(showError);
     $("resetColumns").onclick = () => resetColumns().catch(showError);
-    $("projectList").onclick = async (event) => {
-      const btn = event.target.closest("button[data-project]");
-      if (!btn) return;
-      state.projectId = btn.dataset.project;
-      state.view = btn.dataset.action === "open-settings" ? "settings" : "kanban";
-      await refreshAll().catch(showError);
-    };
-    $("board").onclick = async (event) => {
-      const btn = event.target.closest("button[data-task]");
-      if (!btn) return;
-      await api(`/v1/kanban/tasks/${btn.dataset.task}/move`, {
-        method: "POST",
-        body: JSON.stringify({ status_key: btn.dataset.status })
-      });
-      await refreshAll();
-    };
-
+    $("projectList").onclick = async (event) => { const btn = event.target.closest("button[data-project]"); if (!btn) return; state.projectId = btn.dataset.project; state.view = btn.dataset.action === "open-project-settings" ? "projects" : "kanban"; await refreshAll().catch(showError); };
+    $("board").onclick = async (event) => { const btn = event.target.closest("button[data-task]"); if (!btn) return; await api(`/v1/kanban/tasks/${btn.dataset.task}/move`, { method: "POST", body: JSON.stringify({ status_key: btn.dataset.status }) }); await refreshAll(); };
     function clearError() { $("error").textContent = ""; }
     function showError(err) { $("error").textContent = err.message || String(err); }
-    function escapeHtml(value) {
-      return String(value).replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[ch]));
-    }
+    function escapeHtml(value) { return String(value).replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[ch])); }
     function escapeAttr(value) { return escapeHtml(value).replace(/`/g, "&#96;"); }
     refreshAll().catch(showError);
   </script>
 </body>
 </html>
 """
-
-
 KANBAN_HTML = r"""
 <!doctype html>
 <html lang="en">

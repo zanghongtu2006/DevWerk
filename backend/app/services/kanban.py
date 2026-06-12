@@ -38,31 +38,31 @@ DEFAULT_COLUMNS: list[dict[str, Any]] = [
         "status_key": "planned",
         "title": "Planned",
         "position": 30,
-        "transition_to": ["approved", "draft", "failed"],
-    },
-    {
-        "status_key": "approved",
-        "title": "Approved",
-        "position": 40,
-        "transition_to": ["snapshot_ready", "failed"],
-    },
-    {
-        "status_key": "snapshot_ready",
-        "title": "Snapshot Ready",
-        "position": 50,
-        "transition_to": ["coding", "failed"],
+        "transition_to": ["coding", "draft", "failed"],
     },
     {
         "status_key": "coding",
         "title": "Coding",
-        "position": 60,
-        "transition_to": ["verification", "failed"],
+        "position": 40,
+        "transition_to": ["ready_to_apply", "planned", "failed"],
     },
     {
-        "status_key": "verification",
-        "title": "Verification",
+        "status_key": "ready_to_apply",
+        "title": "Ready To Apply",
+        "position": 50,
+        "transition_to": ["applied", "coding", "failed"],
+    },
+    {
+        "status_key": "applied",
+        "title": "Applied",
+        "position": 60,
+        "transition_to": ["verified", "coding", "planned", "failed"],
+    },
+    {
+        "status_key": "verified",
+        "title": "Verified",
         "position": 70,
-        "transition_to": ["done", "coding", "failed"],
+        "transition_to": ["done", "applied", "failed"],
     },
     {
         "status_key": "done",
@@ -273,7 +273,6 @@ def update_project_settings(
     project_id: str | None,
     *,
     agents: dict[str, Any] | None = None,
-    models: dict[str, Any] | None = None,
     parameters: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     pid = _project_id(project_id)
@@ -285,9 +284,6 @@ def update_project_settings(
     if agents is not None:
         updates.append("agents_json = ?")
         params.append(_json(agents))
-    if models is not None:
-        updates.append("models_json = ?")
-        params.append(_json(models))
     if parameters is not None:
         updates.append("parameters_json = ?")
         params.append(_json(parameters))
@@ -557,6 +553,7 @@ def ensure_default_columns(project_id: str | None = None) -> None:
             (pid,),
         ).fetchone()["count"]
         if count:
+            _ensure_workflow_columns(conn, pid)
             return
         now = _now()
         for col in DEFAULT_COLUMNS:
@@ -580,6 +577,35 @@ def ensure_default_columns(project_id: str | None = None) -> None:
                 ),
             )
     _log.debug("kanban default columns created project_id=%s", pid)
+
+
+def _ensure_workflow_columns(conn: sqlite3.Connection, pid: str) -> None:
+    now = _now()
+    for col in DEFAULT_COLUMNS:
+        conn.execute(
+            """
+            INSERT INTO kb_columns (
+                id, project_id, status_key, title, position, wip_limit,
+                transition_to, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, status_key) DO UPDATE SET
+                title = excluded.title,
+                position = excluded.position,
+                transition_to = excluded.transition_to,
+                updated_at = excluded.updated_at
+            """,
+            (
+                str(uuid.uuid4()),
+                pid,
+                col["status_key"],
+                col["title"],
+                col["position"],
+                col.get("wip_limit"),
+                _json(col["transition_to"]),
+                now,
+                now,
+            ),
+        )
 
 
 def ensure_project(project_id: str | None = None) -> None:
@@ -615,7 +641,7 @@ def _ensure_project_settings_no_init(pid: str) -> None:
             (
                 pid,
                 _json(_default_agents()),
-                _json(_default_models()),
+                "{}",
                 _json(_default_parameters()),
                 now,
                 now,
@@ -715,13 +741,13 @@ def _settings_dict(row: sqlite3.Row | None) -> dict[str, Any]:
     if row is None:
         return {
             "agents": _default_agents(),
-            "models": _default_models(),
             "parameters": _default_parameters(),
         }
+    agents = _normalize_agents(_loads(row["agents_json"], _default_agents()))
+    parameters = {**_default_parameters(), **_loads(row["parameters_json"], {})}
     return {
-        "agents": _loads(row["agents_json"], _default_agents()),
-        "models": _loads(row["models_json"], _default_models()),
-        "parameters": _loads(row["parameters_json"], _default_parameters()),
+        "agents": agents,
+        "parameters": parameters,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -784,26 +810,31 @@ def _project_stats(conn: sqlite3.Connection, project_id: str) -> dict[str, Any]:
 
 def _default_agents() -> dict[str, Any]:
     return {
-        "coder": {"enabled": True, "model_profile": "default"},
-        "planner": {"enabled": True, "model_profile": "default"},
-        "executor": {"enabled": True, "model_profile": "default"},
+        "coder": {"enabled": True, "model_ref": "minimax/m3"},
+        "planner": {"enabled": True, "model_ref": "deepseek/deepseek-chat"},
+        "executor": {"enabled": True, "model_ref": "minimax/m3"},
     }
 
 
-def _default_models() -> dict[str, Any]:
-    return {
-        "default": {
-            "provider": "backend-default",
-            "model": "backend-configured",
-            "note": "Resolved by backend environment unless overridden later.",
-        }
-    }
+def _normalize_agents(value: Any) -> dict[str, Any]:
+    agents = {**_default_agents()}
+    if isinstance(value, dict):
+        for name, raw in value.items():
+            if isinstance(raw, dict):
+                item = {**agents.get(name, {}), **raw}
+                legacy_profile = item.pop("model_profile", None)
+                if item.get("model_ref") in {None, "", "default", "DEVWERK_DEFAULT_API"}:
+                    item["model_ref"] = "minimax/m3" if legacy_profile != "deepseek" else "deepseek/deepseek-chat"
+                agents[name] = item
+    return agents
 
 
 def _default_parameters() -> dict[str, Any]:
     return {
         "thinking_mode": "balanced",
         "effort_level": "max",
+        "temperature": 0.2,
+        "max_tokens": 4096,
     }
 
 

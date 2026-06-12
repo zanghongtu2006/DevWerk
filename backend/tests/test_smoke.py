@@ -12,5 +12,15 @@ def test_ide_error_response_can_omit_reply():
 def test_default_kanban_flow_contains_required_control_points():
     statuses = [column["status_key"] for column in DEFAULT_COLUMNS]
 
-    for required in ("draft", "planned", "snapshot_ready", "coding", "verification", "done", "failed"):
+    for required in (
+        "draft",
+        "context_indexed",
+        "planned",
+        "coding",
+        "ready_to_apply",
+        "applied",
+        "verified",
+        "done",
+        "failed",
+    ):
         assert required in statuses
