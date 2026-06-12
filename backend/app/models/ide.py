@@ -80,6 +80,8 @@ class FileOp(BaseModel):
 
 class IdeChatRequest(BaseModel):
     mode: str  # scaffold | agent
+    project_id: Optional[str] = None
+    task_id: Optional[str] = None
     project_root: Optional[str] = None
     messages: List[Message]
 
@@ -89,7 +91,7 @@ class IdeChatRequest(BaseModel):
 
 
 class IdeChatResponse(BaseModel):
-    reply: str
+    reply: str = ""
 
     # scaffold（可选）
     code_tree: Optional[str] = None

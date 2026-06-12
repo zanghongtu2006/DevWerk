@@ -1,57 +1,61 @@
 @echo off
-:: DevWerk Backend — Quick Startup Script (Windows batch)
-::
-:: Usage:
-::   startup.bat              — runs with current .env settings
-::   startup.bat development  — forces APP_ENV=development
-::   startup.bat production   — forces APP_ENV=production
-::
-:: Prerequisites:
-::   1. pip install -r requirements.txt
-::   2. cp .env.example .env    (and fill in your values)
+setlocal EnableExtensions
 
-setlocal
+rem DevWerk Backend - Windows startup script
+rem Usage:
+rem   startup.bat
+rem   startup.bat development
+rem   startup.bat production
+rem   startup.bat test
 
-:: ── Detect environment ────────────────────────────────────────────────────
-if "%1"=="" (
-    for /f "usebackq tokens=1,* delims==" %%a in (`.env 2^>nul`) do (
-        if "%%a"=="APP_ENV" set "APP_ENV=%%b"
+cd /d "%~dp0"
+
+rem Load .env as KEY=VALUE lines. Do not execute .env.
+if exist ".env" (
+    for /f "usebackq eol=# tokens=1,* delims==" %%A in (".env") do (
+        if not "%%~A"=="" (
+            set "%%~A=%%~B"
+        )
     )
-    if not defined APP_ENV set "APP_ENV=development"
-) else (
-    set "APP_ENV=%1"
 )
 
-:: ── Validate APP_ENV ──────────────────────────────────────────────────────
+rem Optional first argument overrides APP_ENV from .env.
+if not "%~1"=="" (
+    set "APP_ENV=%~1"
+)
+
+rem Defaults when .env is missing or incomplete.
+if not defined APP_ENV set "APP_ENV=development"
+if not defined HOST set "HOST=0.0.0.0"
+if not defined PORT set "PORT=8000"
+if not defined RELOAD set "RELOAD=false"
+
 if not "%APP_ENV%"=="development" if not "%APP_ENV%"=="production" if not "%APP_ENV%"=="test" (
     echo [DevWerk] Invalid APP_ENV: %APP_ENV%
-    echo Valid values: development ^|^ production ^|^ test
+    echo [DevWerk] Valid values: development ^| production ^| test
     exit /b 1
 )
 
-echo [DevWerk] Starting in %APP_ENV% mode...
+set "PYTHON_EXE=python"
+if exist ".venv\Scripts\python.exe" set "PYTHON_EXE=.venv\Scripts\python.exe"
 
-:: ── Check Python ──────────────────────────────────────────────────────────
-python --version >nul 2>&1
+"%PYTHON_EXE%" --version >nul 2>&1
 if errorlevel 1 (
     echo [DevWerk] Python not found. Install Python 3.10+ and retry.
     exit /b 1
 )
 
-:: ── Check requirements ────────────────────────────────────────────────────
-if not exist requirements.txt (
+if not exist "requirements.txt" (
     echo [DevWerk] requirements.txt not found. Are you in the backend directory?
     exit /b 1
 )
 
-:: ── Load environment variables from .env ──────────────────────────────────
-if exist .env (
-    for /f "usebackq tokens=1,* delims==" %%a in (`.env 2^>nul`) do (
-        set "%%a=%%b"
-    )
-)
+set "UVICORN_RELOAD="
+if /i "%RELOAD%"=="true" set "UVICORN_RELOAD=--reload"
+if /i "%RELOAD%"=="1" set "UVICORN_RELOAD=--reload"
+if /i "%RELOAD%"=="yes" set "UVICORN_RELOAD=--reload"
 
-:: ── Start uvicorn ─────────────────────────────────────────────────────────
+echo [DevWerk] Starting in %APP_ENV% mode...
 echo [DevWerk] Starting uvicorn on http://%HOST%:%PORT% ...
 echo [DevWerk] API docs:           http://localhost:%PORT%/docs
 echo [DevWerk] Alternative docs:   http://localhost:%PORT%/redoc
@@ -59,4 +63,11 @@ echo.
 echo [DevWerk] Press Ctrl+C to stop.
 echo.
 
-uvicorn app.main:app --reload --host %HOST% --port %PORT%
+"%PYTHON_EXE%" -c "import fastapi, uvicorn" >nul 2>&1
+if errorlevel 1 (
+    echo [DevWerk] Missing backend dependencies for %PYTHON_EXE%.
+    echo [DevWerk] Run: %PYTHON_EXE% -m pip install -r requirements.txt
+    exit /b 1
+)
+
+"%PYTHON_EXE%" -m uvicorn app.main:app %UVICORN_RELOAD% --host %HOST% --port %PORT%

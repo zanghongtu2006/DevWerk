@@ -1,43 +1,72 @@
 """
 LLM client factory.
 
-Returns the appropriate LLM adapter based on the active LLM_PROVIDER setting.
+Routes each backend agent to its configured API profile. Today the main agent
+is `coder`, but planner/executor can already be bound to different profiles.
 """
 
 from __future__ import annotations
 
+import time
+from typing import Any
+
 from app.core.config import settings
-from app.services.minimax_client import MiniMaxClient
+from app.services.anthropic_client import AnthropicClient
 from app.services.ollama_client import OllamaClient
 from app.services.openai_client import OpenAIClient
+from app.services.usage import record_llm_usage
 
 
-def get_llm_client() -> OllamaClient | OpenAIClient | MiniMaxClient:
-    """
-    Build and return the active LLM client.
+def get_llm_client(agent: str = "coder") -> "UsageTrackedClient":
+    cfg = settings().get_llm_config(agent)
+    protocol = str(cfg.get("protocol") or "").lower()
 
-    Raises:
-        ValueError: if the provider is unsupported or missing credentials.
-    """
-    cfg = settings()
-    provider = cfg.llm_provider.strip().lower()
-
-    if provider == "ollama":
-        return OllamaClient(config=cfg.get_llm_config())
-
-    if provider == "openai":
-        return OpenAIClient(config=cfg.get_llm_config())
-
-    if provider in ("minimax", "minimax_overseas"):
-        return MiniMaxClient(config=cfg.get_llm_config())
-
-    if provider in ("xai", "gemini"):
-        raise NotImplementedError(
-            f"Provider '{provider}' adapter is not yet implemented. "
-            f"Supported providers: ollama, openai, minimax"
-        )
+    if protocol == "openai":
+        return UsageTrackedClient(OpenAIClient(config=cfg), cfg)
+    if protocol == "anthropic":
+        return UsageTrackedClient(AnthropicClient(config=cfg), cfg)
+    if protocol == "ollama":
+        return UsageTrackedClient(OllamaClient(config=cfg), cfg)
 
     raise ValueError(
-        f"Unsupported LLM_PROVIDER: {provider!r}. "
-        f"Supported: ollama, openai, minimax"
+        f"Unsupported LLM protocol {protocol!r} for agent {agent!r}. "
+        "Supported protocols: openai, anthropic, ollama"
     )
+
+
+class UsageTrackedClient:
+    def __init__(self, client: AnthropicClient | OllamaClient | OpenAIClient, config: dict[str, Any]):
+        self._client = client
+        self._config = config
+
+    def chat_structured(self, *args, **kwargs):
+        return self._tracked_call("chat_structured", *args, **kwargs)
+
+    def chat_json(self, *args, **kwargs):
+        return self._tracked_call("chat_json", *args, **kwargs)
+
+    def __getattr__(self, name: str):
+        return getattr(self._client, name)
+
+    def _tracked_call(self, method_name: str, *args, **kwargs):
+        started = time.monotonic()
+        success = False
+        error_type: str | None = None
+        try:
+            result = getattr(self._client, method_name)(*args, **kwargs)
+            success = True
+            return result
+        except Exception as exc:  # noqa: BLE001
+            error_type = type(exc).__name__
+            raise
+        finally:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            record_llm_usage(
+                agent_name=str(self._config.get("agent") or "coder"),
+                provider=str(self._config.get("protocol") or self._config.get("api_name") or "unknown"),
+                model=str(self._config.get("model") or "unknown"),
+                usage=getattr(self._client, "last_usage", None),
+                duration_ms=duration_ms,
+                success=success,
+                error_type=error_type,
+            )

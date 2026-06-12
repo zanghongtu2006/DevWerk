@@ -11,15 +11,11 @@ No file is written during the plan phase.
 
 from __future__ import annotations
 
-import json
 import logging
 import time
-from typing import Any
 
-from app.core.config import settings
-from app.core.schema import MODEL_RESPONSE_SCHEMA
 from app.models.plan import PlanFile, PlanResponse
-from app.services.validation import validate_model_response
+from app.services.llm_factory import get_llm_client
 
 _log = logging.getLogger("devwerk.planner")
 
@@ -50,21 +46,8 @@ class Planner:
         "  6. summary is one line; warnings[] lists any risky files.\n"
     )
 
-    def __init__(self, config: dict | None = None):
-        if config:
-            self.base_url: str = config.get("base_url", "http://127.0.0.1:11434").rstrip("/")
-            self.model: str = config.get("model", "deepseek-r1:32b")
-            self.timeout: float = float(config.get("timeout", 180.0))
-            self.enable_schema: bool = bool(config.get("enable_schema", True))
-        else:
-            cfg = settings()
-            self.base_url = cfg.ollama_base_url.rstrip("/")
-            self.model = cfg.ollama_model
-            self.timeout = float(cfg.ollama_timeout)
-            self.enable_schema = cfg.ollama_enable_schema
-
-        import requests as http_requests
-        self._http = http_requests
+    def __init__(self, agent_name: str = "planner"):
+        self.agent_name = agent_name
 
     def plan(self, messages: list[dict], mode: str = "agent") -> PlanResponse:
         """
@@ -129,42 +112,11 @@ class Planner:
         )
 
     def _call_llm(self, messages: list[dict]) -> dict:
-        """Single LLM call — same protocol as OllamaClient.chat_structured."""
-        import requests as http_requests
-
-        _log.debug(
-            "Planner.call_llm: base_url=%s model=%s enable_schema=%s messages=%s timeout=%s",
-            self.base_url,
-            self.model,
-            self.enable_schema,
-            len(messages),
-            self.timeout,
-        )
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "stream": False,
-            "messages": messages,
-            "options": {"temperature": 0.3},
-        }
-
-        if self.enable_schema:
-            payload["format"] = MODEL_RESPONSE_SCHEMA
-
-        url = f"{self.base_url}/api/chat"
-        resp = http_requests.post(url, json=payload, timeout=self.timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        _log.debug("Planner.call_llm: response_keys=%s", sorted(data.keys()))
-
-        content = (data.get("message") or {}).get("content")
-        if isinstance(content, dict):
-            _log.debug("Planner.call_llm: content_type=dict keys=%s", sorted(content.keys()))
-            return content
-        if isinstance(content, str):
-            _log.debug("Planner.call_llm: content_type=str chars=%s", len(content))
-            return json.loads(content)
-
-        raise ValueError(f"Ollama returned unexpected content type: {type(content).__name__}")
+        _log.debug("Planner.call_llm: agent=%s messages=%s", self.agent_name, len(messages))
+        client = get_llm_client(self.agent_name)
+        result = client.chat_json(messages)
+        _log.debug("Planner.call_llm: result_keys=%s", sorted(result.keys()))
+        return result
 
     @staticmethod
     def _extract_plan(raw: dict) -> PlanResponse:

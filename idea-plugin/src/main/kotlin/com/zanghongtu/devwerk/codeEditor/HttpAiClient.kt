@@ -79,6 +79,9 @@ class HttpAiClient(
             .post(requestBody)
             .header("Content-Type", "application/json; charset=utf-8")
 
+        context.projectId?.takeIf { it.isNotBlank() }?.let {
+            requestBuilder.header("X-DevWerk-Project-Id", it)
+        }
         if (!authToken.isNullOrBlank()) {
             requestBuilder.header("Authorization", "Bearer $authToken")
         }
@@ -97,7 +100,7 @@ class HttpAiClient(
         }
     }
 
-    fun uploadAttachment(file: File): UploadedAttachment {
+    fun uploadAttachment(file: File, projectId: String? = null): UploadedAttachment {
         if (!file.exists() || !file.isFile) {
             throw IllegalArgumentException("Attachment is not a file: ${file.absolutePath}")
         }
@@ -106,6 +109,7 @@ class HttpAiClient(
             ?: "application/octet-stream"
         val requestBody = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
+            .addFormDataPart("project_id", projectId ?: "")
             .addFormDataPart(
                 name = "file",
                 filename = file.name,
@@ -117,6 +121,9 @@ class HttpAiClient(
             .url(attachmentEndpoint)
             .post(requestBody)
 
+        if (!projectId.isNullOrBlank()) {
+            requestBuilder.header("X-DevWerk-Project-Id", projectId)
+        }
         if (!authToken.isNullOrBlank()) {
             requestBuilder.header("Authorization", "Bearer $authToken")
         }
@@ -231,7 +238,7 @@ class HttpAiClient(
             runCatching { SourceMapBuilder.build(project, projectRoot) }.getOrNull()
         }
         return WorkspaceSummary(
-            rootId = null,
+            rootId = context.projectId,
             changedFiles = emptyList(),
             openFiles = emptyList(),
             treePreview = preview,
@@ -265,13 +272,14 @@ class HttpAiClient(
         }
 
         val root = JSONObject()
+        root.put("project_id", chatContext.projectId ?: JSONObject.NULL)
         root.put("mode", mode)
         root.put("project_root", projectRoot ?: JSONObject.NULL)
         root.put("messages", messagesJson)
 
         if (workspace != null) {
             val w = JSONObject()
-            w.put("root_id", workspace.rootId ?: JSONObject.NULL)
+            w.put("root_id", workspace.rootId ?: chatContext.projectId ?: JSONObject.NULL)
             val changed = JSONArray()
             for (f in workspace.changedFiles) {
                 val fo = JSONObject()
@@ -312,6 +320,9 @@ class HttpAiClient(
             .post(requestBody)
             .header("Content-Type", "application/json; charset=utf-8")
 
+        chatContext.projectId?.takeIf { it.isNotBlank() }?.let {
+            requestBuilder.header("X-DevWerk-Project-Id", it)
+        }
         if (!authToken.isNullOrBlank()) {
             requestBuilder.header("Authorization", "Bearer $authToken")
         }
@@ -354,6 +365,7 @@ class HttpAiClient(
         }
 
         val root = JSONObject()
+        root.put("project_id", context.projectId ?: JSONObject.NULL)
         root.put("messages", messagesJson)
         root.put("mode", mode)
         root.put("project_root", context.projectRoot ?: JSONObject.NULL)
@@ -361,7 +373,7 @@ class HttpAiClient(
         root.put("approved_ops", opsJson)
         buildWorkspaceSummary(context)?.let { workspace ->
             val w = JSONObject()
-            w.put("root_id", workspace.rootId ?: JSONObject.NULL)
+            w.put("root_id", workspace.rootId ?: context.projectId ?: JSONObject.NULL)
             w.put("changed_files", JSONArray())
             w.put("open_files", JSONArray(workspace.openFiles))
             w.put("tree_preview", workspace.treePreview ?: JSONObject.NULL)

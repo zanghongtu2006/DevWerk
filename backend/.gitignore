@@ -1,20 +1,9 @@
-<<<<<<< HEAD
-.venv/
-.idea/
-.env.development
-
-# 忽略所有 __pycache__ 目录
-__pycache__/
-
-# 忽略所有编译后的 Python 文件
-*.pyc
-*.pyo
-*.pyd
-=======
-# ── Python ───────────────────────────────────────────────────────────────────
+# Python
 __pycache__/
 *.py[cod]
 *.pyc
+*.pyo
+*.pyd
 *.egg-info/
 dist/
 build/
@@ -25,32 +14,29 @@ build/
 venv/
 env/
 
-# ── IDE / Editor ─────────────────────────────────────────────────────────────
+# IDE / editor
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
 
-# ── Environment & secrets ────────────────────────────────────────────────────
-# Real config — NEVER commit these
+# Environment and secrets
 .env
 .env.local
-.env.production
-
-# Environment-specific overrides — NOT committed (local machine only)
 .env.development
+.env.production
 .env.test
 
-# ── Test / Coverage ───────────────────────────────────────────────────────────
+# Test and coverage
 htmlcov/
 .coverage
 .pytest_cache/
 .tox/
 .nox/
 
-# ── Misc ─────────────────────────────────────────────────────────────────────
+# Misc
 *.log
+data/
 .DS_Store
 Thumbs.db
->>>>>>> dbb267c48dbf486f1d989451806376f74befa5fc

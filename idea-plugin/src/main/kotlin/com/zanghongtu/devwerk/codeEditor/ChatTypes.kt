@@ -20,6 +20,7 @@ data class ChatMessage(
 data class ChatContext(
     val projectRoot: String?,
     val history: List<ChatMessage>,
+    val projectId: String? = null,
     // IntelliJ Project, used for zero-token local workspace/source-map indexing.
     val project: Project? = null,
     // DevWerk 上下文（记录请求/响应/执行）

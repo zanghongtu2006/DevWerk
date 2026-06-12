@@ -1,16 +1,14 @@
 """
-OpenAI (and OpenAI-compatible) Responses API client.
+OpenAI-compatible Chat Completions client.
 
-Supports any server that implements the /v1/responses endpoint, including:
-  - OpenAI cloud
-  - xAI (Grok)
-  - Self-hosted compatible proxies
+Targets the widely implemented /v1/chat/completions API rather than a
+provider-specific endpoint, so it can work with OpenAI and compatible gateways.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import requests as http_requests
 
@@ -19,19 +17,8 @@ from app.services.validation import validate_model_response
 
 
 class OpenAIClient:
-    """
-    OpenAI Responses API client.
-
-    Structured Outputs via json_schema(strict) are used by default.
-    Falls back to json_object if the model/server rejects the strict schema.
-    """
-
     def __init__(self, config: dict | None = None):
-        """
-        Args:
-            config: Plain dict with keys: base_url, api_key, model, timeout.
-                    If None, reads from app settings (legacy behaviour).
-        """
+        self.last_usage: dict[str, Any] | None = None
         if config:
             self.base_url: str = config.get("base_url", "https://api.openai.com/v1").rstrip("/")
             self.api_key: str | None = config.get("api_key")
@@ -39,100 +26,84 @@ class OpenAIClient:
             self.timeout: float = float(config.get("timeout", 180.0))
         else:
             from app.core.config import settings
-            cfg = settings()
-            self.base_url = cfg.openai_base_url.rstrip("/")
-            self.api_key = cfg.openai_api_key
-            self.model = cfg.openai_model
-            self.timeout = float(cfg.openai_timeout)
+            cfg = settings().get_llm_config("coder")
+            self.base_url = cfg.get("base_url", "https://api.openai.com/v1").rstrip("/")
+            self.api_key = cfg.get("api_key")
+            self.model = cfg.get("model", "gpt-4o-mini")
+            self.timeout = float(cfg.get("timeout", 180.0))
 
         if not self.base_url.endswith("/v1"):
             self.base_url = f"{self.base_url}/v1"
-        self.url = f"{self.base_url}/responses"
+        self.url = f"{self.base_url}/chat/completions"
 
         if not self.api_key:
-            raise ValueError(
-                "OPENAI_API_KEY is not set. "
-                "Set it as a real environment variable — never in a committed .env file."
-            )
+            raise ValueError("OPENAI_API_KEY is not set.")
 
     def chat_structured(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+        obj = self.chat_json(messages, schema=MODEL_RESPONSE_SCHEMA)
+        validate_model_response(obj)
+        return obj
+
+    def chat_json(self, messages: List[Dict[str, str]], schema: dict | None = None) -> Dict[str, Any]:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-
         payload: Dict[str, Any] = {
             "model": self.model,
-            "input": messages,
+            "messages": messages,
             "temperature": 0.2,
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": "ide_chat_response",
-                    "strict": True,
-                    "schema": MODEL_RESPONSE_SCHEMA,
-                }
-            },
+            "response_format": {"type": "json_object"},
         }
+        if schema is not None:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "devwerk_json_response",
+                    "strict": True,
+                    "schema": schema,
+                },
+            }
 
         resp = http_requests.post(self.url, json=payload, headers=headers, timeout=self.timeout)
-
-        # If json_schema is rejected, fallback to json_object.
         if resp.status_code == 400:
-            txt = (resp.text or "").lower()
-            if any(kw in txt for kw in ("json_schema", "text.format", "schema")):
-                payload_fallback: Dict[str, Any] = {
-                    "model": self.model,
-                    "input": messages,
-                    "temperature": 0.2,
-                    "text": {"format": {"type": "json_object"}},
-                }
-                resp = http_requests.post(
-                    self.url, json=payload_fallback, headers=headers, timeout=self.timeout
-                )
+            text = (resp.text or "").lower()
+            if any(key in text for key in ("json_schema", "response_format", "schema")):
+                fallback = dict(payload)
+                fallback["response_format"] = {"type": "json_object"}
+                resp = http_requests.post(self.url, json=fallback, headers=headers, timeout=self.timeout)
 
         resp.raise_for_status()
         data = resp.json()
-
-        content = self._extract_output_text(data)
-        if not content:
-            raise ValueError("OpenAI returned empty output text")
-
-        try:
-            obj = json.loads(content)
-        except Exception as e:
-            raise ValueError(
-                f"OpenAI output is not valid JSON: {e}. Raw: {content[:200]}"
-            )
-
-        validate_model_response(obj)
+        self.last_usage = self._extract_usage(data)
+        content = self._extract_content(data)
+        obj = json.loads(content)
         return obj
 
     @staticmethod
-    def _extract_output_text(data: Dict[str, Any]) -> Optional[str]:
-        out = data.get("output")
-        if not isinstance(out, list):
-            return None
+    def _extract_usage(data: Dict[str, Any]) -> Dict[str, Any]:
+        usage = data.get("usage")
+        if not isinstance(usage, dict):
+            return {}
+        details = usage.get("prompt_tokens_details")
+        if not isinstance(details, dict):
+            details = {}
+        return {
+            "input_tokens": usage.get("prompt_tokens") or usage.get("input_tokens"),
+            "output_tokens": usage.get("completion_tokens") or usage.get("output_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+            "cached_input_tokens": details.get("cached_tokens"),
+        }
 
-        parts: List[str] = []
-        for item in out:
-            if not isinstance(item, dict):
-                continue
-            content = item.get("content")
-            if isinstance(content, str):
-                if content.strip():
-                    parts.append(content)
-                continue
-            if not isinstance(content, list):
-                continue
-            for c in content:
-                if not isinstance(c, dict):
-                    continue
-                t = c.get("type")
-                if t in ("output_text", "text"):
-                    text = c.get("text")
-                    if isinstance(text, str) and text.strip():
-                        parts.append(text)
-
-        joined = "\n".join(parts).strip()
-        return joined or None
+    @staticmethod
+    def _extract_content(data: Dict[str, Any]) -> str:
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ValueError("OpenAI-compatible API returned no choices")
+        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        if not isinstance(message, dict):
+            raise ValueError("OpenAI-compatible API returned no message")
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        raise ValueError("OpenAI-compatible API returned empty message content")

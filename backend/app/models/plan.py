@@ -73,6 +73,8 @@ class ExecuteRequest(BaseModel):
     )
 
     project_root: Optional[str] = Field(default=None)
+    project_id: Optional[str] = Field(default=None)
+    task_id: Optional[str] = Field(default=None)
 
     mode: Literal["agent", "scaffold"] = Field(default="agent")
 

@@ -15,16 +15,18 @@ import time
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, File, Request, UploadFile
+from fastapi import APIRouter, File, Form, Request, UploadFile
 
 from app.core.config import settings
 from app.models.ide import IdeChatRequest, IdeChatResponse
 from app.models.plan import ExecuteRequest, PlanResponse
 from app.services.coerce import coerce_to_fileops, coerce_to_patchops, coerce_to_toolrequests
 from app.services.coder_harness import build_coder_skill
+from app.services.kanban import add_artifact, add_event, move_task
 from app.services.llm_factory import get_llm_client
 from app.services.planner import Planner as build_planner
 from app.services.prompt_builder import build_model_messages
+from app.services.usage import usage_summary
 
 router = APIRouter()
 _log = logging.getLogger("devwerk.ide")
@@ -38,8 +40,13 @@ async def debug_raw(request: Request):
     return {"ok": True}
 
 
+@router.get("/usage/summary")
+async def get_usage_summary(project_id: str | None = None, start: str | None = None, end: str | None = None):
+    return usage_summary(project_id=project_id, start=start, end=end)
+
+
 @router.post("/ide/attachments")
-async def upload_attachment(file: UploadFile = File(...)):
+async def upload_attachment(file: UploadFile = File(...), project_id: str | None = Form(default=None)):
     """
     Store an IDE attachment on the local backend filesystem.
 
@@ -65,6 +72,15 @@ async def upload_attachment(file: UploadFile = File(...)):
             out.write(chunk)
 
     content_type = file.content_type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
+    _log.debug(
+        "upload_attachment: project_id=%s attachment_id=%s filename=%s content_type=%s size=%s path=%s",
+        project_id,
+        attachment_id,
+        safe_name,
+        content_type,
+        size,
+        dst,
+    )
 
     return {
         "ok": True,
@@ -105,7 +121,8 @@ async def ide_plan(request: Request) -> PlanResponse:
             error_message="messages must be a non-empty list",
         )
     _log.debug(
-        "ide_plan: received mode=%s messages=%s workspace_summary=%s",
+        "ide_plan: received project_id=%s mode=%s messages=%s workspace_summary=%s",
+        body.get("project_id"),
         body.get("mode", "agent"),
         len(messages),
         _workspace_debug_summary(body.get("workspace")),
@@ -122,7 +139,7 @@ async def ide_plan(request: Request) -> PlanResponse:
 
     cfg = settings()
     try:
-        cfg.validate_provider()
+        cfg.validate_provider("planner")
     except ValueError as ve:
         _log.warning("Provider validation failed: %s", ve)
         return PlanResponse(
@@ -132,7 +149,7 @@ async def ide_plan(request: Request) -> PlanResponse:
         )
 
     try:
-        p = build_planner(config=cfg.get_llm_config())
+        p = build_planner(agent_name="planner")
     except (ValueError, NotImplementedError) as exc:
         _log.warning("Planner creation failed: %s", exc)
         return PlanResponse(
@@ -142,9 +159,16 @@ async def ide_plan(request: Request) -> PlanResponse:
         )
 
     mode = str(body.get("mode", "agent")).strip().lower() or "agent"
+    task_id = _body_task_id(body)
+    _kanban_event(task_id, "plan_started", {"mode": mode})
 
     try:
         result = p.plan(messages=messages, mode=mode)
+        if result.ok:
+            _kanban_artifact(task_id, "plan_response", payload=result.model_dump())
+            _kanban_move(task_id, "planned", {"files": len(result.files), "warnings": len(result.warnings)})
+        else:
+            _kanban_move(task_id, "failed", {"phase": "plan", "error_code": result.error_code})
         _log.debug(
             "ide_plan: planner_result ok=%s files=%s warnings=%s summary=%s",
             result.ok,
@@ -155,6 +179,7 @@ async def ide_plan(request: Request) -> PlanResponse:
         return result
     except Exception as exc:  # noqa: BLE001
         _log.exception("Planner raised unhandled exception")
+        _kanban_move(task_id, "failed", {"phase": "plan", "error": f"{type(exc).__name__}: {exc}"})
         return PlanResponse(
             ok=False,
             error_code="PLAN_ERROR",
@@ -196,7 +221,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
 
     cfg = settings()
     try:
-        cfg.validate_provider()
+        cfg.validate_provider("executor")
     except ValueError as ve:
         _log.warning("Provider validation failed: %s", ve)
         return IdeChatResponse(
@@ -208,7 +233,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
         )
 
     try:
-        client = get_llm_client()
+        client = get_llm_client("executor")
     except (ValueError, NotImplementedError) as exc:
         _log.warning("LLM client creation failed: %s", exc)
         return IdeChatResponse(
@@ -228,7 +253,8 @@ async def ide_execute(request: Request) -> IdeChatResponse:
             error_message="messages must be a list",
         )
     _log.debug(
-        "ide_execute: received mode=%s messages=%s approved_paths=%s workspace_summary=%s",
+        "ide_execute: received project_id=%s mode=%s messages=%s approved_paths=%s workspace_summary=%s",
+        body.get("project_id"),
         body.get("mode", "agent"),
         len(messages),
         approved_paths,
@@ -252,6 +278,9 @@ async def ide_execute(request: Request) -> IdeChatResponse:
     _log.debug("ide_execute: appended_execution_guard approved_count=%s final_messages=%s", len(approved_set), len(messages))
 
     mode = str(body.get("mode", "agent")).strip().lower() or "agent"
+    task_id = _body_task_id(body)
+    _kanban_event(task_id, "execute_started", {"mode": mode, "approved_paths": approved_paths})
+    _kanban_move(task_id, "coding", {"approved_paths": approved_paths})
 
     max_retries = 2
     backoff = 0.8
@@ -259,7 +288,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
     for attempt in range(max_retries + 1):
         try:
             obj = client.chat_structured(
-                build_model_messages(_ChatProxy(messages), provider=cfg.llm_provider)
+                build_model_messages(_ChatProxy(messages), provider=cfg.llm_provider_name)
             )
             _log.debug(
                 "ide_execute: model_response keys=%s ops=%s patch_ops=%s tool_requests=%s done=%s",
@@ -279,7 +308,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                 sorted(approved_set),
             )
 
-            return IdeChatResponse(
+            response = IdeChatResponse(
                 ok=True,
                 reply=obj.get("reply", ""),
                 code_tree=obj.get("code_tree"),
@@ -288,6 +317,13 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                 patch_ops=coerce_to_patchops(patch_ops, tool_results=[]),
                 done=bool(obj.get("done") or False),
             )
+            _kanban_artifact(task_id, "execute_response", payload=response.model_dump())
+            _kanban_move(
+                task_id,
+                "verification",
+                {"ops": len(response.ops), "patch_ops": len(response.patch_ops), "done": response.done},
+            )
+            return response
 
         except Exception as exc:  # noqa: BLE001
             is_timeout = (
@@ -299,6 +335,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                 continue
 
             _log.exception("Execute LLM call failed (attempt %s/%s)", attempt, max_retries)
+            _kanban_move(task_id, "failed", {"phase": "execute", "error": f"{type(exc).__name__}: {exc}"})
             return IdeChatResponse(
                 ok=False,
                 reply="",
@@ -393,6 +430,41 @@ def _safe_filename(name: str) -> str:
     return cleaned or "attachment.bin"
 
 
+def _body_task_id(body: dict) -> str | None:
+    value = body.get("task_id")
+    if value is None:
+        value = body.get("taskId")
+    text = str(value or "").strip()
+    return text or None
+
+
+def _kanban_event(task_id: str | None, event_type: str, payload: dict) -> None:
+    if not task_id:
+        return
+    try:
+        add_event(task_id, event_type, payload)
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("kanban event skipped task_id=%s event=%s error=%s", task_id, event_type, exc)
+
+
+def _kanban_artifact(task_id: str | None, artifact_type: str, payload: dict) -> None:
+    if not task_id:
+        return
+    try:
+        add_artifact(task_id, artifact_type=artifact_type, payload=payload)
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("kanban artifact skipped task_id=%s type=%s error=%s", task_id, artifact_type, exc)
+
+
+def _kanban_move(task_id: str | None, status_key: str, payload: dict) -> None:
+    if not task_id:
+        return
+    try:
+        move_task(task_id, status_key, force=True, payload=payload)
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("kanban move skipped task_id=%s status=%s error=%s", task_id, status_key, exc)
+
+
 # ---------------------------------------------------------------------------
 # Original chat endpoint (unchanged)
 # ---------------------------------------------------------------------------
@@ -400,9 +472,17 @@ def _safe_filename(name: str) -> str:
 @router.post("/chat", response_model=IdeChatResponse)
 def ide_chat(req: IdeChatRequest) -> IdeChatResponse:
     cfg = settings()
+    _log.debug(
+        "ide_chat: received project_id=%s mode=%s messages=%s workspace_summary=%s tool_results=%s",
+        req.project_id,
+        req.mode,
+        len(req.messages),
+        _workspace_debug_summary(req.workspace.model_dump() if req.workspace else None),
+        len(req.tool_results),
+    )
 
     try:
-        cfg.validate_provider()
+        cfg.validate_provider("coder")
     except ValueError as ve:
         _log.warning("Provider validation failed: %s", ve)
         return IdeChatResponse(
@@ -411,7 +491,7 @@ def ide_chat(req: IdeChatRequest) -> IdeChatResponse:
         )
 
     try:
-        client = get_llm_client()
+        client = get_llm_client("coder")
     except (ValueError, NotImplementedError) as exc:
         _log.warning("LLM client creation failed: %s", exc)
         return IdeChatResponse(
@@ -419,7 +499,7 @@ def ide_chat(req: IdeChatRequest) -> IdeChatResponse:
             error_code="CONFIG_ERROR", error_message=str(exc), retryable=False,
         )
 
-    messages = build_model_messages(req, provider=cfg.llm_provider)
+    messages = build_model_messages(req, provider=cfg.llm_provider_name)
 
     max_retries = 2
     backoff = 0.8

@@ -234,7 +234,8 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 return
             }
 
-            val uploaded = files.map { file -> aiClient!!.uploadAttachment(file) }
+            val projectId = DevWerkProjectMeta.getOrCreateProjectId(project)
+            val uploaded = files.map { file -> aiClient!!.uploadAttachment(file, projectId) }
             val message = buildUserMessage(userText, uploaded)
             currentPlanUserMessage = message
             runPlanPhase(message)
@@ -258,6 +259,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
             val chatCtx = ChatContext(
                 projectRoot = project.basePath,
                 history = history.toList(),
+                projectId = DevWerkProjectMeta.getOrCreateProjectId(project),
                 project = project,
                 devCtx = devCtx
             )
@@ -373,6 +375,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
             val chatCtx = ChatContext(
                 projectRoot = project.basePath,
                 history = history.toList(),
+                projectId = DevWerkProjectMeta.getOrCreateProjectId(project),
                 project = project,
                 devCtx = devCtx
             )

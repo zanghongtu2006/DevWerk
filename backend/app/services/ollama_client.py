@@ -17,6 +17,7 @@ from app.services.validation import validate_model_response
 
 class OllamaClient:
     def __init__(self, config: dict | None = None):
+        self.last_usage: dict[str, Any] | None = None
         """
         Args:
             config: Plain dict with keys: base_url, model, timeout, enable_schema.
@@ -38,6 +39,11 @@ class OllamaClient:
         self.url = f"{self.base_url}/api/chat"
 
     def chat_structured(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+        obj = self.chat_json(messages, schema=MODEL_RESPONSE_SCHEMA if self.enable_schema else None)
+        validate_model_response(obj)
+        return obj
+
+    def chat_json(self, messages: List[Dict[str, str]], schema: dict | None = None) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "model": self.model,
             "stream": False,
@@ -47,12 +53,12 @@ class OllamaClient:
 
         # Only send schema if the server/model is known to support it.
         # Older models (e.g. llama3 without --format flag) may reject it.
-        if self.enable_schema:
-            payload["format"] = MODEL_RESPONSE_SCHEMA
+        payload["format"] = schema if schema is not None else "json"
 
         resp = http_requests.post(self.url, json=payload, timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json()
+        self.last_usage = self._extract_usage(data)
 
         content = (data.get("message") or {}).get("content")
         if isinstance(content, dict):
@@ -69,5 +75,17 @@ class OllamaClient:
                 f"Ollama returned unexpected content type: {type(content).__name__}"
             )
 
-        validate_model_response(obj)
         return obj
+
+    @staticmethod
+    def _extract_usage(data: Dict[str, Any]) -> Dict[str, Any]:
+        input_tokens = data.get("prompt_eval_count")
+        output_tokens = data.get("eval_count")
+        total_tokens = None
+        if isinstance(input_tokens, int) and isinstance(output_tokens, int):
+            total_tokens = input_tokens + output_tokens
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+        }

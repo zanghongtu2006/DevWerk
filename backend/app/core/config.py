@@ -1,509 +1,256 @@
-<<<<<<< HEAD
-# app/core/config.py
+"""
+DevWerk backend configuration.
+
+The backend owns model/provider selection. The IDE plugin only sends context.
+
+Configuration is split into:
+  - API profiles: protocol + base URL + auth + default model
+  - Agent bindings: which API profile/model each backend agent should use
+
+This keeps today's single coder agent simple while leaving room for planner,
+reviewer, framework-memory, and other future agents to use different APIs.
+"""
+
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
-
-from dotenv import load_dotenv
-
-
-def _is_dev_env(env_name: str) -> bool:
-    v = (env_name or "").strip().lower()
-    return v in ("dev", "development", "develop", "local")
-
-
-def _project_root() -> Path:
-    # backend/app/core/config.py -> backend/
-    return Path(__file__).resolve().parents[2]
-
-
-def _parse_env_file(path: Path) -> dict[str, str]:
-    """
-    Very small .env parser:
-    - supports KEY=VALUE
-    - ignores blank lines and comments (# ...)
-    - strips optional quotes around VALUE
-    """
-    data: dict[str, str] = {}
-    if not path.exists() or not path.is_file():
-        return data
-
-    for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        k = k.strip()
-        v = v.strip()
-
-        # remove inline comment: KEY=VALUE # comment
-        if " #" in v:
-            v = v.split(" #", 1)[0].strip()
-
-        # strip quotes
-        if (len(v) >= 2) and ((v[0] == v[-1]) and v[0] in ("'", '"')):
-            v = v[1:-1]
-
-        if k:
-            data[k] = v
-    return data
-
-
-def _detect_env_name(root: Path) -> str:
-    # 1) real env vars first
-    for k in ("APP_ENV", "ENV", "ENVIRONMENT"):
-        v = os.getenv(k)
-        if v and str(v).strip():
-            return str(v).strip()
-
-    # 2) if not set, try base .env (only for deciding env_name)
-    base_env = _parse_env_file(root / ".env")
-    for k in ("APP_ENV", "ENV", "ENVIRONMENT"):
-        v = base_env.get(k)
-        if v and str(v).strip():
-            return str(v).strip()
-
-    return "production"
-
-
-def _load_dotenvs() -> None:
-    """
-    Priority:
-      1) real env vars (never overwritten)
-      2) .env.development / .env.dev (dev only)
-      3) .env
-    """
-    root = _project_root()
-    env_name = _detect_env_name(root)
-
-    if _is_dev_env(env_name):
-        for fname in (".env.development", ".env.dev"):
-            p = root / fname
-            if p.exists():
-                load_dotenv(dotenv_path=p, override=False)
-
-    p = root / ".env"
-    if p.exists():
-        load_dotenv(dotenv_path=p, override=False)
-
-
-def _get_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return float(default)
-    try:
-        return float(v)
-    except Exception:
-        return float(default)
-
-
-def _get_str(name: str, default: str) -> str:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    s = str(v).strip()
-    return s if s != "" else default
-
-
-def _get_opt_str(name: str) -> Optional[str]:
-    v = os.getenv(name)
-    if v is None:
-        return None
-    s = str(v).strip()
-    return s if s != "" else None
-
-
-@dataclass(frozen=True)
-class Settings:
-    llm_provider: str
-
-    # ---- ollama ----
-    ollama_base_url: str
-    ollama_model: str
-    ollama_timeout: float
-
-    # ---- OpenAI ----
-    openai_base_url: str
-    openai_api_key: Optional[str]
-    openai_model: str
-    openai_timeout: float
-
-    # ---- xAI ----
-    xai_base_url: str
-    xai_api_key: Optional[str]
-    xai_model: str
-    xai_timeout: float
-
-    # ---- Gemini ----
-    gemini_base_url: str
-    gemini_api_key: Optional[str]
-    gemini_model: str
-    gemini_timeout: float
-
-    @staticmethod
-    def from_env() -> "Settings":
-        _load_dotenvs()
-
-        provider = _get_str("LLM_PROVIDER", "openai").lower()
-
-        ollama_base = _get_str("OLLAMA_BASE_URL", "http://127.0.0.1:12434").rstrip("/")
-        ollama_model = _get_str("OLLAMA_MODEL", "deepseek-r1:32b")
-        ollama_timeout = _get_float("OLLAMA_TIMEOUT", 180.0)
-
-        # 更稳的默认值：不给也能直接跑 openai（只差 key）
-        openai_base = _get_str("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-        # openai_key = _get_opt_str("OPENAI_API_KEY")
-        openai_key = "sk-proj-your-code"
-        openai_model = _get_str("OPENAI_MODEL", "gpt-5.2")
-        openai_timeout = _get_float("OPENAI_TIMEOUT", 180.0)
-
-        xai_base = _get_str("XAI_BASE_URL", "").rstrip("/")
-        xai_key = _get_opt_str("XAI_API_KEY")
-        xai_model = _get_str("XAI_MODEL", "")
-        xai_timeout = _get_float("XAI_TIMEOUT", 180.0)
-
-        gemini_base = _get_str("GEMINI_BASE_URL", "").rstrip("/")
-        gemini_key = _get_opt_str("GEMINI_API_KEY") or _get_opt_str("GOOGLE_API_KEY")
-        gemini_model = _get_str("GEMINI_MODEL", "")
-        gemini_timeout = _get_float("GEMINI_TIMEOUT", 180.0)
-
-        return Settings(
-            llm_provider=provider,
-
-            ollama_base_url=ollama_base,
-            ollama_model=ollama_model,
-            ollama_timeout=ollama_timeout,
-
-            openai_base_url=openai_base,
-            openai_api_key=openai_key,
-            openai_model=openai_model,
-            openai_timeout=openai_timeout,
-
-            xai_base_url=xai_base,
-            xai_api_key=xai_key,
-            xai_model=xai_model,
-            xai_timeout=xai_timeout,
-
-            gemini_base_url=gemini_base,
-            gemini_api_key=gemini_key,
-            gemini_model=gemini_model,
-            gemini_timeout=gemini_timeout,
-        )
-=======
-"""
-DevWerk Configuration — Pydantic BaseSettings + python-dotenv
-
-Environment loading priority (high → low):
-  1. Real environment variables  (always, never overwritten by .env files)
-  2. OS-level dotenv file         (path pointed to by APP_ENV_FILE, or .env in CWD)
-  3. Environment-specific files   (.env.development, .env.test, .env.production)
-
-Usage:
-  from app.core.config import settings
-
-  # settings is a global, lazily-initialised Pydantic instance.
-  # It reads from real env vars first, then from .env / .env.{APP_ENV}.
-"""
-
-from __future__ import annotations
-
-import os
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
+from dotenv import load_dotenv
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-# ---------------------------------------------------------------------------
-# Path helpers
-# ---------------------------------------------------------------------------
-
 def _project_root() -> Path:
-    """backend/app/core/config.py → backend/"""
     return Path(__file__).resolve().parents[2]
 
 
-def _env_file_for_env(env_name: str) -> Path | None:
-    """Return the optional .env.{env} side-car file, or None."""
+def _load_env_files() -> None:
     root = _project_root()
-    candidates = [root / f".env.{env_name}", root / f".env.{env_name.lower()}"]
-    for p in candidates:
-        if p.is_file():
-            return p
-    return None
+    for name in (".env", ".env.development", ".env.local"):
+        path = root / name
+        if path.is_file():
+            load_dotenv(path, override=False)
 
 
-# ---------------------------------------------------------------------------
-# Pydantic model — fields map 1-to-1 with environment variables
-# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ApiProfile:
+    name: str
+    protocol: Literal["openai", "anthropic", "ollama"]
+    base_url: str
+    api_key: str | None
+    model: str
+    timeout: float
+    effort_level: str | None = None
+
+
+@dataclass(frozen=True)
+class AgentModelConfig:
+    agent: str
+    api: ApiProfile
+    model: str
+
+    def as_client_config(self) -> dict:
+        return {
+            "agent": self.agent,
+            "api_name": self.api.name,
+            "protocol": self.api.protocol,
+            "base_url": self.api.base_url,
+            "api_key": self.api.api_key,
+            "model": self.model,
+            "timeout": self.api.timeout,
+            "effort_level": self.api.effort_level,
+        }
+
 
 class Settings(BaseSettings):
-    """
-    DevWerk application settings.
-
-    All fields default to safe, development-friendly values.
-    Switching to production only requires setting APP_ENV=production
-    and providing real API keys — no code changes needed.
-    """
-
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         env_ignore_case=True,
-        extra="ignore",          # reject unknown env vars loudly in tests, not in prod
+        extra="ignore",
     )
 
-    # ── Environment ──────────────────────────────────────────────────────
+    # Server
+    app_env: str = Field(default="development")
+    host: str = Field(default="0.0.0.0")
+    port: int = Field(default=8000)
+    reload: bool = Field(default=False)
 
-    app_env: Literal["development", "test", "production"] = Field(
-        default="development",
-        description="Active environment. Controls which .env.{name} file is loaded.",
+    # Local usage accounting.
+    devwerk_usage_tracking: bool = Field(default=True)
+    devwerk_db_path: str = Field(default="./data/devwerk.db")
+
+    # Agent routing. Values are API profile names: openai, anthropic, ollama.
+    devwerk_default_api: str = Field(default="anthropic")
+    devwerk_coder_api: str | None = Field(default=None)
+    devwerk_planner_api: str | None = Field(default=None)
+    devwerk_executor_api: str | None = Field(default=None)
+    devwerk_default_agent: str = Field(default="coder")
+
+    # OpenAI-compatible API profile.
+    openai_base_url: str = Field(default="https://api.openai.com/v1")
+    openai_api_key: str | None = Field(default=None)
+    openai_model: str = Field(default="gpt-4o-mini")
+    openai_timeout: float = Field(default=180.0)
+
+    # Anthropic-compatible API profile. Defaults match Claude Code + MiniMax.
+    anthropic_auth_token: str | None = Field(default=None)
+    anthropic_base_url: str = Field(default="https://api.minimaxi.com/anthropic")
+    anthropic_model: str = Field(default="M3")
+    anthropic_default_sonnet_model: str | None = Field(default=None)
+    anthropic_default_haiku_model: str | None = Field(default=None)
+    anthropic_default_opus_model: str | None = Field(default=None)
+    claude_code_subagent_model: str | None = Field(default=None)
+    claude_code_effort_level: str = Field(default="max")
+    anthropic_timeout: float = Field(default=180.0)
+
+    # Ollama remains useful for local development.
+    ollama_base_url: str = Field(default="http://127.0.0.1:11434")
+    ollama_model: str = Field(default="deepseek-r1:32b")
+    ollama_timeout: float = Field(default=180.0)
+    ollama_enable_schema: bool = Field(default=True)
+
+    # Backward-compatible selector. If set, it becomes the default API profile.
+    llm_provider: str | None = Field(default=None)
+
+    @field_validator(
+        "openai_api_key",
+        "anthropic_auth_token",
+        "devwerk_coder_api",
+        "devwerk_planner_api",
+        "devwerk_executor_api",
+        "anthropic_default_sonnet_model",
+        "anthropic_default_haiku_model",
+        "anthropic_default_opus_model",
+        "claude_code_subagent_model",
+        "llm_provider",
+        mode="before",
     )
-
-    # ── Server ───────────────────────────────────────────────────────────
-
-    host: str = Field(default="0.0.0.0", description="Bind address")
-    port: int = Field(default=8000, description="Bind port")
-    reload: bool = Field(default=False, description="Enable uvicorn hot-reload")
-
-    # ── LLM general ──────────────────────────────────────────────────────
-
-    llm_provider: Literal["ollama", "openai", "xai", "gemini", "minimax", "minimax_overseas"] = Field(
-        default="ollama",
-        description="Which LLM backend to use.",
-    )
-
-    # ── Ollama ──────────────────────────────────────────────────────────
-
-    ollama_base_url: str = Field(
-        default="http://127.0.0.1:11434",
-        description="Ollama server base URL.",
-    )
-    ollama_model: str = Field(default="deepseek-r1:32b", description="Default Ollama model.")
-    ollama_timeout: float = Field(default=180.0, description="Request timeout in seconds.")
-    ollama_enable_schema: bool = Field(
-        default=True,
-        description=(
-            "Send JSON schema to Ollama (modern models such as deepseek-r1 support it; "
-            "older models like llama3 may need --format json instead). "
-            "Set to false if Ollama returns schema errors."
-        ),
-    )
-
-    # ── OpenAI-compatible (OpenAI, xAI, o1-preview, ...) ─────────────────
-
-    openai_base_url: str = Field(
-        default="https://api.openai.com/v1",
-        description="Base URL for OpenAI-compatible API (v1 endpoint).",
-    )
-    openai_api_key: str | None = Field(
-        default=None,
-        description="API key. Leave None to use Ollama. Set in a real env var, not in .env files that get committed!",
-    )
-    openai_model: str = Field(default="gpt-4o-mini", description="Default OpenAI model.")
-    openai_timeout: float = Field(default=180.0, description="Request timeout in seconds.")
-
-    # ── xAI (Grok) ───────────────────────────────────────────────────────
-
-    xai_base_url: str = Field(
-        default="https://api.x.ai/v1",
-        description="Base URL for xAI (Grok) API.",
-    )
-    xai_api_key: str | None = Field(default=None, description="xAI API key.")
-    xai_model: str = Field(default="grok-3", description="Default xAI model.")
-    xai_timeout: float = Field(default=180.0, description="Request timeout in seconds.")
-
-    # ── Google Gemini ─────────────────────────────────────────────────────
-
-    gemini_base_url: str = Field(
-        default="https://generativelanguage.googleapis.com/v1beta",
-        description="Base URL for Google Gemini API.",
-    )
-    gemini_api_key: str | None = Field(
-        default=None,
-        description="Gemini API key. Also reads GOOGLE_API_KEY for compatibility.",
-    )
-    gemini_model: str = Field(default="gemini-2.0-flash", description="Default Gemini model.")
-    gemini_timeout: float = Field(default=180.0, description="Request timeout in seconds.")
-
-    # ── MiniMax ──────────────────────────────────────────────────────────
-
-    minimax_base_url: str = Field(
-        default="https://api.minimax.chat/v1",
-        description="Base URL for MiniMax China mainland API (api.minimax.chat).",
-    )
-    minimax_api_key: str | None = Field(
-        default=None,
-        description="MiniMax API key for China mainland.",
-    )
-    minimax_model: str = Field(default="MiniMax-Text-01", description="Default MiniMax model.")
-    minimax_timeout: float = Field(default=180.0, description="Request timeout in seconds.")
-
-    # ── MiniMax Overseas ─────────────────────────────────────────────────
-
-    minimax_overseas_base_url: str = Field(
-        default="https://api.minimaxi.chat/v1",
-        description="Base URL for MiniMax overseas API (api.minimaxi.chat).",
-    )
-    minimax_overseas_api_key: str | None = Field(
-        default=None,
-        description="MiniMax API key for overseas.",
-    )
-    minimax_overseas_model: str = Field(default="MiniMax-Text-01", description="Default MiniMax overseas model.")
-    minimax_overseas_timeout: float = Field(default=180.0, description="Request timeout in seconds.")
-
-    # ── Validation ───────────────────────────────────────────────────────
-
-    @field_validator("openai_api_key", "xai_api_key", "gemini_api_key",
-                     "minimax_api_key", "minimax_overseas_api_key", mode="before")
     @classmethod
-    def _empty_str_to_none(cls, v: str | None) -> str | None:
-        """Treat empty-string API keys as None so the provider is silently skipped."""
-        if v is None:
+    def _empty_str_to_none(cls, value: str | None) -> str | None:
+        if value is None:
             return None
-        s = str(v).strip()
-        return s if s else None
+        text = str(value).strip()
+        return text or None
 
-    @field_validator("ollama_base_url", "openai_base_url", "xai_base_url", "gemini_base_url", mode="after")
+    @field_validator("openai_base_url", "anthropic_base_url", "ollama_base_url", mode="after")
     @classmethod
-    def _strip_trailing_slash(cls, v: str) -> str:
-        return v.rstrip("/")
-
-    # ── Computed properties ──────────────────────────────────────────────
+    def _strip_trailing_slash(cls, value: str) -> str:
+        return value.rstrip("/")
 
     @property
     def is_production(self) -> bool:
-        return self.app_env == "production"
+        return self.app_env.lower() == "production"
 
     @property
     def is_development(self) -> bool:
-        return self.app_env == "development"
+        return self.app_env.lower() in {"dev", "development", "local"}
 
-    def get_llm_config(self) -> dict:
-        """Return the active LLM provider config as a plain dict (for clients)."""
-        p = self.llm_provider
-        if p == "ollama":
-            return {
-                "base_url": self.ollama_base_url,
-                "model": self.ollama_model,
-                "timeout": self.ollama_timeout,
-                "enable_schema": self.ollama_enable_schema,
-            }
-        if p == "openai":
-            return {
-                "base_url": self.openai_base_url,
-                "api_key": self.openai_api_key,
-                "model": self.openai_model,
-                "timeout": self.openai_timeout,
-            }
-        if p == "xai":
-            return {
-                "base_url": self.xai_base_url,
-                "api_key": self.xai_api_key,
-                "model": self.xai_model,
-                "timeout": self.xai_timeout,
-            }
-        if p == "gemini":
-            return {
-                "base_url": self.gemini_base_url,
-                "api_key": self.gemini_api_key,
-                "model": self.gemini_model,
-                "timeout": self.gemini_timeout,
-            }
-        if p == "minimax":
-            return {
-                "base_url": self.minimax_base_url,
-                "api_key": self.minimax_api_key,
-                "model": self.minimax_model,
-                "timeout": self.minimax_timeout,
-            }
-        if p == "minimax_overseas":
-            return {
-                "base_url": self.minimax_overseas_base_url,
-                "api_key": self.minimax_overseas_api_key,
-                "model": self.minimax_overseas_model,
-                "timeout": self.minimax_overseas_timeout,
-            }
-        raise ValueError(f"Unknown LLM provider: {p!r}")
+    @property
+    def active_provider(self) -> str:
+        return (self.llm_provider or self.devwerk_default_api or "anthropic").strip().lower()
 
-    def validate_provider(self) -> None:
-        """
-        Raise ValueError with a clear message if the selected provider
-        is missing its required credentials.
-        """
-        p = self.llm_provider
-        if p == "openai" and not self.openai_api_key:
+    @property
+    def llm_provider_name(self) -> str:
+        return self.active_provider
+
+    def api_profiles(self) -> dict[str, ApiProfile]:
+        anthropic_model = (
+            self.claude_code_subagent_model
+            or self.anthropic_model
+            or self.anthropic_default_sonnet_model
+            or "M3"
+        )
+        return {
+            "openai": ApiProfile(
+                name="openai",
+                protocol="openai",
+                base_url=self.openai_base_url,
+                api_key=self.openai_api_key,
+                model=self.openai_model,
+                timeout=self.openai_timeout,
+            ),
+            "anthropic": ApiProfile(
+                name="anthropic",
+                protocol="anthropic",
+                base_url=self.anthropic_base_url,
+                api_key=self.anthropic_auth_token,
+                model=anthropic_model,
+                timeout=self.anthropic_timeout,
+                effort_level=self.claude_code_effort_level,
+            ),
+            "ollama": ApiProfile(
+                name="ollama",
+                protocol="ollama",
+                base_url=self.ollama_base_url,
+                api_key=None,
+                model=self.ollama_model,
+                timeout=self.ollama_timeout,
+            ),
+        }
+
+    def agent_config(self, agent: str | None = None) -> AgentModelConfig:
+        agent_name = (agent or self.devwerk_default_agent or "coder").strip().lower()
+        profile_name = self._agent_profile_name(agent_name)
+        profiles = self.api_profiles()
+        profile = profiles.get(profile_name)
+        if profile is None:
             raise ValueError(
-                "OPENAI_API_KEY is not set. "
-                "Set it as a real environment variable, or switch to APP_ENV=ollama."
+                f"Unknown API profile {profile_name!r} for agent {agent_name!r}. "
+                f"Supported profiles: {', '.join(sorted(profiles))}"
             )
-        if p == "xai" and not self.xai_api_key:
+        return AgentModelConfig(agent=agent_name, api=profile, model=profile.model)
+
+    def _agent_profile_name(self, agent: str) -> str:
+        if agent == "coder" and self.devwerk_coder_api:
+            return self.devwerk_coder_api.strip().lower()
+        if agent == "planner" and self.devwerk_planner_api:
+            return self.devwerk_planner_api.strip().lower()
+        if agent in {"executor", "execute"} and self.devwerk_executor_api:
+            return self.devwerk_executor_api.strip().lower()
+        return self.active_provider
+
+    def get_llm_config(self, agent: str | None = None) -> dict:
+        return self.agent_config(agent).as_client_config()
+
+    def validate_provider(self, agent: str | None = None) -> None:
+        config = self.agent_config(agent)
+        if config.api.protocol in {"openai", "anthropic"} and not config.api.api_key:
+            env_name = "OPENAI_API_KEY" if config.api.protocol == "openai" else "ANTHROPIC_AUTH_TOKEN"
             raise ValueError(
-                "XAI_API_KEY is not set. "
-                "Set it as a real environment variable, or switch to APP_ENV=ollama."
-            )
-        if p == "gemini" and not self.gemini_api_key:
-            raise ValueError(
-                "GEMINI_API_KEY (or GOOGLE_API_KEY) is not set. "
-                "Set it as a real environment variable, or switch to APP_ENV=ollama."
-            )
-        if p == "minimax" and not self.minimax_api_key:
-            raise ValueError(
-                "MINIMAX_API_KEY is not set. "
-                "Set it as a real environment variable, or switch to APP_ENV=ollama."
-            )
-        if p == "minimax_overseas" and not self.minimax_overseas_api_key:
-            raise ValueError(
-                "MINIMAX_OVERSEAS_API_KEY is not set. "
-                "Set it as a real environment variable, or switch to APP_ENV=ollama."
+                f"{env_name} is not set for agent {config.agent!r} using API profile {config.api.name!r}."
             )
 
-
-# ---------------------------------------------------------------------------
-# Module-level singleton (lazily instantiated on first import)
-# ---------------------------------------------------------------------------
 
 _settings: Settings | None = None
 
 
 def settings() -> Settings:
-    """Return the global Settings instance, initialising it on first call."""
     global _settings
     if _settings is None:
+        _load_env_files()
         _settings = Settings()
         _settings.validate_provider()
     return _settings
 
 
-# ---------------------------------------------------------------------------
-# Backwards-compatible API (for existing code that imports Settings.from_env)
-# ---------------------------------------------------------------------------
-
 def reload_settings() -> Settings:
-    """Force-reload settings (useful in tests)."""
     global _settings
+    _load_env_files()
     _settings = Settings()
     _settings.validate_provider()
     return _settings
 
 
 class _CompatSettings(Settings):
-    """
-    Compatibility shim that mimics the old frozen dataclass interface.
-    Existing code that does `settings = Settings.from_env()` continues to work.
-    """
     @classmethod
     def from_env(cls) -> "_CompatSettings":
+        _load_env_files()
         return cls()
 
 
 class _FrozenSettings(_CompatSettings):
-    """Drop-in replacement for old `Settings.from_env()` calls."""
     pass
->>>>>>> dbb267c48dbf486f1d989451806376f74befa5fc
