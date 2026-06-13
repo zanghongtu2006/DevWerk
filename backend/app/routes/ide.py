@@ -342,7 +342,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                 code_tree=obj.get("code_tree"),
                 ops=coerce_to_fileops(ops, tool_results=[]),
                 tool_requests=coerce_to_toolrequests(obj.get("tool_requests") or []),
-                patch_ops=coerce_to_patchops(patch_ops, tool_results=[]),
+                patch_ops=coerce_to_patchops(patch_ops),
                 done=bool(obj.get("done") or False),
             )
             _kanban_artifact(task_id, "execute_response", payload=response.model_dump())
