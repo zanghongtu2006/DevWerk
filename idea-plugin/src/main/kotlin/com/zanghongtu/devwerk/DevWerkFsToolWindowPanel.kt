@@ -260,6 +260,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 projectRoot = project.basePath,
                 history = history.toList(),
                 projectId = DevWerkProjectMeta.getOrCreateProjectId(project),
+                taskId = currentPlan?.taskId,
                 project = project,
                 devCtx = devCtx
             )

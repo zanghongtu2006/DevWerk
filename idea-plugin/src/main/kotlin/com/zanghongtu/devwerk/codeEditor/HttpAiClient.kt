@@ -273,6 +273,7 @@ class HttpAiClient(
 
         val root = JSONObject()
         root.put("project_id", chatContext.projectId ?: JSONObject.NULL)
+        root.put("task_id", chatContext.taskId ?: JSONObject.NULL)
         root.put("mode", mode)
         root.put("project_root", projectRoot ?: JSONObject.NULL)
         root.put("messages", messagesJson)
@@ -366,6 +367,7 @@ class HttpAiClient(
 
         val root = JSONObject()
         root.put("project_id", context.projectId ?: JSONObject.NULL)
+        root.put("task_id", context.taskId ?: JSONObject.NULL)
         root.put("messages", messagesJson)
         root.put("mode", mode)
         root.put("project_root", context.projectRoot ?: JSONObject.NULL)
@@ -523,11 +525,19 @@ class HttpAiClient(
         return try {
             val obj = JSONObject(body)
             val ok = obj.optBoolean("ok", true)
+            val taskId = if (obj.has("task_id") && !obj.isNull("task_id")) obj.getString("task_id") else null
+            val statusKey = if (obj.has("status_key") && !obj.isNull("status_key")) obj.getString("status_key") else null
             val errorCode = if (obj.has("error_code") && !obj.isNull("error_code")) obj.getString("error_code") else null
             val errorMessage = if (obj.has("error_message") && !obj.isNull("error_message")) obj.getString("error_message") else null
 
             if (!ok) {
-                return PlanResponse(ok = false, errorCode = errorCode, errorMessage = errorMessage)
+                return PlanResponse(
+                    ok = false,
+                    taskId = taskId,
+                    statusKey = statusKey,
+                    errorCode = errorCode,
+                    errorMessage = errorMessage
+                )
             }
 
             val filesArr = obj.optJSONArray("files") ?: JSONArray()
@@ -549,7 +559,7 @@ class HttpAiClient(
                 warningsArr.optString(it, "").trim().takeIf { w -> w.isNotBlank() }
             }
 
-            PlanResponse(ok = true, files = files, summary = summary, warnings = warnings)
+            PlanResponse(ok = true, taskId = taskId, statusKey = statusKey, files = files, summary = summary, warnings = warnings)
         } catch (t: Throwable) {
             PlanResponse(ok = false, errorCode = "PARSE_ERROR", errorMessage = "${typeName(t)}: ${t.message}")
         }
@@ -563,6 +573,8 @@ class HttpAiClient(
         val retryable = obj.optBoolean("retryable", false)
 
         val reply = obj.optString("reply", "")
+        val taskId = if (obj.has("task_id") && !obj.isNull("task_id")) obj.getString("task_id") else null
+        val statusKey = if (obj.has("status_key") && !obj.isNull("status_key")) obj.getString("status_key") else null
         val codeTree = if (obj.has("code_tree") && !obj.isNull("code_tree")) obj.getString("code_tree") else null
         val done = obj.optBoolean("done", false)
 
@@ -604,7 +616,8 @@ class HttpAiClient(
         }
 
         return IdeChatResponse(
-            reply = reply, codeTree = codeTree, ops = ops,
+            reply = reply, taskId = taskId, statusKey = statusKey,
+            codeTree = codeTree, ops = ops,
             toolRequests = toolReqs, patchOps = patchOps, done = done,
             ok = ok, errorCode = errorCode, errorMessage = errorMessage, retryable = retryable
         )

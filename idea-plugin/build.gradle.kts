@@ -1,7 +1,7 @@
 plugins {
     id("java")
-    id("org.jetbrains.intellij") version "1.17.4" // 可以根据本地最新版本稍微调整
     kotlin("jvm") version "1.9.23"
+    id("org.jetbrains.intellij") version "1.17.4"
 }
 
 group = "com.zanghongtu"
@@ -17,16 +17,15 @@ dependencies {
 }
 
 intellij {
-    // 指定你本机有的 IntelliJ 版本（或使用 IC-2024.1 等）
     version.set("2024.1")
-    type.set("IC") // Community Edition
+    type.set("IC")
     plugins.set(listOf("java"))
 }
 
 tasks {
     patchPluginXml {
-        sinceBuild.set("241")          // 对应 2024.1
-        untilBuild.set("243.*")        // 兼容范围可自行调整
+        sinceBuild.set("241")
+        untilBuild.set("243.*")
     }
 
     compileKotlin {
@@ -39,6 +38,10 @@ tasks {
     }
 
     runIde {
-        // 这里可以保持默认
+        // Keep the default sandbox and IDE runtime behavior.
     }
+}
+
+tasks.matching { it.name == "initializeIntelliJPlugin" }.configureEach {
+    enabled = false
 }

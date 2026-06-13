@@ -21,6 +21,7 @@ data class ChatContext(
     val projectRoot: String?,
     val history: List<ChatMessage>,
     val projectId: String? = null,
+    val taskId: String? = null,
     // IntelliJ Project, used for zero-token local workspace/source-map indexing.
     val project: Project? = null,
     // DevWerk 上下文（记录请求/响应/执行）
@@ -117,6 +118,8 @@ data class FileOp(
  */
 data class IdeChatResponse(
     val reply: String,
+    val taskId: String? = null,
+    val statusKey: String? = null,
     val codeTree: String? = null,
     val ops: List<FileOp> = emptyList(),
     val toolRequests: List<ToolRequest> = emptyList(),
@@ -155,6 +158,8 @@ data class PlanFile(
  */
 data class PlanResponse(
     val ok: Boolean = true,
+    val taskId: String? = null,
+    val statusKey: String? = null,
     val files: List<PlanFile> = emptyList(),
     val summary: String = "",
     val warnings: List<String> = emptyList(),
@@ -168,6 +173,8 @@ data class PlanResponse(
 data class ExecuteRequest(
     val messages: List<ChatMessage>,
     val projectRoot: String?,
+    val projectId: String? = null,
+    val taskId: String? = null,
     val mode: String = "agent",
     val approvedPaths: List<String> = emptyList(),
     val approvedOps: List<FileOp> = emptyList()

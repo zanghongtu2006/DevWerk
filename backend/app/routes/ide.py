@@ -120,19 +120,26 @@ async def ide_plan(request: Request) -> PlanResponse:
             error_code="BAD_REQUEST",
             error_message="messages must be a non-empty list",
         )
+    task_id = _ensure_plan_task(body)
     _log.debug(
-        "ide_plan: received project_id=%s mode=%s messages=%s workspace_summary=%s",
+        "ide_plan: received project_id=%s task_id=%s mode=%s messages=%s workspace_summary=%s",
         body.get("project_id"),
+        task_id,
         body.get("mode", "agent"),
         len(messages),
         _workspace_debug_summary(body.get("workspace")),
     )
+    _kanban_artifact(task_id, "plan_request", payload=_plan_request_artifact(body))
+    _kanban_move(task_id, "context_indexed", {"workspace": _workspace_debug_summary(body.get("workspace"))})
     messages = _append_workspace_context(messages, body.get("workspace"))
     _log.debug("ide_plan: messages_after_workspace_context=%s", len(messages))
 
     if not any(m.get("role", "").lower() == "user" for m in messages):
+        _kanban_move(task_id, "failed", {"phase": "plan", "error": "messages must contain at least one user message"})
         return PlanResponse(
             ok=False,
+            task_id=task_id,
+            status_key="failed",
             error_code="BAD_REQUEST",
             error_message="messages must contain at least one user message",
         )
@@ -142,8 +149,11 @@ async def ide_plan(request: Request) -> PlanResponse:
         cfg.validate_provider("planner")
     except ValueError as ve:
         _log.warning("Provider validation failed: %s", ve)
+        _kanban_move(task_id, "failed", {"phase": "plan", "error": str(ve)})
         return PlanResponse(
             ok=False,
+            task_id=task_id,
+            status_key="failed",
             error_code="CONFIG_ERROR",
             error_message=str(ve),
         )
@@ -152,14 +162,16 @@ async def ide_plan(request: Request) -> PlanResponse:
         p = build_planner(agent_name="planner")
     except (ValueError, NotImplementedError) as exc:
         _log.warning("Planner creation failed: %s", exc)
+        _kanban_move(task_id, "failed", {"phase": "plan", "error": str(exc)})
         return PlanResponse(
             ok=False,
+            task_id=task_id,
+            status_key="failed",
             error_code="CONFIG_ERROR",
             error_message=str(exc),
         )
 
     mode = str(body.get("mode", "agent")).strip().lower() or "agent"
-    task_id = _body_task_id(body)
     _kanban_event(task_id, "plan_started", {"mode": mode})
 
     try:
@@ -167,8 +179,12 @@ async def ide_plan(request: Request) -> PlanResponse:
         if result.ok:
             _kanban_artifact(task_id, "plan_response", payload=result.model_dump())
             _kanban_move(task_id, "planned", {"files": len(result.files), "warnings": len(result.warnings)})
+            result.task_id = task_id
+            result.status_key = "planned"
         else:
             _kanban_move(task_id, "failed", {"phase": "plan", "error_code": result.error_code})
+            result.task_id = task_id
+            result.status_key = "failed"
         _log.debug(
             "ide_plan: planner_result ok=%s files=%s warnings=%s summary=%s",
             result.ok,
@@ -182,6 +198,8 @@ async def ide_plan(request: Request) -> PlanResponse:
         _kanban_move(task_id, "failed", {"phase": "plan", "error": f"{type(exc).__name__}: {exc}"})
         return PlanResponse(
             ok=False,
+            task_id=task_id,
+            status_key="failed",
             error_code="PLAN_ERROR",
             error_message=f"{type(exc).__name__}: {exc}",
         )
@@ -210,11 +228,14 @@ async def ide_execute(request: Request) -> IdeChatResponse:
             error_message=f"Failed to parse JSON: {exc}",
         )
 
+    task_id = _body_task_id(body)
     approved_paths = body.get("approved_paths", [])
     if not isinstance(approved_paths, list):
         return IdeChatResponse(
             ok=False,
             done=True,
+            task_id=task_id,
+            status_key="failed",
             error_code="BAD_REQUEST",
             error_message="approved_paths must be a list",
         )
@@ -227,6 +248,8 @@ async def ide_execute(request: Request) -> IdeChatResponse:
         return IdeChatResponse(
             ok=False,
             done=True,
+            task_id=task_id,
+            status_key="failed",
             error_code="CONFIG_ERROR",
             error_message=str(ve),
             retryable=False,
@@ -239,6 +262,8 @@ async def ide_execute(request: Request) -> IdeChatResponse:
         return IdeChatResponse(
             ok=False,
             done=True,
+            task_id=task_id,
+            status_key="failed",
             error_code="CONFIG_ERROR",
             error_message=str(exc),
             retryable=False,
@@ -249,6 +274,8 @@ async def ide_execute(request: Request) -> IdeChatResponse:
         return IdeChatResponse(
             ok=False,
             done=True,
+            task_id=task_id,
+            status_key="failed",
             error_code="BAD_REQUEST",
             error_message="messages must be a list",
         )
@@ -278,7 +305,6 @@ async def ide_execute(request: Request) -> IdeChatResponse:
     _log.debug("ide_execute: appended_execution_guard approved_count=%s final_messages=%s", len(approved_set), len(messages))
 
     mode = str(body.get("mode", "agent")).strip().lower() or "agent"
-    task_id = _body_task_id(body)
     _kanban_event(task_id, "execute_started", {"mode": mode, "approved_paths": approved_paths})
     _kanban_move(task_id, "coding", {"approved_paths": approved_paths})
 
@@ -311,6 +337,8 @@ async def ide_execute(request: Request) -> IdeChatResponse:
             response = IdeChatResponse(
                 ok=True,
                 reply=obj.get("reply", ""),
+                task_id=task_id,
+                status_key="ready_to_apply",
                 code_tree=obj.get("code_tree"),
                 ops=coerce_to_fileops(ops, tool_results=[]),
                 tool_requests=coerce_to_toolrequests(obj.get("tool_requests") or []),
@@ -340,12 +368,14 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                 ok=False,
                 reply="",
                 done=True,
+                task_id=task_id,
+                status_key="failed",
                 error_code="MODEL_ERROR",
                 error_message=f"{type(exc).__name__}: {exc}",
                 retryable=(attempt < max_retries),
             )
 
-    return IdeChatResponse(ok=False, reply="", done=True, error_code="UNKNOWN")
+    return IdeChatResponse(ok=False, reply="", done=True, task_id=task_id, status_key="failed", error_code="UNKNOWN")
 
 
 def _filter_ops(ops: list[dict], approved: set[str]) -> list[dict]:
@@ -595,6 +625,42 @@ def ide_chat(req: IdeChatRequest) -> IdeChatResponse:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _ensure_plan_task(body: dict) -> str:
+    task_id = _body_task_id(body)
+    if task_id:
+        return task_id
+
+    messages = body.get("messages") if isinstance(body, dict) else []
+    user_text = _first_user_text_from_messages(messages)
+    title = (user_text or "DevWerk planning task").strip().splitlines()[0][:120]
+    try:
+        result = create_task(
+            project_id=body.get("project_id"),
+            title=title or "DevWerk planning task",
+            description=user_text,
+            status_key="draft",
+            metadata={"entrypoint": "/v1/plan", "mode": body.get("mode", "agent")},
+        )
+        task_id = result["task"]["id"]
+        _log.debug("ide_plan: created kanban task_id=%s project_id=%s", task_id, body.get("project_id"))
+        return task_id
+    except Exception as exc:  # noqa: BLE001
+        fallback = str(uuid.uuid4())
+        _log.warning("ide_plan: failed to create kanban task, using ephemeral id=%s error=%s", fallback, exc)
+        return fallback
+
+
+def _plan_request_artifact(body: dict) -> dict:
+    messages = body.get("messages") if isinstance(body, dict) else []
+    return {
+        "project_id": body.get("project_id"),
+        "mode": body.get("mode", "agent"),
+        "message_count": len(messages) if isinstance(messages, list) else 0,
+        "user_request": _first_user_text_from_messages(messages),
+        "workspace_summary": _workspace_debug_summary(body.get("workspace")),
+    }
+
+
 def _ensure_chat_task(req: IdeChatRequest) -> str:
     if req.task_id:
         return req.task_id
@@ -709,6 +775,15 @@ def _first_user_text(req: IdeChatRequest) -> str:
     for m in reversed(req.messages):
         if (m.role or "").lower() == "user":
             return m.content or ""
+    return ""
+
+
+def _first_user_text_from_messages(messages: object) -> str:
+    if not isinstance(messages, list):
+        return ""
+    for item in reversed(messages):
+        if isinstance(item, dict) and str(item.get("role") or "").lower() == "user":
+            return str(item.get("content") or "")
     return ""
 
 

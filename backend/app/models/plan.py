@@ -38,6 +38,8 @@ class PlanResponse(BaseModel):
     """
 
     ok: bool = True
+    task_id: Optional[str] = None
+    status_key: Optional[str] = None
 
     files: list[PlanFile] = Field(
         default_factory=list,

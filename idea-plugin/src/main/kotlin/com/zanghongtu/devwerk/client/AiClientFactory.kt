@@ -13,9 +13,9 @@ object AiClientFactory {
         val base = normalizeBackendBase(profile.baseUrl.ifBlank { DEFAULT_BASE })
 
         return HttpAiClient(
-            chatEndpoint = "$base/v1/ide/chat",
-            planEndpoint = "$base/v1/ide/plan",
-            executeEndpoint = "$base/v1/ide/execute",
+            chatEndpoint = "$base/v1/chat",
+            planEndpoint = "$base/v1/plan",
+            executeEndpoint = "$base/v1/execute",
             attachmentEndpoint = "$base/v1/ide/attachments",
             authToken = profile.token.ifBlank { null }
         )
@@ -23,7 +23,17 @@ object AiClientFactory {
 
     private fun normalizeBackendBase(input: String): String {
         var s = input.trim().trimEnd('/')
-        val suffixes = listOf("/v1/ide/chat", "/v1/ide/plan", "/v1/ide/execute", "/v1/ide/attachments", "/v1/ide", "/v1")
+        val suffixes = listOf(
+            "/v1/ide/attachments",
+            "/v1/ide/chat",
+            "/v1/ide/plan",
+            "/v1/ide/execute",
+            "/v1/chat",
+            "/v1/plan",
+            "/v1/execute",
+            "/v1/ide",
+            "/v1"
+        )
         for (suffix in suffixes) {
             if (s.endsWith(suffix, ignoreCase = true)) {
                 s = s.removeSuffix(suffix)
