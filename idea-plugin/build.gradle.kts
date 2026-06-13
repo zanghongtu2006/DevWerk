@@ -1,3 +1,5 @@
+import org.gradle.jvm.tasks.Jar
+
 plugins {
     id("java")
     kotlin("jvm") version "1.9.23"
@@ -38,10 +40,22 @@ tasks {
     }
 
     runIde {
+        dependsOn("ensureCoroutinesJavaAgent")
         // Keep the default sandbox and IDE runtime behavior.
     }
 }
 
-tasks.matching { it.name == "initializeIntelliJPlugin" }.configureEach {
-    enabled = false
+tasks.register<Jar>("ensureCoroutinesJavaAgent") {
+    archiveFileName.set("coroutines-javaagent.jar")
+    destinationDirectory.set(layout.buildDirectory.dir("tmp/initializeIntelliJPlugin"))
+    manifest {
+        attributes(
+            mapOf(
+                "Premain-Class" to "kotlinx.coroutines.debug.AgentPremain",
+                "Can-Retransform-Classes" to "true",
+                "Multi-Release" to "true",
+            )
+        )
+    }
+    mustRunAfter("initializeIntelliJPlugin")
 }
