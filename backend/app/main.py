@@ -5,8 +5,8 @@ DevWerk Backend — FastAPI application entry point.
 from __future__ import annotations
 
 import logging
-import os
 import sys
+import time
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 sys.path.insert(0, str(__file__.rsplit("/", 2)[0]))
 
 from app.core.config import settings
+from app.core.logging import configure_logging, configure_logging_from_env
 from app.routes.ide import router as ide_router
 from app.routes.kanban import router as kanban_router
 from app.routes.kanban import ui_router as kanban_ui_router
@@ -34,6 +35,7 @@ async def lifespan(app: FastAPI):
     - Validate provider credentials on startup so failures are visible immediately.
     """
     cfg = settings()
+    configure_logging(cfg)
     log = logging.getLogger("devwerk")
 
     log.info("DevWerk starting — APP_ENV=%s, DEFAULT_API=%s", cfg.app_env, cfg.llm_provider_name)
@@ -61,6 +63,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
+    configure_logging_from_env()
     app = FastAPI(
         title="DevWerk API",
         description="AI-driven CodeOps backend for IDE integration.",
@@ -79,17 +82,49 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def usage_tracking_middleware(request: Request, call_next):
+        log = logging.getLogger("devwerk.request")
+        started = time.monotonic()
         if not request.url.path.startswith("/v1/"):
-            return await call_next(request)
+            response = await call_next(request)
+            log.debug(
+                "request path=%s method=%s status=%s duration_ms=%s",
+                request.url.path,
+                request.method,
+                response.status_code,
+                int((time.monotonic() - started) * 1000),
+            )
+            return response
 
         project_id = request.headers.get("X-DevWerk-Project-Id") or request.query_params.get("project_id")
         ctx = start_request(project_id, route=request.url.path, action=request.method)
+        log.debug(
+            "request start method=%s path=%s project_id=%s query=%s",
+            request.method,
+            request.url.path,
+            project_id,
+            str(request.query_params),
+        )
         try:
             response = await call_next(request)
             finish_request(ctx, status_code=response.status_code, success=response.status_code < 500)
+            log.debug(
+                "request end method=%s path=%s project_id=%s status=%s duration_ms=%s",
+                request.method,
+                request.url.path,
+                ctx.project_id,
+                response.status_code,
+                int((time.monotonic() - started) * 1000),
+            )
             return response
         except Exception as exc:  # noqa: BLE001
             finish_request(ctx, status_code=500, success=False, error_type=type(exc).__name__)
+            log.exception(
+                "request failed method=%s path=%s project_id=%s duration_ms=%s",
+                request.method,
+                request.url.path,
+                ctx.project_id,
+                int((time.monotonic() - started) * 1000),
+            )
             raise
         finally:
             clear_request()
@@ -109,9 +144,12 @@ if __name__ == "__main__":
     # Allow:  python app/main.py
     # Equivalent to: uvicorn app.main:app --reload --port 8000
     cfg = settings()
+    configure_logging(cfg)
     uvicorn.run(
         "app.main:app",
         host=cfg.host,
         port=cfg.port,
         reload=cfg.reload,
+        log_level=cfg.log_level.lower(),
+        access_log=cfg.uvicorn_access_log,
     )

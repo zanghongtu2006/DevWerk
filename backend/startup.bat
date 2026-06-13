@@ -29,6 +29,8 @@ if not defined APP_ENV set "APP_ENV=development"
 if not defined HOST set "HOST=0.0.0.0"
 if not defined PORT set "PORT=8000"
 if not defined RELOAD set "RELOAD=false"
+if not defined LOG_LEVEL set "LOG_LEVEL=debug"
+if not defined UVICORN_ACCESS_LOG set "UVICORN_ACCESS_LOG=true"
 
 if not "%APP_ENV%"=="development" if not "%APP_ENV%"=="production" if not "%APP_ENV%"=="test" (
     echo [DevWerk] Invalid APP_ENV: %APP_ENV%
@@ -55,8 +57,14 @@ if /i "%RELOAD%"=="true" set "UVICORN_RELOAD=--reload"
 if /i "%RELOAD%"=="1" set "UVICORN_RELOAD=--reload"
 if /i "%RELOAD%"=="yes" set "UVICORN_RELOAD=--reload"
 
+set "UVICORN_ACCESS_FLAG=--access-log"
+if /i "%UVICORN_ACCESS_LOG%"=="false" set "UVICORN_ACCESS_FLAG=--no-access-log"
+if /i "%UVICORN_ACCESS_LOG%"=="0" set "UVICORN_ACCESS_FLAG=--no-access-log"
+if /i "%UVICORN_ACCESS_LOG%"=="no" set "UVICORN_ACCESS_FLAG=--no-access-log"
+
 echo [DevWerk] Starting in %APP_ENV% mode...
 echo [DevWerk] Starting uvicorn on http://%HOST%:%PORT% ...
+echo [DevWerk] Log level:          %LOG_LEVEL%
 echo [DevWerk] API docs:           http://localhost:%PORT%/docs
 echo [DevWerk] Alternative docs:   http://localhost:%PORT%/redoc
 echo.
@@ -70,4 +78,4 @@ if errorlevel 1 (
     exit /b 1
 )
 
-"%PYTHON_EXE%" -m uvicorn app.main:app %UVICORN_RELOAD% --host %HOST% --port %PORT%
+"%PYTHON_EXE%" -m uvicorn app.main:app %UVICORN_RELOAD% --host %HOST% --port %PORT% --log-level %LOG_LEVEL% %UVICORN_ACCESS_FLAG%

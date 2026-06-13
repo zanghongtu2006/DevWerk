@@ -72,6 +72,40 @@ Expected result:
 3 passed
 ```
 
+## Backend Debug Log Smoke
+
+The backend defaults to debug logging. These settings can be overridden in
+`backend/.env`:
+
+```env
+LOG_LEVEL=debug
+LOG_FORMAT=%(asctime)s %(levelname)s [%(name)s] %(message)s
+UVICORN_ACCESS_LOG=true
+```
+
+Command:
+
+```powershell
+cd backend
+startup.bat
+```
+
+Coverage:
+
+- Uvicorn starts with debug log level.
+- `devwerk.*` loggers emit debug logs.
+- Each `/v1/*` request logs start/end, method, path, project id, status, and duration.
+- Usage, kanban, planner, coder harness, and IDE route debug logs are visible.
+
+Expected result:
+
+```text
+[DevWerk] Log level:          debug
+...
+DEBUG [devwerk.request] request start method=...
+DEBUG [devwerk.request] request end method=...
+```
+
 ## Backend Syntax Smoke
 
 Command:

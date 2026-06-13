@@ -89,6 +89,9 @@ class Settings(BaseSettings):
     host: str = Field(default="0.0.0.0")
     port: int = Field(default=8000)
     reload: bool = Field(default=False)
+    log_level: str = Field(default="debug")
+    log_format: str = Field(default="%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    uvicorn_access_log: bool = Field(default=True)
 
     # Local usage accounting.
     devwerk_usage_tracking: bool = Field(default=True)
