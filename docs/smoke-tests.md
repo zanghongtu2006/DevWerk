@@ -23,7 +23,7 @@ Coverage:
 Expected result:
 
 ```text
-4 passed
+3 passed
 ```
 
 ## Backend Coding Workflow Smoke
@@ -43,13 +43,17 @@ Coverage:
 - Verifies `/v1/plan` returns `task_id`, `status_key=planned`, and file-level plan data.
 - Calls `POST /v1/execute` with the same `task_id` and approved paths.
 - Verifies `/v1/execute` returns `ok=true`, `status_key=ready_to_apply`, `done=true`, and file ops.
+- Verifies `/v1/execute` can return client-side `tool_requests` such as
+  `run_command` together with file ops.
+- Verifies a simulated plugin `apply_result` with passing verification moves the
+  same kanban task to `done`.
 - Verifies the kanban task is still the same task and contains `plan_request`,
   `plan_response`, and `execute_response` artifacts.
 
 Expected result:
 
 ```text
-3 passed
+5 passed
 ```
 
 ## Backend Full Test Smoke
@@ -69,7 +73,7 @@ Coverage:
 Expected result:
 
 ```text
-7 passed
+8 passed
 ```
 
 ## Backend Debug Log Smoke

@@ -26,6 +26,8 @@ import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import javax.swing.*
 import javax.swing.border.AbstractBorder
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * DevWerk tool window panel — two-phase workflow:
@@ -429,7 +431,15 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                     runCatching {
                         runner.applyResponse(project, devCtx, execResp)
                     }.onSuccess {
-                        reportApplyResult(aiClient, execResp, devCtx, ok = true, changedPaths = collectChangedPaths(execResp))
+                        val verification = runPostApplyTools(aiClient, chatCtx, execResp, devCtx)
+                        reportApplyResult(
+                            aiClient,
+                            execResp,
+                            devCtx,
+                            ok = true,
+                            changedPaths = collectChangedPaths(execResp),
+                            verification = verification
+                        )
                     }.onFailure { applyError ->
                         reportApplyResult(
                             aiClient,
@@ -504,7 +514,15 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                     runCatching {
                         runner.applyResponse(project, devCtx, response)
                     }.onSuccess {
-                        reportApplyResult(aiClient, response, devCtx, ok = true, changedPaths = collectChangedPaths(response))
+                        val verification = runPostApplyTools(aiClient as? HttpAiClient, updatedCtx, response, devCtx)
+                        reportApplyResult(
+                            aiClient,
+                            response,
+                            devCtx,
+                            ok = true,
+                            changedPaths = collectChangedPaths(response),
+                            verification = verification
+                        )
                     }.onFailure { applyError ->
                         reportApplyResult(
                             aiClient,
@@ -568,7 +586,8 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         devCtx: DevwerkContext?,
         ok: Boolean,
         changedPaths: List<String>,
-        errorMessage: String? = null
+        errorMessage: String? = null,
+        verification: JSONObject = JSONObject()
     ) {
         val taskId = response.taskId ?: currentPlan?.taskId ?: return
         val http = aiClient as? HttpAiClient ?: return
@@ -579,7 +598,8 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 snapshotId = devCtx?.opDir?.fileName?.toString(),
                 changedPaths = changedPaths,
                 errorMessage = errorMessage,
-                projectId = DevWerkProjectMeta.getOrCreateProjectId(project)
+                projectId = DevWerkProjectMeta.getOrCreateProjectId(project),
+                verification = verification
             )
             appendOpLog(devCtx, "[INFO] Kanban apply_result action reported: ok=$ok taskId=$taskId\n")
         }.onFailure { syncError ->
@@ -589,6 +609,43 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 appendChatLine("[Warn] Kanban sync failed: ${syncError.message}")
             }
         }
+    }
+
+    private fun runPostApplyTools(
+        http: HttpAiClient?,
+        context: ChatContext,
+        response: IdeChatResponse,
+        devCtx: DevwerkContext?
+    ): JSONObject {
+        val requests = response.toolRequests
+        if (http == null || requests.isEmpty()) return JSONObject()
+
+        appendOpLog(devCtx, "[INFO] Executing ${requests.size} post-apply tool request(s).\n")
+        val results = http.executeClientTools(context, requests)
+        val byId = results.associateBy { it.id }
+        val required = JSONArray()
+        val resultMap = JSONObject()
+        val details = JSONArray()
+
+        for (request in requests) {
+            val result = byId[request.id]
+            val ok = result?.ok == true
+            required.put(request.id)
+            resultMap.put(request.id, if (ok) "passed" else "failed")
+            details.put(
+                JSONObject()
+                    .put("id", request.id)
+                    .put("tool", request.tool)
+                    .put("ok", ok)
+                    .put("content", result?.content ?: JSONObject.NULL)
+                    .put("error", result?.error ?: JSONObject.NULL)
+            )
+        }
+
+        return JSONObject()
+            .put("required", required)
+            .put("results", resultMap)
+            .put("tool_results", details)
     }
 
     private fun collectChangedPaths(response: IdeChatResponse): List<String> {

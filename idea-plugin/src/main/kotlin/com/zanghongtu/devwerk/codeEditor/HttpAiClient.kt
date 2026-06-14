@@ -162,15 +162,24 @@ class HttpAiClient(
         snapshotId: String?,
         changedPaths: List<String>,
         errorMessage: String? = null,
-        projectId: String? = null
+        projectId: String? = null,
+        verification: JSONObject = JSONObject()
     ) {
         val body = JSONObject()
         body.put("ok", ok)
         body.put("snapshot_id", snapshotId ?: JSONObject.NULL)
         body.put("changed_paths", JSONArray(changedPaths))
-        body.put("verification", JSONObject())
+        body.put("verification", verification)
         body.put("error_message", errorMessage ?: JSONObject.NULL)
         postKanbanAction(taskId, "apply_result", body, projectId)
+    }
+
+    fun executeClientTools(context: ChatContext, reqs: List<ToolRequest>): List<ToolResult> {
+        if (reqs.isEmpty()) return emptyList()
+        appendDevLog(context, "\n===== CLIENT TOOL REQUESTS =====\n${toolRequestsToJson(reqs)}\n")
+        val results = executeTools(context.projectRoot, reqs)
+        appendDevLog(context, "\n===== CLIENT TOOL RESULTS =====\n${toolResultsToJson(results)}\n")
+        return results
     }
 
     // -------------------------------------------------------------------------
@@ -209,22 +218,26 @@ class HttpAiClient(
             var resp = respParsed.copy(rawResponses = rawResponses.toList())
             lastResp = resp
 
-            if (resp.toolRequests.isNotEmpty() && mode == "agent") {
+            val backendToolRequests = resp.toolRequests.filter { isBackendTool(it.tool) }
+            val clientToolRequests = resp.toolRequests.filterNot { isBackendTool(it.tool) }
+
+            if (backendToolRequests.isNotEmpty() && mode == "agent") {
                 if (resp.ops.isNotEmpty() || resp.patchOps.isNotEmpty()) {
                     accOps += resp.ops
                     accPatchOps += resp.patchOps
-                    appendDevLog(context, "\n[WARN] Model returned tool_requests with ops/patch_ops. Accumulating and continuing.\n")
+                    appendDevLog(context, "\n[WARN] Model returned backend tool_requests with ops/patch_ops. Accumulating and continuing.\n")
                     resp = resp.copy(ops = emptyList(), patchOps = emptyList())
                 }
 
-                messages += ChatMessage("assistant", "tool_requests:\n" + toolRequestsToJson(resp.toolRequests))
-                pendingToolResults = executeTools(context.projectRoot, resp.toolRequests)
+                messages += ChatMessage("assistant", "tool_requests:\n" + toolRequestsToJson(backendToolRequests))
+                pendingToolResults = executeTools(context.projectRoot, backendToolRequests)
                 continue
             }
 
             val merged = resp.copy(
                 ops = (accOps + resp.ops),
                 patchOps = (accPatchOps + resp.patchOps),
+                toolRequests = clientToolRequests,
                 rawResponses = rawResponses.toList()
             )
             return merged
@@ -496,6 +509,19 @@ class HttpAiClient(
         return arr.toString()
     }
 
+    private fun toolResultsToJson(results: List<ToolResult>): String {
+        val arr = JSONArray()
+        for (r in results) {
+            val o = JSONObject()
+            o.put("id", r.id)
+            o.put("ok", r.ok)
+            o.put("content", r.content ?: JSONObject.NULL)
+            o.put("error", r.error ?: JSONObject.NULL)
+            arr.put(o)
+        }
+        return arr.toString()
+    }
+
     // -------------------------------------------------------------------------
     // Hidden-dir guard helpers
     // -------------------------------------------------------------------------
@@ -556,11 +582,22 @@ class HttpAiClient(
                         val paths: List<String> = when (pathsAny) {
                             is List<*> -> pathsAny.filterIsInstance<String>()
                             is Array<*> -> pathsAny.filterIsInstance<String>()
+                            is JSONArray -> (0 until pathsAny.length()).mapNotNull { pathsAny.optString(it, "").takeIf { s -> s.isNotBlank() } }
                             else -> emptyList()
                         }
                         val safePaths = paths.map { normRel(it) }.filter { it.isBlank() || !containsHiddenSegment(it) }
                         val content = WorkspaceTools.search(base, query, safePaths, maxResults)
                         results += ToolResult(id = id, ok = true, content = content)
+                    }
+                    "run_command" -> {
+                        val content = runCommandTool(base, r.args)
+                        val ok = content.first
+                        results += ToolResult(
+                            id = id,
+                            ok = ok,
+                            content = content.second,
+                            error = if (ok) null else content.second
+                        )
                     }
                     else -> results += ToolResult(id = id, ok = false, error = "unknown tool: ${r.tool}")
                 }
@@ -570,6 +607,129 @@ class HttpAiClient(
         }
         return results
     }
+
+    private fun runCommandTool(basePath: String, args: Map<String, Any?>): Pair<Boolean, String> {
+        val command = commandParts(args)
+        if (command.isEmpty()) return false to "[run_command] command must be a non-empty array or string"
+        val cwdRel = normRel((args["cwd"] as? String) ?: "")
+        if (cwdRel.isNotBlank() && containsHiddenSegment(cwdRel)) {
+            return false to "[run_command] blocked hidden cwd: $cwdRel"
+        }
+        val base = File(basePath).canonicalFile
+        val cwd = if (cwdRel.isBlank()) base else File(base, cwdRel).canonicalFile
+        if (cwd != base && !cwd.path.startsWith(base.path + File.separator)) {
+            return false to "[run_command] cwd escapes project root: $cwdRel"
+        }
+        if (!cwd.exists() || !cwd.isDirectory) {
+            return false to "[run_command] cwd is not a directory: $cwdRel"
+        }
+
+        val resolved = resolveCommand(base, cwd, command)
+        if (resolved.second != null) {
+            return false to resolved.second!!
+        }
+        val commandToRun = resolved.first ?: command
+
+        val timeoutSeconds = ((args["timeout_seconds"] as? Number)?.toLong() ?: 120L).coerceIn(1L, 300L)
+        val process = ProcessBuilder(commandToRun)
+            .directory(cwd)
+            .redirectErrorStream(true)
+            .start()
+        val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroyForcibly()
+            return false to "[run_command] timed out after ${timeoutSeconds}s\ncommand=${commandToRun.joinToString(" ")}"
+        }
+        val output = process.inputStream.readBytes().toString(StandardCharsets.UTF_8).takeLast(20000)
+        val exitCode = process.exitValue()
+        val content = buildString {
+            append("[run_command] command=").append(command.joinToString(" ")).append("\n")
+            append("[run_command] resolved_command=").append(commandToRun.joinToString(" ")).append("\n")
+            append("[run_command] cwd=").append(cwd.relativeToOrSelf(base).path.ifBlank { "." }).append("\n")
+            append("[run_command] exit_code=").append(exitCode).append("\n")
+            append(output)
+        }
+        return (exitCode == 0) to content
+    }
+
+    private fun commandParts(args: Map<String, Any?>): List<String> {
+        val raw = args["command"]
+        val parts = when (raw) {
+            is JSONArray -> (0 until raw.length()).mapNotNull { raw.optString(it, "").takeIf { s -> s.isNotBlank() } }
+            is List<*> -> raw.mapNotNull { it as? String }.filter { it.isNotBlank() }
+            is Array<*> -> raw.mapNotNull { it as? String }.filter { it.isNotBlank() }
+            is String -> raw.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+            else -> emptyList()
+        }
+        val extra = when (val rawArgs = args["args"]) {
+            is JSONArray -> (0 until rawArgs.length()).mapNotNull { rawArgs.optString(it, "").takeIf { s -> s.isNotBlank() } }
+            is List<*> -> rawArgs.mapNotNull { it as? String }.filter { it.isNotBlank() }
+            is Array<*> -> rawArgs.mapNotNull { it as? String }.filter { it.isNotBlank() }
+            else -> emptyList()
+        }
+        return parts + extra
+    }
+
+    private fun isAllowedCommand(executable: String): Boolean {
+        val normalized = executable.trim().replace("\\", "/").substringAfterLast("/").lowercase()
+        return normalized in setOf(
+            "gradlew",
+            "gradlew.bat",
+            "mvnw",
+            "mvnw.cmd",
+            "gradle",
+            "gradle.bat",
+            "mvn",
+            "mvn.cmd"
+        )
+    }
+
+    private fun resolveCommand(base: File, cwd: File, command: List<String>): Pair<List<String>?, String?> {
+        val rawExecutable = command.first().trim()
+        val executableName = rawExecutable.replace("\\", "/").substringAfterLast("/").lowercase()
+        if (!isAllowedCommand(rawExecutable)) {
+            return null to "[run_command] executable is not allowed: $rawExecutable"
+        }
+
+        val hasPath = rawExecutable.contains("/") || rawExecutable.contains("\\")
+        val args = command.drop(1)
+        val isWrapper = executableName in setOf("gradlew", "gradlew.bat", "mvnw", "mvnw.cmd")
+        val isWindows = System.getProperty("os.name").lowercase().contains("win")
+
+        if (!isWrapper) {
+            if (hasPath) {
+                return null to "[run_command] path-qualified global executable is not allowed: $rawExecutable"
+            }
+            return command to null
+        }
+
+        val rel = rawExecutable.trimStart('.', '/', '\\')
+        val candidates = mutableListOf<File>()
+        candidates += File(cwd, rel)
+        if (!executableName.endsWith(".bat") && !executableName.endsWith(".cmd")) {
+            candidates += File(cwd, "$rel.cmd")
+            candidates += File(cwd, "$rel.bat")
+        }
+
+        val target = candidates
+            .map { runCatching { it.canonicalFile }.getOrNull() }
+            .firstOrNull { it != null && it.exists() && it.isFile }
+            ?: return null to "[run_command] project wrapper not found: $rawExecutable"
+
+        if (target != base && !target.path.startsWith(base.path + File.separator)) {
+            return null to "[run_command] wrapper escapes project root: $rawExecutable"
+        }
+
+        val resolved = if (isWindows && target.extension.lowercase() in setOf("bat", "cmd")) {
+            listOf("cmd.exe", "/c", target.path) + args
+        } else {
+            listOf(target.path) + args
+        }
+        return resolved to null
+    }
+
+    private fun isBackendTool(tool: String): Boolean =
+        tool in setOf("list_dir", "read_file", "search")
 
     private fun typeName(t: Throwable): String = t::class.java.simpleName.ifBlank { "Throwable" }
 

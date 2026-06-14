@@ -393,22 +393,25 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                 ops = _filter_ops(obj.get("ops") or [], approved_set, body.get("project_root"))
                 patch_ops = _filter_patch_ops(obj.get("patch_ops") or [], approved_set, body.get("project_root"))
                 tool_requests = coerce_to_toolrequests(obj.get("tool_requests") or [])
+                backend_tool_requests = [req for req in tool_requests if _is_backend_tool_request(req)]
+                client_tool_requests = [req for req in tool_requests if not _is_backend_tool_request(req)]
                 _log.debug(
-                    "ide_execute: filtered round=%s ops=%s patch_ops=%s tool_requests=%s approved_paths=%s",
+                    "ide_execute: filtered round=%s ops=%s patch_ops=%s backend_tool_requests=%s client_tool_requests=%s approved_paths=%s",
                     tool_round + 1,
                     len(ops),
                     len(patch_ops),
-                    len(tool_requests),
+                    len(backend_tool_requests),
+                    len(client_tool_requests),
                     sorted(approved_set),
                 )
 
-                if tool_requests and mode == "agent" and not ops and not patch_ops:
+                if backend_tool_requests and mode == "agent" and not ops and not patch_ops:
                     _kanban_event(
                         task_id,
                         "execute_tool_requests",
-                        {"round": tool_round + 1, "count": len(tool_requests)},
+                        {"round": tool_round + 1, "count": len(backend_tool_requests)},
                     )
-                    tool_results = _execute_tool_requests(body.get("project_root"), tool_requests)
+                    tool_results = _execute_tool_requests(body.get("project_root"), backend_tool_requests)
                     _log.debug(
                         "ide_execute: tool_results round=%s results=%s",
                         tool_round + 1,
@@ -421,7 +424,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                         {
                             "role": "assistant",
                             "content": "tool_requests:\n"
-                            + json.dumps([r.model_dump(exclude_none=True) for r in tool_requests], ensure_ascii=False),
+                            + json.dumps([r.model_dump(exclude_none=True) for r in backend_tool_requests], ensure_ascii=False),
                         }
                     ]
                     continue
@@ -433,7 +436,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                     status_key="ready_to_apply",
                     code_tree=obj.get("code_tree"),
                     ops=coerce_to_fileops(ops, tool_results=[]),
-                    tool_requests=[],
+                    tool_requests=client_tool_requests,
                     patch_ops=coerce_to_patchops(patch_ops),
                     done=bool(obj.get("done") or False),
                 )
@@ -451,6 +454,10 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                     outputs={
                         "ops": [{"op": op.op, "path": op.path, "language": op.language} for op in response.ops],
                         "patch_ops": len(response.patch_ops),
+                        "client_tool_requests": [
+                            {"id": req.id, "tool": req.tool, "args": req.args}
+                            for req in response.tool_requests
+                        ],
                         "done": response.done,
                     },
                     warnings=[],
@@ -464,7 +471,13 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                 _kanban_move(
                     task_id,
                     "ready_to_apply",
-                    {"ops": len(response.ops), "patch_ops": len(response.patch_ops), "done": response.done, "session_id": response.session_id},
+                    {
+                        "ops": len(response.ops),
+                        "patch_ops": len(response.patch_ops),
+                        "tool_requests": len(response.tool_requests),
+                        "done": response.done,
+                        "session_id": response.session_id,
+                    },
                 )
                 return response
 
@@ -650,6 +663,10 @@ def _execute_tool_requests(project_root: str | None, reqs: list[ToolRequest]) ->
         except Exception as exc:  # noqa: BLE001
             results.append(ToolResult(id=req.id, ok=False, error=f"{type(exc).__name__}: {exc}"))
     return results
+
+
+def _is_backend_tool_request(req: ToolRequest) -> bool:
+    return req.tool in {"list_dir", "read_file", "search"}
 
 
 def _tool_list_dir(root: Path, rel: str, max_depth: int) -> str:

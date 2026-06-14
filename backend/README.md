@@ -138,7 +138,38 @@ Behavior:
 5. Move to `Planned`.
 6. Generate code changes.
 7. Move to `Ready To Apply`.
-8. Return `phase_output`, `next_action`, and `ops` and/or `patch_ops` to the plugin.
+8. Return `phase_output`, `next_action`, `ops` and/or `patch_ops`, plus any
+   client-side post-apply `tool_requests` to the plugin.
+
+## Tool Requests
+
+`tool_requests` is an extensible backend-to-client action protocol.
+
+- Backend research tools: `list_dir`, `read_file`, `search`
+- Client-side post-apply tools: currently `run_command`; future IntelliJ SDK
+  actions can use the same response field
+
+Backend research tools are resolved inside `/v1/execute` before file operations
+are returned. Client-side tools may be returned with `ops` or `patch_ops`; the
+IDE plugin applies the generated changes first, runs the tool, then reports the
+result through `apply_result.verification`.
+
+Example client-side tool request:
+
+```json
+{
+  "id": "compile",
+  "tool": "run_command",
+  "args": {
+    "command": ["./mvnw", "test"],
+    "timeout_seconds": 120
+  }
+}
+```
+
+The current plugin implementation refuses shell wrappers and only allows
+project-local Gradle/Maven executables such as `gradlew`, `mvnw`, `gradle`, and
+`mvn`.
 
 ### `POST /v1/kanban/tasks/{task_id}/actions`
 

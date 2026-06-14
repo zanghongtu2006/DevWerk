@@ -76,7 +76,7 @@ data class SourceMapSymbol(
  */
 data class ToolRequest(
     val id: String,
-    val tool: String, // list_dir | read_file | search
+    val tool: String,
     val args: Map<String, Any?> = emptyMap()
 )
 

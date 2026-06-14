@@ -35,7 +35,7 @@ MODEL_RESPONSE_SCHEMA = {
         "required": ["id", "tool", "args"],
         "properties": {
           "id": {"type": "string"},
-          "tool": {"type": "string", "enum": ["list_dir","read_file","search"]},
+          "tool": {"type": "string"},
           "args": {"type": "object"},
         },
       },

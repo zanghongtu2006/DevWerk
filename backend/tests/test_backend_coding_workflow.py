@@ -124,6 +124,30 @@ class FakeToolLoopExecutorClient:
         }
 
 
+class FakeClientToolExecutorClient:
+    def chat_structured(self, messages: list[dict]) -> dict:
+        return {
+            "reply": "Generated code and requested a post-apply compile.",
+            "ops": [
+                {
+                    "op": "create_file",
+                    "path": "src/main/java/com/devwerk/demo/HelloController.java",
+                    "language": "java",
+                    "content": "package com.devwerk.demo;\n\npublic class HelloController {}\n",
+                }
+            ],
+            "patch_ops": [],
+            "tool_requests": [
+                {
+                    "id": "compile",
+                    "tool": "run_command",
+                    "args": {"command": ["./mvnw", "test"], "timeout_seconds": 120},
+                }
+            ],
+            "done": True,
+        }
+
+
 @pytest.mark.asyncio
 async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_path):
     db_path = tmp_path / "devwerk-smoke.db"
@@ -360,6 +384,109 @@ async def test_execute_resolves_tool_requests_and_strips_project_root_prefix(mon
     assert executed["tool_requests"] == []
     assert fake_executor.calls == 2
     assert executed["ops"][0]["path"] == "src/main/java/org/example/HelloController.java"
+
+
+@pytest.mark.asyncio
+async def test_execute_returns_client_tool_requests_and_apply_result_completes_task(monkeypatch, tmp_path):
+    db_path = tmp_path / "devwerk-client-tool.db"
+    project_root = tmp_path / "tool-project"
+    project_root.mkdir()
+    fake_settings = FakeSettings(db_path)
+
+    import app.main as main_module
+    import app.routes.ide as ide_routes
+    import app.services.kanban as kanban_service
+    import app.services.usage as usage_service
+
+    monkeypatch.setattr(main_module, "settings", lambda: fake_settings)
+    monkeypatch.setattr(ide_routes, "settings", lambda: fake_settings)
+    monkeypatch.setattr(kanban_service, "settings", lambda: fake_settings)
+    monkeypatch.setattr(usage_service, "settings", lambda: fake_settings)
+    reset_service_dbs(kanban_service, usage_service)
+    monkeypatch.setattr(ide_routes, "get_llm_client", lambda agent="executor": FakeClientToolExecutorClient())
+
+    task = kanban_service.create_task(
+        project_id="backend-client-tool-smoke",
+        title="Add controller",
+        description="Smoke",
+        status_key="planned",
+    )["task"]
+
+    app = main_module.create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            execute_response = await client.post(
+                "/v1/execute",
+                json={
+                    "project_id": "backend-client-tool-smoke",
+                    "task_id": task["id"],
+                    "mode": "agent",
+                    "project_root": str(project_root),
+                    "messages": [
+                        {"role": "user", "content": "Add a controller and verify it compiles."}
+                    ],
+                    "approved_paths": ["src/main/java/com/devwerk/demo/HelloController.java"],
+                    "approved_ops": [],
+                    "workspace": {
+                        "root_id": "backend-client-tool-smoke",
+                        "changed_files": [],
+                        "open_files": [],
+                        "tree_preview": "",
+                        "source_map": None,
+                    },
+                },
+                headers={"X-DevWerk-Project-Id": "backend-client-tool-smoke"},
+            )
+
+            assert execute_response.status_code == 200
+            executed = execute_response.json()
+            assert executed["ok"] is True
+            assert executed["status_key"] == "ready_to_apply"
+            assert len(executed["ops"]) == 1
+            assert executed["tool_requests"] == [
+                {
+                    "id": "compile",
+                    "tool": "run_command",
+                    "args": {"command": ["./mvnw", "test"], "timeout_seconds": 120},
+                }
+            ]
+            assert executed["phase_output"]["outputs"]["client_tool_requests"][0]["tool"] == "run_command"
+
+            apply_response = await client.post(
+                f"/v1/kanban/tasks/{task['id']}/actions",
+                json={
+                    "action": "apply_result",
+                    "payload": {
+                        "ok": True,
+                        "snapshot_id": "20260614-0001-smoke",
+                        "changed_paths": ["src/main/java/com/devwerk/demo/HelloController.java"],
+                        "verification": {
+                            "required": ["compile"],
+                            "results": {"compile": "passed"},
+                            "tool_results": [
+                                {
+                                    "id": "compile",
+                                    "tool": "run_command",
+                                    "ok": True,
+                                    "content": "BUILD SUCCESS",
+                                    "error": None,
+                                }
+                            ],
+                        },
+                    },
+                },
+            )
+
+            assert apply_response.status_code == 200
+            applied = apply_response.json()
+            assert applied["task"]["status_key"] == "done"
+
+            task_response = await client.get(f"/v1/kanban/tasks/{task['id']}")
+            task_detail = task_response.json()["task"]
+            artifact_types = [artifact["artifact_type"] for artifact in task_detail["artifacts"]]
+            assert "apply_result" in artifact_types
+            assert artifact_types.count("workflow_phase_output") >= 2
 
 
 def _apply_file_ops(project_root: Path, ops: list[dict]) -> None:

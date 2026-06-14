@@ -5,7 +5,7 @@ from typing import Any, Dict, List
 
 
 ALLOWED_FILE_OPS = {"create_dir", "create_file", "update_file", "delete_path"}
-ALLOWED_TOOLS = {"list_dir", "read_file", "search"}
+BACKEND_RESEARCH_TOOLS = {"list_dir", "read_file", "search"}
 ALLOWED_PATCH_OPS = {"apply_patch"}
 
 
@@ -57,7 +57,7 @@ def validate_model_response(obj: Dict[str, Any]) -> None:
         for i, tr in enumerate(tool_requests):
             if not isinstance(tr, dict):
                 raise ValueError(f"tool_requests[{i}] must be object")
-            if tr.get("tool") not in ALLOWED_TOOLS:
+            if not isinstance(tr.get("tool"), str) or not tr.get("tool"):
                 raise ValueError(f"tool_requests[{i}].tool invalid")
             if not isinstance(tr.get("id"), str) or not tr.get("id"):
                 raise ValueError(f"tool_requests[{i}].id invalid")
@@ -97,6 +97,6 @@ def validate_model_response(obj: Dict[str, Any]) -> None:
     tool_requests = obj.get("tool_requests") or []
     patch_ops = obj.get("patch_ops") or []
 
-    #  强制：同一轮不能“边问边改”
-    if tool_requests and (ops or patch_ops):
-        raise ValueError("If tool_requests is non-empty, ops and patch_ops must be empty in the same response.")
+    backend_tools = [tr for tr in tool_requests if isinstance(tr, dict) and tr.get("tool") in BACKEND_RESEARCH_TOOLS]
+    if backend_tools and (ops or patch_ops):
+        raise ValueError("Backend research tools cannot be returned with ops/patch_ops in the same response.")

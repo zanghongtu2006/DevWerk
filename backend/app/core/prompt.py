@@ -59,11 +59,23 @@ SYSTEM_PROMPT = textwrap.dedent(
        - 严禁编造路径或把 A 文件名当成 B 文件名。
 
     8) 多轮交互策略（必须遵守）：
-       - 如果你输出了 tool_requests，本轮不得同时输出 ops/patch_ops（避免“边问边改”）。
+       - 如果你输出了后端研究工具（list_dir/read_file/search），本轮不得同时输出 ops/patch_ops（避免“边问边改”）。
        - 下一轮你会收到 tool_results；你必须基于 tool_results 决策下一步：
          * 继续 tool_requests（当信息仍不足）
          * 或输出 ops / patch_ops（当信息足够）
          * 或 done=true（当用户目标已完成且验证通过）
+
+    9) Tool request protocol override:
+       - Backend research tools are list_dir, read_file, and search. If you need
+         these tools, return them without ops or patch_ops.
+       - Client-side post-apply tools may be returned together with ops or
+         patch_ops. The IDE plugin applies changes first, then executes the
+         client tool, then reports apply_result verification to the kanban state
+         machine.
+       - Use client-side run_command only for project-local build/test commands,
+         for example:
+         {"id":"compile","tool":"run_command","args":{"command":["./mvnw","test"],"timeout_seconds":120}}
+       - Do not use shell wrappers such as cmd, powershell, bash, or sh.
 
     JSON Schema：
     __SCHEMA_JSON__

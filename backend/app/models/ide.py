@@ -54,7 +54,7 @@ class WorkspaceSummary(BaseModel):
 
 class ToolRequest(BaseModel):
     id: str
-    tool: str  # list_dir | read_file | search
+    tool: str
     args: Dict[str, Any] = Field(default_factory=dict)
 
 

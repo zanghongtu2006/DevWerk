@@ -18,7 +18,10 @@ OPENAI_SYSTEM_PROMPT = textwrap.dedent(
     3) mode=agent 时：信息不足必须先 tool_requests；严禁凭空猜测文件内容、文件路径、文件名、项目结构。
        若 workspace_summary.source_map 存在，必须优先使用它定位文件、包、类、方法、入口点和依赖关系。
        若收到 coder_harness_skill，必须把它视为本轮代码写入规则并优先遵守。
-    4) 如果输出了 tool_requests，本轮不得同时输出 ops/patch_ops。
+    4) Backend research tool_requests (list_dir/read_file/search) must not be
+       returned with ops/patch_ops. Client-side post-apply tool_requests such as
+       run_command may be returned with ops/patch_ops; the IDE applies changes
+       first, runs the client tool, then reports verification to kanban.
     5) patch_ops 仅允许 apply_patch，content 必须是 unified diff（包含 --- / +++ / @@）。
     6) 当 tool=read_file 时：
        args 必须包含：
@@ -26,7 +29,10 @@ OPENAI_SYSTEM_PROMPT = textwrap.dedent(
        - start_line
        - end_line
        且必须提供具体整数范围，不允许省略
-       
+    7) Use run_command only for project-local build/test commands, for example:
+       {"id":"compile","tool":"run_command","args":{"command":["./mvnw","test"],"timeout_seconds":120}}
+       Do not use shell wrappers such as cmd, powershell, bash, or sh.
+
     JSON Schema：
     __SCHEMA_JSON__
     """

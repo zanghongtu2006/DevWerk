@@ -14,6 +14,9 @@ harness system:
   returned changes through its local snapshot safety layer.
 - The backend owns kanban workflow, model routing, planning artifacts, coder
   harness rules, token accounting, and generated patch/file operations.
+- Backend tool requests are an extensible action protocol. Research tools are
+  resolved by the backend loop; client tools are returned to the IDE plugin and
+  reported back through kanban verification.
 - Kanban is the operating surface. `/v1/chat` is no longer just a chat endpoint;
   it creates or advances a kanban task.
 
@@ -205,6 +208,38 @@ and Hermes-style main/auxiliary slot routing, but DevWerk maps them to engineeri
 loop roles such as planning, architecture, coding, and compression.
 
 ## Main APIs
+
+### Tool Requests
+
+`tool_requests` is not a fixed review helper. It is the backend-to-client action
+protocol for the coding loop.
+
+Backend research tools are consumed inside the backend execution loop:
+
+```json
+{"id": "r1", "tool": "read_file", "args": {"path": "pom.xml", "start_line": 1, "end_line": 200}}
+```
+
+Client-side tools are returned with generated changes. The plugin applies the
+snapshot-protected write first, then executes the tool, then reports the result
+through `apply_result.verification`.
+
+```json
+{
+  "ops": [],
+  "tool_requests": [
+    {
+      "id": "compile",
+      "tool": "run_command",
+      "args": {"command": ["./mvnw", "test"], "timeout_seconds": 120}
+    }
+  ]
+}
+```
+
+Today the plugin implements `run_command` for project-local Gradle/Maven
+commands. Future IntelliJ SDK actions can use the same protocol without changing
+the kanban state-machine boundary.
 
 ### `POST /v1/chat`
 
