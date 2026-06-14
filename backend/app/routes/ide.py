@@ -27,6 +27,7 @@ from app.services.llm_factory import get_llm_client
 from app.services.planner import Planner as build_planner
 from app.services.prompt_builder import build_model_messages
 from app.services.usage import usage_summary
+from app.services.workflow import apply_workflow_action
 
 router = APIRouter()
 _log = logging.getLogger("devwerk.ide")
@@ -727,9 +728,31 @@ def _kanban_move(task_id: str | None, status_key: str, payload: dict) -> None:
     if not task_id:
         return
     try:
-        move_task(task_id, status_key, force=True, payload=payload)
+        action = _workflow_action_for_status(status_key, payload)
+        if action:
+            apply_workflow_action(task_id, action, payload)
+        else:
+            move_task(task_id, status_key, force=True, payload=payload)
     except Exception as exc:  # noqa: BLE001
         _log.debug("kanban move skipped task_id=%s status=%s error=%s", task_id, status_key, exc)
+
+
+def _workflow_action_for_status(status_key: str, payload: dict) -> str | None:
+    status = str(status_key or "").strip().lower()
+    if status == "context_indexed":
+        return "context_indexed"
+    if status == "planned":
+        return "plan_ready"
+    if status == "coding":
+        return "coding_started"
+    if status == "ready_to_apply":
+        return "ready_to_apply"
+    if status == "failed":
+        phase = str((payload or {}).get("phase") or "").strip().lower()
+        if phase == "plan":
+            return "plan_failed"
+        return "coding_failed"
+    return None
 
 
 # ---------------------------------------------------------------------------

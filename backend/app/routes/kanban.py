@@ -22,6 +22,7 @@ from app.services.kanban import (
     upsert_project,
     update_task,
 )
+from app.services.workflow import apply_workflow_action, current_workflow_state
 
 router = APIRouter(prefix="/kanban", tags=["Kanban"])
 ui_router = APIRouter(tags=["Kanban UI"])
@@ -91,6 +92,11 @@ class ApplyResultRequest(BaseModel):
     changed_paths: list[str] = Field(default_factory=list)
     verification: dict[str, Any] = Field(default_factory=dict)
     error_message: str | None = None
+
+
+class WorkflowActionRequest(BaseModel):
+    action: str
+    payload: dict[str, Any] = Field(default_factory=dict)
 
 
 @router.get("/board")
@@ -187,19 +193,39 @@ def kanban_move_task(task_id: str, req: TaskMoveRequest):
 @router.post("/tasks/{task_id}/retry")
 def kanban_retry_task(task_id: str):
     try:
-        add_event(task_id, "manual_retry_requested", {"reason": "user_requested_retry"})
-        return move_task(task_id, "draft", force=True, payload={"reason": "manual_retry"})
+        return apply_workflow_action(task_id, "retry", {"reason": "user_requested_retry"})
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/tasks/{task_id}/abandon")
 def kanban_abandon_task(task_id: str):
     try:
-        add_event(task_id, "manual_abandon_requested", {"reason": "user_abandoned_task"})
-        return move_task(task_id, "failed", force=True, payload={"reason": "manual_abandon"})
+        return apply_workflow_action(task_id, "abandon", {"reason": "user_abandoned_task"})
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/tasks/{task_id}/workflow")
+def kanban_task_workflow(task_id: str):
+    try:
+        return current_workflow_state(task_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/tasks/{task_id}/actions")
+def kanban_task_action(task_id: str, req: WorkflowActionRequest):
+    try:
+        return apply_workflow_action(task_id, req.action, req.payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/tasks/{task_id}/events")
@@ -231,21 +257,11 @@ def kanban_add_artifact(task_id: str, req: ArtifactCreateRequest):
 def kanban_apply_result(task_id: str, req: ApplyResultRequest):
     payload = req.model_dump()
     try:
-        add_artifact(task_id, artifact_type="apply_result", payload=payload)
-        add_event(task_id, "apply_result_received", payload)
-        if not req.ok:
-            return move_task(task_id, "failed", force=True, payload={"phase": "apply", **payload})
-        applied = move_task(task_id, "applied", force=True, payload=payload)
-        required = req.verification.get("required") if isinstance(req.verification, dict) else None
-        results = req.verification.get("results") if isinstance(req.verification, dict) else None
-        if isinstance(required, list) and isinstance(results, dict):
-            passed = all(str(results.get(item)).lower() == "passed" for item in required)
-            if passed:
-                move_task(task_id, "verified", force=True, payload={"verification": req.verification})
-                return move_task(task_id, "done", force=True, payload={"reason": "verification_passed"})
-        return applied
+        return apply_workflow_action(task_id, "apply_result", payload)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @ui_router.get("/kanban", response_class=HTMLResponse)
