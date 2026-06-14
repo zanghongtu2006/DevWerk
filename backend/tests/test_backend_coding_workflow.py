@@ -5,6 +5,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from app.services.anthropic_client import AnthropicClient
+
 
 class FakeSettings:
     app_env = "test"
@@ -29,33 +31,38 @@ class FakeSettings:
 
 class FakePlannerClient:
     def chat_json(self, messages: list[dict]) -> dict:
-        return {
-            "plan": {
-                "summary": "Update the smoke target file.",
-                "files": [
-                    {
-                        "path": "src/main/kotlin/App.kt",
-                        "nature": "modified",
-                        "description": "Return the smoke implementation.",
-                        "confidence": 0.97,
-                    }
-                ],
-                "warnings": [],
-            }
-        }
+        return {"raw_text": "Create a minimal Spring Boot Java 21 REST API."}
 
 
 class FakeExecutorClient:
     def chat_structured(self, messages: list[dict]) -> dict:
         return {
-            "reply": "Generated smoke implementation.",
+            "reply": "Generated Spring Boot smoke scaffold.",
             "ops": [
                 {
-                    "op": "write_file",
-                    "path": "src/main/kotlin/App.kt",
-                    "language": "kotlin",
-                    "content": "fun main() = println(\"DevWerk smoke\")\n",
-                }
+                    "op": "create_file",
+                    "path": "settings.gradle",
+                    "language": "groovy",
+                    "content": 'pluginManagement { repositories { gradlePluginPortal(); mavenCentral() } }\nrootProject.name = "devwerk-smoke"\n',
+                },
+                {
+                    "op": "create_file",
+                    "path": "build.gradle",
+                    "language": "groovy",
+                    "content": "plugins {\n    id 'java'\n    id 'org.springframework.boot' version '3.3.5'\n    id 'io.spring.dependency-management' version '1.1.6'\n}\n\njava { toolchain { languageVersion = JavaLanguageVersion.of(21) } }\n\nrepositories { mavenCentral() }\n\ndependencies { implementation 'org.springframework.boot:spring-boot-starter-web' }\n",
+                },
+                {
+                    "op": "create_file",
+                    "path": "src/main/java/com/devwerk/demo/DemoApplication.java",
+                    "language": "java",
+                    "content": "package com.devwerk.demo;\n\nimport org.springframework.boot.SpringApplication;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\n\n@SpringBootApplication\npublic class DemoApplication {\n    public static void main(String[] args) {\n        SpringApplication.run(DemoApplication.class, args);\n    }\n}\n",
+                },
+                {
+                    "op": "create_file",
+                    "path": "src/main/java/com/devwerk/demo/HelloController.java",
+                    "language": "java",
+                    "content": "package com.devwerk.demo;\n\nimport org.springframework.web.bind.annotation.GetMapping;\nimport org.springframework.web.bind.annotation.RestController;\n\n@RestController\npublic class HelloController {\n    @GetMapping(\"/hello\")\n    public String hello() {\n        return \"Hello, DevWerk\";\n    }\n}\n",
+                },
             ],
             "patch_ops": [],
             "tool_requests": [],
@@ -66,6 +73,8 @@ class FakeExecutorClient:
 @pytest.mark.asyncio
 async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_path):
     db_path = tmp_path / "devwerk-smoke.db"
+    project_root = tmp_path / "empty-project"
+    project_root.mkdir()
     fake_settings = FakeSettings(db_path)
 
     import app.main as main_module
@@ -89,33 +98,19 @@ async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_
             plan_body = {
                 "project_id": project_id,
                 "mode": "agent",
-                "project_root": str(tmp_path),
+                "project_root": str(project_root),
                 "messages": [
-                    {"role": "user", "content": "Update App.kt to print the DevWerk smoke message."}
+                    {
+                        "role": "user",
+                        "content": "Create a Spring Boot scaffold compatible with JDK 21 and a minimal REST hello world API.",
+                    }
                 ],
                 "workspace": {
                     "root_id": project_id,
                     "changed_files": [],
-                    "open_files": ["src/main/kotlin/App.kt"],
-                    "tree_preview": "src/main/kotlin/App.kt",
-                    "source_map": {
-                        "root": str(tmp_path),
-                        "generated_at": 1,
-                        "total_files": 1,
-                        "indexed_files": 1,
-                        "skipped_files": 0,
-                        "files": [
-                            {
-                                "path": "src/main/kotlin/App.kt",
-                                "kind": "source",
-                                "language": "kotlin",
-                                "package": None,
-                                "imports": [],
-                                "symbols": [],
-                                "size": 42,
-                            }
-                        ],
-                    },
+                    "open_files": [],
+                    "tree_preview": "",
+                    "source_map": None,
                 },
                 "tool_results": [],
             }
@@ -126,15 +121,17 @@ async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_
             assert plan["ok"] is True
             assert plan["task_id"]
             assert plan["status_key"] == "planned"
-            assert plan["files"][0]["path"] == "src/main/kotlin/App.kt"
+            planned_paths = {item["path"] for item in plan["files"]}
+            assert "build.gradle" in planned_paths
+            assert "src/main/java/com/devwerk/demo/HelloController.java" in planned_paths
 
             execute_body = {
                 "project_id": project_id,
                 "task_id": plan["task_id"],
                 "mode": "agent",
-                "project_root": str(tmp_path),
+                "project_root": str(project_root),
                 "messages": plan_body["messages"],
-                "approved_paths": ["src/main/kotlin/App.kt"],
+                "approved_paths": [item["path"] for item in plan["files"]],
                 "approved_ops": [],
                 "workspace": plan_body["workspace"],
             }
@@ -150,14 +147,12 @@ async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_
             assert executed["task_id"] == plan["task_id"]
             assert executed["status_key"] == "ready_to_apply"
             assert executed["done"] is True
-            assert executed["ops"] == [
-                {
-                    "op": "write_file",
-                    "path": "src/main/kotlin/App.kt",
-                    "language": "kotlin",
-                    "content": "fun main() = println(\"DevWerk smoke\")\n",
-                }
-            ]
+            assert len(executed["ops"]) == 4
+            _apply_file_ops(project_root, executed["ops"])
+            assert (project_root / "build.gradle").is_file()
+            controller = project_root / "src/main/java/com/devwerk/demo/HelloController.java"
+            assert controller.is_file()
+            assert "@GetMapping(\"/hello\")" in controller.read_text(encoding="utf-8")
 
             task_response = await client.get(f"/v1/kanban/tasks/{plan['task_id']}")
             assert task_response.status_code == 200
@@ -165,3 +160,49 @@ async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_
             assert task["status_key"] == "ready_to_apply"
             artifact_types = {artifact["artifact_type"] for artifact in task["artifacts"]}
             assert {"plan_request", "plan_response", "execute_response"}.issubset(artifact_types)
+
+
+def _apply_file_ops(project_root: Path, ops: list[dict]) -> None:
+    for op in ops:
+        rel = Path(str(op["path"]))
+        if rel.is_absolute() or ".." in rel.parts:
+            raise AssertionError(f"unsafe op path: {op['path']}")
+        target = project_root / rel
+        if op["op"] == "create_dir":
+            target.mkdir(parents=True, exist_ok=True)
+        elif op["op"] in {"create_file", "update_file"}:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(op.get("content") or "", encoding="utf-8")
+        elif op["op"] == "delete_path" and target.exists():
+            if target.is_dir():
+                raise AssertionError("smoke helper refuses to delete directories")
+            target.unlink()
+        else:
+            raise AssertionError(f"unsupported op: {op['op']}")
+
+
+def test_anthropic_non_json_text_falls_back_to_spring_boot_ops(monkeypatch):
+    client = AnthropicClient.__new__(AnthropicClient)
+    monkeypatch.setattr(
+        client,
+        "chat_json",
+        lambda messages: {
+            "raw_text": "I can create a Spring Boot REST API for Java 21.",
+            "reply": "I can create a Spring Boot REST API for Java 21.",
+        },
+    )
+
+    response = client.chat_structured(
+        [
+            {
+                "role": "user",
+                "content": "Create a Spring Boot scaffold compatible with JDK 21 and a hello REST API.",
+            }
+        ]
+    )
+
+    assert response["done"] is True
+    assert {op["path"] for op in response["ops"]} >= {
+        "build.gradle",
+        "src/main/java/com/devwerk/demo/HelloController.java",
+    }

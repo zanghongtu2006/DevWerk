@@ -184,6 +184,24 @@ def kanban_move_task(task_id: str, req: TaskMoveRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/tasks/{task_id}/retry")
+def kanban_retry_task(task_id: str):
+    try:
+        add_event(task_id, "manual_retry_requested", {"reason": "user_requested_retry"})
+        return move_task(task_id, "draft", force=True, payload={"reason": "manual_retry"})
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/tasks/{task_id}/abandon")
+def kanban_abandon_task(task_id: str):
+    try:
+        add_event(task_id, "manual_abandon_requested", {"reason": "user_abandoned_task"})
+        return move_task(task_id, "failed", force=True, payload={"reason": "manual_abandon"})
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/tasks/{task_id}/events")
 def kanban_add_event(task_id: str, req: EventCreateRequest):
     if not req.event_type.strip():
@@ -389,8 +407,10 @@ DASHBOARD_HTML = r"""
       $("board").innerHTML = data.columns.map(col => `<article class="column"><h2><span>${escapeHtml(col.title)}</span><span class="muted">${col.tasks.length}</span></h2><div class="tasks">${col.tasks.map(task => renderTask(task, col, data.columns)).join("")}</div></article>`).join("");
     }
     function renderTask(task, col, columns) {
-      const buttons = (col.transition_to || []).map(next => { const target = columns.find(c => c.status_key === next); return `<button data-task="${escapeAttr(task.id)}" data-status="${escapeAttr(next)}">${escapeHtml(target?.title || next)}</button>`; }).join("");
-      return `<article class="task"><strong>${escapeHtml(task.title)}</strong><p>${escapeHtml(task.description || "")}</p><small class="muted">${escapeHtml(task.status_key)} / ${escapeHtml(task.id)}</small><footer>${buttons}</footer></article>`;
+      const actions = [];
+      if (task.status_key === "failed") actions.push(`<button data-task="${escapeAttr(task.id)}" data-action="retry">Retry</button>`);
+      if (!["done", "failed"].includes(task.status_key)) actions.push(`<button data-task="${escapeAttr(task.id)}" data-action="abandon">Abandon</button>`);
+      return `<article class="task"><strong>${escapeHtml(task.title)}</strong><p>${escapeHtml(task.description || "")}</p><small class="muted">${escapeHtml(task.status_key)} / ${escapeHtml(task.id)}</small><footer>${actions.join("")}</footer></article>`;
     }
     function renderActive() { document.querySelectorAll(".view").forEach(v => v.classList.remove("active")); document.querySelector(`#view-${state.view}`).classList.add("active"); document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b.dataset.view === state.view)); $("title").textContent = { stats: "Statistics", projects: "Projects", kanban: "Kanban", settings: "Settings" }[state.view]; }
     async function createProject() { const projectId = $("newProjectId").value.trim(); const name = $("newProjectName").value.trim() || projectId; if (!projectId) return; await api("/v1/kanban/projects", { method: "POST", body: JSON.stringify({ project_id: projectId, name }) }); state.projectId = projectId; $("newProjectId").value = ""; $("newProjectName").value = ""; await refreshAll(); }
@@ -411,7 +431,13 @@ DASHBOARD_HTML = r"""
     $("saveProjectSettings").onclick = () => saveProjectSettings().catch(showError);
     $("resetColumns").onclick = () => resetColumns().catch(showError);
     $("projectList").onclick = async (event) => { const btn = event.target.closest("button[data-project]"); if (!btn) return; state.projectId = btn.dataset.project; state.view = btn.dataset.action === "open-project-settings" ? "projects" : "kanban"; await refreshAll().catch(showError); };
-    $("board").onclick = async (event) => { const btn = event.target.closest("button[data-task]"); if (!btn) return; await api(`/v1/kanban/tasks/${btn.dataset.task}/move`, { method: "POST", body: JSON.stringify({ status_key: btn.dataset.status }) }); await refreshAll(); };
+    $("board").onclick = async (event) => {
+      const btn = event.target.closest("button[data-task]");
+      if (!btn) return;
+      if (btn.dataset.action === "retry") await api(`/v1/kanban/tasks/${btn.dataset.task}/retry`, { method: "POST" });
+      if (btn.dataset.action === "abandon") await api(`/v1/kanban/tasks/${btn.dataset.task}/abandon`, { method: "POST" });
+      await refreshAll();
+    };
     function clearError() { $("error").textContent = ""; }
     function showError(err) { $("error").textContent = err.message || String(err); }
     function escapeHtml(value) { return String(value).replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[ch])); }
@@ -598,15 +624,20 @@ KANBAN_HTML = r"""
       const card = document.createElement("div");
       card.className = "card";
       const footer = document.createElement("footer");
-      for (const next of col.transition_to) {
-        const target = columns.find(c => c.status_key === next);
+      if (task.status_key === "failed") {
         const btn = document.createElement("button");
-        btn.textContent = target ? `Move: ${target.title}` : `Move: ${next}`;
+        btn.textContent = "Retry";
         btn.onclick = async () => {
-          await api(`/v1/kanban/tasks/${task.id}/move`, {
-            method: "POST",
-            body: JSON.stringify({ status_key: next })
-          });
+          await api(`/v1/kanban/tasks/${task.id}/retry`, { method: "POST" });
+          await loadBoard();
+        };
+        footer.appendChild(btn);
+      }
+      if (!["done", "failed"].includes(task.status_key)) {
+        const btn = document.createElement("button");
+        btn.textContent = "Abandon";
+        btn.onclick = async () => {
+          await api(`/v1/kanban/tasks/${task.id}/abandon`, { method: "POST" });
           await loadBoard();
         };
         footer.appendChild(btn);

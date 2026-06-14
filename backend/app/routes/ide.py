@@ -145,21 +145,27 @@ async def ide_plan(request: Request) -> PlanResponse:
         )
 
     cfg = settings()
+    planner_agent = "planner"
     try:
-        cfg.validate_provider("planner")
+        cfg.validate_provider(planner_agent)
     except ValueError as ve:
-        _log.warning("Provider validation failed: %s", ve)
-        _kanban_move(task_id, "failed", {"phase": "plan", "error": str(ve)})
-        return PlanResponse(
-            ok=False,
-            task_id=task_id,
-            status_key="failed",
-            error_code="CONFIG_ERROR",
-            error_message=str(ve),
-        )
+        _log.warning("Planner provider unavailable, falling back to coder: %s", ve)
+        planner_agent = "coder"
+        try:
+            cfg.validate_provider(planner_agent)
+        except ValueError as coder_ve:
+            _log.warning("Provider validation failed: %s", coder_ve)
+            _kanban_move(task_id, "failed", {"phase": "plan", "error": str(coder_ve)})
+            return PlanResponse(
+                ok=False,
+                task_id=task_id,
+                status_key="failed",
+                error_code="CONFIG_ERROR",
+                error_message=str(coder_ve),
+            )
 
     try:
-        p = build_planner(agent_name="planner")
+        p = build_planner(agent_name=planner_agent)
     except (ValueError, NotImplementedError) as exc:
         _log.warning("Planner creation failed: %s", exc)
         _kanban_move(task_id, "failed", {"phase": "plan", "error": str(exc)})
@@ -172,7 +178,7 @@ async def ide_plan(request: Request) -> PlanResponse:
         )
 
     mode = str(body.get("mode", "agent")).strip().lower() or "agent"
-    _kanban_event(task_id, "plan_started", {"mode": mode})
+    _kanban_event(task_id, "plan_started", {"mode": mode, "agent": planner_agent})
 
     try:
         result = p.plan(messages=messages, mode=mode)
