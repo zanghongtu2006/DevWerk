@@ -32,7 +32,7 @@ DevWerk Backend (FastAPI)
   - coder harness from source_map
   - planning bundle artifacts
   - patch/file operation generation
-  - apply-result and verification state
+  - workflow action and verification state
   - local SQLite usage accounting
         |
         v
@@ -200,25 +200,32 @@ Important response fields:
 }
 ```
 
-### `POST /v1/kanban/tasks/{task_id}/apply-result`
+### `POST /v1/kanban/tasks/{task_id}/actions`
 
-Called by the plugin after it applies returned changes. The plugin snapshot layer
-is local and atomic; the backend only records the result.
+Single kanban workflow action endpoint. Clients do not move columns directly;
+they report semantic actions and the backend state machine advances the task.
 
 ```json
 {
-  "ok": true,
-  "snapshot_id": "optional-audit-id",
-  "changed_paths": ["src/..."],
-  "verification": {
-    "required": ["compile", "smoke"],
-    "results": {
-      "compile": "passed",
-      "smoke": "passed"
+  "action": "apply_result",
+  "payload": {
+    "ok": true,
+    "snapshot_id": "optional-audit-id",
+    "changed_paths": ["src/..."],
+    "verification": {
+      "required": ["compile", "smoke"],
+      "results": {
+        "compile": "passed",
+        "smoke": "passed"
+      }
     }
   }
 }
 ```
+
+Supported actions include `apply_result`, `retry`, and `abandon`. Internal coding
+stages use the same workflow service, so API clients, the dashboard, and the IDE
+plugin all go through the same state-machine boundary.
 
 ### `GET/PUT /v1/settings`
 

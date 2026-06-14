@@ -16,7 +16,6 @@ from app.services.kanban import (
     get_task,
     list_columns,
     list_projects,
-    move_task,
     replace_columns,
     update_project_settings,
     upsert_project,
@@ -69,12 +68,6 @@ class TaskUpdateRequest(BaseModel):
     archived: bool | None = None
 
 
-class TaskMoveRequest(BaseModel):
-    status_key: str
-    force: bool = False
-    payload: dict[str, Any] = Field(default_factory=dict)
-
-
 class EventCreateRequest(BaseModel):
     event_type: str
     payload: dict[str, Any] = Field(default_factory=dict)
@@ -84,14 +77,6 @@ class ArtifactCreateRequest(BaseModel):
     artifact_type: str
     path: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
-
-
-class ApplyResultRequest(BaseModel):
-    ok: bool = True
-    snapshot_id: str | None = None
-    changed_paths: list[str] = Field(default_factory=list)
-    verification: dict[str, Any] = Field(default_factory=dict)
-    error_message: str | None = None
 
 
 class WorkflowActionRequest(BaseModel):
@@ -180,36 +165,6 @@ def kanban_update_task(task_id: str, req: TaskUpdateRequest):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.post("/tasks/{task_id}/move")
-def kanban_move_task(task_id: str, req: TaskMoveRequest):
-    try:
-        return move_task(task_id, req.status_key, force=req.force, payload=req.payload)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@router.post("/tasks/{task_id}/retry")
-def kanban_retry_task(task_id: str):
-    try:
-        return apply_workflow_action(task_id, "retry", {"reason": "user_requested_retry"})
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@router.post("/tasks/{task_id}/abandon")
-def kanban_abandon_task(task_id: str):
-    try:
-        return apply_workflow_action(task_id, "abandon", {"reason": "user_abandoned_task"})
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
 @router.get("/tasks/{task_id}/workflow")
 def kanban_task_workflow(task_id: str):
     try:
@@ -251,17 +206,6 @@ def kanban_add_artifact(task_id: str, req: ArtifactCreateRequest):
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@router.post("/tasks/{task_id}/apply-result")
-def kanban_apply_result(task_id: str, req: ApplyResultRequest):
-    payload = req.model_dump()
-    try:
-        return apply_workflow_action(task_id, "apply_result", payload)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @ui_router.get("/kanban", response_class=HTMLResponse)
@@ -450,8 +394,8 @@ DASHBOARD_HTML = r"""
     $("board").onclick = async (event) => {
       const btn = event.target.closest("button[data-task]");
       if (!btn) return;
-      if (btn.dataset.action === "retry") await api(`/v1/kanban/tasks/${btn.dataset.task}/retry`, { method: "POST" });
-      if (btn.dataset.action === "abandon") await api(`/v1/kanban/tasks/${btn.dataset.task}/abandon`, { method: "POST" });
+      if (btn.dataset.action === "retry") await api(`/v1/kanban/tasks/${btn.dataset.task}/actions`, { method: "POST", body: JSON.stringify({ action: "retry", payload: { reason: "user_requested_retry" } }) });
+      if (btn.dataset.action === "abandon") await api(`/v1/kanban/tasks/${btn.dataset.task}/actions`, { method: "POST", body: JSON.stringify({ action: "abandon", payload: { reason: "user_abandoned_task" } }) });
       await refreshAll();
     };
     function clearError() { $("error").textContent = ""; }
@@ -644,7 +588,7 @@ KANBAN_HTML = r"""
         const btn = document.createElement("button");
         btn.textContent = "Retry";
         btn.onclick = async () => {
-          await api(`/v1/kanban/tasks/${task.id}/retry`, { method: "POST" });
+          await api(`/v1/kanban/tasks/${task.id}/actions`, { method: "POST", body: JSON.stringify({ action: "retry", payload: { reason: "user_requested_retry" } }) });
           await loadBoard();
         };
         footer.appendChild(btn);
@@ -653,7 +597,7 @@ KANBAN_HTML = r"""
         const btn = document.createElement("button");
         btn.textContent = "Abandon";
         btn.onclick = async () => {
-          await api(`/v1/kanban/tasks/${task.id}/abandon`, { method: "POST" });
+          await api(`/v1/kanban/tasks/${task.id}/actions`, { method: "POST", body: JSON.stringify({ action: "abandon", payload: { reason: "user_abandoned_task" } }) });
           await loadBoard();
         };
         footer.appendChild(btn);

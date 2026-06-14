@@ -119,20 +119,24 @@ Behavior:
 7. Move to `Ready To Apply`.
 8. Return `ops` and/or `patch_ops` to the plugin.
 
-### `POST /v1/kanban/tasks/{task_id}/apply-result`
+### `POST /v1/kanban/tasks/{task_id}/actions`
 
-Called by the plugin after applying changes.
+Single workflow action endpoint. Clients report semantic actions; the backend
+state machine decides the next kanban state.
 
 ```json
 {
-  "ok": true,
-  "snapshot_id": "optional",
-  "changed_paths": ["src/..."],
-  "verification": {
-    "required": ["compile", "smoke"],
-    "results": {
-      "compile": "passed",
-      "smoke": "passed"
+  "action": "apply_result",
+  "payload": {
+    "ok": true,
+    "snapshot_id": "optional",
+    "changed_paths": ["src/..."],
+    "verification": {
+      "required": ["compile", "smoke"],
+      "results": {
+        "compile": "passed",
+        "smoke": "passed"
+      }
     }
   }
 }
@@ -140,6 +144,9 @@ Called by the plugin after applying changes.
 
 When required verification checks all pass, the backend moves the task through
 `Verified` to `Done`.
+
+Other client-visible actions include `retry` and `abandon`. No client should call
+direct column-move endpoints.
 
 ### `GET/PUT /v1/settings`
 
@@ -154,7 +161,8 @@ Reads/writes `config/llm.json`. Dashboard Settings presents two editors:
 - `POST /v1/kanban/projects`
 - `GET /v1/kanban/board?project_id=...`
 - `POST /v1/kanban/tasks`
-- `POST /v1/kanban/tasks/{task_id}/move`
+- `GET /v1/kanban/tasks/{task_id}/workflow`
+- `POST /v1/kanban/tasks/{task_id}/actions`
 - `POST /v1/kanban/tasks/{task_id}/events`
 - `POST /v1/kanban/tasks/{task_id}/artifacts`
 

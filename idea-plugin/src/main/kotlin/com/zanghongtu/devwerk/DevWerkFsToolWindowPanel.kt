@@ -368,7 +368,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         if (!taskId.isNullOrBlank()) {
             ApplicationManager.getApplication().executeOnPooledThread {
                 runCatching {
-                    (AiClientFactory.create(project) as? HttpAiClient)?.abandonTask(taskId)
+                    (AiClientFactory.create(project) as? HttpAiClient)?.abandonTask(taskId, DevWerkProjectMeta.getOrCreateProjectId(project))
                 }.onFailure { it.printStackTrace() }
             }
         }
@@ -578,12 +578,13 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 ok = ok,
                 snapshotId = devCtx?.opDir?.fileName?.toString(),
                 changedPaths = changedPaths,
-                errorMessage = errorMessage
+                errorMessage = errorMessage,
+                projectId = DevWerkProjectMeta.getOrCreateProjectId(project)
             )
-            appendOpLog(devCtx, "[INFO] Kanban apply-result reported: ok=$ok taskId=$taskId\n")
+            appendOpLog(devCtx, "[INFO] Kanban apply_result action reported: ok=$ok taskId=$taskId\n")
         }.onFailure { syncError ->
             syncError.printStackTrace()
-            appendOpLog(devCtx, "[WARN] Kanban apply-result report failed: ${syncError::class.java.simpleName}: ${syncError.message}\n")
+            appendOpLog(devCtx, "[WARN] Kanban apply_result action failed: ${syncError::class.java.simpleName}: ${syncError.message}\n")
             SwingUtilities.invokeLater {
                 appendChatLine("[Warn] Kanban sync failed: ${syncError.message}")
             }

@@ -152,8 +152,8 @@ class HttpAiClient(
         }
     }
 
-    fun abandonTask(taskId: String) {
-        postKanbanAction(taskId, "abandon", JSONObject())
+    fun abandonTask(taskId: String, projectId: String? = null) {
+        postKanbanAction(taskId, "abandon", JSONObject(), projectId)
     }
 
     fun reportApplyResult(
@@ -161,7 +161,8 @@ class HttpAiClient(
         ok: Boolean,
         snapshotId: String?,
         changedPaths: List<String>,
-        errorMessage: String? = null
+        errorMessage: String? = null,
+        projectId: String? = null
     ) {
         val body = JSONObject()
         body.put("ok", ok)
@@ -169,7 +170,7 @@ class HttpAiClient(
         body.put("changed_paths", JSONArray(changedPaths))
         body.put("verification", JSONObject())
         body.put("error_message", errorMessage ?: JSONObject.NULL)
-        postKanbanAction(taskId, "apply-result", body)
+        postKanbanAction(taskId, "apply_result", body, projectId)
     }
 
     // -------------------------------------------------------------------------
@@ -233,13 +234,19 @@ class HttpAiClient(
         return fallback.copy(ops = (accOps + fallback.ops), patchOps = (accPatchOps + fallback.patchOps))
     }
 
-    private fun postKanbanAction(taskId: String, action: String, body: JSONObject) {
+    private fun postKanbanAction(taskId: String, action: String, body: JSONObject, projectId: String? = null) {
         val mediaType = "application/json; charset=utf-8".toMediaType()
+        val requestJson = JSONObject()
+        requestJson.put("action", action)
+        requestJson.put("payload", body)
         val requestBuilder = Request.Builder()
-            .url("${kanbanTasksEndpoint.trimEnd('/')}/$taskId/$action")
-            .post(body.toString().toRequestBody(mediaType))
+            .url("${kanbanTasksEndpoint.trimEnd('/')}/$taskId/actions")
+            .post(requestJson.toString().toRequestBody(mediaType))
             .header("Content-Type", "application/json; charset=utf-8")
 
+        projectId?.takeIf { it.isNotBlank() }?.let {
+            requestBuilder.header("X-DevWerk-Project-Id", it)
+        }
         if (!authToken.isNullOrBlank()) {
             requestBuilder.header("Authorization", "Bearer $authToken")
         }
