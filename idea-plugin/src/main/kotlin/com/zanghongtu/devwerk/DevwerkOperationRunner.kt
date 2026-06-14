@@ -10,6 +10,7 @@ import com.zanghongtu.devwerk.codeEditor.PatchApplier
 import java.nio.charset.StandardCharsets
 import java.nio.file.*
 import java.time.LocalDate
+import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.util.UUID
 import kotlin.streams.asSequence
@@ -290,11 +291,18 @@ class DevwerkOperationRunner {
     private fun appendLog(logFile: Path, text: String) {
         Files.writeString(
             logFile,
-            text,
+            timestampLogText(text),
             StandardCharsets.UTF_8,
             StandardOpenOption.CREATE,
             StandardOpenOption.APPEND
         )
+    }
+
+    private fun timestampLogText(text: String): String {
+        val suffix = if (text.endsWith("\n")) "\n" else ""
+        return text.trimEnd('\n').split('\n').joinToString("\n") { line ->
+            if (line.isBlank()) line else "${LocalDateTime.now().format(LOG_TIME_FORMAT)} $line"
+        } + suffix
     }
 
     private fun normalizeRelPath(p: String): String {
@@ -320,5 +328,9 @@ class DevwerkOperationRunner {
         val lfs = LocalFileSystem.getInstance()
         val rootVf = lfs.refreshAndFindFileByPath(projectRoot.toString().replace('\\', '/'))
         rootVf?.refresh(true, true)
+    }
+
+    companion object {
+        private val LOG_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
     }
 }

@@ -18,7 +18,7 @@ from pathlib import Path
 from fastapi import APIRouter, File, Form, Request, UploadFile
 
 from app.core.config import settings
-from app.models.ide import IdeChatRequest, IdeChatResponse
+from app.models.ide import IdeChatRequest, IdeChatResponse, ToolRequest, ToolResult
 from app.models.plan import ExecuteRequest, PlanResponse
 from app.services.coerce import coerce_to_fileops, coerce_to_patchops, coerce_to_toolrequests
 from app.services.coder_harness import build_coder_skill
@@ -296,7 +296,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
     messages = _append_workspace_context(messages, body.get("workspace"))
     _log.debug("ide_execute: messages_after_workspace_context=%s", len(messages))
 
-    approved_set = set(approved_paths)
+    approved_set = _approved_path_set(approved_paths, body.get("project_root"))
 
     # Keep the execution guard as the final instruction after workspace/coder context.
     guard_message = {
@@ -317,47 +317,103 @@ async def ide_execute(request: Request) -> IdeChatResponse:
     max_retries = 2
     backoff = 0.8
 
+    tool_results: list[ToolResult] = []
+    max_tool_rounds = 6
+
     for attempt in range(max_retries + 1):
         try:
-            obj = client.chat_structured(
-                build_model_messages(_ChatProxy(messages), provider=cfg.get_llm_config("executor").get("protocol", cfg.llm_provider_name))
-            )
-            _log.debug(
-                "ide_execute: model_response keys=%s ops=%s patch_ops=%s tool_requests=%s done=%s",
-                sorted(obj.keys()) if isinstance(obj, dict) else type(obj).__name__,
-                len(obj.get("ops") or []),
-                len(obj.get("patch_ops") or []),
-                len(obj.get("tool_requests") or []),
-                bool(obj.get("done") or False),
-            )
+            for tool_round in range(max_tool_rounds):
+                obj = client.chat_structured(
+                    build_model_messages(
+                        _ChatProxy(
+                            messages,
+                            project_root=body.get("project_root"),
+                            tool_results=tool_results,
+                        ),
+                        provider=cfg.get_llm_config("executor").get("protocol", cfg.llm_provider_name),
+                    )
+                )
+                _log.debug(
+                    "ide_execute: model_response round=%s keys=%s ops=%s patch_ops=%s tool_requests=%s done=%s",
+                    tool_round + 1,
+                    sorted(obj.keys()) if isinstance(obj, dict) else type(obj).__name__,
+                    len(obj.get("ops") or []),
+                    len(obj.get("patch_ops") or []),
+                    len(obj.get("tool_requests") or []),
+                    bool(obj.get("done") or False),
+                )
 
-            ops = _filter_ops(obj.get("ops") or [], approved_set)
-            patch_ops = _filter_patch_ops(obj.get("patch_ops") or [], approved_set)
-            _log.debug(
-                "ide_execute: filtered ops=%s patch_ops=%s approved_paths=%s",
-                len(ops),
-                len(patch_ops),
-                sorted(approved_set),
-            )
+                ops = _filter_ops(obj.get("ops") or [], approved_set, body.get("project_root"))
+                patch_ops = _filter_patch_ops(obj.get("patch_ops") or [], approved_set, body.get("project_root"))
+                tool_requests = coerce_to_toolrequests(obj.get("tool_requests") or [])
+                _log.debug(
+                    "ide_execute: filtered round=%s ops=%s patch_ops=%s tool_requests=%s approved_paths=%s",
+                    tool_round + 1,
+                    len(ops),
+                    len(patch_ops),
+                    len(tool_requests),
+                    sorted(approved_set),
+                )
 
-            response = IdeChatResponse(
-                ok=True,
-                reply=obj.get("reply", ""),
+                if tool_requests and mode == "agent" and not ops and not patch_ops:
+                    _kanban_event(
+                        task_id,
+                        "execute_tool_requests",
+                        {"round": tool_round + 1, "count": len(tool_requests)},
+                    )
+                    tool_results = _execute_tool_requests(body.get("project_root"), tool_requests)
+                    _log.debug(
+                        "ide_execute: tool_results round=%s results=%s",
+                        tool_round + 1,
+                        [
+                            {"id": r.id, "ok": r.ok, "content_chars": len(r.content or ""), "error": r.error}
+                            for r in tool_results
+                        ],
+                    )
+                    messages = messages + [
+                        {
+                            "role": "assistant",
+                            "content": "tool_requests:\n"
+                            + json.dumps([r.model_dump(exclude_none=True) for r in tool_requests], ensure_ascii=False),
+                        }
+                    ]
+                    continue
+
+                response = IdeChatResponse(
+                    ok=True,
+                    reply=obj.get("reply", ""),
+                    task_id=task_id,
+                    status_key="ready_to_apply",
+                    code_tree=obj.get("code_tree"),
+                    ops=coerce_to_fileops(ops, tool_results=[]),
+                    tool_requests=[],
+                    patch_ops=coerce_to_patchops(patch_ops),
+                    done=bool(obj.get("done") or False),
+                )
+                _kanban_artifact(task_id, "execute_response", payload=response.model_dump())
+                _kanban_move(
+                    task_id,
+                    "ready_to_apply",
+                    {"ops": len(response.ops), "patch_ops": len(response.patch_ops), "done": response.done},
+                )
+                return response
+
+            _log.debug(
+                "ide_execute: tool loop exhausted rounds=%s last_tool_results=%s",
+                max_tool_rounds,
+                len(tool_results),
+            )
+            _kanban_move(task_id, "failed", {"phase": "execute", "error": "tool loop exhausted"})
+            return IdeChatResponse(
+                ok=False,
+                reply="",
+                done=True,
                 task_id=task_id,
-                status_key="ready_to_apply",
-                code_tree=obj.get("code_tree"),
-                ops=coerce_to_fileops(ops, tool_results=[]),
-                tool_requests=coerce_to_toolrequests(obj.get("tool_requests") or []),
-                patch_ops=coerce_to_patchops(patch_ops),
-                done=bool(obj.get("done") or False),
+                status_key="failed",
+                error_code="TOOL_LOOP_EXHAUSTED",
+                error_message=f"Executor requested tools for {max_tool_rounds} rounds without producing file operations.",
+                retryable=True,
             )
-            _kanban_artifact(task_id, "execute_response", payload=response.model_dump())
-            _kanban_move(
-                task_id,
-                "ready_to_apply",
-                {"ops": len(response.ops), "patch_ops": len(response.patch_ops), "done": response.done},
-            )
-            return response
 
         except Exception as exc:  # noqa: BLE001
             is_timeout = (
@@ -384,19 +440,26 @@ async def ide_execute(request: Request) -> IdeChatResponse:
     return IdeChatResponse(ok=False, reply="", done=True, task_id=task_id, status_key="failed", error_code="UNKNOWN")
 
 
-def _filter_ops(ops: list[dict], approved: set[str]) -> list[dict]:
-    result = [op for op in ops if isinstance(op, dict) and op.get("path", "").strip() in approved]
-    dropped = [
-        op.get("path", "") if isinstance(op, dict) else type(op).__name__
-        for op in ops
-        if not (isinstance(op, dict) and op.get("path", "").strip() in approved)
-    ]
+def _filter_ops(ops: list[dict], approved: set[str], project_root: str | None = None) -> list[dict]:
+    result = []
+    dropped = []
+    for op in ops:
+        if not isinstance(op, dict):
+            dropped.append(type(op).__name__)
+            continue
+        path = _canonical_rel_path(str(op.get("path") or ""), project_root)
+        if path and path in approved:
+            normalized = dict(op)
+            normalized["path"] = path
+            result.append(normalized)
+            continue
+        dropped.append(str(op.get("path") or ""))
     if dropped:
         _log.debug("filter_ops: dropped_unapproved_or_invalid=%s", dropped)
     return result
 
 
-def _filter_patch_ops(patch_ops: list[dict], approved: set[str]) -> list[dict]:
+def _filter_patch_ops(patch_ops: list[dict], approved: set[str], project_root: str | None = None) -> list[dict]:
     result = []
     for po in patch_ops:
         if not isinstance(po, dict):
@@ -405,12 +468,34 @@ def _filter_patch_ops(patch_ops: list[dict], approved: set[str]) -> list[dict]:
         import re as _re
         diff_paths = set()
         for m in _re.finditer(r"^\+\+\+ b/(.+)$", content, _re.MULTILINE):
-            diff_paths.add(m.group(1).strip())
+            diff_paths.add(_canonical_rel_path(m.group(1).strip(), project_root))
         if diff_paths and not diff_paths.issubset(approved):
             _log.debug("filter_patch_ops: dropped diff_paths=%s approved=%s", sorted(diff_paths), sorted(approved))
             continue
         result.append(po)
     return result
+
+
+def _approved_path_set(paths: list, project_root: str | None) -> set[str]:
+    approved = set()
+    for item in paths:
+        path = _canonical_rel_path(str(item or ""), project_root)
+        if path:
+            approved.add(path)
+    return approved
+
+
+def _canonical_rel_path(path: str, project_root: str | None = None) -> str:
+    text = str(path or "").strip().replace("\\", "/")
+    while text.startswith("/"):
+        text = text[1:]
+    parts = [part for part in text.split("/") if part]
+    if not parts or any(part == ".." for part in parts):
+        return ""
+    root_name = Path(project_root).name if project_root else ""
+    if root_name and len(parts) > 1 and parts[0].lower() == root_name.lower():
+        parts = parts[1:]
+    return "/".join(parts)
 
 
 def _append_workspace_context(messages: list[dict], workspace: object) -> list[dict]:
@@ -452,6 +537,152 @@ def _workspace_debug_summary(workspace: object) -> dict[str, object]:
         "source_map_files_payload": len(files) if isinstance(files, list) else 0,
         "sample_paths": sample_paths,
     }
+
+
+def _execute_tool_requests(project_root: str | None, reqs: list[ToolRequest]) -> list[ToolResult]:
+    if not project_root:
+        return [ToolResult(id=req.id, ok=False, error="project_root is null") for req in reqs]
+    root = Path(project_root).expanduser().resolve()
+    if not root.exists() or not root.is_dir():
+        return [ToolResult(id=req.id, ok=False, error=f"project_root is not a directory: {project_root}") for req in reqs]
+
+    results: list[ToolResult] = []
+    for req in reqs:
+        try:
+            if req.tool == "list_dir":
+                rel = _canonical_rel_path(str(req.args.get("path") or ""), str(root))
+                if rel and _contains_hidden_segment(rel):
+                    results.append(ToolResult(id=req.id, ok=False, error=f"blocked hidden directory path: {rel}"))
+                    continue
+                max_depth = _int_arg(req.args.get("max_depth"), 2, 1, 8)
+                results.append(ToolResult(id=req.id, ok=True, content=_tool_list_dir(root, rel, max_depth)))
+            elif req.tool == "read_file":
+                rel = _canonical_rel_path(str(req.args.get("path") or ""), str(root))
+                if _has_hidden_dir_segment(rel):
+                    results.append(ToolResult(id=req.id, ok=False, error=f"blocked hidden directory path: {rel}"))
+                    continue
+                start_line = _int_arg(req.args.get("start_line"), 1, 1, 1_000_000)
+                end_line = _int_arg(req.args.get("end_line"), start_line + 200, start_line, 1_000_000)
+                results.append(ToolResult(id=req.id, ok=True, content=_tool_read_file(root, rel, start_line, end_line)))
+            elif req.tool == "search":
+                query = str(req.args.get("query") or "")
+                max_results = _int_arg(req.args.get("max_results"), 50, 1, 500)
+                raw_paths = req.args.get("paths")
+                paths = raw_paths if isinstance(raw_paths, list) else []
+                safe_paths = []
+                for item in paths:
+                    rel = _canonical_rel_path(str(item or ""), str(root))
+                    if not rel or not _contains_hidden_segment(rel):
+                        safe_paths.append(rel)
+                results.append(ToolResult(id=req.id, ok=True, content=_tool_search(root, query, safe_paths, max_results)))
+            else:
+                results.append(ToolResult(id=req.id, ok=False, error=f"unknown tool: {req.tool}"))
+        except Exception as exc:  # noqa: BLE001
+            results.append(ToolResult(id=req.id, ok=False, error=f"{type(exc).__name__}: {exc}"))
+    return results
+
+
+def _tool_list_dir(root: Path, rel: str, max_depth: int) -> str:
+    target = _safe_project_path(root, rel)
+    if not target.exists():
+        return f"[list_dir] not found: {rel}"
+    if not target.is_dir():
+        return f"[list_dir] not a directory: {rel}"
+    lines = [f"{target.name or '.'}/"]
+
+    def walk(path: Path, depth: int, indent: str) -> None:
+        if depth >= max_depth:
+            return
+        children = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        for child in children:
+            if child.is_dir() and child.name.startswith("."):
+                continue
+            if child.is_dir():
+                lines.append(f"{indent}  {child.name}/")
+                walk(child, depth + 1, indent + "  ")
+            else:
+                lines.append(f"{indent}  {child.name}")
+
+    walk(target, 0, "")
+    return "\n".join(lines).rstrip()
+
+
+def _tool_read_file(root: Path, rel: str, start_line: int, end_line: int) -> str:
+    target = _safe_project_path(root, rel)
+    if not target.exists():
+        return f"[read_file] not found: {rel}"
+    if target.is_dir():
+        return f"[read_file] is a directory: {rel}"
+    lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+    start = max(start_line, 1) - 1
+    end = max(end_line, start_line)
+    sliced = lines[start:end]
+    return f"FILE: {rel} (lines {start_line}-{end_line})\n" + "\n".join(sliced)
+
+
+def _tool_search(root: Path, query: str, paths: list[str], max_results: int) -> str:
+    needle = query.strip()
+    if not needle:
+        return "[search] empty query"
+    roots = paths or ["src", "app", ""]
+    filename_mode = _looks_like_filename_query(needle)
+    results: list[str] = []
+    for rel in roots:
+        base = _safe_project_path(root, rel)
+        if not base.exists():
+            continue
+        candidates = [base] if base.is_file() else base.rglob("*")
+        for path in candidates:
+            if len(results) >= max_results:
+                break
+            if not path.is_file():
+                continue
+            rel_path = path.relative_to(root).as_posix()
+            if _has_hidden_dir_segment(rel_path):
+                continue
+            if any(part.lower() in {"build", "out", "node_modules"} for part in path.relative_to(root).parts[:-1]):
+                continue
+            if filename_mode:
+                matched = path.name.lower() == needle.lower()
+            else:
+                if path.stat().st_size > 1_000_000:
+                    continue
+                matched = needle.lower() in path.read_text(encoding="utf-8", errors="ignore").lower()
+            if matched:
+                results.append(rel_path)
+        if len(results) >= max_results:
+            break
+    return "\n".join(results) if results else "[search] no hits"
+
+
+def _safe_project_path(root: Path, rel: str) -> Path:
+    target = (root / rel).resolve()
+    if target != root and root not in target.parents:
+        raise ValueError(f"path escapes project_root: {rel}")
+    return target
+
+
+def _contains_hidden_segment(rel: str) -> bool:
+    return any(part.startswith(".") for part in rel.replace("\\", "/").split("/") if part)
+
+
+def _has_hidden_dir_segment(rel: str) -> bool:
+    parts = [part for part in rel.replace("\\", "/").split("/") if part]
+    return len(parts) > 1 and any(part.startswith(".") for part in parts[:-1])
+
+
+def _looks_like_filename_query(query: str) -> bool:
+    if any(ch in query for ch in ("/", "\\", "\n", "\t")) or "." not in query:
+        return False
+    return query.lower().endswith((".java", ".kt", ".xml", ".yml", ".yaml", ".gradle", ".properties", ".json"))
+
+
+def _int_arg(value: object, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = default
+    return max(minimum, min(maximum, parsed))
 
 
 def _upload_root() -> Path:
@@ -870,12 +1101,12 @@ def _guard_delete_ops(req: IdeChatRequest, obj: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 class _ChatProxy:
-    def __init__(self, messages: list[dict]):
+    def __init__(self, messages: list[dict], project_root: str | None = None, tool_results: list[ToolResult] | None = None):
         self.messages = [_Message(m) for m in messages]
         self.mode = "agent"
-        self.project_root = None
+        self.project_root = project_root
         self.workspace = None
-        self.tool_results = []
+        self.tool_results = tool_results or []
 
 
 class _Message:

@@ -22,6 +22,8 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Paths
 import java.nio.file.StandardOpenOption
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
 import javax.swing.*
 import javax.swing.border.AbstractBorder
 
@@ -502,8 +504,15 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
     private fun appendOpLog(devCtx: DevwerkContext?, text: String) {
         val logPath = devCtx?.opLog ?: return
         runCatching {
-            Files.writeString(logPath, text, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND)
+            Files.writeString(logPath, timestampLogText(text), StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND)
         }
+    }
+
+    private fun timestampLogText(text: String): String {
+        val suffix = if (text.endsWith("\n")) "\n" else ""
+        return text.trimEnd('\n').split('\n').joinToString("\n") { line ->
+            if (line.isBlank()) line else "${LocalDateTime.now().format(LOG_TIME_FORMAT)} $line"
+        } + suffix
     }
 
     private fun chooseAttachments() {
@@ -559,6 +568,10 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
             }
             chatArea.caretPosition = chatArea.document.length
         }
+    }
+
+    companion object {
+        private val LOG_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
     }
 }
 

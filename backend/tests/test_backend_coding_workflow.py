@@ -70,6 +70,46 @@ class FakeExecutorClient:
         }
 
 
+class FakeToolLoopExecutorClient:
+    def __init__(self):
+        self.calls = 0
+
+    def chat_structured(self, messages: list[dict]) -> dict:
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "reply": "Need to inspect files first.",
+                "ops": [],
+                "patch_ops": [],
+                "tool_requests": [
+                    {"id": "r1", "tool": "list_dir", "args": {"path": "test", "max_depth": 4}},
+                    {"id": "r2", "tool": "read_file", "args": {"path": "test/pom.xml", "start_line": 1, "end_line": 200}},
+                    {
+                        "id": "r3",
+                        "tool": "read_file",
+                        "args": {"path": "test/src/main/java/org/example/Main.java", "start_line": 1, "end_line": 200},
+                    },
+                ],
+                "done": False,
+            }
+
+        assert any("tool_results:" in message.get("content", "") for message in messages)
+        return {
+            "reply": "Generated controller.",
+            "ops": [
+                {
+                    "op": "create_file",
+                    "path": "test/src/main/java/org/example/HelloController.java",
+                    "language": "java",
+                    "content": "package org.example;\n\nimport org.springframework.web.bind.annotation.GetMapping;\nimport org.springframework.web.bind.annotation.RestController;\n\n@RestController\npublic class HelloController {\n    @GetMapping(\"/hello\")\n    public String hello() {\n        return \"Hello\";\n    }\n}\n",
+                }
+            ],
+            "patch_ops": [],
+            "tool_requests": [],
+            "done": True,
+        }
+
+
 @pytest.mark.asyncio
 async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_path):
     db_path = tmp_path / "devwerk-smoke.db"
@@ -160,6 +200,69 @@ async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_
             assert task["status_key"] == "ready_to_apply"
             artifact_types = {artifact["artifact_type"] for artifact in task["artifacts"]}
             assert {"plan_request", "plan_response", "execute_response"}.issubset(artifact_types)
+
+
+@pytest.mark.asyncio
+async def test_execute_resolves_tool_requests_and_strips_project_root_prefix(monkeypatch, tmp_path):
+    db_path = tmp_path / "devwerk-tool-loop.db"
+    project_root = tmp_path / "test"
+    source_dir = project_root / "src/main/java/org/example"
+    source_dir.mkdir(parents=True)
+    (project_root / "pom.xml").write_text("<project></project>\n", encoding="utf-8")
+    (source_dir / "Main.java").write_text("package org.example;\n\npublic class Main {}\n", encoding="utf-8")
+    fake_settings = FakeSettings(db_path)
+    fake_executor = FakeToolLoopExecutorClient()
+
+    import app.main as main_module
+    import app.routes.ide as ide_routes
+    import app.services.kanban as kanban_service
+    import app.services.usage as usage_service
+
+    monkeypatch.setattr(main_module, "settings", lambda: fake_settings)
+    monkeypatch.setattr(ide_routes, "settings", lambda: fake_settings)
+    monkeypatch.setattr(kanban_service, "settings", lambda: fake_settings)
+    monkeypatch.setattr(usage_service, "settings", lambda: fake_settings)
+    monkeypatch.setattr(ide_routes, "get_llm_client", lambda agent="executor": fake_executor)
+
+    app = main_module.create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            execute_response = await client.post(
+                "/v1/execute",
+                json={
+                    "project_id": "backend-tool-loop-smoke",
+                    "mode": "agent",
+                    "project_root": str(project_root),
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "Add a simple Spring Boot hello controller.",
+                        }
+                    ],
+                    "approved_paths": [
+                        "test/pom.xml",
+                        "test/src/main/java/org/example/Main.java",
+                        "test/src/main/java/org/example/HelloController.java",
+                    ],
+                    "approved_ops": [],
+                    "workspace": {
+                        "root_id": "backend-tool-loop-smoke",
+                        "changed_files": [],
+                        "open_files": [],
+                        "tree_preview": "test/\n  pom.xml\n  src/\n    main/\n      java/\n        org/\n          example/\n            Main.java",
+                        "source_map": None,
+                    },
+                },
+            )
+
+    assert execute_response.status_code == 200
+    executed = execute_response.json()
+    assert executed["ok"] is True
+    assert executed["status_key"] == "ready_to_apply"
+    assert executed["tool_requests"] == []
+    assert fake_executor.calls == 2
+    assert executed["ops"][0]["path"] == "src/main/java/org/example/HelloController.java"
 
 
 def _apply_file_ops(project_root: Path, ops: list[dict]) -> None:
