@@ -361,9 +361,17 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
 
     private fun onCancelPlanClicked() {
         if (state != State.PLAN_READY) return
+        val taskId = currentPlan?.taskId
         appendChatLine("Plan cancelled by user.")
         currentPlan = null
         setState(State.IDLE)
+        if (!taskId.isNullOrBlank()) {
+            ApplicationManager.getApplication().executeOnPooledThread {
+                runCatching {
+                    (AiClientFactory.create(project) as? HttpAiClient)?.abandonTask(taskId)
+                }.onFailure { it.printStackTrace() }
+            }
+        }
     }
 
     private fun runExecutePhase() {
@@ -379,6 +387,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 projectRoot = project.basePath,
                 history = history.toList(),
                 projectId = DevWerkProjectMeta.getOrCreateProjectId(project),
+                taskId = currentPlan?.taskId,
                 project = project,
                 devCtx = devCtx
             )
@@ -416,7 +425,25 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
 
             if (devCtx != null) {
                 runner.recordFinalSummaryAndBackup(project, devCtx, execResp)
-                if (execResp.ok) runner.applyResponse(project, devCtx, execResp)
+                if (execResp.ok) {
+                    runCatching {
+                        runner.applyResponse(project, devCtx, execResp)
+                    }.onSuccess {
+                        reportApplyResult(aiClient, execResp, devCtx, ok = true, changedPaths = collectChangedPaths(execResp))
+                    }.onFailure { applyError ->
+                        reportApplyResult(
+                            aiClient,
+                            execResp,
+                            devCtx,
+                            ok = false,
+                            changedPaths = collectChangedPaths(execResp),
+                            errorMessage = "${applyError::class.java.simpleName}: ${applyError.message}"
+                        )
+                        throw applyError
+                    }
+                }
+            } else if (execResp.ok) {
+                reportApplyResult(aiClient, execResp, null, ok = false, changedPaths = collectChangedPaths(execResp), errorMessage = "DevWerk local operation context is unavailable.")
             }
 
             val resp = execResp
@@ -473,7 +500,27 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
 
             if (devCtx != null) {
                 runner.recordFinalSummaryAndBackup(project, devCtx, response)
-                if (response.ok) runner.applyResponse(project, devCtx, response)
+                if (response.ok) {
+                    runCatching {
+                        runner.applyResponse(project, devCtx, response)
+                    }.onSuccess {
+                        reportApplyResult(aiClient, response, devCtx, ok = true, changedPaths = collectChangedPaths(response))
+                    }.onFailure { applyError ->
+                        reportApplyResult(
+                            aiClient,
+                            response,
+                            devCtx,
+                            ok = false,
+                            changedPaths = collectChangedPaths(response),
+                            errorMessage = "${applyError::class.java.simpleName}: ${applyError.message}"
+                        )
+                        throw applyError
+                    }
+                }
+            } else if (response.ok) {
+                (aiClient as? HttpAiClient)?.let {
+                    reportApplyResult(it, response, null, ok = false, changedPaths = collectChangedPaths(response), errorMessage = "DevWerk local operation context is unavailable.")
+                }
             }
 
             val resp = response
@@ -513,6 +560,49 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         return text.trimEnd('\n').split('\n').joinToString("\n") { line ->
             if (line.isBlank()) line else "${LocalDateTime.now().format(LOG_TIME_FORMAT)} $line"
         } + suffix
+    }
+
+    private fun reportApplyResult(
+        aiClient: AiClient,
+        response: IdeChatResponse,
+        devCtx: DevwerkContext?,
+        ok: Boolean,
+        changedPaths: List<String>,
+        errorMessage: String? = null
+    ) {
+        val taskId = response.taskId ?: currentPlan?.taskId ?: return
+        val http = aiClient as? HttpAiClient ?: return
+        runCatching {
+            http.reportApplyResult(
+                taskId = taskId,
+                ok = ok,
+                snapshotId = devCtx?.opDir?.fileName?.toString(),
+                changedPaths = changedPaths,
+                errorMessage = errorMessage
+            )
+            appendOpLog(devCtx, "[INFO] Kanban apply-result reported: ok=$ok taskId=$taskId\n")
+        }.onFailure { syncError ->
+            syncError.printStackTrace()
+            appendOpLog(devCtx, "[WARN] Kanban apply-result report failed: ${syncError::class.java.simpleName}: ${syncError.message}\n")
+            SwingUtilities.invokeLater {
+                appendChatLine("[Warn] Kanban sync failed: ${syncError.message}")
+            }
+        }
+    }
+
+    private fun collectChangedPaths(response: IdeChatResponse): List<String> {
+        val fromOps = response.ops.mapNotNull { normalizeRelPath(it.path).takeIf { p -> p.isNotBlank() } }
+        val fromPatchOps = PatchApplier.collectAffectedPaths(response.patchOps)
+            .mapNotNull { normalizeRelPath(it).takeIf { p -> p.isNotBlank() } }
+        return (fromOps + fromPatchOps).distinct()
+    }
+
+    private fun normalizeRelPath(path: String): String {
+        var s = path.trim().replace("\\", "/")
+        while (s.startsWith("/")) s = s.substring(1)
+        val parts = s.split("/").filter { it.isNotBlank() }
+        if (parts.any { it == ".." }) return ""
+        return parts.joinToString("/")
     }
 
     private fun chooseAttachments() {

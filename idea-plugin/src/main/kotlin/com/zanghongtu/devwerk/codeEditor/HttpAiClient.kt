@@ -22,6 +22,7 @@ class HttpAiClient(
     private val planEndpoint: String,
     private val executeEndpoint: String,
     private val attachmentEndpoint: String,
+    private val kanbanTasksEndpoint: String,
     private val authToken: String? = null
 ) : AiClient {
 
@@ -151,6 +152,26 @@ class HttpAiClient(
         }
     }
 
+    fun abandonTask(taskId: String) {
+        postKanbanAction(taskId, "abandon", JSONObject())
+    }
+
+    fun reportApplyResult(
+        taskId: String,
+        ok: Boolean,
+        snapshotId: String?,
+        changedPaths: List<String>,
+        errorMessage: String? = null
+    ) {
+        val body = JSONObject()
+        body.put("ok", ok)
+        body.put("snapshot_id", snapshotId ?: JSONObject.NULL)
+        body.put("changed_paths", JSONArray(changedPaths))
+        body.put("verification", JSONObject())
+        body.put("error_message", errorMessage ?: JSONObject.NULL)
+        postKanbanAction(taskId, "apply-result", body)
+    }
+
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
@@ -210,6 +231,25 @@ class HttpAiClient(
 
         val fallback = (lastResp ?: IdeChatResponse(reply = "No response", done = true)).copy(rawResponses = rawResponses.toList())
         return fallback.copy(ops = (accOps + fallback.ops), patchOps = (accPatchOps + fallback.patchOps))
+    }
+
+    private fun postKanbanAction(taskId: String, action: String, body: JSONObject) {
+        val mediaType = "application/json; charset=utf-8".toMediaType()
+        val requestBuilder = Request.Builder()
+            .url("${kanbanTasksEndpoint.trimEnd('/')}/$taskId/$action")
+            .post(body.toString().toRequestBody(mediaType))
+            .header("Content-Type", "application/json; charset=utf-8")
+
+        if (!authToken.isNullOrBlank()) {
+            requestBuilder.header("Authorization", "Bearer $authToken")
+        }
+
+        client.newCall(requestBuilder.build()).execute().use { response ->
+            val respBody = response.body?.string() ?: ""
+            if (!response.isSuccessful) {
+                throw RuntimeException("HTTP ${response.code} from kanban server: $respBody")
+            }
+        }
     }
 
     private fun buildMessages(context: ChatContext, newUserMsg: String): MutableList<ChatMessage> {

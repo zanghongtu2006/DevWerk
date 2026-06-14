@@ -17,6 +17,7 @@ object AiClientFactory {
             planEndpoint = "$base/v1/plan",
             executeEndpoint = "$base/v1/execute",
             attachmentEndpoint = "$base/v1/ide/attachments",
+            kanbanTasksEndpoint = "$base/v1/kanban/tasks",
             authToken = profile.token.ifBlank { null }
         )
     }
