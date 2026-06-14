@@ -27,7 +27,7 @@ from app.services.llm_factory import get_llm_client
 from app.services.planner import Planner as build_planner
 from app.services.prompt_builder import build_model_messages
 from app.services.usage import usage_summary
-from app.services.workflow import apply_workflow_action
+from app.services.workflow import apply_workflow_action, record_phase_output
 
 router = APIRouter()
 _log = logging.getLogger("devwerk.ide")
@@ -185,13 +185,59 @@ async def ide_plan(request: Request) -> PlanResponse:
         result = p.plan(messages=messages, mode=mode)
         if result.ok:
             _kanban_artifact(task_id, "plan_response", payload=result.model_dump())
-            _kanban_move(task_id, "planned", {"files": len(result.files), "warnings": len(result.warnings)})
+            phase_output = _record_phase_output(
+                task_id,
+                phase="plan",
+                agent=planner_agent,
+                status_key="planned",
+                summary=result.summary,
+                inputs={
+                    "mode": mode,
+                    "message_count": len(messages),
+                    "workspace": _workspace_debug_summary(body.get("workspace")),
+                },
+                outputs={
+                    "files": [f.model_dump() for f in result.files],
+                    "file_count": len(result.files),
+                },
+                warnings=result.warnings,
+                next_action="execute",
+            )
+            _kanban_move(task_id, "planned", {"files": len(result.files), "warnings": len(result.warnings), "session_id": phase_output.get("session_id") if phase_output else None})
             result.task_id = task_id
             result.status_key = "planned"
+            if phase_output:
+                result.session_id = phase_output.get("session_id")
+                result.phase_output = phase_output
+                result.next_action = phase_output.get("next_action")
         else:
+            phase_output = _record_phase_output(
+                task_id,
+                phase="plan",
+                agent=planner_agent,
+                status_key="failed",
+                summary=result.error_message or result.summary or "Planner failed to produce a file-level plan.",
+                inputs={
+                    "mode": mode,
+                    "message_count": len(messages),
+                    "workspace": _workspace_debug_summary(body.get("workspace")),
+                },
+                outputs={
+                    "files": [],
+                    "file_count": 0,
+                    "error_code": result.error_code,
+                    "error_message": result.error_message,
+                },
+                warnings=result.warnings,
+                next_action="retry",
+            )
             _kanban_move(task_id, "failed", {"phase": "plan", "error_code": result.error_code})
             result.task_id = task_id
             result.status_key = "failed"
+            if phase_output:
+                result.session_id = phase_output.get("session_id")
+                result.phase_output = phase_output
+                result.next_action = phase_output.get("next_action")
         _log.debug(
             "ide_plan: planner_result ok=%s files=%s warnings=%s summary=%s",
             result.ok,
@@ -391,11 +437,34 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                     patch_ops=coerce_to_patchops(patch_ops),
                     done=bool(obj.get("done") or False),
                 )
+                phase_output = _record_phase_output(
+                    task_id,
+                    phase="coding",
+                    agent="executor",
+                    status_key="ready_to_apply",
+                    summary=response.reply or "Generated changes are ready for plugin apply.",
+                    inputs={
+                        "mode": mode,
+                        "approved_paths": sorted(approved_set),
+                        "tool_round": tool_round + 1,
+                    },
+                    outputs={
+                        "ops": [{"op": op.op, "path": op.path, "language": op.language} for op in response.ops],
+                        "patch_ops": len(response.patch_ops),
+                        "done": response.done,
+                    },
+                    warnings=[],
+                    next_action="apply_result",
+                )
+                if phase_output:
+                    response.session_id = phase_output.get("session_id")
+                    response.phase_output = phase_output
+                    response.next_action = phase_output.get("next_action")
                 _kanban_artifact(task_id, "execute_response", payload=response.model_dump())
                 _kanban_move(
                     task_id,
                     "ready_to_apply",
-                    {"ops": len(response.ops), "patch_ops": len(response.patch_ops), "done": response.done},
+                    {"ops": len(response.ops), "patch_ops": len(response.patch_ops), "done": response.done, "session_id": response.session_id},
                 )
                 return response
 
@@ -722,6 +791,37 @@ def _kanban_artifact(task_id: str | None, artifact_type: str, payload: dict) -> 
         add_artifact(task_id, artifact_type=artifact_type, payload=payload)
     except Exception as exc:  # noqa: BLE001
         _log.debug("kanban artifact skipped task_id=%s type=%s error=%s", task_id, artifact_type, exc)
+
+
+def _record_phase_output(
+    task_id: str | None,
+    *,
+    phase: str,
+    agent: str,
+    status_key: str,
+    summary: str,
+    inputs: dict,
+    outputs: dict,
+    warnings: list[str],
+    next_action: str | None,
+) -> dict | None:
+    if not task_id:
+        return None
+    try:
+        return record_phase_output(
+            task_id,
+            phase=phase,
+            agent=agent,
+            status_key=status_key,
+            summary=summary,
+            inputs=inputs,
+            outputs=outputs,
+            warnings=warnings,
+            next_action=next_action,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("workflow phase output skipped task_id=%s phase=%s error=%s", task_id, phase, exc)
+        return None
 
 
 def _kanban_move(task_id: str | None, status_key: str, payload: dict) -> None:

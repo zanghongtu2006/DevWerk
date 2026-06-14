@@ -8,6 +8,11 @@ import pytest
 from app.services.anthropic_client import AnthropicClient
 
 
+def reset_service_dbs(kanban_service, usage_service) -> None:
+    kanban_service._initialized = False
+    usage_service._initialized = False
+
+
 class FakeSettings:
     app_env = "test"
     llm_provider_name = "stub"
@@ -32,6 +37,15 @@ class FakeSettings:
 class FakePlannerClient:
     def chat_json(self, messages: list[dict]) -> dict:
         return {"raw_text": "Create a minimal Spring Boot Java 21 REST API."}
+
+
+class FakeToolRequestPlannerClient:
+    def chat_json(self, messages: list[dict]) -> dict:
+        return {
+            "tool_requests": [
+                {"id": "p1", "tool": "read_file", "args": {"path": "pom.xml", "start_line": 1, "end_line": 200}}
+            ]
+        }
 
 
 class FakeExecutorClient:
@@ -127,6 +141,7 @@ async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_
     monkeypatch.setattr(ide_routes, "settings", lambda: fake_settings)
     monkeypatch.setattr(kanban_service, "settings", lambda: fake_settings)
     monkeypatch.setattr(usage_service, "settings", lambda: fake_settings)
+    reset_service_dbs(kanban_service, usage_service)
     monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": FakePlannerClient())
     monkeypatch.setattr(ide_routes, "get_llm_client", lambda agent="executor": FakeExecutorClient())
 
@@ -161,6 +176,9 @@ async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_
             assert plan["ok"] is True
             assert plan["task_id"]
             assert plan["status_key"] == "planned"
+            assert plan["session_id"]
+            assert plan["next_action"] == "execute"
+            assert plan["phase_output"]["phase"] == "plan"
             planned_paths = {item["path"] for item in plan["files"]}
             assert "build.gradle" in planned_paths
             assert "src/main/java/com/devwerk/demo/HelloController.java" in planned_paths
@@ -186,6 +204,9 @@ async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_
             assert executed["ok"] is True
             assert executed["task_id"] == plan["task_id"]
             assert executed["status_key"] == "ready_to_apply"
+            assert executed["session_id"]
+            assert executed["next_action"] == "apply_result"
+            assert executed["phase_output"]["phase"] == "coding"
             assert executed["done"] is True
             assert len(executed["ops"]) == 4
             _apply_file_ops(project_root, executed["ops"])
@@ -199,7 +220,82 @@ async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_
             task = task_response.json()["task"]
             assert task["status_key"] == "ready_to_apply"
             artifact_types = {artifact["artifact_type"] for artifact in task["artifacts"]}
-            assert {"plan_request", "plan_response", "execute_response"}.issubset(artifact_types)
+            assert {"plan_request", "plan_response", "execute_response", "workflow_phase_output"}.issubset(artifact_types)
+
+
+@pytest.mark.asyncio
+async def test_plan_falls_back_to_user_management_files_when_planner_returns_tool_requests(monkeypatch, tmp_path):
+    db_path = tmp_path / "devwerk-user-management-plan.db"
+    project_root = tmp_path / "test"
+    project_root.mkdir()
+    fake_settings = FakeSettings(db_path)
+
+    import app.main as main_module
+    import app.routes.ide as ide_routes
+    import app.services.kanban as kanban_service
+    import app.services.planner as planner_service
+    import app.services.usage as usage_service
+
+    monkeypatch.setattr(main_module, "settings", lambda: fake_settings)
+    monkeypatch.setattr(ide_routes, "settings", lambda: fake_settings)
+    monkeypatch.setattr(kanban_service, "settings", lambda: fake_settings)
+    monkeypatch.setattr(usage_service, "settings", lambda: fake_settings)
+    reset_service_dbs(kanban_service, usage_service)
+    monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": FakeToolRequestPlannerClient())
+
+    app = main_module.create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            project_id = "backend-user-management-plan-smoke"
+            response = await client.post(
+                "/v1/plan",
+                json={
+                    "project_id": project_id,
+                    "mode": "agent",
+                    "project_root": str(project_root),
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "加一个用户管理功能，需要有注册，以及用户的增删改查，当前不需要考虑注册用户的权限，任何人都可以注册，但是需要考虑增删改查的权限，当前无设计，保留一个可以扩展的方式",
+                        }
+                    ],
+                    "workspace": {
+                        "root_id": project_id,
+                        "changed_files": [],
+                        "open_files": [],
+                        "source_map": None,
+                        "tree_preview": (
+                            "test/\n"
+                            "  src/\n"
+                            "    main/\n"
+                            "      java/\n"
+                            "        org/\n"
+                            "          example/\n"
+                            "            controller/\n"
+                            "              Application.java\n"
+                            "      resources/\n"
+                            "        application.properties\n"
+                            "  pom.xml"
+                        ),
+                    },
+                    "tool_results": [],
+                },
+                headers={"X-DevWerk-Project-Id": project_id},
+            )
+
+    assert response.status_code == 200
+    plan = response.json()
+    assert plan["ok"] is True
+    assert plan["status_key"] == "planned"
+    assert plan["next_action"] == "execute"
+    assert plan["phase_output"]["phase"] == "plan"
+    planned_paths = {item["path"] for item in plan["files"]}
+    assert "src/main/java/org/example/user/UserController.java" in planned_paths
+    assert "src/main/java/org/example/user/UserService.java" in planned_paths
+    assert "src/main/java/org/example/user/UserPermissionPolicy.java" in planned_paths
+    assert "pom.xml" in planned_paths
+    assert plan["warnings"]
 
 
 @pytest.mark.asyncio
@@ -222,6 +318,7 @@ async def test_execute_resolves_tool_requests_and_strips_project_root_prefix(mon
     monkeypatch.setattr(ide_routes, "settings", lambda: fake_settings)
     monkeypatch.setattr(kanban_service, "settings", lambda: fake_settings)
     monkeypatch.setattr(usage_service, "settings", lambda: fake_settings)
+    reset_service_dbs(kanban_service, usage_service)
     monkeypatch.setattr(ide_routes, "get_llm_client", lambda agent="executor": fake_executor)
 
     app = main_module.create_app()

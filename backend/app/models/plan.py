@@ -4,7 +4,7 @@ Plan models — file-level change declarations returned by /v1/ide/plan.
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -40,12 +40,15 @@ class PlanResponse(BaseModel):
     ok: bool = True
     task_id: Optional[str] = None
     status_key: Optional[str] = None
+    session_id: Optional[str] = None
+    phase_output: Optional[dict[str, Any]] = None
+    next_action: Optional[str] = None
 
     files: list[PlanFile] = Field(
         default_factory=list,
         description=(
             "Files the LLM intends to modify. "
-            "Empty list means the request is a pure Q&A with no file operations."
+            "Empty list is valid only when the backend classified the request as pure Q&A."
         ),
     )
 

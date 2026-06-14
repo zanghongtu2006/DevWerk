@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any
 
 from app.services.kanban import add_artifact, add_event, get_task, move_task
@@ -17,6 +18,63 @@ ACTION_CODING_FAILED = "coding_failed"
 ACTION_APPLY_RESULT = "apply_result"
 ACTION_RETRY = "retry"
 ACTION_ABANDON = "abandon"
+
+
+def record_phase_output(
+    task_id: str,
+    *,
+    phase: str,
+    agent: str,
+    status_key: str,
+    summary: str,
+    inputs: dict[str, Any] | None = None,
+    outputs: dict[str, Any] | None = None,
+    warnings: list[str] | None = None,
+    session_id: str | None = None,
+    next_action: str | None = None,
+) -> dict[str, Any]:
+    """
+    Persist the stable output contract for one workflow phase.
+
+    Today one configured LLM profile may execute every phase. Future planner,
+    coder, and tester agents can keep this same artifact shape while owning
+    their own session context.
+    """
+    sid = session_id or f"{phase}-{uuid.uuid4()}"
+    payload = {
+        "session_id": sid,
+        "phase": phase,
+        "agent": agent,
+        "status_key": status_key,
+        "summary": summary or "",
+        "inputs": inputs or {},
+        "outputs": outputs or {},
+        "warnings": warnings or [],
+        "next_action": next_action,
+    }
+    _log.debug(
+        "workflow phase output task_id=%s phase=%s agent=%s status=%s session_id=%s next_action=%s summary=%s",
+        task_id,
+        phase,
+        agent,
+        status_key,
+        sid,
+        next_action,
+        summary,
+    )
+    add_artifact(task_id, artifact_type="workflow_phase_output", payload=payload)
+    add_event(
+        task_id,
+        "workflow_phase_output_recorded",
+        {
+            "session_id": sid,
+            "phase": phase,
+            "agent": agent,
+            "status_key": status_key,
+            "next_action": next_action,
+        },
+    )
+    return payload
 
 
 def apply_workflow_action(task_id: str, action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -75,18 +133,51 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     add_event(task_id, "apply_result_received", payload)
 
     if not ok:
+        record_phase_output(
+            task_id,
+            phase="apply",
+            agent="plugin",
+            status_key="failed",
+            summary=str(payload.get("error_message") or "Plugin failed to apply generated changes."),
+            outputs={
+                "ok": False,
+                "snapshot_id": payload.get("snapshot_id"),
+                "changed_paths": payload.get("changed_paths") or [],
+                "verification": payload.get("verification") or {},
+            },
+            warnings=[str(payload.get("error_message") or "apply failed")],
+            next_action=ACTION_RETRY,
+        )
         return move_task(task_id, "failed", force=True, payload={"phase": "apply", **payload})
 
-    applied = move_task(task_id, "applied", force=True, payload=payload)
     verification = payload.get("verification")
     required = verification.get("required") if isinstance(verification, dict) else None
     results = verification.get("results") if isinstance(verification, dict) else None
-    if isinstance(required, list) and isinstance(results, dict):
-        passed = all(str(results.get(item)).lower() == "passed" for item in required)
-        if passed:
-            move_task(task_id, "verified", force=True, payload={"verification": verification})
-            return move_task(task_id, "done", force=True, payload={"reason": "verification_passed"})
-    return applied
+    has_verification_policy = isinstance(required, list) and isinstance(results, dict)
+    passed = all(str(results.get(item)).lower() == "passed" for item in required) if has_verification_policy else True
+    auto_done = passed
+    record_phase_output(
+        task_id,
+        phase="apply",
+        agent="plugin",
+        status_key="done" if auto_done else "failed",
+        summary="Plugin applied generated changes through the snapshot-protected path.",
+        outputs={
+            "ok": True,
+            "snapshot_id": payload.get("snapshot_id"),
+            "changed_paths": payload.get("changed_paths") or [],
+            "verification": verification or {},
+        },
+        warnings=[] if auto_done else ["Verification requirements did not pass."],
+        next_action=None if auto_done else ACTION_RETRY,
+    )
+
+    applied = move_task(task_id, "applied", force=True, payload=payload)
+    if auto_done:
+        move_task(task_id, "verified", force=True, payload={"verification": verification or {}})
+        reason = "verification_passed" if has_verification_policy else "apply_completed_without_verification_policy"
+        return move_task(task_id, "done", force=True, payload={"reason": reason})
+    return move_task(task_id, "failed", force=True, payload={"phase": "verify", **payload})
 
 
 def current_workflow_state(task_id: str) -> dict[str, Any]:

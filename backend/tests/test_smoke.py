@@ -54,9 +54,9 @@ def test_workflow_action_protocol_drives_kanban_state(monkeypatch, tmp_path):
         },
     )
 
-    assert applied["task"]["status_key"] == "applied"
+    assert applied["task"]["status_key"] == "done"
     state = workflow_service.current_workflow_state(task["id"])
-    assert state["status_key"] == "applied"
+    assert state["status_key"] == "done"
 
     abandoned = workflow_service.apply_workflow_action(task["id"], "abandon", {"reason": "test"})
     assert abandoned["task"]["status_key"] == "failed"

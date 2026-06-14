@@ -78,6 +78,30 @@ State meaning:
 - `Failed`: A phase failed. Rework should move the task back to the appropriate
   earlier state rather than adding more columns.
 
+## Phase Outputs
+
+Every workflow column must produce a stable phase output artifact. This keeps the
+kanban board as the execution contract instead of a passive review view. Today a
+single configured model can run every phase; future planner, coder, and tester
+agents can own separate sessions while writing the same artifact shape.
+
+```json
+{
+  "session_id": "plan-...",
+  "phase": "plan",
+  "agent": "planner",
+  "status_key": "planned",
+  "summary": "...",
+  "inputs": {},
+  "outputs": {},
+  "warnings": [],
+  "next_action": "execute"
+}
+```
+
+If a coding request cannot produce a file-level plan, the task moves to `Failed`
+instead of returning `ok=true` with an empty file list.
+
 ## Planning Artifacts
 
 `Planned` is a state, not a single string. DevWerk stores a planning bundle:
@@ -194,6 +218,9 @@ Important response fields:
   "ok": true,
   "task_id": "...",
   "status_key": "ready_to_apply",
+  "session_id": "coding-...",
+  "phase_output": {},
+  "next_action": "apply_result",
   "planning": {},
   "ops": [],
   "patch_ops": []
@@ -226,6 +253,10 @@ they report semantic actions and the backend state machine advances the task.
 Supported actions include `apply_result`, `retry`, and `abandon`. Internal coding
 stages use the same workflow service, so API clients, the dashboard, and the IDE
 plugin all go through the same state-machine boundary.
+
+`apply_result` is terminal in the current single-agent flow: successful apply
+without a verification policy moves through `Applied` and `Verified` to `Done`;
+failed apply or failed verification moves the task to `Failed`.
 
 ### `GET/PUT /v1/settings`
 

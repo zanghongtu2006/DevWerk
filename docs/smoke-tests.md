@@ -23,7 +23,7 @@ Coverage:
 Expected result:
 
 ```text
-3 passed
+4 passed
 ```
 
 ## Backend Coding Workflow Smoke
@@ -69,7 +69,7 @@ Coverage:
 Expected result:
 
 ```text
-6 passed
+7 passed
 ```
 
 ## Backend Debug Log Smoke

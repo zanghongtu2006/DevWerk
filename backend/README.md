@@ -85,6 +85,27 @@ Draft -> Context Indexed -> Planned -> Coding -> Ready To Apply
 `Failed` is available from every stage. Rework should move a task back to the
 right previous state and record a reason in events/artifacts.
 
+Every phase writes a `workflow_phase_output` artifact:
+
+```json
+{
+  "session_id": "plan-...",
+  "phase": "plan",
+  "agent": "planner",
+  "status_key": "planned",
+  "summary": "...",
+  "inputs": {},
+  "outputs": {},
+  "warnings": [],
+  "next_action": "execute"
+}
+```
+
+This is the compatibility contract for future multi-agent scheduling. Planner,
+coder, and tester agents may use separate sessions, but the backend state machine
+still owns column transitions. Empty file-level plans for coding requests are
+treated as planning failures, not successful pure Q&A.
+
 ## Main Endpoints
 
 ### `POST /v1/chat`
@@ -117,7 +138,7 @@ Behavior:
 5. Move to `Planned`.
 6. Generate code changes.
 7. Move to `Ready To Apply`.
-8. Return `ops` and/or `patch_ops` to the plugin.
+8. Return `phase_output`, `next_action`, and `ops` and/or `patch_ops` to the plugin.
 
 ### `POST /v1/kanban/tasks/{task_id}/actions`
 
@@ -142,8 +163,10 @@ state machine decides the next kanban state.
 }
 ```
 
-When required verification checks all pass, the backend moves the task through
-`Verified` to `Done`.
+`apply_result` is terminal in the current single-agent flow. Successful apply
+without a verification policy moves through `Applied` and `Verified` to `Done`.
+If verification requirements are present, they must all pass; otherwise the task
+moves to `Failed`.
 
 Other client-visible actions include `retry` and `abandon`. No client should call
 direct column-move endpoints.
