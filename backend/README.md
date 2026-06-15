@@ -106,6 +106,38 @@ coder, and tester agents may use separate sessions, but the backend state machin
 still owns column transitions. Empty file-level plans for coding requests are
 treated as planning failures, not successful pure Q&A.
 
+## Session And Memory Storage
+
+Session state is durable. It is not held only in Python process memory.
+
+Default paths:
+
+```text
+backend/data/devwerk.db
+backend/data/sessions/{projectId}/{taskId}/events.jsonl
+backend/data/sessions/{projectId}/{taskId}/memory.jsonl
+backend/data/sessions/{projectId}/{taskId}/latest_memory.json
+backend/data/sessions/{projectId}/{taskId}/sessions/{sessionId}/events.jsonl
+backend/data/sessions/{projectId}/{taskId}/sessions/{sessionId}/memory.json
+backend/data/sessions/{projectId}/{taskId}/sessions/{sessionId}/phase_outputs.jsonl
+```
+
+Override the file root:
+
+```env
+DEVWERK_SESSION_DIR=./data/sessions
+```
+
+Rules:
+
+- Every kanban event appends to task `events.jsonl`.
+- Events with `payload.session_id` also append to that session's `events.jsonl`.
+- Every `workflow_phase_output` updates task/session memory snapshots.
+- Current memory is task/session memory: phase inputs, outputs, summaries,
+  warnings, status, and next actions.
+- Long-term framework memory is not implemented yet; it should use a separate
+  explicit store rather than implicit process memory.
+
 ## Main Endpoints
 
 ### `POST /v1/chat`

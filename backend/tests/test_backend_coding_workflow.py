@@ -13,6 +13,14 @@ def reset_service_dbs(kanban_service, usage_service) -> None:
     usage_service._initialized = False
 
 
+def patch_service_settings(monkeypatch, fake_settings, *modules) -> None:
+    import app.services.session_store as session_store
+
+    for module in modules:
+        monkeypatch.setattr(module, "settings", lambda: fake_settings)
+    monkeypatch.setattr(session_store, "settings", lambda: fake_settings)
+
+
 class FakeSettings:
     app_env = "test"
     llm_provider_name = "stub"
@@ -161,10 +169,7 @@ async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_
     import app.services.planner as planner_service
     import app.services.usage as usage_service
 
-    monkeypatch.setattr(main_module, "settings", lambda: fake_settings)
-    monkeypatch.setattr(ide_routes, "settings", lambda: fake_settings)
-    monkeypatch.setattr(kanban_service, "settings", lambda: fake_settings)
-    monkeypatch.setattr(usage_service, "settings", lambda: fake_settings)
+    patch_service_settings(monkeypatch, fake_settings, main_module, ide_routes, kanban_service, usage_service)
     reset_service_dbs(kanban_service, usage_service)
     monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": FakePlannerClient())
     monkeypatch.setattr(ide_routes, "get_llm_client", lambda agent="executor": FakeExecutorClient())
@@ -272,10 +277,7 @@ async def test_plan_falls_back_to_user_management_files_when_planner_returns_too
     import app.services.planner as planner_service
     import app.services.usage as usage_service
 
-    monkeypatch.setattr(main_module, "settings", lambda: fake_settings)
-    monkeypatch.setattr(ide_routes, "settings", lambda: fake_settings)
-    monkeypatch.setattr(kanban_service, "settings", lambda: fake_settings)
-    monkeypatch.setattr(usage_service, "settings", lambda: fake_settings)
+    patch_service_settings(monkeypatch, fake_settings, main_module, ide_routes, kanban_service, usage_service)
     reset_service_dbs(kanban_service, usage_service)
     monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": FakeToolRequestPlannerClient())
 
@@ -350,10 +352,7 @@ async def test_execute_resolves_tool_requests_and_strips_project_root_prefix(mon
     import app.services.kanban as kanban_service
     import app.services.usage as usage_service
 
-    monkeypatch.setattr(main_module, "settings", lambda: fake_settings)
-    monkeypatch.setattr(ide_routes, "settings", lambda: fake_settings)
-    monkeypatch.setattr(kanban_service, "settings", lambda: fake_settings)
-    monkeypatch.setattr(usage_service, "settings", lambda: fake_settings)
+    patch_service_settings(monkeypatch, fake_settings, main_module, ide_routes, kanban_service, usage_service)
     reset_service_dbs(kanban_service, usage_service)
     monkeypatch.setattr(ide_routes, "get_llm_client", lambda agent="executor": fake_executor)
 
@@ -410,10 +409,7 @@ async def test_execute_returns_client_tool_requests_and_apply_result_completes_t
     import app.services.kanban as kanban_service
     import app.services.usage as usage_service
 
-    monkeypatch.setattr(main_module, "settings", lambda: fake_settings)
-    monkeypatch.setattr(ide_routes, "settings", lambda: fake_settings)
-    monkeypatch.setattr(kanban_service, "settings", lambda: fake_settings)
-    monkeypatch.setattr(usage_service, "settings", lambda: fake_settings)
+    patch_service_settings(monkeypatch, fake_settings, main_module, ide_routes, kanban_service, usage_service)
     reset_service_dbs(kanban_service, usage_service)
     monkeypatch.setattr(ide_routes, "get_llm_client", lambda agent="executor": FakeClientToolExecutorClient())
 

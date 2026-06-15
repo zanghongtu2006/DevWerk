@@ -5,6 +5,7 @@ import uuid
 from typing import Any
 
 from app.services.kanban import add_artifact, add_event, get_task, move_task
+from app.services.session_store import record_phase_memory
 
 _log = logging.getLogger("devwerk.workflow")
 
@@ -74,6 +75,12 @@ def record_phase_output(
             "next_action": next_action,
         },
     )
+    try:
+        task = get_task(task_id).get("task") or {}
+        project_id = str(task.get("project_id") or "default")
+        record_phase_memory(project_id=project_id, task_id=task_id, phase_output=payload)
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("workflow phase memory skipped task_id=%s phase=%s error=%s", task_id, phase, exc)
     return payload
 
 

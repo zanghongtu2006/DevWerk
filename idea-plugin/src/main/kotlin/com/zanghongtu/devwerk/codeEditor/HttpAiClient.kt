@@ -28,10 +28,10 @@ class HttpAiClient(
 
     private val client = OkHttpClient().newBuilder()
         .proxy(java.net.Proxy.NO_PROXY)
-        .connectTimeout(300, TimeUnit.SECONDS)
-        .writeTimeout(300, TimeUnit.SECONDS)
-        .readTimeout(300, TimeUnit.SECONDS)
-        .callTimeout(300, TimeUnit.SECONDS)
+        .connectTimeout(120, TimeUnit.SECONDS)
+        .writeTimeout(1200, TimeUnit.SECONDS)
+        .readTimeout(1200, TimeUnit.SECONDS)
+        .callTimeout(1200, TimeUnit.SECONDS)
         .build()
 
     // -------------------------------------------------------------------------

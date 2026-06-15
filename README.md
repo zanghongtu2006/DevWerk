@@ -105,6 +105,31 @@ agents can own separate sessions while writing the same artifact shape.
 If a coding request cannot produce a file-level plan, the task moves to `Failed`
 instead of returning `ok=true` with an empty file list.
 
+## Session And Memory Storage
+
+DevWerk persists workflow session state in two layers:
+
+- SQLite: `backend/data/devwerk.db`
+  - `kb_events`: every kanban event and column transition
+  - `kb_artifacts`: phase outputs, request/response artifacts, apply results
+- Files: `backend/data/sessions/` by default
+  - Override with `DEVWERK_SESSION_DIR`
+  - Task event log:
+    `backend/data/sessions/{projectId}/{taskId}/events.jsonl`
+  - Task memory snapshots:
+    `backend/data/sessions/{projectId}/{taskId}/memory.jsonl`
+    and `latest_memory.json`
+  - Phase/session log:
+    `backend/data/sessions/{projectId}/{taskId}/sessions/{sessionId}/events.jsonl`
+  - Phase/session memory:
+    `backend/data/sessions/{projectId}/{taskId}/sessions/{sessionId}/memory.json`
+    and `phase_outputs.jsonl`
+
+Current memory is durable task/session memory: phase inputs, outputs, summaries,
+warnings, status, and next actions. It is not yet a long-term framework memory
+or vector store. Future framework recognition memory should build on this file
+contract rather than living only in process memory.
+
 ## Planning Artifacts
 
 `Planned` is a state, not a single string. DevWerk stores a planning bundle:

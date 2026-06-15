@@ -1,3 +1,5 @@
+import json
+
 from app.models.ide import IdeChatResponse
 from app.services.kanban import DEFAULT_COLUMNS
 
@@ -28,12 +30,14 @@ def test_default_kanban_flow_contains_required_control_points():
 
 def test_workflow_action_protocol_drives_kanban_state(monkeypatch, tmp_path):
     import app.services.kanban as kanban_service
+    import app.services.session_store as session_store
     import app.services.workflow as workflow_service
 
     class FakeSettings:
         devwerk_db_path = str(tmp_path / "workflow.db")
 
     monkeypatch.setattr(kanban_service, "settings", lambda: FakeSettings())
+    monkeypatch.setattr(session_store, "settings", lambda: FakeSettings())
     kanban_service._initialized = False
 
     task = kanban_service.create_task(
@@ -62,6 +66,28 @@ def test_workflow_action_protocol_drives_kanban_state(monkeypatch, tmp_path):
     assert "task_moved" in event_types
     assert "apply_result_received" in event_types
     assert events[0]["task_title"] == "Implement feature"
+    task_log = tmp_path / "sessions" / "workflow-smoke" / task["id"] / "events.jsonl"
+    latest_memory = tmp_path / "sessions" / "workflow-smoke" / task["id"] / "latest_memory.json"
+    assert task_log.is_file()
+    assert latest_memory.is_file()
+    task_events = [json.loads(line) for line in task_log.read_text(encoding="utf-8").splitlines()]
+    assert any(event["event_type"] == "task_moved" for event in task_events)
+    memory = json.loads(latest_memory.read_text(encoding="utf-8"))
+    assert memory["task_id"] == task["id"]
+    assert memory["phase"] == "apply"
+    assert memory["status_key"] == "done"
+    session_events = (
+        tmp_path
+        / "sessions"
+        / "workflow-smoke"
+        / task["id"]
+        / "sessions"
+        / memory["session_id"]
+        / "events.jsonl"
+    )
+    session_memory = session_events.parent / "memory.json"
+    assert session_events.is_file()
+    assert session_memory.is_file()
 
     abandoned = workflow_service.apply_workflow_action(task["id"], "abandon", {"reason": "test"})
     assert abandoned["task"]["status_key"] == "failed"

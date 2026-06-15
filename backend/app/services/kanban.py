@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import settings
+from app.services.session_store import append_task_event
 
 _log = logging.getLogger("devwerk.kanban")
 _initialized = False
@@ -733,6 +734,7 @@ def _insert_event(
     to_status: str | None,
     payload: dict[str, Any],
 ) -> None:
+    event_payload = payload or {}
     conn.execute(
         """
         INSERT INTO kb_events (
@@ -747,9 +749,17 @@ def _insert_event(
             event_type,
             from_status,
             to_status,
-            _json(payload),
+            _json(event_payload),
             _now(),
         ),
+    )
+    append_task_event(
+        project_id=project_id,
+        task_id=task_id,
+        event_type=event_type,
+        from_status=from_status,
+        to_status=to_status,
+        payload=event_payload,
     )
 
 
