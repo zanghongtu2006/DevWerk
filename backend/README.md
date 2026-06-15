@@ -202,6 +202,18 @@ moves to `Failed`.
 Other client-visible actions include `retry` and `abandon`. No client should call
 direct column-move endpoints.
 
+### `GET /v1/kanban/events`
+
+Lists project/task event logs for tracing rapid AI workflow movement.
+
+```text
+GET /v1/kanban/events?project_id=...&task_id=...&limit=200
+```
+
+The event stream includes column transitions, workflow actions, planner/executor
+round input-output summaries, tool request results, artifacts, apply results,
+and verification outcomes. Dashboard Events is a UI over this endpoint.
+
 ### `GET/PUT /v1/settings`
 
 Reads/writes `config/llm.json`. Dashboard Settings presents two editors:
@@ -214,6 +226,7 @@ Reads/writes `config/llm.json`. Dashboard Settings presents two editors:
 - `GET /v1/kanban/projects`
 - `POST /v1/kanban/projects`
 - `GET /v1/kanban/board?project_id=...`
+- `GET /v1/kanban/events?project_id=...&task_id=...`
 - `POST /v1/kanban/tasks`
 - `GET /v1/kanban/tasks/{task_id}/workflow`
 - `POST /v1/kanban/tasks/{task_id}/actions`

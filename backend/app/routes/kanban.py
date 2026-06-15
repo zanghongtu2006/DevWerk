@@ -14,6 +14,7 @@ from app.services.kanban import (
     get_project,
     get_project_settings,
     get_task,
+    list_events,
     list_columns,
     list_projects,
     replace_columns,
@@ -92,6 +93,11 @@ def kanban_board(project_id: str | None = None):
 @router.get("/projects")
 def kanban_projects():
     return {"ok": True, "projects": list_projects()}
+
+
+@router.get("/events")
+def kanban_events(project_id: str | None = None, task_id: str | None = None, limit: int = 200):
+    return list_events(project_id=project_id, task_id=task_id, limit=limit)
 
 
 @router.post("/projects")
@@ -272,11 +278,19 @@ DASHBOARD_HTML = r"""
     .task p { margin: 0 0 8px; color: var(--muted); white-space: pre-wrap; }
     .task footer { display: flex; gap: 6px; flex-wrap: wrap; }
     .task footer button { height: 28px; padding: 0 8px; font-size: 12px; }
+    .events { display: grid; gap: 8px; }
+    .event-row { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 10px; }
+    .event-head { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; flex-wrap: wrap; }
+    .event-title { font-weight: 650; }
+    .event-meta { color: var(--muted); font-size: 12px; }
+    .event-flow { margin-top: 6px; color: var(--muted); }
+    .event-row details { margin-top: 8px; }
+    .event-row pre { margin: 6px 0 0; overflow: auto; max-height: 260px; padding: 8px; border-radius: 7px; border: 1px solid var(--line); background: color-mix(in srgb, var(--bg) 80%, var(--panel)); font-size: 12px; }
     .settings-grid { grid-template-columns: repeat(2, minmax(260px, 1fr)); align-items: start; }
     .settings-box { padding: 12px; }
     .settings-box h3 { margin: 0 0 10px; font-size: 14px; }
     .wide { grid-column: 1 / -1; }
-    @media (max-width: 900px) { .shell, .shell.collapsed { grid-template-columns: 1fr; } aside { position: sticky; top: 0; z-index: 2; border-right: 0; border-bottom: 1px solid var(--line); } nav { grid-template-columns: repeat(4, 1fr); } .stats, .settings-grid { grid-template-columns: 1fr; } .project-select { min-width: 0; width: 100%; margin-left: 0; } }
+    @media (max-width: 900px) { .shell, .shell.collapsed { grid-template-columns: 1fr; } aside { position: sticky; top: 0; z-index: 2; border-right: 0; border-bottom: 1px solid var(--line); } nav { grid-template-columns: repeat(5, 1fr); } .stats, .settings-grid { grid-template-columns: 1fr; } .project-select { min-width: 0; width: 100%; margin-left: 0; } }
   </style>
 </head>
 <body>
@@ -287,6 +301,7 @@ DASHBOARD_HTML = r"""
         <button data-view="stats" class="active">S <span>Statistics</span></button>
         <button data-view="projects">P <span>Projects</span></button>
         <button data-view="kanban">K <span>Kanban</span></button>
+        <button data-view="events">E <span>Events</span></button>
         <button data-view="settings">G <span>Settings</span></button>
       </nav>
     </aside>
@@ -313,6 +328,10 @@ DASHBOARD_HTML = r"""
           <div class="toolbar"><input id="taskTitle" placeholder="Task title" /><input id="taskDescription" placeholder="Description" /><button id="createTask" class="primary">Create Task</button></div>
           <div id="board" class="board"></div>
         </section>
+        <section id="view-events" class="view">
+          <div class="toolbar"><input id="eventTaskId" placeholder="Filter task id" /><input id="eventLimit" placeholder="Limit" value="200" /><button id="loadEvents" class="primary">Load Events</button></div>
+          <div id="eventList" class="events"></div>
+        </section>
         <section id="view-settings" class="view">
           <div class="grid settings-grid">
             <div class="settings-box"><h3>LLM Catalog</h3><textarea id="llmsJson" style="min-height:360px"></textarea></div>
@@ -325,7 +344,7 @@ DASHBOARD_HTML = r"""
   </div>
   <script>
     const $ = (id) => document.getElementById(id);
-    const state = { view: "stats", projects: [], projectId: "default", board: null };
+    const state = { view: "stats", projects: [], projectId: "default", board: null, events: [] };
     async function api(path, options = {}) {
       const res = await fetch(path, { ...options, headers: { "Content-Type": "application/json", "X-DevWerk-Project-Id": state.projectId, ...(options.headers || {}) } });
       const text = await res.text();
@@ -333,7 +352,7 @@ DASHBOARD_HTML = r"""
       if (!res.ok) throw new Error(data.detail || text || `HTTP ${res.status}`);
       return data;
     }
-    async function refreshAll() { clearError(); await loadProjects(); await Promise.all([loadStats(), loadBoard(), loadGlobalSettings(), loadProjectSettings()]); renderActive(); }
+    async function refreshAll() { clearError(); await loadProjects(); await Promise.all([loadStats(), loadBoard(), loadEvents(), loadGlobalSettings(), loadProjectSettings()]); renderActive(); }
     async function loadProjects() {
       const data = await api("/v1/kanban/projects");
       state.projects = data.projects || [];
@@ -344,6 +363,15 @@ DASHBOARD_HTML = r"""
     }
     async function loadStats() { const usage = await api(`/v1/usage/summary?project_id=${encodeURIComponent(state.projectId)}`); const project = await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}`); renderStats(project.project, usage); }
     async function loadBoard() { state.board = await api(`/v1/kanban/board?project_id=${encodeURIComponent(state.projectId)}`); renderBoard(); }
+    async function loadEvents() {
+      const taskId = $("eventTaskId")?.value.trim() || "";
+      const limit = $("eventLimit")?.value.trim() || "200";
+      const query = new URLSearchParams({ project_id: state.projectId, limit });
+      if (taskId) query.set("task_id", taskId);
+      const data = await api(`/v1/kanban/events?${query.toString()}`);
+      state.events = data.events || [];
+      renderEvents();
+    }
     async function loadGlobalSettings() {
       const data = await api("/v1/settings"); const s = data.settings || {};
       $("llmsJson").value = JSON.stringify(s.llms || {}, null, 2);
@@ -372,7 +400,16 @@ DASHBOARD_HTML = r"""
       if (!["done", "failed"].includes(task.status_key)) actions.push(`<button data-task="${escapeAttr(task.id)}" data-action="abandon">Abandon</button>`);
       return `<article class="task"><strong>${escapeHtml(task.title)}</strong><p>${escapeHtml(task.description || "")}</p><small class="muted">${escapeHtml(task.status_key)} / ${escapeHtml(task.id)}</small><footer>${actions.join("")}</footer></article>`;
     }
-    function renderActive() { document.querySelectorAll(".view").forEach(v => v.classList.remove("active")); document.querySelector(`#view-${state.view}`).classList.add("active"); document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b.dataset.view === state.view)); $("title").textContent = { stats: "Statistics", projects: "Projects", kanban: "Kanban", settings: "Settings" }[state.view]; }
+    function renderEvents() {
+      const rows = state.events || [];
+      $("eventList").innerHTML = rows.map(event => {
+        const payload = JSON.stringify(event.payload || {}, null, 2);
+        const flow = event.from_status || event.to_status ? `${event.from_status || "-"} -> ${event.to_status || "-"}` : "no status change";
+        const task = event.task_title ? `${event.task_title} / ${event.task_id}` : event.task_id;
+        return `<article class="event-row"><div class="event-head"><span class="event-title">${escapeHtml(event.event_type)}</span><span class="event-meta">${escapeHtml(event.created_at)}</span></div><div class="event-flow">${escapeHtml(flow)}</div><div class="event-meta">${escapeHtml(task || "")}</div><details><summary>Details</summary><pre>${escapeHtml(payload)}</pre></details></article>`;
+      }).join("") || `<div class="muted">No events</div>`;
+    }
+    function renderActive() { document.querySelectorAll(".view").forEach(v => v.classList.remove("active")); document.querySelector(`#view-${state.view}`).classList.add("active"); document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b.dataset.view === state.view)); $("title").textContent = { stats: "Statistics", projects: "Projects", kanban: "Kanban", events: "Events", settings: "Settings" }[state.view]; }
     async function createProject() { const projectId = $("newProjectId").value.trim(); const name = $("newProjectName").value.trim() || projectId; if (!projectId) return; await api("/v1/kanban/projects", { method: "POST", body: JSON.stringify({ project_id: projectId, name }) }); state.projectId = projectId; $("newProjectId").value = ""; $("newProjectName").value = ""; await refreshAll(); }
     async function createTask() { const title = $("taskTitle").value.trim(); if (!title) return; await api("/v1/kanban/tasks", { method: "POST", body: JSON.stringify({ project_id: state.projectId, title, description: $("taskDescription").value.trim() }) }); $("taskTitle").value = ""; $("taskDescription").value = ""; await refreshAll(); }
     async function saveGlobalSettings() { await api("/v1/settings", { method: "PUT", body: JSON.stringify({ llms: JSON.parse($("llmsJson").value || "{}"), routing: JSON.parse($("routingJson").value || "{}") }) }); await refreshAll(); }
@@ -390,6 +427,7 @@ DASHBOARD_HTML = r"""
     $("saveGlobalSettings").onclick = () => saveGlobalSettings().catch(showError);
     $("saveProjectSettings").onclick = () => saveProjectSettings().catch(showError);
     $("resetColumns").onclick = () => resetColumns().catch(showError);
+    $("loadEvents").onclick = () => loadEvents().catch(showError);
     $("projectList").onclick = async (event) => { const btn = event.target.closest("button[data-project]"); if (!btn) return; state.projectId = btn.dataset.project; state.view = btn.dataset.action === "open-project-settings" ? "projects" : "kanban"; await refreshAll().catch(showError); };
     $("board").onclick = async (event) => {
       const btn = event.target.closest("button[data-task]");

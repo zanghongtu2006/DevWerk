@@ -293,6 +293,19 @@ plugin all go through the same state-machine boundary.
 without a verification policy moves through `Applied` and `Verified` to `Done`;
 failed apply or failed verification moves the task to `Failed`.
 
+### `GET /v1/kanban/events`
+
+Returns the kanban event/log stream for a project, optionally filtered to one
+task. This is the main trace surface for fast AI-driven workflows.
+
+```text
+GET /v1/kanban/events?project_id=...&task_id=...&limit=200
+```
+
+Events include column transitions (`task_moved`), workflow actions, phase output
+records, planner LLM rounds, executor LLM rounds, tool request results, and final
+apply/verification reports. Dashboard Events uses this endpoint.
+
 ### `GET/PUT /v1/settings`
 
 Reads and writes `backend/config/llm.json`. The dashboard exposes this as two
@@ -305,6 +318,7 @@ Local web UI for:
 - statistics
 - projects
 - kanban
+- events
 - global model/routing settings
 - project settings
 

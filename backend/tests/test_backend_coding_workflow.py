@@ -246,6 +246,18 @@ async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_
             artifact_types = {artifact["artifact_type"] for artifact in task["artifacts"]}
             assert {"plan_request", "plan_response", "execute_response", "workflow_phase_output"}.issubset(artifact_types)
 
+            events_response = await client.get(
+                f"/v1/kanban/events?project_id={project_id}&task_id={plan['task_id']}&limit=100"
+            )
+            assert events_response.status_code == 200
+            event_types = [event["event_type"] for event in events_response.json()["events"]]
+            assert "task_moved" in event_types
+            assert "plan_llm_round_started" in event_types
+            assert "plan_llm_round_result" in event_types
+            assert "execute_llm_round_started" in event_types
+            assert "execute_llm_round_result" in event_types
+            assert "execute_response_ready" in event_types
+
 
 @pytest.mark.asyncio
 async def test_plan_falls_back_to_user_management_files_when_planner_returns_tool_requests(monkeypatch, tmp_path):

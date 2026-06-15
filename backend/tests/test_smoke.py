@@ -57,6 +57,11 @@ def test_workflow_action_protocol_drives_kanban_state(monkeypatch, tmp_path):
     assert applied["task"]["status_key"] == "done"
     state = workflow_service.current_workflow_state(task["id"])
     assert state["status_key"] == "done"
+    events = kanban_service.list_events(project_id="workflow-smoke", task_id=task["id"], limit=50)["events"]
+    event_types = [event["event_type"] for event in events]
+    assert "task_moved" in event_types
+    assert "apply_result_received" in event_types
+    assert events[0]["task_title"] == "Implement feature"
 
     abandoned = workflow_service.apply_workflow_action(task["id"], "abandon", {"reason": "test"})
     assert abandoned["task"]["status_key"] == "failed"

@@ -166,7 +166,10 @@ async def ide_plan(request: Request) -> PlanResponse:
             )
 
     try:
-        p = build_planner(agent_name=planner_agent)
+        p = build_planner(
+            agent_name=planner_agent,
+            event_sink=lambda event_type, payload: _kanban_event(task_id, event_type, payload),
+        )
     except (ValueError, NotImplementedError) as exc:
         _log.warning("Planner creation failed: %s", exc)
         _kanban_move(task_id, "failed", {"phase": "plan", "error": str(exc)})
@@ -370,6 +373,22 @@ async def ide_execute(request: Request) -> IdeChatResponse:
     for attempt in range(max_retries + 1):
         try:
             for tool_round in range(max_tool_rounds):
+                _kanban_event(
+                    task_id,
+                    "execute_llm_round_started",
+                    {
+                        "round": tool_round + 1,
+                        "attempt": attempt + 1,
+                        "max_tool_rounds": max_tool_rounds,
+                        "agent": "executor",
+                        "input": {
+                            "message_count": len(messages),
+                            "tool_result_count": len(tool_results),
+                            "approved_paths": sorted(approved_set),
+                            "roles": [str(m.get("role") or "") for m in messages],
+                        },
+                    },
+                )
                 obj = client.chat_structured(
                     build_model_messages(
                         _ChatProxy(
@@ -379,6 +398,16 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                         ),
                         provider=cfg.get_llm_config("executor").get("protocol", cfg.llm_provider_name),
                     )
+                )
+                _kanban_event(
+                    task_id,
+                    "execute_llm_round_result",
+                    {
+                        "round": tool_round + 1,
+                        "attempt": attempt + 1,
+                        "agent": "executor",
+                        "output": _model_response_summary(obj),
+                    },
                 )
                 _log.debug(
                     "ide_execute: model_response round=%s keys=%s ops=%s patch_ops=%s tool_requests=%s done=%s",
@@ -412,6 +441,17 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                         {"round": tool_round + 1, "count": len(backend_tool_requests)},
                     )
                     tool_results = _execute_tool_requests(body.get("project_root"), backend_tool_requests)
+                    _kanban_event(
+                        task_id,
+                        "execute_tool_results",
+                        {
+                            "round": tool_round + 1,
+                            "results": [
+                                {"id": r.id, "ok": r.ok, "content_chars": len(r.content or ""), "error": r.error}
+                                for r in tool_results
+                            ],
+                        },
+                    )
                     _log.debug(
                         "ide_execute: tool_results round=%s results=%s",
                         tool_round + 1,
@@ -468,6 +508,21 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                     response.phase_output = phase_output
                     response.next_action = phase_output.get("next_action")
                 _kanban_artifact(task_id, "execute_response", payload=response.model_dump())
+                _kanban_event(
+                    task_id,
+                    "execute_response_ready",
+                    {
+                        "round": tool_round + 1,
+                        "ops": len(response.ops),
+                        "paths": [op.path for op in response.ops],
+                        "patch_ops": len(response.patch_ops),
+                        "client_tool_requests": [
+                            {"id": req.id, "tool": req.tool}
+                            for req in response.tool_requests
+                        ],
+                        "done": response.done,
+                    },
+                )
                 _kanban_move(
                     task_id,
                     "ready_to_apply",
@@ -784,6 +839,34 @@ def _safe_filename(name: str) -> str:
     return cleaned or "attachment.bin"
 
 
+def _model_response_summary(obj: object) -> dict:
+    if not isinstance(obj, dict):
+        return {"type": type(obj).__name__}
+    reply = str(obj.get("reply") or obj.get("raw_text") or "")
+    ops = obj.get("ops") or []
+    patch_ops = obj.get("patch_ops") or []
+    tool_requests = obj.get("tool_requests") or []
+    return {
+        "keys": sorted(obj.keys()),
+        "reply_chars": len(reply),
+        "reply_preview": reply[:240],
+        "ops": len(ops) if isinstance(ops, list) else 0,
+        "op_paths": [
+            str(op.get("path") or "")
+            for op in ops[:30]
+            if isinstance(op, dict)
+        ] if isinstance(ops, list) else [],
+        "patch_ops": len(patch_ops) if isinstance(patch_ops, list) else 0,
+        "tool_requests": len(tool_requests) if isinstance(tool_requests, list) else 0,
+        "tool_request_tools": [
+            str(req.get("tool") or "")
+            for req in tool_requests[:30]
+            if isinstance(req, dict)
+        ] if isinstance(tool_requests, list) else [],
+        "done": bool(obj.get("done") or False),
+    }
+
+
 def _body_task_id(body: dict) -> str | None:
     value = body.get("task_id")
     if value is None:
@@ -946,8 +1029,30 @@ def ide_chat(req: IdeChatRequest) -> IdeChatResponse:
 
     for attempt in range(max_retries + 1):
         try:
+            _kanban_event(
+                task_id,
+                "chat_coding_round_started",
+                {
+                    "attempt": attempt + 1,
+                    "max_retries": max_retries + 1,
+                    "agent": "coder",
+                    "input": {
+                        "message_count": len(messages),
+                        "tool_result_count": len(req.tool_results),
+                    },
+                },
+            )
             obj = client.chat_structured(messages)
             obj = _guard_delete_ops(req, obj)
+            _kanban_event(
+                task_id,
+                "chat_coding_round_result",
+                {
+                    "attempt": attempt + 1,
+                    "agent": "coder",
+                    "output": _model_response_summary(obj),
+                },
+            )
 
             response = IdeChatResponse(
                 ok=True,
@@ -962,6 +1067,21 @@ def ide_chat(req: IdeChatRequest) -> IdeChatResponse:
                 done=bool(obj.get("done") or False),
             )
             _kanban_artifact(task_id, "coding_response", payload=response.model_dump())
+            _kanban_event(
+                task_id,
+                "chat_coding_response_ready",
+                {
+                    "attempt": attempt + 1,
+                    "ops": len(response.ops),
+                    "paths": [op.path for op in response.ops],
+                    "patch_ops": len(response.patch_ops),
+                    "tool_requests": [
+                        {"id": req.id, "tool": req.tool}
+                        for req in response.tool_requests
+                    ],
+                    "done": response.done,
+                },
+            )
             _kanban_move(
                 task_id,
                 "ready_to_apply",
@@ -1089,7 +1209,10 @@ def _run_chat_planning(req: IdeChatRequest, task_id: str) -> dict:
             }
 
     _kanban_event(task_id, "planning_started", {"agent": agent_name})
-    planner = build_planner(agent_name=agent_name)
+    planner = build_planner(
+        agent_name=agent_name,
+        event_sink=lambda event_type, payload: _kanban_event(task_id, event_type, payload),
+    )
     plan = planner.plan(messages=messages, mode=req.mode)
     bundle = _planning_bundle(req, plan.model_dump())
     bundle["ok"] = plan.ok

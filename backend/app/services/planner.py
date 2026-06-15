@@ -15,6 +15,8 @@ import json
 import logging
 import re
 import time
+from collections.abc import Callable
+from typing import Any
 
 from app.models.plan import PlanFile, PlanResponse
 from app.services.llm_factory import get_llm_client
@@ -48,8 +50,9 @@ class Planner:
         "  6. summary is one line; warnings[] lists any risky files.\n"
     )
 
-    def __init__(self, agent_name: str = "planner"):
+    def __init__(self, agent_name: str = "planner", event_sink: Callable[[str, dict[str, Any]], None] | None = None):
         self.agent_name = agent_name
+        self.event_sink = event_sink
 
     def plan(self, messages: list[dict], mode: str = "agent") -> PlanResponse:
         """
@@ -77,9 +80,46 @@ class Planner:
         for attempt in range(max_rounds):
             try:
                 _log.debug("Planner.plan: attempt=%s/%s calling_llm", attempt + 1, max_rounds)
+                self._emit_event(
+                    "plan_llm_round_started",
+                    {
+                        "round": attempt + 1,
+                        "max_rounds": max_rounds,
+                        "mode": mode,
+                        "agent": self.agent_name,
+                        "input": {
+                            "message_count": len(injected_messages),
+                            "roles": [str(m.get("role") or "") for m in injected_messages],
+                            "last_user_chars": len(_last_user_text(injected_messages)),
+                        },
+                    },
+                )
                 result = self._call_llm(injected_messages)
+                self._emit_event(
+                    "plan_llm_round_result",
+                    {
+                        "round": attempt + 1,
+                        "agent": self.agent_name,
+                        "output": _raw_result_summary(result),
+                    },
+                )
                 _log.debug("Planner.plan: attempt=%s raw_result_keys=%s", attempt + 1, sorted(result.keys()))
                 plan = self._extract_plan(result, messages)
+                self._emit_event(
+                    "plan_llm_round_extracted",
+                    {
+                        "round": attempt + 1,
+                        "agent": self.agent_name,
+                        "result": {
+                            "ok": plan.ok,
+                            "file_count": len(plan.files),
+                            "files": [f.path for f in plan.files],
+                            "warnings": plan.warnings,
+                            "summary": plan.summary,
+                            "error_code": plan.error_code,
+                        },
+                    },
+                )
                 _log.debug(
                     "Planner.plan: extracted ok=%s files=%s warnings=%s summary=%s",
                     plan.ok,
@@ -99,6 +139,15 @@ class Planner:
                     continue
 
                 _log.warning("Planner failed: %s", exc)
+                self._emit_event(
+                    "plan_llm_round_failed",
+                    {
+                        "round": attempt + 1,
+                        "agent": self.agent_name,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "retryable": attempt < max_rounds - 1 and is_timeout,
+                    },
+                )
                 return PlanResponse(
                     ok=False,
                     files=[],
@@ -119,6 +168,14 @@ class Planner:
         result = client.chat_json(messages)
         _log.debug("Planner.call_llm: result_keys=%s", sorted(result.keys()))
         return result
+
+    def _emit_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        if self.event_sink is None:
+            return
+        try:
+            self.event_sink(event_type, payload)
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("Planner event sink failed event=%s error=%s", event_type, exc)
 
     @staticmethod
     def _extract_plan(raw: dict, messages: list[dict] | None = None) -> PlanResponse:
@@ -190,6 +247,21 @@ def _inject_plan_instruction(messages: list[dict], mode: str) -> list[dict]:
         return [{"role": "system", "content": merged}] + messages[1:]
 
     return [{"role": "system", "content": system_content}] + messages
+
+
+def _raw_result_summary(raw: dict) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {"type": type(raw).__name__}
+    text = str(raw.get("raw_text") or raw.get("reply") or raw.get("content") or "")
+    plan = raw.get("plan") if isinstance(raw.get("plan"), dict) else raw
+    files = plan.get("files") if isinstance(plan, dict) else []
+    return {
+        "keys": sorted(raw.keys()),
+        "raw_text_chars": len(text),
+        "raw_text_preview": text[:240],
+        "file_count": len(files) if isinstance(files, list) else 0,
+        "tool_request_count": len(raw.get("tool_requests") or []) if isinstance(raw.get("tool_requests") or [], list) else 0,
+    }
 
 
 def _fallback_plan(raw: dict, messages: list[dict]) -> PlanResponse:

@@ -155,6 +155,9 @@ def init_kanban_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_kb_events_task_time
                 ON kb_events(task_id, created_at);
 
+            CREATE INDEX IF NOT EXISTS idx_kb_events_project_time
+                ON kb_events(project_id, created_at);
+
             CREATE TABLE IF NOT EXISTS kb_artifacts (
                 id TEXT PRIMARY KEY,
                 task_id TEXT NOT NULL,
@@ -502,6 +505,43 @@ def add_event(task_id: str, event_type: str, payload: dict[str, Any] | None = No
             payload=payload or {},
         )
     return get_task(task_id)
+
+
+def list_events(
+    *,
+    project_id: str | None = None,
+    task_id: str | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    pid = _project_id(project_id)
+    max_rows = max(1, min(int(limit or 200), 1000))
+    where = ["e.project_id = ?"]
+    params: list[Any] = [pid]
+    if task_id:
+        where.append("e.task_id = ?")
+        params.append(task_id)
+    params.append(max_rows)
+    with _conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT
+                e.*,
+                t.title AS task_title,
+                t.status_key AS task_status_key
+              FROM kb_events e
+              LEFT JOIN kb_tasks t ON t.id = e.task_id
+             WHERE {' AND '.join(where)}
+             ORDER BY e.created_at DESC
+             LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    return {
+        "ok": True,
+        "project_id": pid,
+        "task_id": task_id,
+        "events": [_event_dict(row) for row in rows],
+    }
 
 
 def add_artifact(
@@ -854,7 +894,7 @@ def _task_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _event_dict(row: sqlite3.Row) -> dict[str, Any]:
-    return {
+    event = {
         "id": row["id"],
         "task_id": row["task_id"],
         "project_id": row["project_id"],
@@ -864,6 +904,12 @@ def _event_dict(row: sqlite3.Row) -> dict[str, Any]:
         "payload": _loads(row["payload_json"], {}),
         "created_at": row["created_at"],
     }
+    keys = set(row.keys())
+    if "task_title" in keys:
+        event["task_title"] = row["task_title"]
+    if "task_status_key" in keys:
+        event["task_status_key"] = row["task_status_key"]
+    return event
 
 
 def _artifact_dict(row: sqlite3.Row) -> dict[str, Any]:
