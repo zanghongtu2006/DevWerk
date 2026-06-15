@@ -68,8 +68,12 @@ def test_workflow_action_protocol_drives_kanban_state(monkeypatch, tmp_path):
     assert events[0]["task_title"] == "Implement feature"
     task_log = tmp_path / "sessions" / "workflow-smoke" / task["id"] / "events.jsonl"
     latest_memory = tmp_path / "sessions" / "workflow-smoke" / task["id"] / "latest_memory.json"
+    project_memory_path = tmp_path / "sessions" / "workflow-smoke" / "project_memory.json"
+    project_memory_log = tmp_path / "sessions" / "workflow-smoke" / "project_memory.jsonl"
     assert task_log.is_file()
     assert latest_memory.is_file()
+    assert project_memory_path.is_file()
+    assert project_memory_log.is_file()
     task_events = [json.loads(line) for line in task_log.read_text(encoding="utf-8").splitlines()]
     assert any(event["event_type"] == "task_moved" for event in task_events)
     memory = json.loads(latest_memory.read_text(encoding="utf-8"))
@@ -88,6 +92,11 @@ def test_workflow_action_protocol_drives_kanban_state(monkeypatch, tmp_path):
     session_memory = session_events.parent / "memory.json"
     assert session_events.is_file()
     assert session_memory.is_file()
+    project_memory = session_store.read_project_memory("workflow-smoke")
+    assert project_memory["project_id"] == "workflow-smoke"
+    assert task["id"] in project_memory["tasks_seen"]
+    assert "src/main/java/App.java" in project_memory["paths"]
+    assert any(item["phase"] == "apply" and item["status_key"] == "done" for item in project_memory["phase_summaries"])
 
     abandoned = workflow_service.apply_workflow_action(task["id"], "abandon", {"reason": "test"})
     assert abandoned["task"]["status_key"] == "failed"

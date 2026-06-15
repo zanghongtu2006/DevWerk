@@ -22,6 +22,7 @@ from app.services.kanban import (
     upsert_project,
     update_task,
 )
+from app.services.session_store import read_project_memory
 from app.services.workflow import apply_workflow_action, current_workflow_state
 
 router = APIRouter(prefix="/kanban", tags=["Kanban"])
@@ -113,6 +114,11 @@ def kanban_get_project(project_id: str):
 @router.get("/projects/{project_id}/settings")
 def kanban_get_project_settings(project_id: str):
     return get_project_settings(project_id)
+
+
+@router.get("/projects/{project_id}/memory")
+def kanban_get_project_memory(project_id: str):
+    return {"ok": True, "project_id": project_id, "memory": read_project_memory(project_id)}
 
 
 @router.put("/projects/{project_id}/settings")
@@ -286,11 +292,16 @@ DASHBOARD_HTML = r"""
     .event-flow { margin-top: 6px; color: var(--muted); }
     .event-row details { margin-top: 8px; }
     .event-row pre { margin: 6px 0 0; overflow: auto; max-height: 260px; padding: 8px; border-radius: 7px; border: 1px solid var(--line); background: color-mix(in srgb, var(--bg) 80%, var(--panel)); font-size: 12px; }
+    .memory-grid { grid-template-columns: 1fr 1fr; align-items: start; }
+    .memory-box { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 12px; }
+    .memory-box h3 { margin: 0 0 10px; font-size: 14px; }
+    .memory-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+    .memory-list li { border: 1px solid var(--line); border-radius: 7px; padding: 7px 8px; color: var(--muted); }
     .settings-grid { grid-template-columns: repeat(2, minmax(260px, 1fr)); align-items: start; }
     .settings-box { padding: 12px; }
     .settings-box h3 { margin: 0 0 10px; font-size: 14px; }
     .wide { grid-column: 1 / -1; }
-    @media (max-width: 900px) { .shell, .shell.collapsed { grid-template-columns: 1fr; } aside { position: sticky; top: 0; z-index: 2; border-right: 0; border-bottom: 1px solid var(--line); } nav { grid-template-columns: repeat(5, 1fr); } .stats, .settings-grid { grid-template-columns: 1fr; } .project-select { min-width: 0; width: 100%; margin-left: 0; } }
+    @media (max-width: 900px) { .shell, .shell.collapsed { grid-template-columns: 1fr; } aside { position: sticky; top: 0; z-index: 2; border-right: 0; border-bottom: 1px solid var(--line); } nav { grid-template-columns: repeat(6, 1fr); } .stats, .settings-grid, .memory-grid { grid-template-columns: 1fr; } .project-select { min-width: 0; width: 100%; margin-left: 0; } }
   </style>
 </head>
 <body>
@@ -302,6 +313,7 @@ DASHBOARD_HTML = r"""
         <button data-view="projects">P <span>Projects</span></button>
         <button data-view="kanban">K <span>Kanban</span></button>
         <button data-view="events">E <span>Events</span></button>
+        <button data-view="memory">M <span>Memory</span></button>
         <button data-view="settings">G <span>Settings</span></button>
       </nav>
     </aside>
@@ -332,6 +344,16 @@ DASHBOARD_HTML = r"""
           <div class="toolbar"><input id="eventTaskId" placeholder="Filter task id" /><input id="eventLimit" placeholder="Limit" value="200" /><button id="loadEvents" class="primary">Load Events</button></div>
           <div id="eventList" class="events"></div>
         </section>
+        <section id="view-memory" class="view">
+          <div class="toolbar"><button id="loadMemory" class="primary">Load Memory</button><span id="memoryUpdated" class="muted"></span></div>
+          <div class="grid memory-grid">
+            <div class="memory-box"><h3>Frameworks</h3><ul id="memoryFrameworks" class="memory-list"></ul></div>
+            <div class="memory-box"><h3>Paths</h3><ul id="memoryPaths" class="memory-list"></ul></div>
+            <div class="memory-box"><h3>Commands</h3><ul id="memoryCommands" class="memory-list"></ul></div>
+            <div class="memory-box"><h3>Recent Phase Summaries</h3><ul id="memorySummaries" class="memory-list"></ul></div>
+            <div class="memory-box wide"><h3>Raw Project Memory</h3><textarea id="projectMemoryJson" readonly style="min-height:280px"></textarea></div>
+          </div>
+        </section>
         <section id="view-settings" class="view">
           <div class="grid settings-grid">
             <div class="settings-box"><h3>LLM Catalog</h3><textarea id="llmsJson" style="min-height:360px"></textarea></div>
@@ -344,7 +366,7 @@ DASHBOARD_HTML = r"""
   </div>
   <script>
     const $ = (id) => document.getElementById(id);
-    const state = { view: "stats", projects: [], projectId: "default", board: null, events: [] };
+    const state = { view: "stats", projects: [], projectId: "default", board: null, events: [], memory: null };
     async function api(path, options = {}) {
       const res = await fetch(path, { ...options, headers: { "Content-Type": "application/json", "X-DevWerk-Project-Id": state.projectId, ...(options.headers || {}) } });
       const text = await res.text();
@@ -352,7 +374,7 @@ DASHBOARD_HTML = r"""
       if (!res.ok) throw new Error(data.detail || text || `HTTP ${res.status}`);
       return data;
     }
-    async function refreshAll() { clearError(); await loadProjects(); await Promise.all([loadStats(), loadBoard(), loadEvents(), loadGlobalSettings(), loadProjectSettings()]); renderActive(); }
+    async function refreshAll() { clearError(); await loadProjects(); await Promise.all([loadStats(), loadBoard(), loadEvents(), loadMemory(), loadGlobalSettings(), loadProjectSettings()]); renderActive(); }
     async function loadProjects() {
       const data = await api("/v1/kanban/projects");
       state.projects = data.projects || [];
@@ -371,6 +393,11 @@ DASHBOARD_HTML = r"""
       const data = await api(`/v1/kanban/events?${query.toString()}`);
       state.events = data.events || [];
       renderEvents();
+    }
+    async function loadMemory() {
+      const data = await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/memory`);
+      state.memory = data.memory || {};
+      renderMemory();
     }
     async function loadGlobalSettings() {
       const data = await api("/v1/settings"); const s = data.settings || {};
@@ -409,7 +436,19 @@ DASHBOARD_HTML = r"""
         return `<article class="event-row"><div class="event-head"><span class="event-title">${escapeHtml(event.event_type)}</span><span class="event-meta">${escapeHtml(event.created_at)}</span></div><div class="event-flow">${escapeHtml(flow)}</div><div class="event-meta">${escapeHtml(task || "")}</div><details><summary>Details</summary><pre>${escapeHtml(payload)}</pre></details></article>`;
       }).join("") || `<div class="muted">No events</div>`;
     }
-    function renderActive() { document.querySelectorAll(".view").forEach(v => v.classList.remove("active")); document.querySelector(`#view-${state.view}`).classList.add("active"); document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b.dataset.view === state.view)); $("title").textContent = { stats: "Statistics", projects: "Projects", kanban: "Kanban", events: "Events", settings: "Settings" }[state.view]; }
+    function renderMemory() {
+      const memory = state.memory || {};
+      $("memoryUpdated").textContent = memory.updated_at ? `Updated ${memory.updated_at}` : "No project memory yet";
+      renderMemoryList("memoryFrameworks", memory.frameworks || [], item => item);
+      renderMemoryList("memoryPaths", (memory.paths || []).slice(-30), item => item);
+      renderMemoryList("memoryCommands", (memory.commands || []).slice(-20), item => item);
+      renderMemoryList("memorySummaries", (memory.phase_summaries || []).slice(-20).reverse(), item => `${item.phase || ""} / ${item.status_key || ""} / ${item.summary || ""}`);
+      $("projectMemoryJson").value = JSON.stringify(memory, null, 2);
+    }
+    function renderMemoryList(id, rows, labelFn) {
+      $(id).innerHTML = rows.map(item => `<li>${escapeHtml(labelFn(item))}</li>`).join("") || `<li>No data</li>`;
+    }
+    function renderActive() { document.querySelectorAll(".view").forEach(v => v.classList.remove("active")); document.querySelector(`#view-${state.view}`).classList.add("active"); document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b.dataset.view === state.view)); $("title").textContent = { stats: "Statistics", projects: "Projects", kanban: "Kanban", events: "Events", memory: "Memory", settings: "Settings" }[state.view]; }
     async function createProject() { const projectId = $("newProjectId").value.trim(); const name = $("newProjectName").value.trim() || projectId; if (!projectId) return; await api("/v1/kanban/projects", { method: "POST", body: JSON.stringify({ project_id: projectId, name }) }); state.projectId = projectId; $("newProjectId").value = ""; $("newProjectName").value = ""; await refreshAll(); }
     async function createTask() { const title = $("taskTitle").value.trim(); if (!title) return; await api("/v1/kanban/tasks", { method: "POST", body: JSON.stringify({ project_id: state.projectId, title, description: $("taskDescription").value.trim() }) }); $("taskTitle").value = ""; $("taskDescription").value = ""; await refreshAll(); }
     async function saveGlobalSettings() { await api("/v1/settings", { method: "PUT", body: JSON.stringify({ llms: JSON.parse($("llmsJson").value || "{}"), routing: JSON.parse($("routingJson").value || "{}") }) }); await refreshAll(); }
@@ -428,6 +467,7 @@ DASHBOARD_HTML = r"""
     $("saveProjectSettings").onclick = () => saveProjectSettings().catch(showError);
     $("resetColumns").onclick = () => resetColumns().catch(showError);
     $("loadEvents").onclick = () => loadEvents().catch(showError);
+    $("loadMemory").onclick = () => loadMemory().catch(showError);
     $("projectList").onclick = async (event) => { const btn = event.target.closest("button[data-project]"); if (!btn) return; state.projectId = btn.dataset.project; state.view = btn.dataset.action === "open-project-settings" ? "projects" : "kanban"; await refreshAll().catch(showError); };
     $("board").onclick = async (event) => {
       const btn = event.target.closest("button[data-task]");

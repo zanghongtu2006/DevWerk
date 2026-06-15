@@ -120,6 +120,8 @@ backend/data/sessions/{projectId}/{taskId}/latest_memory.json
 backend/data/sessions/{projectId}/{taskId}/sessions/{sessionId}/events.jsonl
 backend/data/sessions/{projectId}/{taskId}/sessions/{sessionId}/memory.json
 backend/data/sessions/{projectId}/{taskId}/sessions/{sessionId}/phase_outputs.jsonl
+backend/data/sessions/{projectId}/project_memory.json
+backend/data/sessions/{projectId}/project_memory.jsonl
 ```
 
 Override the file root:
@@ -133,10 +135,11 @@ Rules:
 - Every kanban event appends to task `events.jsonl`.
 - Events with `payload.session_id` also append to that session's `events.jsonl`.
 - Every `workflow_phase_output` updates task/session memory snapshots.
-- Current memory is task/session memory: phase inputs, outputs, summaries,
-  warnings, status, and next actions.
-- Long-term framework memory is not implemented yet; it should use a separate
-  explicit store rather than implicit process memory.
+- Project memory is updated from every phase output. It keeps compact reusable
+  facts: phase summaries, touched paths, framework signals, run commands,
+  extracted rules, and tasks seen.
+- Project memory intentionally does not store raw prompt transcripts. Full
+  phase inputs and outputs remain in task/session memory.
 
 ## Main Endpoints
 
@@ -245,6 +248,27 @@ GET /v1/kanban/events?project_id=...&task_id=...&limit=200
 The event stream includes column transitions, workflow actions, planner/executor
 round input-output summaries, tool request results, artifacts, apply results,
 and verification outcomes. Dashboard Events is a UI over this endpoint.
+
+### `GET /v1/kanban/projects/{project_id}/memory`
+
+Reads the durable project memory summary.
+
+```json
+{
+  "ok": true,
+  "project_id": "...",
+  "memory": {
+    "tasks_seen": [],
+    "frameworks": [],
+    "paths": [],
+    "commands": [],
+    "rules": [],
+    "phase_summaries": []
+  }
+}
+```
+
+Dashboard Memory is a UI over this endpoint.
 
 ### `GET/PUT /v1/settings`
 

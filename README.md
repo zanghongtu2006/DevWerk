@@ -124,11 +124,15 @@ DevWerk persists workflow session state in two layers:
   - Phase/session memory:
     `backend/data/sessions/{projectId}/{taskId}/sessions/{sessionId}/memory.json`
     and `phase_outputs.jsonl`
+  - Project memory:
+    `backend/data/sessions/{projectId}/project_memory.json`
+    and `project_memory.jsonl`
 
-Current memory is durable task/session memory: phase inputs, outputs, summaries,
-warnings, status, and next actions. It is not yet a long-term framework memory
-or vector store. Future framework recognition memory should build on this file
-contract rather than living only in process memory.
+Task/session memory keeps detailed phase inputs, outputs, summaries, warnings,
+status, and next actions for a single delivery loop. Project memory is a compact
+cross-task summary: tasks seen, framework signals, touched paths, run commands,
+extracted rules, and recent phase summaries. It is not a vector store yet, but it
+is durable and intentionally separated from process memory.
 
 ## Planning Artifacts
 
@@ -331,6 +335,12 @@ Events include column transitions (`task_moved`), workflow actions, phase output
 records, planner LLM rounds, executor LLM rounds, tool request results, and final
 apply/verification reports. Dashboard Events uses this endpoint.
 
+### `GET /v1/kanban/projects/{project_id}/memory`
+
+Returns durable project-level memory derived from completed workflow phase
+outputs. Dashboard Memory uses this endpoint to show framework signals, touched
+paths, commands, and recent summaries.
+
 ### `GET/PUT /v1/settings`
 
 Reads and writes `backend/config/llm.json`. The dashboard exposes this as two
@@ -344,6 +354,7 @@ Local web UI for:
 - projects
 - kanban
 - events
+- project memory
 - global model/routing settings
 - project settings
 
