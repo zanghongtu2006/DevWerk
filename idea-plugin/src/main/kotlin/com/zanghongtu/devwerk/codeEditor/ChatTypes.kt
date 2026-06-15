@@ -139,53 +139,11 @@ data class DevwerkContext(
     val opLog: java.nio.file.Path
 )
 
-// =============================================================================
-// Plan types — returned by POST /v1/ide/plan
-// =============================================================================
-
-/**
- * One file in the planner's proposed change list.
- */
-data class PlanFile(
-    val path: String,
-    val nature: String,   // "new" | "modified" | "deleted"
-    val description: String,
-    val confidence: Double = 0.8
-)
-
-/**
- * Response from POST /v1/ide/plan.
- */
-data class PlanResponse(
-    val ok: Boolean = true,
-    val taskId: String? = null,
-    val statusKey: String? = null,
-    val files: List<PlanFile> = emptyList(),
-    val summary: String = "",
-    val warnings: List<String> = emptyList(),
-    val errorCode: String? = null,
-    val errorMessage: String? = null
-)
-
-/**
- * Request body for POST /v1/ide/execute.
- */
-data class ExecuteRequest(
-    val messages: List<ChatMessage>,
-    val projectRoot: String?,
-    val projectId: String? = null,
-    val taskId: String? = null,
-    val mode: String = "agent",
-    val approvedPaths: List<String> = emptyList(),
-    val approvedOps: List<FileOp> = emptyList()
-)
-
-// =============================================================================
 // AI client interface
 // =============================================================================
 
 interface AiClient {
-    fun sendChat(
+    fun sendWorkflow(
         context: ChatContext,
         userMessage: String
     ): IdeChatResponse

@@ -13,7 +13,7 @@ object AiClientFactory {
         val base = normalizeBackendBase(profile.baseUrl.ifBlank { DEFAULT_BASE })
 
         return HttpAiClient(
-            chatEndpoint = "$base/v1/chat",
+            workflowsEndpoint = "$base/v1/workflows",
             planEndpoint = "$base/v1/plan",
             executeEndpoint = "$base/v1/execute",
             attachmentEndpoint = "$base/v1/ide/attachments",
@@ -26,10 +26,9 @@ object AiClientFactory {
         var s = input.trim().trimEnd('/')
         val suffixes = listOf(
             "/v1/ide/attachments",
-            "/v1/ide/chat",
             "/v1/ide/plan",
             "/v1/ide/execute",
-            "/v1/chat",
+            "/v1/workflows",
             "/v1/plan",
             "/v1/execute",
             "/v1/ide",

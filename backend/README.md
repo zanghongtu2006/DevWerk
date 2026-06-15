@@ -143,9 +143,10 @@ Rules:
 
 ## Main Endpoints
 
-### `POST /v1/chat`
+### `POST /v1/workflows`
 
-Primary coding loop entrypoint.
+Primary coding loop entrypoint. The request returns immediately with a task id;
+the backend then drives the kanban workflow in the background.
 
 Request shape follows `IdeChatRequest`:
 
@@ -167,14 +168,25 @@ Request shape follows `IdeChatRequest`:
 Behavior:
 
 1. Create a kanban task if `task_id` is missing.
-2. Record request/context artifacts.
-3. Move to `Context Indexed`.
-4. Generate a planning bundle.
-5. Move to `Planned`.
-6. Generate code changes.
-7. Move to `Ready To Apply`.
-8. Return `phase_output`, `next_action`, `ops` and/or `patch_ops`, plus any
-   client-side post-apply `tool_requests` to the plugin.
+2. Return `poll_url`, `result_url`, and `events_url`.
+3. Record request/context artifacts in the background.
+4. Move to `Context Indexed`.
+5. Generate a planning bundle.
+6. Move to `Planned`.
+7. Generate code changes.
+8. Move to `Ready To Apply`.
+9. Store a `workflow_result` artifact with `phase_output`, `next_action`,
+   `ops` and/or `patch_ops`, plus any client-side post-apply `tool_requests`.
+
+Clients poll:
+
+```text
+GET /v1/workflows/{task_id}
+GET /v1/workflows/{task_id}/result
+```
+
+`/v1/chat` has been removed. IDE and API clients should use workflow polling
+instead of long blocking chat requests.
 
 ## Tool Requests
 

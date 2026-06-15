@@ -10,6 +10,7 @@ import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.net.URI
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.StandardOpenOption
@@ -18,7 +19,7 @@ import java.time.format.DateTimeFormatter
 import java.util.concurrent.TimeUnit
 
 class HttpAiClient(
-    private val chatEndpoint: String,
+    private val workflowsEndpoint: String,
     private val planEndpoint: String,
     private val executeEndpoint: String,
     private val attachmentEndpoint: String,
@@ -38,69 +39,87 @@ class HttpAiClient(
     // Public API
     // -------------------------------------------------------------------------
 
-    override fun sendChat(context: ChatContext, userMessage: String): IdeChatResponse {
-        return sendChatInternal(context, userMessage, chatEndpoint)
-    }
-
-    fun sendPlan(context: ChatContext, userMessage: String): PlanResponse {
+    override fun sendWorkflow(context: ChatContext, userMessage: String): IdeChatResponse {
         val (mode, cleanMsg) = parseMode(userMessage)
         val messages = buildMessages(context, cleanMsg)
         val workspace = buildWorkspaceSummary(context)
+        val bodyJson = buildWorkflowStartBody(context, messages, mode, context.projectRoot, workspace)
 
-        val respBody = postToServer(
-            endpoint = planEndpoint,
-            chatContext = context,
-            round = 1,
-            mode = mode,
-            projectRoot = context.projectRoot,
-            messages = messages,
-            workspace = workspace,
-            toolResults = emptyList()
-        )
+        appendDevLog(context, "\n===== WORKFLOW START REQUEST ($workflowsEndpoint) =====\n$bodyJson\n")
+        val startBody = postJson(workflowsEndpoint, bodyJson, context)
+        appendDevLog(context, "\n===== WORKFLOW START RESPONSE =====\n$startBody\n")
 
-        return parsePlanResponse(respBody)
-    }
-
-    fun sendExecute(
-        context: ChatContext,
-        userMessage: String,
-        approvedPaths: List<String>,
-        approvedOps: List<FileOp> = emptyList()
-    ): IdeChatResponse {
-        val (mode, cleanMsg) = parseMode(userMessage)
-        val messages = buildMessages(context, cleanMsg)
-
-        val bodyJson = buildExecuteBody(context, messages, mode, approvedPaths, approvedOps)
-
-        appendDevLog(context, "\n===== EXECUTE REQUEST =====\n$bodyJson\n")
-
-        val mediaType = "application/json; charset=utf-8".toMediaType()
-        val requestBody = bodyJson.toRequestBody(mediaType)
-
-        val requestBuilder = Request.Builder()
-            .url(executeEndpoint)
-            .post(requestBody)
-            .header("Content-Type", "application/json; charset=utf-8")
-
-        context.projectId?.takeIf { it.isNotBlank() }?.let {
-            requestBuilder.header("X-DevWerk-Project-Id", it)
-        }
-        if (!authToken.isNullOrBlank()) {
-            requestBuilder.header("Authorization", "Bearer $authToken")
+        val startObj = JSONObject(startBody)
+        if (!startObj.optBoolean("ok", false)) {
+            return IdeChatResponse(
+                reply = "",
+                ok = false,
+                done = true,
+                errorCode = startObj.optString("error_code", "WORKFLOW_START_ERROR"),
+                errorMessage = startObj.optString("error_message", startBody),
+                retryable = startObj.optBoolean("retryable", true),
+                rawResponses = listOf(startBody)
+            )
         }
 
-        val request = requestBuilder.build()
+        val taskId = startObj.optString("task_id", "").trim()
+        if (taskId.isBlank()) {
+            return IdeChatResponse(
+                reply = "",
+                ok = false,
+                done = true,
+                errorCode = "WORKFLOW_START_ERROR",
+                errorMessage = "Workflow start response did not include task_id.",
+                retryable = true,
+                rawResponses = listOf(startBody)
+            )
+        }
 
-        client.newCall(request).execute().use { response: Response ->
-            val respBody = response.body?.string() ?: ""
-            appendDevLog(context, "\n===== EXECUTE RESPONSE =====\n$respBody\n")
+        val pollUrl = resolveServerUrl(workflowsEndpoint, startObj.optString("poll_url", "/v1/workflows/$taskId"))
+        val rawResponses = mutableListOf(startBody)
+        val maxPolls = 1800
+        val pollDelayMs = 2000L
 
-            if (!response.isSuccessful) {
-                throw RuntimeException("HTTP ${response.code} from AI server: $respBody")
+        for (attempt in 1..maxPolls) {
+            val stateBody = getJson(pollUrl, context)
+            rawResponses += stateBody
+            appendDevLog(context, "\n===== WORKFLOW POLL $attempt RESPONSE =====\n$stateBody\n")
+
+            val state = JSONObject(stateBody)
+            val result = state.optJSONObject("result")
+            if (result != null) {
+                return parseIdeChatResponse(result.toString()).copy(rawResponses = rawResponses.toList())
             }
 
-            return parseIdeChatResponse(respBody)
+            val status = state.optString("status_key", "")
+            if (status == "failed") {
+                return IdeChatResponse(
+                    reply = "",
+                    taskId = taskId,
+                    statusKey = "failed",
+                    ok = false,
+                    done = true,
+                    errorCode = "WORKFLOW_FAILED",
+                    errorMessage = "Workflow failed before producing a result.",
+                    retryable = true,
+                    rawResponses = rawResponses.toList()
+                )
+            }
+
+            Thread.sleep(pollDelayMs)
         }
+
+        return IdeChatResponse(
+            reply = "",
+            taskId = taskId,
+            statusKey = "timeout",
+            ok = false,
+            done = true,
+            errorCode = "WORKFLOW_TIMEOUT",
+            errorMessage = "Workflow polling timed out after ${maxPolls * pollDelayMs / 1000}s.",
+            retryable = true,
+            rawResponses = rawResponses.toList()
+        )
     }
 
     fun uploadAttachment(file: File, projectId: String? = null): UploadedAttachment {
@@ -186,67 +205,6 @@ class HttpAiClient(
     // Internal helpers
     // -------------------------------------------------------------------------
 
-    private fun sendChatInternal(context: ChatContext, userMessage: String, endpoint: String): IdeChatResponse {
-        val (mode, cleanUserMsg) = parseMode(userMessage)
-        val messages = buildMessages(context, cleanUserMsg)
-        val workspace = buildWorkspaceSummary(context)
-
-        val maxRounds = 6
-        var round = 0
-        var lastResp: IdeChatResponse? = null
-        var pendingToolResults: List<ToolResult> = emptyList()
-        val rawResponses = mutableListOf<String>()
-        val accOps = mutableListOf<FileOp>()
-        val accPatchOps = mutableListOf<PatchOp>()
-
-        while (round < maxRounds) {
-            round++
-
-            val respBody = postToServer(
-                endpoint = endpoint,
-                chatContext = context,
-                round = round,
-                mode = mode,
-                projectRoot = context.projectRoot,
-                messages = messages,
-                workspace = workspace,
-                toolResults = pendingToolResults
-            )
-
-            rawResponses += respBody
-            val respParsed = parseIdeChatResponse(respBody)
-            var resp = respParsed.copy(rawResponses = rawResponses.toList())
-            lastResp = resp
-
-            val backendToolRequests = resp.toolRequests.filter { isBackendTool(it.tool) }
-            val clientToolRequests = resp.toolRequests.filterNot { isBackendTool(it.tool) }
-
-            if (backendToolRequests.isNotEmpty() && mode == "agent") {
-                if (resp.ops.isNotEmpty() || resp.patchOps.isNotEmpty()) {
-                    accOps += resp.ops
-                    accPatchOps += resp.patchOps
-                    appendDevLog(context, "\n[WARN] Model returned backend tool_requests with ops/patch_ops. Accumulating and continuing.\n")
-                    resp = resp.copy(ops = emptyList(), patchOps = emptyList())
-                }
-
-                messages += ChatMessage("assistant", "tool_requests:\n" + toolRequestsToJson(backendToolRequests))
-                pendingToolResults = executeTools(context.projectRoot, backendToolRequests)
-                continue
-            }
-
-            val merged = resp.copy(
-                ops = (accOps + resp.ops),
-                patchOps = (accPatchOps + resp.patchOps),
-                toolRequests = clientToolRequests,
-                rawResponses = rawResponses.toList()
-            )
-            return merged
-        }
-
-        val fallback = (lastResp ?: IdeChatResponse(reply = "No response", done = true)).copy(rawResponses = rawResponses.toList())
-        return fallback.copy(ops = (accOps + fallback.ops), patchOps = (accPatchOps + fallback.patchOps))
-    }
-
     private fun postKanbanAction(taskId: String, action: String, body: JSONObject, projectId: String? = null) {
         val mediaType = "application/json; charset=utf-8".toMediaType()
         val requestJson = JSONObject()
@@ -322,15 +280,12 @@ class HttpAiClient(
         } + suffix
     }
 
-    private fun postToServer(
-        endpoint: String,
-        chatContext: ChatContext,
-        round: Int,
+    private fun buildWorkflowStartBody(
+        context: ChatContext,
+        messages: List<ChatMessage>,
         mode: String,
         projectRoot: String?,
-        messages: List<ChatMessage>,
-        workspace: WorkspaceSummary?,
-        toolResults: List<ToolResult>
+        workspace: WorkspaceSummary?
     ): String {
         val messagesJson = JSONArray()
         for (m in messages) {
@@ -341,15 +296,15 @@ class HttpAiClient(
         }
 
         val root = JSONObject()
-        root.put("project_id", chatContext.projectId ?: JSONObject.NULL)
-        root.put("task_id", chatContext.taskId ?: JSONObject.NULL)
+        root.put("project_id", context.projectId ?: JSONObject.NULL)
+        root.put("task_id", context.taskId ?: JSONObject.NULL)
         root.put("mode", mode)
         root.put("project_root", projectRoot ?: JSONObject.NULL)
         root.put("messages", messagesJson)
 
         if (workspace != null) {
             val w = JSONObject()
-            w.put("root_id", workspace.rootId ?: chatContext.projectId ?: JSONObject.NULL)
+            w.put("root_id", workspace.rootId ?: context.projectId ?: JSONObject.NULL)
             val changed = JSONArray()
             for (f in workspace.changedFiles) {
                 val fo = JSONObject()
@@ -368,91 +323,57 @@ class HttpAiClient(
         } else {
             root.put("workspace", JSONObject.NULL)
         }
+        root.put("tool_results", JSONArray())
+        return root.toString()
+    }
 
-        val trArr = JSONArray()
-        for (tr in toolResults) {
-            val o = JSONObject()
-            o.put("id", tr.id); o.put("ok", tr.ok)
-            o.put("content", tr.content ?: JSONObject.NULL)
-            o.put("error", tr.error ?: JSONObject.NULL)
-            trArr.put(o)
-        }
-        root.put("tool_results", trArr)
-
-        val bodyJson = root.toString()
-        appendDevLog(chatContext, "\n===== ROUND $round REQUEST ($endpoint) =====\n$bodyJson\n")
-
+    private fun postJson(endpoint: String, bodyJson: String, context: ChatContext): String {
         val mediaType = "application/json; charset=utf-8".toMediaType()
-        val requestBody = bodyJson.toRequestBody(mediaType)
-
         val requestBuilder = Request.Builder()
             .url(endpoint)
-            .post(requestBody)
+            .post(bodyJson.toRequestBody(mediaType))
             .header("Content-Type", "application/json; charset=utf-8")
 
-        chatContext.projectId?.takeIf { it.isNotBlank() }?.let {
+        context.projectId?.takeIf { it.isNotBlank() }?.let {
             requestBuilder.header("X-DevWerk-Project-Id", it)
         }
         if (!authToken.isNullOrBlank()) {
             requestBuilder.header("Authorization", "Bearer $authToken")
         }
 
-        val request = requestBuilder.build()
-
-        client.newCall(request).execute().use { response: Response ->
+        client.newCall(requestBuilder.build()).execute().use { response: Response ->
             val respBody = response.body?.string() ?: ""
-            appendDevLog(chatContext, "\n===== ROUND $round RESPONSE =====\n$respBody\n")
-
             if (!response.isSuccessful) {
-                throw RuntimeException("HTTP ${response.code} from AI server: $respBody")
+                throw RuntimeException("HTTP ${response.code} from DevWerk backend: $respBody")
             }
             return respBody
         }
     }
 
-    private fun buildExecuteBody(
-        context: ChatContext,
-        messages: List<ChatMessage>,
-        mode: String,
-        approvedPaths: List<String>,
-        approvedOps: List<FileOp>
-    ): String {
-        val messagesJson = JSONArray()
-        for (m in messages) {
-            val obj = JSONObject()
-            obj.put("role", m.role.lowercase())
-            obj.put("content", m.content)
-            messagesJson.put(obj)
+    private fun getJson(endpoint: String, context: ChatContext): String {
+        val requestBuilder = Request.Builder().url(endpoint).get()
+        context.projectId?.takeIf { it.isNotBlank() }?.let {
+            requestBuilder.header("X-DevWerk-Project-Id", it)
+        }
+        if (!authToken.isNullOrBlank()) {
+            requestBuilder.header("Authorization", "Bearer $authToken")
         }
 
-        val opsJson = JSONArray()
-        for (op in approvedOps) {
-            val o = JSONObject()
-            o.put("op", op.op); o.put("path", op.path)
-            op.language?.let { o.put("language", it) }
-            op.content?.let { o.put("content", it) }
-            opsJson.put(o)
+        client.newCall(requestBuilder.build()).execute().use { response: Response ->
+            val respBody = response.body?.string() ?: ""
+            if (!response.isSuccessful) {
+                throw RuntimeException("HTTP ${response.code} from DevWerk backend: $respBody")
+            }
+            return respBody
         }
+    }
 
-        val root = JSONObject()
-        root.put("project_id", context.projectId ?: JSONObject.NULL)
-        root.put("task_id", context.taskId ?: JSONObject.NULL)
-        root.put("messages", messagesJson)
-        root.put("mode", mode)
-        root.put("project_root", context.projectRoot ?: JSONObject.NULL)
-        root.put("approved_paths", JSONArray(approvedPaths))
-        root.put("approved_ops", opsJson)
-        buildWorkspaceSummary(context)?.let { workspace ->
-            val w = JSONObject()
-            w.put("root_id", workspace.rootId ?: context.projectId ?: JSONObject.NULL)
-            w.put("changed_files", JSONArray())
-            w.put("open_files", JSONArray(workspace.openFiles))
-            w.put("tree_preview", workspace.treePreview ?: JSONObject.NULL)
-            w.put("source_map", sourceMapToJson(workspace.sourceMap))
-            root.put("workspace", w)
-        } ?: root.put("workspace", JSONObject.NULL)
-
-        return root.toString()
+    private fun resolveServerUrl(baseEndpoint: String, maybeRelative: String): String {
+        val value = maybeRelative.trim()
+        if (value.startsWith("http://", ignoreCase = true) || value.startsWith("https://", ignoreCase = true)) {
+            return value
+        }
+        return URI(baseEndpoint).resolve(value).toString()
     }
 
     private fun sourceMapToJson(sourceMap: SourceMap?): Any {
@@ -527,7 +448,7 @@ class HttpAiClient(
     // -------------------------------------------------------------------------
 
     private fun normRel(p: String): String {
-        var s = (p ?: "").trim().replace("\\", "/")
+        var s = p.trim().replace("\\", "/")
         while (s.startsWith("/")) s = s.substring(1)
         val parts = s.split("/").filter { it.isNotBlank() }
         return if (parts.any { it == ".." }) "" else parts.joinToString("/")
@@ -728,9 +649,6 @@ class HttpAiClient(
         return resolved to null
     }
 
-    private fun isBackendTool(tool: String): Boolean =
-        tool in setOf("list_dir", "read_file", "search")
-
     private fun typeName(t: Throwable): String = t::class.java.simpleName.ifBlank { "Throwable" }
 
     companion object {
@@ -740,50 +658,6 @@ class HttpAiClient(
     // -------------------------------------------------------------------------
     // Response parsers
     // -------------------------------------------------------------------------
-
-    private fun parsePlanResponse(body: String): PlanResponse {
-        return try {
-            val obj = JSONObject(body)
-            val ok = obj.optBoolean("ok", true)
-            val taskId = if (obj.has("task_id") && !obj.isNull("task_id")) obj.getString("task_id") else null
-            val statusKey = if (obj.has("status_key") && !obj.isNull("status_key")) obj.getString("status_key") else null
-            val errorCode = if (obj.has("error_code") && !obj.isNull("error_code")) obj.getString("error_code") else null
-            val errorMessage = if (obj.has("error_message") && !obj.isNull("error_message")) obj.getString("error_message") else null
-
-            if (!ok) {
-                return PlanResponse(
-                    ok = false,
-                    taskId = taskId,
-                    statusKey = statusKey,
-                    errorCode = errorCode,
-                    errorMessage = errorMessage
-                )
-            }
-
-            val filesArr = obj.optJSONArray("files") ?: JSONArray()
-            val files = (0 until filesArr.length()).mapNotNull { i ->
-                val item = filesArr.optJSONObject(i) ?: return@mapNotNull null
-                val path = item.optString("path", "").trim()
-                if (path.isBlank()) return@mapNotNull null
-                PlanFile(
-                    path = path,
-                    nature = item.optString("nature", "modified").trim(),
-                    description = item.optString("description", "").trim(),
-                    confidence = item.optDouble("confidence", 0.8)
-                )
-            }
-
-            val summary = obj.optString("summary", "").trim()
-            val warningsArr = obj.optJSONArray("warnings") ?: JSONArray()
-            val warnings = (0 until warningsArr.length()).mapNotNull {
-                warningsArr.optString(it, "").trim().takeIf { w -> w.isNotBlank() }
-            }
-
-            PlanResponse(ok = true, taskId = taskId, statusKey = statusKey, files = files, summary = summary, warnings = warnings)
-        } catch (t: Throwable) {
-            PlanResponse(ok = false, errorCode = "PARSE_ERROR", errorMessage = "${typeName(t)}: ${t.message}")
-        }
-    }
 
     private fun parseIdeChatResponse(body: String): IdeChatResponse {
         val obj = JSONObject(body)

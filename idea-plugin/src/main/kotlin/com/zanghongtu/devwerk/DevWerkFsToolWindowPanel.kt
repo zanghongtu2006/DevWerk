@@ -30,23 +30,20 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * DevWerk tool window panel — two-phase workflow:
+ * DevWerk tool window panel:
  *
  *   1. USER_TYPING → user enters a request
- *   2. PLAN_PENDING → plan is fetched from backend (read-only)
- *   3. PLAN_READY   → plan shown to user with approve/cancel buttons
- *   4. EXECUTE_PENDING → user approved; ops are applied with snapshot
- *   5. DONE / CANCELLED → back to idle
+ *   2. WORKFLOW_PENDING → backend workflow plans/codes while plugin polls
+ *   3. READY_TO_APPLY → ops are applied with snapshot
+ *   4. DONE / FAILED → back to idle
  */
 class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     // State
-    private enum class State { IDLE, PLAN_PENDING, PLAN_READY, EXECUTE_PENDING }
+    private enum class State { IDLE, WORKFLOW_PENDING }
     @Volatile private var state = State.IDLE
 
     private val history = mutableListOf<ChatMessage>()
-    @Volatile private var currentPlan: PlanResponse? = null
-    private var currentPlanUserMessage: String = ""
 
     // UI components
     private val chatArea       = JTextArea()
@@ -57,14 +54,6 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
     private val settingsBtn     = JButton("⚙")
     private val pendingAttachments = mutableListOf<File>()
     private val attachmentPanel = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
-
-    // Plan panel
-    private val planPanel       = JPanel(BorderLayout())
-    private val planArea        = JTextArea(8, 0)
-    private val planBtnsPanel   = JPanel()
-    private val executeBtn      = JButton("Execute (已确认)")
-    private val cancelPlanBtn   = JButton("Cancel")
-    private val planCheckboxes  = mutableMapOf<String, JCheckBox>()
 
     init {
         initUi()
@@ -140,18 +129,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
             it.isFocusable = false
         }
 
-        planArea.isEditable = false
-        planArea.lineWrap = true
-        planArea.wrapStyleWord = true
-        planArea.border = JBUI.Borders.empty(6)
-        planPanel.add(JScrollPane(planArea), BorderLayout.CENTER)
-        planBtnsPanel.add(executeBtn)
-        planBtnsPanel.add(cancelPlanBtn)
-        planPanel.add(planBtnsPanel, BorderLayout.SOUTH)
-        planPanel.isVisible = false
-
         northPanel.add(topPanel, BorderLayout.NORTH)
-        northPanel.add(planPanel, BorderLayout.CENTER)
         add(northPanel, BorderLayout.NORTH)
         add(chatScroll, BorderLayout.CENTER)
         add(bottomPanel, BorderLayout.SOUTH)
@@ -168,9 +146,6 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 appendChatLine("[Error] Failed to open settings: ${t.message}")
             }
         }
-
-        executeBtn.addActionListener { onExecuteClicked() }
-        cancelPlanBtn.addActionListener { onCancelPlanClicked() }
     }
 
     private fun setState(newState: State) {
@@ -182,34 +157,18 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                     inputArea.isEnabled = true
                     attachBtn.isEnabled = true
                     clearAttachBtn.isEnabled = true
-                    planPanel.isVisible = false
                 }
-                State.PLAN_PENDING -> {
+                State.WORKFLOW_PENDING -> {
                     sendButton.isEnabled = false
                     inputArea.isEnabled = false
                     attachBtn.isEnabled = false
                     clearAttachBtn.isEnabled = false
-                    planPanel.isVisible = false
-                }
-                State.PLAN_READY -> {
-                    sendButton.isEnabled = false
-                    inputArea.isEnabled = false
-                    attachBtn.isEnabled = false
-                    clearAttachBtn.isEnabled = false
-                    planPanel.isVisible = true
-                }
-                State.EXECUTE_PENDING -> {
-                    sendButton.isEnabled = false
-                    inputArea.isEnabled = false
-                    attachBtn.isEnabled = false
-                    clearAttachBtn.isEnabled = false
-                    planPanel.isVisible = false
                 }
             }
         }
     }
 
-    // ── Phase 1: Send → Plan ──────────────────────────────────────────────────
+    // Workflow submission
 
     private fun onSendClicked() {
         val text = inputArea.text.trim()
@@ -220,14 +179,14 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         appendChatLine("You: ${text.ifBlank { "(attachments)" }}${if (attachments.isNotEmpty()) "\n[Attachments] ${attachments.joinToString { it.name }}" else ""}")
         inputArea.text = ""
         clearPendingAttachments()
-        setState(State.PLAN_PENDING)
+        setState(State.WORKFLOW_PENDING)
 
         ApplicationManager.getApplication().executeOnPooledThread {
-            runUploadThenPlan(text, attachments)
+            runUploadThenWorkflow(text, attachments)
         }
     }
 
-    private fun runUploadThenPlan(userText: String, files: List<File>) {
+    private fun runUploadThenWorkflow(userText: String, files: List<File>) {
         try {
             val aiClient = AiClientFactory.create(project) as? HttpAiClient
             if (files.isNotEmpty() && aiClient == null) {
@@ -241,247 +200,22 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
             val projectId = DevWerkProjectMeta.getOrCreateProjectId(project)
             val uploaded = files.map { file -> aiClient!!.uploadAttachment(file, projectId) }
             val message = buildUserMessage(userText, uploaded)
-            currentPlanUserMessage = message
-            runPlanPhase(message)
-        } catch (t: Throwable) {
-            t.printStackTrace()
-            SwingUtilities.invokeLater {
-                appendChatLine("[Error] Attachment upload failed: ${t.message}")
-                setState(State.IDLE)
-            }
-        }
-    }
-
-    private fun runPlanPhase(userMessage: String) {
-        try {
-            val basePath = project.basePath
-            val runner = DevwerkOperationRunner()
-
-            // Plan phase is READ-ONLY — no beginOperation here.
-            val devCtx = if (!basePath.isNullOrBlank()) runner.beginOperation(project, Paths.get(basePath)) else null
-
             val chatCtx = ChatContext(
                 projectRoot = project.basePath,
                 history = history.toList(),
-                projectId = DevWerkProjectMeta.getOrCreateProjectId(project),
-                taskId = currentPlan?.taskId,
-                project = project,
-                devCtx = devCtx
+                projectId = projectId,
+                taskId = null,
+                project = project
             )
-
-            val aiClient = AiClientFactory.create(project) as? HttpAiClient
-
-            if (aiClient == null) {
-                SwingUtilities.invokeLater {
-                    appendChatLine("[Info] Provider does not support plan mode; using direct execution.")
-                }
-                runLegacyChat(chatCtx, userMessage)
-                return
-            }
-
-            val planResp = aiClient.sendPlan(chatCtx, userMessage)
-
-            if (!planResp.ok) {
-                SwingUtilities.invokeLater {
-                    appendChatLine("[Plan Error] ${planResp.errorCode ?: "UNKNOWN"}: ${planResp.errorMessage ?: "No details"}")
-                    setState(State.IDLE)
-                }
-                return
-            }
-
-            currentPlan = planResp
-
-            SwingUtilities.invokeLater {
-                showPlan(planResp)
-                setState(State.PLAN_READY)
-            }
-
+            runLegacyChat(chatCtx, message)
         } catch (t: Throwable) {
             t.printStackTrace()
             SwingUtilities.invokeLater {
-                appendChatLine("[Error] Plan failed: ${t.message}")
+                appendChatLine("[Error] Workflow failed: ${t.message}")
                 setState(State.IDLE)
             }
         }
     }
-
-    private fun showPlan(planResp: PlanResponse) {
-        planArea.text = ""
-
-        if (planResp.files.isEmpty()) {
-            planArea.text = "(无文件变更 — 这是纯问答，直接执行)"
-            return
-        }
-
-        val sb = StringBuilder()
-        sb.append("📋 Plan — ${planResp.files.size} 个文件待确认\n")
-        sb.append("━".repeat(50)).append("\n")
-
-        if (planResp.summary.isNotBlank()) {
-            sb.append("摘要: ${planResp.summary}\n\n")
-        }
-
-        planCheckboxes.clear()
-
-        for (file in planResp.files) {
-            val icon = when (file.nature) {
-                "new"      -> "🟢 新增"
-                "modified" -> "🟡 修改"
-                "deleted"  -> "🔴 删除"
-                else       -> "⚪ ${file.nature}"
-            }
-
-            sb.append("$icon  ${file.path}\n")
-            sb.append("       ${file.description}\n")
-            if (file.confidence < 0.7) {
-                sb.append("       ⚠️ 置信度 ${(file.confidence * 100).toInt()}%\n")
-            }
-            sb.append("\n")
-            planCheckboxes[file.path] = JCheckBox(file.path, true)
-        }
-
-        if (planResp.warnings.isNotEmpty()) {
-            sb.append("⚠️  Warnings:\n")
-            for (w in planResp.warnings) {
-                sb.append("  • $w\n")
-            }
-        }
-
-        planArea.text = sb.toString()
-    }
-
-    // ── Phase 2: Approve / Cancel ──────────────────────────────────────────────
-
-    private fun onExecuteClicked() {
-        if (state != State.PLAN_READY) return
-        setState(State.EXECUTE_PENDING)
-
-        ApplicationManager.getApplication().executeOnPooledThread {
-            runExecutePhase()
-        }
-    }
-
-    private fun onCancelPlanClicked() {
-        if (state != State.PLAN_READY) return
-        val taskId = currentPlan?.taskId
-        appendChatLine("Plan cancelled by user.")
-        currentPlan = null
-        setState(State.IDLE)
-        if (!taskId.isNullOrBlank()) {
-            ApplicationManager.getApplication().executeOnPooledThread {
-                runCatching {
-                    (AiClientFactory.create(project) as? HttpAiClient)?.abandonTask(taskId, DevWerkProjectMeta.getOrCreateProjectId(project))
-                }.onFailure { it.printStackTrace() }
-            }
-        }
-    }
-
-    private fun runExecutePhase() {
-        if (currentPlan == null) return
-        val userMessage = currentPlanUserMessage
-
-        try {
-            val basePath = project.basePath
-            val runner = DevwerkOperationRunner()
-            val devCtx = if (!basePath.isNullOrBlank()) runner.beginOperation(project, Paths.get(basePath)) else null
-
-            val chatCtx = ChatContext(
-                projectRoot = project.basePath,
-                history = history.toList(),
-                projectId = DevWerkProjectMeta.getOrCreateProjectId(project),
-                taskId = currentPlan?.taskId,
-                project = project,
-                devCtx = devCtx
-            )
-
-            val aiClient = AiClientFactory.create(project) as? HttpAiClient
-            if (aiClient == null) {
-                SwingUtilities.invokeLater {
-                    appendChatLine("[Error] No DevWerk backend client available.")
-                    setState(State.IDLE)
-                }
-                currentPlan = null
-                return
-            }
-
-            val approved = planCheckboxes.filter { it.value.isSelected }.keys.toList()
-
-            if (approved.isEmpty()) {
-                SwingUtilities.invokeLater {
-                    appendChatLine("[Info] No files selected — nothing to execute.")
-                    setState(State.IDLE)
-                }
-                currentPlan = null
-                return
-            }
-
-            val execResp = aiClient.sendExecute(
-                context = chatCtx,
-                userMessage = userMessage,
-                approvedPaths = approved,
-                approvedOps = emptyList()
-            )
-
-            history += ChatMessage("user", userMessage)
-            if (execResp.ok) history += ChatMessage("assistant", execResp.reply)
-
-            if (devCtx != null) {
-                runner.recordFinalSummaryAndBackup(project, devCtx, execResp)
-                if (execResp.ok) {
-                    runCatching {
-                        runner.applyResponse(project, devCtx, execResp)
-                    }.onSuccess {
-                        val verification = runPostApplyTools(aiClient, chatCtx, execResp, devCtx)
-                        reportApplyResult(
-                            aiClient,
-                            execResp,
-                            devCtx,
-                            ok = true,
-                            changedPaths = collectChangedPaths(execResp),
-                            verification = verification
-                        )
-                    }.onFailure { applyError ->
-                        reportApplyResult(
-                            aiClient,
-                            execResp,
-                            devCtx,
-                            ok = false,
-                            changedPaths = collectChangedPaths(execResp),
-                            errorMessage = "${applyError::class.java.simpleName}: ${applyError.message}"
-                        )
-                        throw applyError
-                    }
-                }
-            } else if (execResp.ok) {
-                reportApplyResult(aiClient, execResp, null, ok = false, changedPaths = collectChangedPaths(execResp), errorMessage = "DevWerk local operation context is unavailable.")
-            }
-
-            val resp = execResp
-            SwingUtilities.invokeLater {
-                if (resp.ok) appendChatLine("Bot: ${resp.reply}")
-                resp.codeTree?.takeIf { it.isNotBlank() }?.let {
-                    appendChatLine("=== Code Tree ==="); appendChatLine(it)
-                }
-                if (resp.ok && resp.patchOps.isNotEmpty()) {
-                    appendChatLine("[System] ${resp.patchOps.size} patch op(s) applied.")
-                } else if (resp.ok && resp.ops.isNotEmpty()) {
-                    appendChatLine("[System] ${resp.ops.size} file op(s) applied.")
-                }
-                currentPlan = null
-                setState(State.IDLE)
-            }
-
-        } catch (t: Throwable) {
-            t.printStackTrace()
-            SwingUtilities.invokeLater {
-                appendChatLine("[Error] Execute failed: ${t.message}")
-                currentPlan = null
-                setState(State.IDLE)
-            }
-        }
-    }
-
-    // ── Fallback: legacy single-shot chat ──────────────────────────────────────
 
     private fun runLegacyChat(chatCtx: ChatContext, userMessage: String) {
         try {
@@ -492,11 +226,11 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
             val updatedCtx = chatCtx.copy(devCtx = devCtx)
             val aiClient = AiClientFactory.create(project)
 
-            var response = aiClient.sendChat(updatedCtx, userMessage)
+            var response = aiClient.sendWorkflow(updatedCtx, userMessage)
 
             if (!response.ok && response.retryable) {
                 appendOpLog(devCtx, "\n[INFO] retry once\n")
-                response = aiClient.sendChat(updatedCtx.copy(history = history.toList()), userMessage)
+                response = aiClient.sendWorkflow(updatedCtx.copy(history = history.toList()), userMessage)
             }
 
             history += ChatMessage("user", userMessage)
@@ -589,7 +323,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         errorMessage: String? = null,
         verification: JSONObject = JSONObject()
     ) {
-        val taskId = response.taskId ?: currentPlan?.taskId ?: return
+        val taskId = response.taskId ?: return
         val http = aiClient as? HttpAiClient ?: return
         runCatching {
             http.reportApplyResult(

@@ -17,8 +17,8 @@ harness system:
 - Backend tool requests are an extensible action protocol. Research tools are
   resolved by the backend loop; client tools are returned to the IDE plugin and
   reported back through kanban verification.
-- Kanban is the operating surface. `/v1/chat` is no longer just a chat endpoint;
-  it creates or advances a kanban task.
+- Kanban is the operating surface. `/v1/workflows` starts a backend-owned
+  workflow, then clients poll for status and result.
 
 ## Architecture
 
@@ -31,7 +31,7 @@ IntelliJ Plugin
         |
         v
 DevWerk Backend (FastAPI)
-  - /v1/chat kanban workflow entry
+  - /v1/workflows kanban workflow entry
   - coder harness from source_map
   - planning bundle artifacts
   - patch/file operation generation
@@ -66,7 +66,7 @@ Failed
 
 State meaning:
 
-- `Draft`: A user request exists. The task may have been created by `/v1/chat`.
+- `Draft`: A user request exists. The task may have been created by `/v1/workflows`.
 - `Context Indexed`: The backend received source map, selected context, and
   attachment metadata. This phase should use as little LLM work as possible.
 - `Planned`: The backend saved a planning bundle containing requirement
@@ -270,26 +270,44 @@ Today the plugin implements `run_command` for project-local Gradle/Maven
 commands. Future IntelliJ SDK actions can use the same protocol without changing
 the kanban state-machine boundary.
 
-### `POST /v1/chat`
+### `POST /v1/workflows`
 
-Kanban workflow entrypoint. If `task_id` is missing, the backend creates a task.
-It then records context, plans, codes, and returns changes in `Ready To Apply`.
+Kanban workflow entrypoint. If `task_id` is missing, the backend creates a task,
+returns immediately, and continues planning/coding in the background.
 
-Important response fields:
+Start response:
+
+```json
+{
+  "ok": true,
+  "task_id": "...",
+  "status_key": "draft",
+  "ready": false,
+  "poll_url": "/v1/workflows/...",
+  "result_url": "/v1/workflows/.../result",
+  "events_url": "/v1/kanban/events?..."
+}
+```
+
+Clients poll `GET /v1/workflows/{task_id}` until `result` appears. The result is
+the same guarded apply payload previously returned synchronously:
 
 ```json
 {
   "ok": true,
   "task_id": "...",
   "status_key": "ready_to_apply",
-  "session_id": "coding-...",
-  "phase_output": {},
-  "next_action": "apply_result",
-  "planning": {},
-  "ops": [],
-  "patch_ops": []
+  "result": {
+    "ops": [],
+    "patch_ops": [],
+    "tool_requests": [],
+    "next_action": "apply_result"
+  }
 }
 ```
+
+`/v1/chat` has been removed. Coding clients should use workflows, not long
+blocking chat requests.
 
 ### `POST /v1/kanban/tasks/{task_id}/actions`
 

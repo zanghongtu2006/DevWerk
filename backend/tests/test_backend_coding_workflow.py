@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import httpx
@@ -262,6 +263,85 @@ async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_
             assert "execute_llm_round_started" in event_types
             assert "execute_llm_round_result" in event_types
             assert "execute_response_ready" in event_types
+
+
+@pytest.mark.asyncio
+async def test_workflow_start_poll_result_smoke(monkeypatch, tmp_path):
+    db_path = tmp_path / "devwerk-workflow.db"
+    project_root = tmp_path / "workflow-project"
+    project_root.mkdir()
+    fake_settings = FakeSettings(db_path)
+
+    import app.main as main_module
+    import app.routes.ide as ide_routes
+    import app.services.kanban as kanban_service
+    import app.services.planner as planner_service
+    import app.services.usage as usage_service
+
+    patch_service_settings(monkeypatch, fake_settings, main_module, ide_routes, kanban_service, usage_service)
+    reset_service_dbs(kanban_service, usage_service)
+    monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": FakePlannerClient())
+    monkeypatch.setattr(ide_routes, "get_llm_client", lambda agent="executor": FakeExecutorClient())
+
+    app = main_module.create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            project_id = "backend-workflow-smoke"
+            body = {
+                "project_id": project_id,
+                "mode": "agent",
+                "project_root": str(project_root),
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Create a Spring Boot scaffold compatible with JDK 21 and a minimal REST hello world API.",
+                    }
+                ],
+                "workspace": {
+                    "root_id": project_id,
+                    "changed_files": [],
+                    "open_files": [],
+                    "tree_preview": "",
+                    "source_map": None,
+                },
+                "tool_results": [],
+            }
+
+            start_response = await client.post("/v1/workflows", json=body, headers={"X-DevWerk-Project-Id": project_id})
+            assert start_response.status_code == 200
+            started = start_response.json()
+            assert started["ok"] is True
+            assert started["task_id"]
+            assert started["poll_url"] == f"/v1/workflows/{started['task_id']}"
+
+            state = {}
+            for _ in range(100):
+                poll_response = await client.get(started["poll_url"])
+                assert poll_response.status_code == 200
+                state = poll_response.json()
+                if state.get("result"):
+                    break
+                await asyncio.sleep(0.05)
+
+            result = state.get("result")
+            assert result
+            assert result["ok"] is True
+            assert result["task_id"] == started["task_id"]
+            assert result["status_key"] == "ready_to_apply"
+            assert len(result["ops"]) == 4
+            _apply_file_ops(project_root, result["ops"])
+            assert (project_root / "src/main/java/com/devwerk/demo/HelloController.java").is_file()
+
+            task_response = await client.get(f"/v1/kanban/tasks/{started['task_id']}")
+            task = task_response.json()["task"]
+            assert task["status_key"] == "ready_to_apply"
+            artifact_types = [artifact["artifact_type"] for artifact in task["artifacts"]]
+            assert "workflow_request" in artifact_types
+            assert "workflow_result" in artifact_types
+
+            chat_response = await client.post("/v1/chat", json=body)
+            assert chat_response.status_code == 404
 
 
 @pytest.mark.asyncio
