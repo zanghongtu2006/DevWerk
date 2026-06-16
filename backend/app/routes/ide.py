@@ -31,6 +31,7 @@ from app.services.planner import Planner as build_planner
 from app.services.prompt_builder import build_model_messages
 from app.services.usage import clear_request, finish_request, start_request, usage_summary
 from app.services.workflow import apply_workflow_action, record_phase_output
+from app.services.workflow_engine import WorkflowEngine
 
 router = APIRouter()
 _log = logging.getLogger("devwerk.ide")
@@ -1044,65 +1045,19 @@ def _run_workflow_thread(task_id: str, body: dict) -> None:
 
 
 async def _run_workflow(task_id: str, body: dict) -> None:
-    _kanban_event(task_id, "workflow_started", {"entrypoint": "/v1/workflows"})
-    plan_response = await ide_plan(_BodyRequest(body))
-    if not plan_response.ok:
-        response = IdeChatResponse(
-            ok=False,
-            reply="",
-            done=True,
-            task_id=task_id,
-            status_key=plan_response.status_key or "failed",
-            error_code=plan_response.error_code or "PLAN_ERROR",
-            error_message=plan_response.error_message or "Planning failed.",
-            retryable=True,
-        )
-        _kanban_artifact(task_id, "workflow_result", payload=response.model_dump())
-        _kanban_event(task_id, "workflow_finished", {"ok": False, "phase": "plan", "status_key": response.status_key})
-        return
-
-    approved_paths = [file.path for file in plan_response.files]
-    if not approved_paths:
-        response = IdeChatResponse(
-            ok=False,
-            reply="",
-            done=True,
-            task_id=task_id,
-            status_key="failed",
-            error_code="EMPTY_PLAN",
-            error_message="Planner produced no files for a coding workflow.",
-            retryable=True,
-        )
-        _kanban_artifact(task_id, "workflow_result", payload=response.model_dump())
-        _kanban_move(task_id, "failed", {"phase": "plan", "error": response.error_message})
-        _kanban_event(task_id, "workflow_finished", {"ok": False, "phase": "plan", "status_key": "failed"})
-        return
-
-    execute_body = {
-        "project_id": body.get("project_id"),
-        "task_id": task_id,
-        "mode": body.get("mode", "agent"),
-        "project_root": body.get("project_root"),
-        "messages": body.get("messages") or [],
-        "workspace": body.get("workspace"),
-        "approved_paths": approved_paths,
-        "approved_ops": [],
-    }
-    execute_response = await ide_execute(_BodyRequest(execute_body))
-    execute_response.task_id = task_id
-    _kanban_artifact(task_id, "workflow_result", payload=execute_response.model_dump())
-    _kanban_event(
-        task_id,
-        "workflow_finished",
-        {
-            "ok": execute_response.ok,
-            "phase": "coding",
-            "status_key": execute_response.status_key,
-            "ops": len(execute_response.ops),
-            "patch_ops": len(execute_response.patch_ops),
-            "tool_requests": len(execute_response.tool_requests),
-        },
+    engine = WorkflowEngine(
+        plan_runner=_run_plan_phase,
+        coding_runner=_run_coding_phase,
     )
+    await engine.run(task_id, body)
+
+
+async def _run_plan_phase(body: dict) -> PlanResponse:
+    return await ide_plan(_BodyRequest(body))
+
+
+async def _run_coding_phase(body: dict) -> IdeChatResponse:
+    return await ide_execute(_BodyRequest(body))
 
 
 def _workflow_state_payload(task_id: str, *, include_result: bool) -> dict:

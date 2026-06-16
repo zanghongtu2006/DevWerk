@@ -19,6 +19,7 @@ def test_default_kanban_flow_contains_required_control_points():
         "context_indexed",
         "planned",
         "coding",
+        "reviewed",
         "ready_to_apply",
         "applied",
         "verified",
@@ -103,3 +104,45 @@ def test_workflow_action_protocol_drives_kanban_state(monkeypatch, tmp_path):
 
     retried = workflow_service.apply_workflow_action(task["id"], "retry", {"reason": "test"})
     assert retried["task"]["status_key"] == "draft"
+
+
+def test_workflow_semantic_rework_actions(monkeypatch, tmp_path):
+    import app.services.kanban as kanban_service
+    import app.services.session_store as session_store
+    import app.services.workflow as workflow_service
+
+    class FakeSettings:
+        devwerk_db_path = str(tmp_path / "workflow-rework.db")
+
+    monkeypatch.setattr(kanban_service, "settings", lambda: FakeSettings())
+    monkeypatch.setattr(session_store, "settings", lambda: FakeSettings())
+    kanban_service._initialized = False
+
+    task = kanban_service.create_task(
+        project_id="workflow-rework",
+        title="Review coding output",
+        description="Smoke",
+        status_key="reviewed",
+    )["task"]
+
+    recoding = workflow_service.apply_workflow_action(
+        task["id"],
+        "request_recoding",
+        {"phase": "reviewed", "reason": "Generated change missed an approved file."},
+    )
+    assert recoding["task"]["status_key"] == "coding"
+
+    reviewed = kanban_service.move_task(task["id"], "reviewed", force=True, payload={"reason": "retry review"})
+    assert reviewed["task"]["status_key"] == "reviewed"
+
+    approved = workflow_service.apply_workflow_action(
+        task["id"],
+        "approve",
+        {"phase": "reviewed", "reason": "Review passed."},
+    )
+    assert approved["task"]["status_key"] == "ready_to_apply"
+
+    events = kanban_service.list_events(project_id="workflow-rework", task_id=task["id"], limit=50)["events"]
+    event_types = [event["event_type"] for event in events]
+    assert "workflow_transition_decided" in event_types
+    assert "workflow_rework_requested" in event_types

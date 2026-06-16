@@ -4,8 +4,9 @@ import logging
 import uuid
 from typing import Any
 
-from app.services.kanban import add_artifact, add_event, get_task, move_task
+from app.services.kanban import add_artifact, add_event, get_project_workflow, get_task, move_task
 from app.services.session_store import record_phase_memory
+from app.services.workflow_definition import workflow_from_dict
 
 _log = logging.getLogger("devwerk.workflow")
 
@@ -14,8 +15,14 @@ ACTION_CONTEXT_INDEXED = "context_indexed"
 ACTION_PLAN_READY = "plan_ready"
 ACTION_PLAN_FAILED = "plan_failed"
 ACTION_CODING_STARTED = "coding_started"
+ACTION_CODING_READY = "coding_ready"
 ACTION_READY_TO_APPLY = "ready_to_apply"
 ACTION_CODING_FAILED = "coding_failed"
+ACTION_REQUEST_RECODING = "request_recoding"
+ACTION_REQUEST_REPLAN = "request_replan"
+ACTION_APPROVE = "approve"
+ACTION_FAIL = "fail"
+ACTION_NEED_CLIENT_TOOL = "need_client_tool"
 ACTION_APPLY_RESULT = "apply_result"
 ACTION_RETRY = "retry"
 ACTION_ABANDON = "abandon"
@@ -33,6 +40,7 @@ def record_phase_output(
     warnings: list[str] | None = None,
     session_id: str | None = None,
     next_action: str | None = None,
+    decision: str | None = None,
 ) -> dict[str, Any]:
     """
     Persist the stable output contract for one workflow phase.
@@ -51,6 +59,7 @@ def record_phase_output(
         "inputs": inputs or {},
         "outputs": outputs or {},
         "warnings": warnings or [],
+        "decision": decision,
         "next_action": next_action,
     }
     _log.debug(
@@ -72,6 +81,7 @@ def record_phase_output(
             "phase": phase,
             "agent": agent,
             "status_key": status_key,
+            "decision": decision,
             "next_action": next_action,
         },
     )
@@ -96,42 +106,68 @@ def apply_workflow_action(task_id: str, action: str, payload: dict[str, Any] | N
     data = dict(payload or {})
     _log.debug("workflow action task_id=%s action=%s payload=%s", task_id, action_key, data)
 
-    if action_key == ACTION_CONTEXT_INDEXED:
-        add_event(task_id, "workflow_context_indexed", data)
-        return move_task(task_id, "context_indexed", force=True, payload=data)
-
-    if action_key == ACTION_PLAN_READY:
-        add_event(task_id, "workflow_plan_ready", data)
-        return move_task(task_id, "planned", force=True, payload=data)
-
-    if action_key == ACTION_PLAN_FAILED:
-        add_event(task_id, "workflow_plan_failed", data)
-        return move_task(task_id, "failed", force=True, payload={"phase": "plan", **data})
-
-    if action_key == ACTION_CODING_STARTED:
-        add_event(task_id, "workflow_coding_started", data)
-        return move_task(task_id, "coding", force=True, payload=data)
-
-    if action_key == ACTION_READY_TO_APPLY:
-        add_event(task_id, "workflow_ready_to_apply", data)
-        return move_task(task_id, "ready_to_apply", force=True, payload=data)
-
-    if action_key == ACTION_CODING_FAILED:
-        add_event(task_id, "workflow_coding_failed", data)
-        return move_task(task_id, "failed", force=True, payload={"phase": "coding", **data})
-
     if action_key == ACTION_APPLY_RESULT:
         return _apply_result(task_id, data)
 
-    if action_key == ACTION_RETRY:
-        add_event(task_id, "manual_retry_requested", data or {"reason": "user_requested_retry"})
-        return move_task(task_id, "draft", force=True, payload={"reason": "manual_retry", **data})
-
-    if action_key == ACTION_ABANDON:
-        add_event(task_id, "manual_abandon_requested", data or {"reason": "user_abandoned_task"})
-        return move_task(task_id, "failed", force=True, payload={"reason": "manual_abandon", **data})
+    semantic = {
+        ACTION_CONTEXT_INDEXED,
+        ACTION_PLAN_READY,
+        ACTION_PLAN_FAILED,
+        ACTION_CODING_STARTED,
+        ACTION_CODING_READY,
+        ACTION_READY_TO_APPLY,
+        ACTION_CODING_FAILED,
+        ACTION_REQUEST_RECODING,
+        ACTION_REQUEST_REPLAN,
+        ACTION_APPROVE,
+        ACTION_FAIL,
+        ACTION_NEED_CLIENT_TOOL,
+        ACTION_RETRY,
+        ACTION_ABANDON,
+    }
+    if action_key in semantic:
+        return _transition_by_definition(task_id, action_key, data)
 
     raise ValueError(f"unknown workflow action: {action}")
+
+
+def _transition_by_definition(task_id: str, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+    task_detail = get_task(task_id)
+    task = task_detail.get("task") or {}
+    project_id = str(task.get("project_id") or "default")
+    current_status = str(task.get("status_key") or "")
+    workflow_payload = get_project_workflow(project_id).get("workflow") or {}
+    definition = workflow_from_dict(workflow_payload)
+    action_rule = definition.action(action)
+    if action_rule is None:
+        raise ValueError(f"unknown workflow action for project workflow: {action}")
+
+    to_status = str(action_rule.get("to") or "").strip().lower()
+    if not to_status:
+        raise ValueError(f"workflow action {action!r} has no target status")
+
+    data = dict(payload or {})
+    data.setdefault("action", action)
+    add_event(
+        task_id,
+        "workflow_transition_decided",
+        {
+            "action": action,
+            "from_status": current_status,
+            "to_status": to_status,
+            "reason": data.get("reason"),
+            "phase": data.get("phase"),
+        },
+    )
+    if action == ACTION_RETRY:
+        add_event(task_id, "manual_retry_requested", data or {"reason": "user_requested_retry"})
+    if action == ACTION_ABANDON:
+        add_event(task_id, "manual_abandon_requested", data or {"reason": "user_abandoned_task"})
+    if action in {ACTION_REQUEST_RECODING, ACTION_REQUEST_REPLAN}:
+        add_event(task_id, "workflow_rework_requested", data)
+    else:
+        add_event(task_id, f"workflow_{action}", data)
+    return move_task(task_id, to_status, force=True, payload=data)
 
 
 def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -205,6 +241,8 @@ def available_actions_for_status(status_key: str) -> list[str]:
         return [ACTION_RETRY, ACTION_ABANDON]
     if status == "ready_to_apply":
         return [ACTION_APPLY_RESULT, ACTION_ABANDON]
+    if status == "reviewed":
+        return [ACTION_APPROVE, ACTION_REQUEST_RECODING, ACTION_REQUEST_REPLAN, ACTION_ABANDON]
     if status in {"planned", "coding", "ready_to_apply", "applied", "verified"}:
         return [ACTION_ABANDON]
     if status in {"done"}:

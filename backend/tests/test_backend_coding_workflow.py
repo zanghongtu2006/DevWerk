@@ -343,13 +343,37 @@ async def test_workflow_start_poll_result_smoke(monkeypatch, tmp_path):
             artifact_types = [artifact["artifact_type"] for artifact in task["artifacts"]]
             assert "workflow_request" in artifact_types
             assert "workflow_result" in artifact_types
+            assert "context_bundle" in artifact_types
+            assert "plan_bundle" in artifact_types
+            assert "code_change_bundle" in artifact_types
+            assert "review_bundle" in artifact_types
+            phase_outputs = [
+                artifact["payload"]
+                for artifact in task["artifacts"]
+                if artifact["artifact_type"] == "workflow_phase_output"
+            ]
+            phases = {item["phase"] for item in phase_outputs}
+            assert {"context_indexed", "plan", "coding", "reviewed"}.issubset(phases)
+            session_ids = [item["session_id"] for item in phase_outputs]
+            assert len(session_ids) == len(set(session_ids))
 
             events_response = await client.get(started["events_url"])
             assert events_response.status_code == 200
             events_text = events_response.text
             assert "event: kanban_event" in events_text
             assert "workflow_started" in events_text
+            assert "workflow_column_started" in events_text
+            assert "workflow_column_completed" in events_text
+            assert "workflow_transition_decided" in events_text
+            assert "agent_context_built" in events_text
+            assert "agent_output_recorded" in events_text
             assert "event: workflow_result" in events_text
+
+            memory_response = await client.get(f"/v1/kanban/projects/{project_id}/memory")
+            memory = memory_response.json()["memory"]
+            memory_text = str(memory)
+            assert "Create a Spring Boot scaffold compatible with JDK 21" not in memory_text
+            assert "context_indexed" in {item["phase"] for item in memory["phase_summaries"]}
 
             chat_response = await client.post("/v1/chat", json=body)
             assert chat_response.status_code == 404

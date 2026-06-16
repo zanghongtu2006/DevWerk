@@ -226,6 +226,8 @@ class Settings(BaseSettings):
                 "design": "deepseek/deepseek-chat",
                 "planner": "deepseek/deepseek-chat",
                 "executor": "minimax/m3",
+                "reviewer": "minimax/m3",
+                "verifier": "minimax/m3",
                 "compression": "ollama/deepseek-r1:32b",
             },
             "llms": {
@@ -481,6 +483,10 @@ def _routing_keys(agent: str) -> list[str]:
         "architecture": ["architecture", "architect"],
         "executor": ["executor", "coding"],
         "execute": ["executor", "coding"],
+        "reviewer": ["reviewer", "review"],
+        "review": ["reviewer", "review"],
+        "verifier": ["verifier", "verify"],
+        "verify": ["verifier", "verify"],
     }
     return aliases.get(agent, [agent])
 

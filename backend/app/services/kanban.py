@@ -10,6 +10,7 @@ from typing import Any
 
 from app.core.config import settings
 from app.services.session_store import append_task_event
+from app.services.workflow_definition import default_columns, default_workflow_definition, workflow_from_dict
 
 _log = logging.getLogger("devwerk.kanban")
 _initialized = False
@@ -22,62 +23,7 @@ T_COLUMNS = f"{TABLE_NAME_PREFIX}columns"
 T_TASKS = f"{TABLE_NAME_PREFIX}tasks"
 T_EVENTS = f"{TABLE_NAME_PREFIX}events"
 T_ARTIFACTS = f"{TABLE_NAME_PREFIX}artifacts"
-DEFAULT_COLUMNS: list[dict[str, Any]] = [
-    {
-        "status_key": "draft",
-        "title": "Draft",
-        "position": 10,
-        "transition_to": ["context_indexed", "failed"],
-    },
-    {
-        "status_key": "context_indexed",
-        "title": "Context Indexed",
-        "position": 20,
-        "transition_to": ["planned", "failed"],
-    },
-    {
-        "status_key": "planned",
-        "title": "Planned",
-        "position": 30,
-        "transition_to": ["coding", "draft", "failed"],
-    },
-    {
-        "status_key": "coding",
-        "title": "Coding",
-        "position": 40,
-        "transition_to": ["ready_to_apply", "planned", "failed"],
-    },
-    {
-        "status_key": "ready_to_apply",
-        "title": "Ready To Apply",
-        "position": 50,
-        "transition_to": ["applied", "coding", "failed"],
-    },
-    {
-        "status_key": "applied",
-        "title": "Applied",
-        "position": 60,
-        "transition_to": ["verified", "coding", "planned", "failed"],
-    },
-    {
-        "status_key": "verified",
-        "title": "Verified",
-        "position": 70,
-        "transition_to": ["done", "applied", "failed"],
-    },
-    {
-        "status_key": "done",
-        "title": "Done",
-        "position": 80,
-        "transition_to": [],
-    },
-    {
-        "status_key": "failed",
-        "title": "Failed",
-        "position": 90,
-        "transition_to": ["draft"],
-    },
-]
+DEFAULT_COLUMNS: list[dict[str, Any]] = default_columns()
 
 
 def init_kanban_db() -> None:
@@ -106,6 +52,7 @@ def init_kanban_db() -> None:
                 agents_json TEXT NOT NULL DEFAULT '{}',
                 models_json TEXT NOT NULL DEFAULT '{}',
                 parameters_json TEXT NOT NULL DEFAULT '{}',
+                workflow_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -173,6 +120,7 @@ def init_kanban_db() -> None:
                 ON kb_artifacts(task_id);
             """
         )
+        _ensure_column(conn, T_PROJECT_SETTINGS, "workflow_json", "TEXT NOT NULL DEFAULT '{}'")
     _initialized = True
     _log.debug("kanban db initialized path=%s", path)
 
@@ -278,6 +226,7 @@ def update_project_settings(
     *,
     agents: dict[str, Any] | None = None,
     parameters: dict[str, Any] | None = None,
+    workflow: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     pid = _project_id(project_id)
     ensure_project(pid)
@@ -291,13 +240,36 @@ def update_project_settings(
     if parameters is not None:
         updates.append("parameters_json = ?")
         params.append(_json(parameters))
+    if workflow is not None:
+        updates.append("workflow_json = ?")
+        params.append(_json(workflow))
     if updates:
         updates.append("updated_at = ?")
         params.append(now)
         params.append(pid)
         with _conn() as conn:
             conn.execute(f"UPDATE kb_project_settings SET {', '.join(updates)} WHERE project_id = ?", params)
+    if workflow is not None:
+        definition = workflow_from_dict(workflow)
+        replace_columns(pid, definition.columns_for_kanban())
     return get_project_settings(pid)
+
+
+def get_project_workflow(project_id: str | None = None) -> dict[str, Any]:
+    pid = _project_id(project_id)
+    ensure_project(pid)
+    ensure_project_settings(pid)
+    with _conn() as conn:
+        row = conn.execute("SELECT workflow_json FROM kb_project_settings WHERE project_id = ?", (pid,)).fetchone()
+    raw = _loads(row["workflow_json"], {}) if row is not None else {}
+    definition = workflow_from_dict(raw) if isinstance(raw, dict) and raw else default_workflow_definition()
+    return {"ok": True, "project_id": pid, "workflow": definition_to_dict(definition)}
+
+
+def update_project_workflow(project_id: str | None, workflow: dict[str, Any]) -> dict[str, Any]:
+    definition = workflow_from_dict(workflow)
+    update_project_settings(project_id, workflow=definition_to_dict(definition))
+    return get_project_workflow(project_id)
 
 
 def list_columns(project_id: str | None = None) -> list[dict[str, Any]]:
@@ -676,14 +648,15 @@ def _ensure_project_settings_no_init(pid: str) -> None:
         conn.execute(
             """
             INSERT OR IGNORE INTO kb_project_settings (
-                project_id, agents_json, models_json, parameters_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                project_id, agents_json, models_json, parameters_json, workflow_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 pid,
                 _json(_default_agents()),
                 "{}",
                 _json(_default_parameters()),
+                "{}",
                 now,
                 now,
             ),
@@ -798,6 +771,7 @@ def _settings_dict(row: sqlite3.Row | None) -> dict[str, Any]:
     return {
         "agents": agents,
         "parameters": parameters,
+        "workflow": _loads(row["workflow_json"], {}),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -863,6 +837,8 @@ def _default_agents() -> dict[str, Any]:
         "coder": {"enabled": True, "model_ref": "minimax/m3"},
         "planner": {"enabled": True, "model_ref": "deepseek/deepseek-chat"},
         "executor": {"enabled": True, "model_ref": "minimax/m3"},
+        "reviewer": {"enabled": True, "model_ref": "minimax/m3"},
+        "verifier": {"enabled": False, "model_ref": "minimax/m3"},
     }
 
 
@@ -957,6 +933,35 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
         (table_name,),
     ).fetchone()
     return row is not None
+
+
+def _ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, ddl: str) -> None:
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+    if column_name not in columns:
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}")
+
+
+def definition_to_dict(definition: Any) -> dict[str, Any]:
+    return {
+        "name": definition.name,
+        "version": definition.version,
+        "columns": [
+            {
+                "status_key": col.status_key,
+                "title": col.title,
+                "position": col.position,
+                "transition_to": col.transition_to,
+                "agent": col.agent,
+                "input_artifacts": col.input_artifacts or [],
+                "output_artifact": col.output_artifact,
+                "success_action": col.success_action,
+                "failure_actions": col.failure_actions or [],
+                "context_policy": col.context_policy or {},
+            }
+            for col in definition.columns
+        ],
+        "actions": definition.actions,
+    }
 
 
 def _conn() -> sqlite3.Connection:

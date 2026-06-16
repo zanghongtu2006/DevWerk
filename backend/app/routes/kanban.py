@@ -13,11 +13,13 @@ from app.services.kanban import (
     get_board,
     get_project,
     get_project_settings,
+    get_project_workflow,
     get_task,
     list_events,
     list_columns,
     list_projects,
     replace_columns,
+    update_project_workflow,
     update_project_settings,
     upsert_project,
     update_task,
@@ -51,6 +53,7 @@ class ProjectUpsertRequest(BaseModel):
 class ProjectSettingsRequest(BaseModel):
     agents: dict[str, Any] | None = None
     parameters: dict[str, Any] | None = None
+    workflow: dict[str, Any] | None = None
 
 
 class TaskCreateRequest(BaseModel):
@@ -84,6 +87,10 @@ class ArtifactCreateRequest(BaseModel):
 class WorkflowActionRequest(BaseModel):
     action: str
     payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowDefinitionRequest(BaseModel):
+    workflow: dict[str, Any] = Field(default_factory=dict)
 
 
 @router.get("/board")
@@ -121,12 +128,26 @@ def kanban_get_project_memory(project_id: str):
     return {"ok": True, "project_id": project_id, "memory": read_project_memory(project_id)}
 
 
+@router.get("/projects/{project_id}/workflow")
+def kanban_get_project_workflow(project_id: str):
+    return get_project_workflow(project_id)
+
+
+@router.put("/projects/{project_id}/workflow")
+def kanban_update_project_workflow(project_id: str, req: WorkflowDefinitionRequest):
+    try:
+        return update_project_workflow(project_id, req.workflow)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.put("/projects/{project_id}/settings")
 def kanban_update_project_settings(project_id: str, req: ProjectSettingsRequest):
     return update_project_settings(
         project_id,
         agents=req.agents,
         parameters=req.parameters,
+        workflow=req.workflow,
     )
 
 
@@ -454,7 +475,7 @@ DASHBOARD_HTML = r"""
     async function saveGlobalSettings() { await api("/v1/settings", { method: "PUT", body: JSON.stringify({ llms: JSON.parse($("llmsJson").value || "{}"), routing: JSON.parse($("routingJson").value || "{}") }) }); await refreshAll(); }
     async function saveProjectSettings() { await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/settings`, { method: "PUT", body: JSON.stringify({ agents: JSON.parse($("projectAgentsJson").value || "{}"), parameters: JSON.parse($("projectParametersJson").value || "{}") }) }); await refreshAll(); }
     async function resetColumns() {
-      await api("/v1/kanban/columns", { method: "PUT", body: JSON.stringify({ project_id: state.projectId, columns: [ { status_key: "draft", title: "Draft", position: 10, transition_to: ["context_indexed", "failed"] }, { status_key: "context_indexed", title: "Context Indexed", position: 20, transition_to: ["planned", "failed"] }, { status_key: "planned", title: "Planned", position: 30, transition_to: ["coding", "draft", "failed"] }, { status_key: "coding", title: "Coding", position: 40, transition_to: ["ready_to_apply", "planned", "failed"] }, { status_key: "ready_to_apply", title: "Ready To Apply", position: 50, transition_to: ["applied", "coding", "failed"] }, { status_key: "applied", title: "Applied", position: 60, transition_to: ["verified", "coding", "planned", "failed"] }, { status_key: "verified", title: "Verified", position: 70, transition_to: ["done", "applied", "failed"] }, { status_key: "done", title: "Done", position: 80, transition_to: [] }, { status_key: "failed", title: "Failed", position: 90, transition_to: ["draft"] } ] }) });
+      await api("/v1/kanban/columns", { method: "PUT", body: JSON.stringify({ project_id: state.projectId, columns: [ { status_key: "draft", title: "Draft", position: 10, transition_to: ["context_indexed", "failed"] }, { status_key: "context_indexed", title: "Context Indexed", position: 20, transition_to: ["planned", "failed"] }, { status_key: "planned", title: "Planned", position: 30, transition_to: ["coding", "draft", "failed"] }, { status_key: "coding", title: "Coding", position: 40, transition_to: ["reviewed", "planned", "failed"] }, { status_key: "reviewed", title: "Reviewed", position: 45, transition_to: ["ready_to_apply", "coding", "planned", "failed"] }, { status_key: "ready_to_apply", title: "Ready To Apply", position: 50, transition_to: ["applied", "coding", "failed"] }, { status_key: "applied", title: "Applied", position: 60, transition_to: ["verified", "coding", "planned", "failed"] }, { status_key: "verified", title: "Verified", position: 70, transition_to: ["done", "applied", "failed"] }, { status_key: "done", title: "Done", position: 80, transition_to: [] }, { status_key: "failed", title: "Failed", position: 90, transition_to: ["draft"] } ] }) });
       await refreshAll();
     }
     document.querySelector("nav").onclick = (event) => { const btn = event.target.closest("button[data-view]"); if (!btn) return; state.view = btn.dataset.view; renderActive(); };

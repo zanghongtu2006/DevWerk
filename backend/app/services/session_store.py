@@ -77,6 +77,7 @@ def record_phase_memory(
         "inputs": phase_output.get("inputs") or {},
         "outputs": phase_output.get("outputs") or {},
         "warnings": phase_output.get("warnings") or [],
+        "decision": phase_output.get("decision"),
         "next_action": phase_output.get("next_action"),
     }
 
@@ -136,6 +137,7 @@ def record_project_memory(
         "commands": _extract_commands(outputs),
         "warnings": [str(item) for item in warnings[:10]],
         "next_action": phase_output.get("next_action"),
+        "decision": phase_output.get("decision"),
     }
 
     memory["project_id"] = project_id
@@ -165,6 +167,7 @@ def record_project_memory(
             "paths": phase_summary["paths"],
             "commands": phase_summary["commands"],
             "next_action": phase_summary["next_action"],
+            "decision": phase_summary["decision"],
         },
     )
     return memory

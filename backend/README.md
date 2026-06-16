@@ -83,12 +83,13 @@ through the host proxy.
 Default kanban states:
 
 ```text
-Draft -> Context Indexed -> Planned -> Coding -> Ready To Apply
+Draft -> Context Indexed -> Planned -> Coding -> Reviewed -> Ready To Apply
       -> Applied -> Verified -> Done
 ```
 
-`Failed` is available from every stage. Rework should move a task back to the
-right previous state and record a reason in events/artifacts.
+`Failed` is available from every stage. Reviewer rework is expressed as semantic
+actions such as `request_recoding` or `request_replan`; the workflow state
+machine chooses the target column and records a reason in events/artifacts.
 
 Every phase writes a `workflow_phase_output` artifact:
 
@@ -102,6 +103,7 @@ Every phase writes a `workflow_phase_output` artifact:
   "inputs": {},
   "outputs": {},
   "warnings": [],
+  "decision": "approve",
   "next_action": "execute"
 }
 ```
@@ -175,12 +177,11 @@ Behavior:
 1. Create a kanban task if `task_id` is missing.
 2. Return `poll_url`, `result_url`, and `events_url`.
 3. Record request/context artifacts in the background.
-4. Move to `Context Indexed`.
-5. Generate a planning bundle.
-6. Move to `Planned`.
-7. Generate code changes.
-8. Move to `Ready To Apply`.
-9. Store a `workflow_result` artifact with `phase_output`, `next_action`,
+4. Move through `Context Indexed`, `Planned`, `Coding`, and `Reviewed` using
+   per-column agent sessions.
+5. Reviewer approval moves the task to `Ready To Apply`; reviewer rework moves
+   back to `Coding` or `Planned`.
+6. Store a `workflow_result` artifact with `phase_output`, `next_action`,
    `ops` and/or `patch_ops`, plus any client-side post-apply `tool_requests`.
 
 Clients poll:
@@ -193,6 +194,8 @@ GET /v1/workflows/{task_id}/result
 
 IDE and API clients should treat `GET /v1/workflows/{task_id}/events` as the
 primary progress channel. It streams `workflow_state`, `kanban_event`,
+`workflow_column_started`, `workflow_column_completed`,
+`workflow_transition_decided`, `agent_context_built`, `agent_output_recorded`,
 `heartbeat`, `workflow_result`, and `workflow_error` events as
 `text/event-stream`. `GET /v1/workflows/{task_id}` is the fallback state endpoint
 for clients that lost the stream.
@@ -253,6 +256,9 @@ state machine decides the next kanban state.
 }
 ```
 
+Internal agents use the same action boundary with `approve`,
+`request_recoding`, `request_replan`, and `fail`.
+
 `apply_result` is terminal in the current single-agent flow. Successful apply
 without a verification policy moves through `Applied` and `Verified` to `Done`.
 If verification requirements are present, they must all pass; otherwise the task
@@ -269,9 +275,10 @@ Lists project/task event logs for tracing rapid AI workflow movement.
 GET /v1/kanban/events?project_id=...&task_id=...&limit=200
 ```
 
-The event stream includes column transitions, workflow actions, planner/executor
-round input-output summaries, tool request results, artifacts, apply results,
-and verification outcomes. Dashboard Events is a UI over this endpoint.
+The event stream includes column transitions, workflow actions, agent
+context/output records, planner/executor round input-output summaries, reviewer
+decisions, tool request results, artifacts, apply results, and verification
+outcomes. Dashboard Events is a UI over this endpoint.
 
 ### `GET /v1/kanban/projects/{project_id}/memory`
 

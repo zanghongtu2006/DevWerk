@@ -12,8 +12,9 @@ harness system:
 
 - The IDE plugin collects project context, source maps, attachments, and applies
   returned changes through its local snapshot safety layer.
-- The backend owns kanban workflow, model routing, planning artifacts, coder
-  harness rules, token accounting, and generated patch/file operations.
+- The backend owns kanban workflow, model routing, per-column agent sessions,
+  planning/review artifacts, coder harness rules, token accounting, and guarded
+  patch/file operations.
 - Backend tool requests are an extensible action protocol. Research tools are
   resolved by the backend loop; client tools are returned to the IDE plugin and
   reported back through kanban verification.
@@ -58,6 +59,7 @@ Draft
 Context Indexed
 Planned
 Coding
+Reviewed
 Ready To Apply
 Applied
 Verified
@@ -73,6 +75,9 @@ State meaning:
 - `Planned`: The backend saved a planning bundle containing requirement
   breakdown, system design, implementation plan, and verification policy.
 - `Coding`: The coder harness is generating guarded changes from the plan.
+- `Reviewed`: A reviewer agent checks the generated change bundle before the
+  plugin is allowed to apply it. It can approve, request recoding, request
+  replanning, or fail the task.
 - `Ready To Apply`: Changes are ready for the plugin. The backend has not
   written to the repository.
 - `Applied`: The plugin applied changes through its snapshot-protected write
@@ -99,6 +104,7 @@ agents can own separate sessions while writing the same artifact shape.
   "inputs": {},
   "outputs": {},
   "warnings": [],
+  "decision": "approve",
   "next_action": "execute"
 }
 ```
@@ -292,6 +298,8 @@ Start response:
 
 Clients should open `GET /v1/workflows/{task_id}/events` and consume the
 `text/event-stream` feed. The stream emits `workflow_state`, `kanban_event`,
+`workflow_column_started`, `workflow_column_completed`,
+`workflow_transition_decided`, `agent_context_built`, `agent_output_recorded`,
 `heartbeat`, `workflow_result`, and `workflow_error` events. `GET
 /v1/workflows/{task_id}` remains a state endpoint and fallback path for clients
 that lost the event stream.
@@ -338,9 +346,11 @@ they report semantic actions and the backend state machine advances the task.
 }
 ```
 
-Supported actions include `apply_result`, `retry`, and `abandon`. Internal coding
-stages use the same workflow service, so API clients, the dashboard, and the IDE
-plugin all go through the same state-machine boundary.
+Supported client actions include `apply_result`, `retry`, and `abandon`.
+Internal agents use semantic actions such as `approve`, `request_recoding`,
+`request_replan`, and `fail`; the workflow state machine maps those actions to
+columns. API clients, the dashboard, and the IDE plugin all go through the same
+state-machine boundary.
 
 `apply_result` is terminal in the current single-agent flow: successful apply
 without a verification policy moves through `Applied` and `Verified` to `Done`;
@@ -355,9 +365,10 @@ task. This is the main trace surface for fast AI-driven workflows.
 GET /v1/kanban/events?project_id=...&task_id=...&limit=200
 ```
 
-Events include column transitions (`task_moved`), workflow actions, phase output
-records, planner LLM rounds, executor LLM rounds, tool request results, and final
-apply/verification reports. Dashboard Events uses this endpoint.
+Events include column transitions (`task_moved`), workflow actions, agent
+context/output records, phase output records, planner LLM rounds, executor LLM
+rounds, tool request results, review decisions, and final apply/verification
+reports. Dashboard Events uses this endpoint.
 
 ### `GET /v1/kanban/projects/{project_id}/memory`
 
