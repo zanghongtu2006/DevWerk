@@ -7,6 +7,9 @@ import httpx
 import pytest
 
 from app.services.anthropic_client import AnthropicClient
+from app.services.openai_client import OpenAIClient
+from app.services.ollama_client import OllamaClient
+from app.services.usage import _normalize_usage
 
 
 def reset_service_dbs(kanban_service, usage_service) -> None:
@@ -314,6 +317,7 @@ async def test_workflow_start_poll_result_smoke(monkeypatch, tmp_path):
             assert started["ok"] is True
             assert started["task_id"]
             assert started["poll_url"] == f"/v1/workflows/{started['task_id']}"
+            assert started["events_url"] == f"/v1/workflows/{started['task_id']}/events"
 
             state = {}
             for _ in range(100):
@@ -339,6 +343,13 @@ async def test_workflow_start_poll_result_smoke(monkeypatch, tmp_path):
             artifact_types = [artifact["artifact_type"] for artifact in task["artifacts"]]
             assert "workflow_request" in artifact_types
             assert "workflow_result" in artifact_types
+
+            events_response = await client.get(started["events_url"])
+            assert events_response.status_code == 200
+            events_text = events_response.text
+            assert "event: kanban_event" in events_text
+            assert "workflow_started" in events_text
+            assert "event: workflow_result" in events_text
 
             chat_response = await client.post("/v1/chat", json=body)
             assert chat_response.status_code == 404
@@ -621,3 +632,18 @@ def test_anthropic_non_json_text_falls_back_to_spring_boot_ops(monkeypatch):
         "build.gradle",
         "src/main/java/com/devwerk/demo/HelloController.java",
     }
+
+
+def test_llm_clients_ignore_environment_proxy_by_default():
+    anthropic = AnthropicClient({"api_name": "minimax", "api_key": "test", "base_url": "https://api.minimaxi.com/anthropic"})
+    openai = OpenAIClient({"api_name": "openai", "api_key": "test", "base_url": "https://api.openai.com/v1"})
+    ollama = OllamaClient({"base_url": "http://127.0.0.1:11434", "model": "stub"})
+
+    assert anthropic.session.trust_env is False
+    assert openai.session.trust_env is False
+    assert ollama.session.trust_env is False
+
+
+def test_usage_cache_hit_rate_is_clamped():
+    usage = _normalize_usage({"input_tokens": 232, "cached_input_tokens": 1650, "output_tokens": 10})
+    assert usage["input_cache_hit_rate"] == 1.0

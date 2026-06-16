@@ -58,6 +58,7 @@ Example:
       "api": "anthropic",
       "base_url": "https://api.minimaxi.com/anthropic",
       "api_key": "API_TOKEN",
+      "trust_env_proxy": false,
       "models": {
         "m3": {
           "model": "M3",
@@ -72,6 +73,10 @@ Example:
 
 `config/llm.json` is ignored by git. Update `config/llm.example.json` when the
 schema changes.
+
+LLM HTTP clients ignore `HTTP_PROXY`/`HTTPS_PROXY` by default. Set
+`trust_env_proxy: true` on a provider only when that provider must be reached
+through the host proxy.
 
 ## Workflow
 
@@ -182,11 +187,18 @@ Clients poll:
 
 ```text
 GET /v1/workflows/{task_id}
+GET /v1/workflows/{task_id}/events
 GET /v1/workflows/{task_id}/result
 ```
 
-`/v1/chat` has been removed. IDE and API clients should use workflow polling
-instead of long blocking chat requests.
+IDE and API clients should treat `GET /v1/workflows/{task_id}/events` as the
+primary progress channel. It streams `workflow_state`, `kanban_event`,
+`heartbeat`, `workflow_result`, and `workflow_error` events as
+`text/event-stream`. `GET /v1/workflows/{task_id}` is the fallback state endpoint
+for clients that lost the stream.
+
+`/v1/chat` has been removed. IDE and API clients should use workflows instead
+of long blocking chat requests.
 
 ## Tool Requests
 

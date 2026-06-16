@@ -16,6 +16,7 @@
       "base_url": "https://api.minimaxi.com/anthropic",
       "api_key": "API_TOKEN",
       "timeout": 180,
+      "trust_env_proxy": false,
       "models": {
         "m3": {
           "model": "M3",
@@ -31,6 +32,7 @@
       "base_url": "https://api.deepseek.com/v1",
       "api_key": "",
       "timeout": 180,
+      "trust_env_proxy": false,
       "models": {
         "deepseek-chat": {
           "temperature": 0.2,
@@ -44,6 +46,7 @@
       "base_url": "https://api.openai.com/v1",
       "api_key": "",
       "timeout": 180,
+      "trust_env_proxy": false,
       "models": {
         "gpt-4o-mini": {
           "temperature": 0.2,
@@ -57,6 +60,7 @@
       "base_url": "http://127.0.0.1:11434",
       "api_key": "",
       "timeout": 180,
+      "trust_env_proxy": false,
       "enable_schema": true,
       "models": {
         "deepseek-r1:32b": {

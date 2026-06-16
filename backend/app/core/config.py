@@ -46,6 +46,7 @@ class ApiProfile:
     timeout: float
     effort_level: str | None = None
     enable_schema: bool = True
+    trust_env_proxy: bool = False
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,7 @@ class AgentModelConfig:
             "timeout": self.api.timeout,
             "effort_level": self.api.effort_level,
             "enable_schema": self.api.enable_schema,
+            "trust_env_proxy": self.api.trust_env_proxy,
             "thinking_mode": self.thinking_mode,
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -108,6 +110,7 @@ class Settings(BaseSettings):
     devwerk_temperature: float = Field(default=0.2)
     devwerk_top_p: float | None = Field(default=None)
     devwerk_max_tokens: int = Field(default=4096)
+    devwerk_trust_env_proxy: bool = Field(default=False)
 
     # Agent routing. Values are API profile names: openai, anthropic, ollama.
     devwerk_default_api: str = Field(default="anthropic")
@@ -231,6 +234,7 @@ class Settings(BaseSettings):
                     "base_url": self.anthropic_base_url,
                     "api_key": self.anthropic_auth_token or "",
                     "timeout": self.anthropic_timeout,
+                    "trust_env_proxy": self.devwerk_trust_env_proxy,
                     "models": {
                         "m3": {
                             "model": anthropic_model,
@@ -247,6 +251,7 @@ class Settings(BaseSettings):
                     "base_url": "https://api.deepseek.com/v1",
                     "api_key": "",
                     "timeout": self.openai_timeout,
+                    "trust_env_proxy": self.devwerk_trust_env_proxy,
                     "models": {
                         "deepseek-chat": {
                             "temperature": 0.2,
@@ -260,6 +265,7 @@ class Settings(BaseSettings):
                     "base_url": self.openai_base_url,
                     "api_key": self.openai_api_key or "",
                     "timeout": self.openai_timeout,
+                    "trust_env_proxy": self.devwerk_trust_env_proxy,
                     "models": {
                         self.openai_model: {
                             "temperature": self.devwerk_temperature,
@@ -275,6 +281,7 @@ class Settings(BaseSettings):
                     "api_key": "",
                     "timeout": self.ollama_timeout,
                     "enable_schema": self.ollama_enable_schema,
+                    "trust_env_proxy": self.devwerk_trust_env_proxy,
                     "models": {
                         self.ollama_model: {
                             "temperature": 0.4,
@@ -309,6 +316,7 @@ class Settings(BaseSettings):
                 timeout=float(provider.get("timeout") or 180.0),
                 effort_level=_none_if_empty(model_settings.get("effort_level") or provider.get("effort_level")),
                 enable_schema=bool(provider.get("enable_schema", True)),
+                trust_env_proxy=bool(provider.get("trust_env_proxy", self.devwerk_trust_env_proxy)),
             )
         if profiles:
             return profiles
@@ -327,6 +335,7 @@ class Settings(BaseSettings):
                 api_key=self.openai_api_key,
                 model=self.openai_model,
                 timeout=self.openai_timeout,
+                trust_env_proxy=self.devwerk_trust_env_proxy,
             ),
             "anthropic": ApiProfile(
                 name="anthropic",
@@ -336,6 +345,7 @@ class Settings(BaseSettings):
                 model=anthropic_model,
                 timeout=self.anthropic_timeout,
                 effort_level=self.claude_code_effort_level,
+                trust_env_proxy=self.devwerk_trust_env_proxy,
             ),
             "ollama": ApiProfile(
                 name="ollama",
@@ -344,6 +354,7 @@ class Settings(BaseSettings):
                 api_key=None,
                 model=self.ollama_model,
                 timeout=self.ollama_timeout,
+                trust_env_proxy=self.devwerk_trust_env_proxy,
             ),
         }
 
@@ -403,6 +414,7 @@ class Settings(BaseSettings):
             timeout=float(provider.get("timeout") or 180.0),
             effort_level=_none_if_empty(model_settings.get("effort_level") or provider.get("effort_level")),
             enable_schema=bool(provider.get("enable_schema", True)),
+            trust_env_proxy=bool(provider.get("trust_env_proxy", self.devwerk_trust_env_proxy)),
         )
         return profile, model_key, model_settings
 

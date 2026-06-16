@@ -18,7 +18,8 @@ harness system:
   resolved by the backend loop; client tools are returned to the IDE plugin and
   reported back through kanban verification.
 - Kanban is the operating surface. `/v1/workflows` starts a backend-owned
-  workflow, then clients poll for status and result.
+  workflow, then clients follow the workflow event stream; polling is only a
+  fallback if the stream is interrupted.
 
 ## Architecture
 
@@ -285,12 +286,17 @@ Start response:
   "ready": false,
   "poll_url": "/v1/workflows/...",
   "result_url": "/v1/workflows/.../result",
-  "events_url": "/v1/kanban/events?..."
+  "events_url": "/v1/workflows/.../events"
 }
 ```
 
-Clients poll `GET /v1/workflows/{task_id}` until `result` appears. The result is
-the same guarded apply payload previously returned synchronously:
+Clients should open `GET /v1/workflows/{task_id}/events` and consume the
+`text/event-stream` feed. The stream emits `workflow_state`, `kanban_event`,
+`heartbeat`, `workflow_result`, and `workflow_error` events. `GET
+/v1/workflows/{task_id}` remains a state endpoint and fallback path for clients
+that lost the event stream.
+
+The final `workflow_result` contains the guarded apply payload:
 
 ```json
 {

@@ -18,13 +18,14 @@ import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, Request, UploadFile
+from fastapi.responses import StreamingResponse
 
 from app.core.config import settings
 from app.models.ide import IdeChatResponse, ToolRequest, ToolResult
 from app.models.plan import PlanResponse
 from app.services.coerce import coerce_to_fileops, coerce_to_patchops, coerce_to_toolrequests
 from app.services.coder_harness import build_coder_skill
-from app.services.kanban import add_artifact, add_event, create_task, get_task, move_task
+from app.services.kanban import add_artifact, add_event, create_task, get_task, list_events, move_task
 from app.services.llm_factory import get_llm_client
 from app.services.planner import Planner as build_planner
 from app.services.prompt_builder import build_model_messages
@@ -88,6 +89,18 @@ async def start_workflow(request: Request):
 @router.get("/workflows/{task_id}")
 async def get_workflow(task_id: str):
     return _workflow_state_payload(task_id, include_result=True)
+
+
+@router.get("/workflows/{task_id}/events")
+async def stream_workflow_events(task_id: str):
+    return StreamingResponse(
+        _workflow_event_stream(task_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/workflows/{task_id}/result")
@@ -1110,11 +1123,81 @@ def _workflow_state_payload(task_id: str, *, include_result: bool) -> dict:
         "done": status_key in {"done", "failed"},
         "poll_url": f"/v1/workflows/{task_id}",
         "result_url": f"/v1/workflows/{task_id}/result",
-        "events_url": f"/v1/kanban/events?project_id={task.get('project_id')}&task_id={task_id}&limit=200",
+        "events_url": f"/v1/workflows/{task_id}/events",
     }
     if include_result and result is not None:
         payload["result"] = result
     return payload
+
+
+async def _workflow_event_stream(task_id: str):
+    sent_ids: set[str] = set()
+    sent_state_status: str | None = None
+    heartbeat_at = time.monotonic()
+
+    while True:
+        state = _workflow_state_payload(task_id, include_result=True)
+        if not state.get("ok"):
+            yield _sse("workflow_error", state)
+            return
+
+        status_key = str(state.get("status_key") or "")
+        project_id = str(state.get("project_id") or "default")
+        if status_key != sent_state_status:
+            yield _sse("workflow_state", _workflow_public_state(state))
+            sent_state_status = status_key
+
+        try:
+            event_payload = list_events(project_id=project_id, task_id=task_id, limit=500)
+            events = event_payload.get("events") if isinstance(event_payload, dict) else []
+            if isinstance(events, list):
+                for event in reversed(events):
+                    if not isinstance(event, dict):
+                        continue
+                    event_id = str(event.get("id") or "")
+                    if not event_id or event_id in sent_ids:
+                        continue
+                    sent_ids.add(event_id)
+                    yield _sse("kanban_event", event)
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("workflow event stream skipped kanban events task_id=%s error=%s", task_id, exc)
+
+        result = state.get("result")
+        if isinstance(result, dict):
+            yield _sse("workflow_result", {"task_id": task_id, "status_key": status_key, "result": result})
+            return
+
+        if status_key == "failed":
+            yield _sse("workflow_error", _workflow_public_state(state))
+            return
+
+        now = time.monotonic()
+        if now - heartbeat_at >= 15:
+            yield _sse("heartbeat", _workflow_public_state(state))
+            heartbeat_at = now
+
+        await asyncio.sleep(0.75)
+
+
+def _workflow_public_state(state: dict) -> dict:
+    return {
+        "ok": bool(state.get("ok")),
+        "task_id": state.get("task_id"),
+        "project_id": state.get("project_id"),
+        "status_key": state.get("status_key"),
+        "ready": bool(state.get("ready")),
+        "done": bool(state.get("done")),
+        "poll_url": state.get("poll_url"),
+        "result_url": state.get("result_url"),
+        "events_url": state.get("events_url"),
+        "error_code": state.get("error_code"),
+        "error_message": state.get("error_message"),
+    }
+
+
+def _sse(event: str, data: dict) -> str:
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {payload}\n\n"
 
 
 def _workflow_result_payload(task_id: str) -> dict:

@@ -8,12 +8,15 @@ provider-specific endpoint, so it can work with OpenAI and compatible gateways.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Dict, List
 
 import requests as http_requests
 
 from app.core.schema import MODEL_RESPONSE_SCHEMA
 from app.services.validation import validate_model_response
+
+_log = logging.getLogger("devwerk.llm.openai")
 
 
 class OpenAIClient:
@@ -29,6 +32,7 @@ class OpenAIClient:
             self.temperature: float = float(config.get("temperature", 0.2))
             self.top_p: float | None = config.get("top_p")
             self.max_tokens: int | None = config.get("max_tokens")
+            self.trust_env_proxy: bool = bool(config.get("trust_env_proxy", False))
         else:
             from app.core.config import settings
             cfg = settings().get_llm_config("coder")
@@ -40,10 +44,21 @@ class OpenAIClient:
             self.temperature = float(cfg.get("temperature", 0.2))
             self.top_p = cfg.get("top_p")
             self.max_tokens = cfg.get("max_tokens")
+            self.trust_env_proxy = bool(cfg.get("trust_env_proxy", False))
 
         if not self.base_url.endswith("/v1"):
             self.base_url = f"{self.base_url}/v1"
         self.url = f"{self.base_url}/chat/completions"
+        self.session = http_requests.Session()
+        self.session.trust_env = self.trust_env_proxy
+        _log.debug(
+            "OpenAI-compatible client configured api_name=%s base_url=%s model=%s timeout=%s trust_env_proxy=%s",
+            self.api_name,
+            self.base_url,
+            self.model,
+            self.timeout,
+            self.trust_env_proxy,
+        )
 
         if not self.api_key:
             raise ValueError(f"api_key is not set for LLM provider {self.api_name!r}.")
@@ -78,13 +93,13 @@ class OpenAIClient:
                 },
             }
 
-        resp = http_requests.post(self.url, json=payload, headers=headers, timeout=self.timeout)
+        resp = self.session.post(self.url, json=payload, headers=headers, timeout=self.timeout)
         if resp.status_code == 400:
             text = (resp.text or "").lower()
             if any(key in text for key in ("json_schema", "response_format", "schema")):
                 fallback = dict(payload)
                 fallback["response_format"] = {"type": "json_object"}
-                resp = http_requests.post(self.url, json=fallback, headers=headers, timeout=self.timeout)
+                resp = self.session.post(self.url, json=fallback, headers=headers, timeout=self.timeout)
 
         resp.raise_for_status()
         data = resp.json()

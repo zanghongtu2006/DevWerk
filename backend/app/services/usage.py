@@ -383,4 +383,5 @@ def _int_or_none(value: Any) -> int | None:
 def _rate(numerator: int | None, denominator: int | None) -> float | None:
     if numerator is None or denominator in (None, 0):
         return None
-    return float(numerator) / float(denominator)
+    value = float(numerator) / float(denominator)
+    return max(0.0, min(1.0, value))

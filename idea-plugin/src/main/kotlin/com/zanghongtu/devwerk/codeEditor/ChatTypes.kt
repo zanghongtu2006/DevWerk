@@ -1,36 +1,21 @@
-// =============================================================================
-// ChatTypes.kt — shared types for DevWerk frontend and backend communication
-// =============================================================================
-
 package com.zanghongtu.devwerk.codeEditor
 
 import com.intellij.openapi.project.Project
 
-/**
- * 单条对话消息
- */
 data class ChatMessage(
-    val role: String,   // "user" / "assistant" / "system"
+    val role: String,
     val content: String
 )
 
-/**
- * 发送给 AI 的上下文（projectRoot + 历史对话）
- */
 data class ChatContext(
     val projectRoot: String?,
     val history: List<ChatMessage>,
     val projectId: String? = null,
     val taskId: String? = null,
-    // IntelliJ Project, used for zero-token local workspace/source-map indexing.
     val project: Project? = null,
-    // DevWerk 上下文（记录请求/响应/执行）
     val devCtx: DevwerkContext? = null
 )
 
-/**
- * agent 模式：工作区摘要（可选，但建议带）
- */
 data class WorkspaceFile(
     val path: String,
     val sha1: String? = null,
@@ -71,9 +56,6 @@ data class SourceMapSymbol(
     val line: Int? = null
 )
 
-/**
- * agent 模式：工具请求/工具结果
- */
 data class ToolRequest(
     val id: String,
     val tool: String,
@@ -95,27 +77,18 @@ data class UploadedAttachment(
     val localPath: String
 )
 
-/**
- * agent 模式：patch 操作
- */
 data class PatchOp(
-    val op: String,     // apply_patch
-    val content: String  // unified diff
+    val op: String,
+    val content: String
 )
 
-/**
- * scaffold 旧模式 / 兼容模式：文件 CRUD
- */
 data class FileOp(
     val op: String,
     val path: String,
     val language: String? = null,
-    val content: String? = null,
+    val content: String? = null
 )
 
-/**
- * 后端返回的整体响应（兼容 scaffold + agent）
- */
 data class IdeChatResponse(
     val reply: String,
     val taskId: String? = null,
@@ -138,9 +111,6 @@ data class DevwerkContext(
     val opDir: java.nio.file.Path,
     val opLog: java.nio.file.Path
 )
-
-// AI client interface
-// =============================================================================
 
 interface AiClient {
     fun sendWorkflow(

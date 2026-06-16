@@ -36,6 +36,7 @@ class AnthropicClient:
             self.temperature: float = float(config.get("temperature", 0.2))
             self.top_p: float | None = config.get("top_p")
             self.max_tokens: int = int(config.get("max_tokens", 4096))
+            self.trust_env_proxy: bool = bool(config.get("trust_env_proxy", False))
         else:
             from app.core.config import settings
             cfg = settings().get_llm_config("coder")
@@ -49,8 +50,19 @@ class AnthropicClient:
             self.temperature = float(cfg.get("temperature", 0.2))
             self.top_p = cfg.get("top_p")
             self.max_tokens = int(cfg.get("max_tokens", 4096))
+            self.trust_env_proxy = bool(cfg.get("trust_env_proxy", False))
 
         self.url = f"{self.base_url}/v1/messages" if not self.base_url.endswith("/v1") else f"{self.base_url}/messages"
+        self.session = http_requests.Session()
+        self.session.trust_env = self.trust_env_proxy
+        _log.debug(
+            "Anthropic-compatible client configured api_name=%s base_url=%s model=%s timeout=%s trust_env_proxy=%s",
+            self.api_name,
+            self.base_url,
+            self.model,
+            self.timeout,
+            self.trust_env_proxy,
+        )
 
         if not self.api_key:
             raise ValueError(f"api_key is not set for LLM provider {self.api_name!r}.")
@@ -88,7 +100,7 @@ class AnthropicClient:
         if metadata:
             payload["metadata"] = metadata
 
-        resp = http_requests.post(self.url, json=payload, headers=headers, timeout=self.timeout)
+        resp = self.session.post(self.url, json=payload, headers=headers, timeout=self.timeout)
         resp.raise_for_status()
 
         data = resp.json()

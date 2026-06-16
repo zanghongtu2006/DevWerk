@@ -32,10 +32,10 @@ import org.json.JSONObject
 /**
  * DevWerk tool window panel:
  *
- *   1. USER_TYPING → user enters a request
- *   2. WORKFLOW_PENDING → backend workflow plans/codes while plugin polls
- *   3. READY_TO_APPLY → ops are applied with snapshot
- *   4. DONE / FAILED → back to idle
+ *   1. USER_TYPING -> user enters a request
+ *   2. WORKFLOW_PENDING -> backend workflow plans/codes and streams events
+ *   3. READY_TO_APPLY -> ops are applied with snapshot
+ *   4. DONE / FAILED -> back to idle
  */
 class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayout()) {
 
@@ -51,7 +51,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
     private val sendButton      = JButton("Send")
     private val attachBtn       = JButton("+")
     private val clearAttachBtn  = JButton("Clear")
-    private val settingsBtn     = JButton("⚙")
+    private val settingsBtn     = JButton("\u2699")
     private val pendingAttachments = mutableListOf<File>()
     private val attachmentPanel = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
 
@@ -207,7 +207,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 taskId = null,
                 project = project
             )
-            runLegacyChat(chatCtx, message)
+            runWorkflow(chatCtx, message)
         } catch (t: Throwable) {
             t.printStackTrace()
             SwingUtilities.invokeLater {
@@ -217,7 +217,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         }
     }
 
-    private fun runLegacyChat(chatCtx: ChatContext, userMessage: String) {
+    private fun runWorkflow(chatCtx: ChatContext, userMessage: String) {
         try {
             val basePath = project.basePath
             val runner = DevwerkOperationRunner()

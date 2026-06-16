@@ -7,12 +7,15 @@ Handles the /api/chat endpoint. Works with any Ollama-compatible server.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Dict, List
 
 import requests as http_requests
 
 from app.core.schema import MODEL_RESPONSE_SCHEMA
 from app.services.validation import validate_model_response
+
+_log = logging.getLogger("devwerk.llm.ollama")
 
 
 class OllamaClient:
@@ -30,6 +33,7 @@ class OllamaClient:
             self.enable_schema: bool = bool(config.get("enable_schema", True))
             self.temperature: float = float(config.get("temperature", 0.4))
             self.top_p: float | None = config.get("top_p")
+            self.trust_env_proxy: bool = bool(config.get("trust_env_proxy", False))
         else:
             from app.core.config import settings
             cfg = settings().get_llm_config("coder")
@@ -39,8 +43,18 @@ class OllamaClient:
             self.enable_schema = bool(cfg.get("enable_schema", True))
             self.temperature = float(cfg.get("temperature", 0.4))
             self.top_p = cfg.get("top_p")
+            self.trust_env_proxy = bool(cfg.get("trust_env_proxy", False))
 
         self.url = f"{self.base_url}/api/chat"
+        self.session = http_requests.Session()
+        self.session.trust_env = self.trust_env_proxy
+        _log.debug(
+            "Ollama client configured base_url=%s model=%s timeout=%s trust_env_proxy=%s",
+            self.base_url,
+            self.model,
+            self.timeout,
+            self.trust_env_proxy,
+        )
 
     def chat_structured(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
         obj = self.chat_json(messages, schema=MODEL_RESPONSE_SCHEMA if self.enable_schema else None)
@@ -61,7 +75,7 @@ class OllamaClient:
         # Older models (e.g. llama3 without --format flag) may reject it.
         payload["format"] = schema if schema is not None else "json"
 
-        resp = http_requests.post(self.url, json=payload, timeout=self.timeout)
+        resp = self.session.post(self.url, json=payload, timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json()
         self.last_usage = self._extract_usage(data)

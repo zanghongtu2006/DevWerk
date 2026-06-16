@@ -20,8 +20,6 @@ import java.util.concurrent.TimeUnit
 
 class HttpAiClient(
     private val workflowsEndpoint: String,
-    private val planEndpoint: String,
-    private val executeEndpoint: String,
     private val attachmentEndpoint: String,
     private val kanbanTasksEndpoint: String,
     private val authToken: String? = null
@@ -33,6 +31,11 @@ class HttpAiClient(
         .writeTimeout(1200, TimeUnit.SECONDS)
         .readTimeout(1200, TimeUnit.SECONDS)
         .callTimeout(1200, TimeUnit.SECONDS)
+        .build()
+
+    private val streamClient = client.newBuilder()
+        .readTimeout(0, TimeUnit.SECONDS)
+        .callTimeout(0, TimeUnit.SECONDS)
         .build()
 
     // -------------------------------------------------------------------------
@@ -75,23 +78,151 @@ class HttpAiClient(
             )
         }
 
+        val eventsUrl = resolveServerUrl(workflowsEndpoint, startObj.optString("events_url", "/v1/workflows/$taskId/events"))
         val pollUrl = resolveServerUrl(workflowsEndpoint, startObj.optString("poll_url", "/v1/workflows/$taskId"))
         val rawResponses = mutableListOf(startBody)
-        val maxPolls = 1800
-        val pollDelayMs = 2000L
 
-        for (attempt in 1..maxPolls) {
+        appendDevLog(context, "\n[workflow] task=$taskId event_stream=$eventsUrl\n")
+        val streamed = runCatching {
+            streamWorkflowEvents(eventsUrl, pollUrl, taskId, context, rawResponses)
+        }.getOrElse { error ->
+            appendDevLog(context, "[workflow] event stream failed, fallback to state polling: ${typeName(error)}: ${error.message}\n")
+            null
+        }
+        if (streamed != null) {
+            return streamed
+        }
+
+        return pollWorkflowResult(pollUrl, taskId, context, rawResponses)
+    }
+
+    private fun streamWorkflowEvents(
+        eventsUrl: String,
+        pollUrl: String,
+        taskId: String,
+        context: ChatContext,
+        rawResponses: MutableList<String>
+    ): IdeChatResponse? {
+        val requestBuilder = Request.Builder().url(eventsUrl).get()
+        context.projectId?.takeIf { it.isNotBlank() }?.let {
+            requestBuilder.header("X-DevWerk-Project-Id", it)
+        }
+        if (!authToken.isNullOrBlank()) {
+            requestBuilder.header("Authorization", "Bearer $authToken")
+        }
+
+        streamClient.newCall(requestBuilder.build()).execute().use { response ->
+            if (!response.isSuccessful) {
+                val body = response.body?.string() ?: ""
+                appendDevLog(context, "[workflow] event stream HTTP ${response.code}: $body\n")
+                return null
+            }
+
+            val reader = response.body?.charStream()?.buffered() ?: return null
+            var eventName = "message"
+            val data = StringBuilder()
+
+            while (true) {
+                val line = reader.readLine() ?: break
+                if (line.isEmpty()) {
+                    val payload = data.toString().trim()
+                    if (payload.isNotBlank()) {
+                        rawResponses += payload
+                        val result = handleWorkflowEvent(eventName, payload, taskId, context)
+                        if (result != null) {
+                            return result.copy(rawResponses = rawResponses.toList())
+                        }
+                    }
+                    eventName = "message"
+                    data.setLength(0)
+                    continue
+                }
+                when {
+                    line.startsWith("event:") -> eventName = line.removePrefix("event:").trim()
+                    line.startsWith("data:") -> {
+                        if (data.isNotEmpty()) data.append('\n')
+                        data.append(line.removePrefix("data:").trimStart())
+                    }
+                }
+            }
+        }
+
+        appendDevLog(context, "[workflow] event stream ended before result, checking latest state: $pollUrl\n")
+        return null
+    }
+
+    private fun handleWorkflowEvent(
+        eventName: String,
+        payload: String,
+        taskId: String,
+        context: ChatContext
+    ): IdeChatResponse? {
+        val obj = JSONObject(payload)
+        when (eventName) {
+            "workflow_state" -> {
+                val status = obj.optString("status_key", "")
+                if (status.isNotBlank()) appendDevLog(context, "[workflow] status=$status task=$taskId\n")
+            }
+            "kanban_event" -> logKanbanEvent(context, obj)
+            "workflow_result" -> {
+                appendDevLog(context, "[workflow] result received task=$taskId\n")
+                val result = obj.optJSONObject("result") ?: return IdeChatResponse(
+                    reply = "",
+                    taskId = taskId,
+                    statusKey = obj.optString("status_key", "failed"),
+                    ok = false,
+                    done = true,
+                    errorCode = "WORKFLOW_RESULT_ERROR",
+                    errorMessage = "Workflow result event did not include result.",
+                    retryable = true
+                )
+                return parseIdeChatResponse(result.toString())
+            }
+            "workflow_error" -> {
+                val message = obj.optString("error_message", "Workflow failed before producing a result.")
+                appendDevLog(context, "[workflow] error task=$taskId message=$message\n")
+                return IdeChatResponse(
+                    reply = "",
+                    taskId = taskId,
+                    statusKey = obj.optString("status_key", "failed"),
+                    ok = false,
+                    done = true,
+                    errorCode = obj.optString("error_code", "WORKFLOW_FAILED"),
+                    errorMessage = message,
+                    retryable = true
+                )
+            }
+        }
+        return null
+    }
+
+    private fun pollWorkflowResult(
+        pollUrl: String,
+        taskId: String,
+        context: ChatContext,
+        rawResponses: MutableList<String>
+    ): IdeChatResponse {
+        var delayMs = 1000L
+        var lastStatus = ""
+        val startedAt = System.nanoTime()
+        val maxDurationMs = TimeUnit.MINUTES.toMillis(40)
+
+        while (TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt) < maxDurationMs) {
             val stateBody = getJson(pollUrl, context)
             rawResponses += stateBody
-            appendDevLog(context, "\n===== WORKFLOW POLL $attempt RESPONSE =====\n$stateBody\n")
-
             val state = JSONObject(stateBody)
+            val status = state.optString("status_key", "")
+            if (status.isNotBlank() && status != lastStatus) {
+                appendDevLog(context, "[workflow] fallback status=$status task=$taskId\n")
+                lastStatus = status
+            }
+
             val result = state.optJSONObject("result")
             if (result != null) {
+                appendDevLog(context, "[workflow] fallback result received task=$taskId\n")
                 return parseIdeChatResponse(result.toString()).copy(rawResponses = rawResponses.toList())
             }
 
-            val status = state.optString("status_key", "")
             if (status == "failed") {
                 return IdeChatResponse(
                     reply = "",
@@ -106,9 +237,9 @@ class HttpAiClient(
                 )
             }
 
-            Thread.sleep(pollDelayMs)
+            Thread.sleep(delayMs)
+            delayMs = (delayMs * 1.5).toLong().coerceAtMost(5000L)
         }
-
         return IdeChatResponse(
             reply = "",
             taskId = taskId,
@@ -116,10 +247,24 @@ class HttpAiClient(
             ok = false,
             done = true,
             errorCode = "WORKFLOW_TIMEOUT",
-            errorMessage = "Workflow polling timed out after ${maxPolls * pollDelayMs / 1000}s.",
+            errorMessage = "Workflow did not produce a result within 40 minutes.",
             retryable = true,
             rawResponses = rawResponses.toList()
         )
+    }
+
+    private fun logKanbanEvent(context: ChatContext, event: JSONObject) {
+        val type = event.optString("event_type", "")
+        val from = event.optString("from_status", "")
+        val to = event.optString("to_status", "")
+        when {
+            type == "task_moved" -> appendDevLog(context, "[workflow] kanban moved $from -> $to\n")
+            type.startsWith("workflow_") ||
+                type.endsWith("_started") ||
+                type.endsWith("_ready") ||
+                type.endsWith("_result") ||
+                type.endsWith("_results") -> appendDevLog(context, "[workflow] event=$type status=$to\n")
+        }
     }
 
     fun uploadAttachment(file: File, projectId: String? = null): UploadedAttachment {
