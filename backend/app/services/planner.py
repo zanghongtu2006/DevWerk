@@ -221,7 +221,7 @@ class Planner:
             if fallback.files:
                 fallback.summary = summary or fallback.summary
                 fallback.warnings = warnings or fallback.warnings
-                return fallback
+            return fallback
 
         if not summary and files:
             n = len(files)
@@ -306,6 +306,19 @@ def _fallback_plan(raw: dict, messages: list[dict]) -> PlanResponse:
             ],
         )
 
+    if _looks_like_tenant_management_request(text):
+        files = _tenant_management_files(tree_preview)
+        _log.debug("Planner.fallback: inferred tenant_management files=%s", [f.path for f in files])
+        return PlanResponse(
+            ok=True,
+            files=files,
+            summary="Add tenant management with tenantId ownership boundaries for organizations.",
+            warnings=[
+                "Planner LLM returned no file-level plan; generated deterministic fallback plan from tenant-management intent and workspace tree.",
+                "Tenant ownership behavior is modeled behind an extensible policy/service boundary.",
+            ],
+        )
+
     target_paths = _mentioned_paths(user_text)
     files = [
         PlanFile(path=path, nature="new" if is_empty_project else "modified", description="Implement the requested change.")
@@ -374,11 +387,23 @@ def _looks_like_spring_boot(text: str) -> bool:
 def _looks_like_user_management_request(text: str) -> bool:
     user_terms = (
         "用户",
+        "用戶",
+        "用户",
         "user",
         "account",
         "member",
     )
     feature_terms = (
+        "注册",
+        "註冊",
+        "增删改查",
+        "新增",
+        "删除",
+        "刪除",
+        "修改",
+        "查询",
+        "查詢",
+        "管理",
         "注册",
         "register",
         "crud",
@@ -393,6 +418,40 @@ def _looks_like_user_management_request(text: str) -> bool:
         "list",
     )
     return any(term in text for term in user_terms) and any(term in text for term in feature_terms)
+
+
+def _looks_like_tenant_management_request(text: str) -> bool:
+    tenant_terms = (
+        "租户",
+        "租戶",
+        "tenant",
+        "tenantid",
+        "tenant id",
+        "组织",
+        "組織",
+        "org",
+        "organization",
+    )
+    feature_terms = (
+        "归属",
+        "歸屬",
+        "所属",
+        "所屬",
+        "管理",
+        "增删改查",
+        "crud",
+        "新增",
+        "删除",
+        "刪除",
+        "修改",
+        "查询",
+        "查詢",
+        "create",
+        "delete",
+        "update",
+        "list",
+    )
+    return any(term in text for term in tenant_terms) and any(term in text for term in feature_terms)
 
 
 def _looks_like_code_change_request(text: str) -> bool:
@@ -471,6 +530,63 @@ def _user_management_files(tree_preview: str) -> list[PlanFile]:
             path=f"{resource_root}/application.properties",
             nature="modified" if _has_tree_file(tree_preview, "application.properties") else "new",
             description="Keep minimal application configuration for the user-management API.",
+            confidence=0.62,
+        ),
+    ]
+
+
+def _tenant_management_files(tree_preview: str) -> list[PlanFile]:
+    base_package_path = _detect_java_package_path(tree_preview) or "src/main/java/com/devwerk/demo"
+    resource_root = _detect_resource_root(tree_preview) or "src/main/resources"
+    existing_pom = _has_tree_file(tree_preview, "pom.xml")
+
+    return [
+        PlanFile(
+            path="pom.xml",
+            nature="modified" if existing_pom else "new",
+            description="Ensure Spring Web and validation dependencies support the tenant-management API.",
+            confidence=0.72,
+        ),
+        PlanFile(
+            path=f"{base_package_path}/tenant/Tenant.java",
+            nature="new",
+            description="Add the tenant domain model with a tenantId ownership identifier.",
+            confidence=0.88,
+        ),
+        PlanFile(
+            path=f"{base_package_path}/tenant/TenantCreateRequest.java",
+            nature="new",
+            description="Add request DTO for creating tenants.",
+            confidence=0.84,
+        ),
+        PlanFile(
+            path=f"{base_package_path}/tenant/TenantUpdateRequest.java",
+            nature="new",
+            description="Add request DTO for updating tenant data.",
+            confidence=0.84,
+        ),
+        PlanFile(
+            path=f"{base_package_path}/tenant/TenantOwnershipPolicy.java",
+            nature="new",
+            description="Add an extensible ownership policy boundary for tenant and org membership rules.",
+            confidence=0.86,
+        ),
+        PlanFile(
+            path=f"{base_package_path}/tenant/TenantService.java",
+            nature="new",
+            description="Implement in-memory tenant CRUD business logic with tenantId lookup.",
+            confidence=0.9,
+        ),
+        PlanFile(
+            path=f"{base_package_path}/tenant/TenantController.java",
+            nature="new",
+            description="Expose REST endpoints for tenant CRUD operations.",
+            confidence=0.9,
+        ),
+        PlanFile(
+            path=f"{resource_root}/application.properties",
+            nature="modified" if _has_tree_file(tree_preview, "application.properties") else "new",
+            description="Keep minimal application configuration for the tenant-management API.",
             confidence=0.62,
         ),
     ]

@@ -9,6 +9,7 @@ import pytest
 from app.services.anthropic_client import AnthropicClient
 from app.services.openai_client import OpenAIClient
 from app.services.ollama_client import OllamaClient
+from app.services.planner import Planner
 from app.services.usage import _normalize_usage
 
 
@@ -449,6 +450,93 @@ async def test_plan_falls_back_to_user_management_files_when_planner_returns_too
     assert "src/main/java/org/example/user/UserPermissionPolicy.java" in planned_paths
     assert "pom.xml" in planned_paths
     assert plan["warnings"]
+
+
+@pytest.mark.asyncio
+async def test_plan_falls_back_to_tenant_management_files_when_planner_returns_tool_requests(monkeypatch, tmp_path):
+    db_path = tmp_path / "devwerk-tenant-management-plan.db"
+    project_root = tmp_path / "test"
+    project_root.mkdir()
+    fake_settings = FakeSettings(db_path)
+
+    import app.main as main_module
+    import app.routes.ide as ide_routes
+    import app.services.kanban as kanban_service
+    import app.services.planner as planner_service
+    import app.services.usage as usage_service
+
+    patch_service_settings(monkeypatch, fake_settings, main_module, ide_routes, kanban_service, usage_service)
+    reset_service_dbs(kanban_service, usage_service)
+    monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": FakeToolRequestPlannerClient())
+
+    app = main_module.create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            project_id = "backend-tenant-management-plan-smoke"
+            response = await client.post(
+                "/v1/plan",
+                json={
+                    "project_id": project_id,
+                    "mode": "agent",
+                    "project_root": str(project_root),
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "\u9700\u8981\u6709\u4e00\u4e2a\u79df\u6237\u7ba1\u7406\uff0c"
+                                "\u6bcf\u4e2aorg\u5fc5\u987b\u6709\u4e00\u4e2atenantid\uff0c"
+                                "\u7528\u6765\u7ba1\u7406\u5f52\u5c5e"
+                            ),
+                        }
+                    ],
+                    "workspace": {
+                        "root_id": project_id,
+                        "changed_files": [],
+                        "open_files": [],
+                        "source_map": None,
+                        "tree_preview": (
+                            "test/\n"
+                            "  src/\n"
+                            "    main/\n"
+                            "      java/\n"
+                            "        org/\n"
+                            "          example/\n"
+                            "            controller/\n"
+                            "              Application.java\n"
+                            "      resources/\n"
+                            "        application.properties\n"
+                            "  pom.xml"
+                        ),
+                    },
+                    "tool_results": [],
+                },
+                headers={"X-DevWerk-Project-Id": project_id},
+            )
+
+    assert response.status_code == 200
+    plan = response.json()
+    assert plan["ok"] is True
+    assert plan["status_key"] == "planned"
+    assert plan["next_action"] == "execute"
+    assert plan["phase_output"]["phase"] == "plan"
+    planned_paths = {item["path"] for item in plan["files"]}
+    assert "src/main/java/org/example/tenant/TenantController.java" in planned_paths
+    assert "src/main/java/org/example/tenant/TenantService.java" in planned_paths
+    assert "src/main/java/org/example/tenant/TenantOwnershipPolicy.java" in planned_paths
+    assert "pom.xml" in planned_paths
+    assert plan["warnings"]
+
+
+def test_planner_extract_plan_returns_failure_when_fallback_cannot_infer_files():
+    plan = Planner._extract_plan(
+        {"raw_text": "I need more information before planning files."},
+        [{"role": "user", "content": "\u8fd9\u53ea\u662f\u4e00\u4e2a\u666e\u901a\u95ee\u9898\uff0c\u4e0d\u9700\u8981\u6539\u4ee3\u7801"}],
+    )
+
+    assert plan.ok is False
+    assert plan.error_code == "PLAN_EMPTY"
+    assert plan.files == []
 
 
 @pytest.mark.asyncio
