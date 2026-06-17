@@ -4,17 +4,14 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.roots.ProjectFileIndex
+import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VirtualFile
-import com.intellij.psi.PsiClass
-import com.intellij.psi.PsiField
-import com.intellij.psi.PsiJavaFile
 import com.intellij.psi.PsiManager
-import com.intellij.psi.PsiMethod
-import com.intellij.psi.util.PsiTreeUtil
+import com.intellij.psi.PsiNamedElement
+import com.intellij.psi.PsiRecursiveElementWalkingVisitor
 
 object SourceMapBuilder {
-    private const val MAX_INDEXED_FILES = 1_500
-    private const val MAX_IMPORTS_PER_FILE = 80
+    private const val MAX_INDEXED_FILES = 2_000
     private const val MAX_SYMBOLS_PER_FILE = 120
     private const val MAX_FILE_SIZE = 1_000_000L
 
@@ -27,7 +24,8 @@ object SourceMapBuilder {
         if (projectRoot.isNullOrBlank()) return null
 
         return ApplicationManager.getApplication().runReadAction<SourceMap?> {
-            val base = project.baseDir ?: return@runReadAction null
+            val basePath = project.basePath ?: return@runReadAction null
+            val base = LocalFileSystem.getInstance().findFileByPath(basePath) ?: return@runReadAction null
             val fileIndex = ProjectFileIndex.getInstance(project)
             val psiManager = PsiManager.getInstance(project)
             val files = mutableListOf<SourceMapFile>()
@@ -50,16 +48,7 @@ object SourceMapBuilder {
                 }
 
                 val psiFile = psiManager.findFile(vf)
-                files += if (psiFile is PsiJavaFile) {
-                    buildJavaEntry(fileIndex, vf, rel, psiFile)
-                } else {
-                    SourceMapFile(
-                        path = rel,
-                        kind = contentKind(fileIndex, vf),
-                        language = languageFor(vf),
-                        size = vf.length
-                    )
-                }
+                files += buildGenericEntry(fileIndex, vf, rel, psiFile)
                 true
             }
 
@@ -74,77 +63,53 @@ object SourceMapBuilder {
         }
     }
 
-    private fun buildJavaEntry(
+    private fun buildGenericEntry(
         fileIndex: ProjectFileIndex,
         vf: VirtualFile,
         rel: String,
-        psiFile: PsiJavaFile
+        psiFile: com.intellij.psi.PsiFile?
     ): SourceMapFile {
-        val imports = psiFile.importList?.allImportStatements
-            ?.mapNotNull { it.importReference?.qualifiedName }
-            ?.distinct()
-            ?.take(MAX_IMPORTS_PER_FILE)
-            ?: emptyList()
-
         val symbols = mutableListOf<SourceMapSymbol>()
-        val classes = PsiTreeUtil.findChildrenOfType(psiFile, PsiClass::class.java)
-        for (cls in classes) {
-            if (symbols.size >= MAX_SYMBOLS_PER_FILE) break
-            symbols += SourceMapSymbol(
-                name = cls.qualifiedName ?: cls.name ?: continue,
-                kind = classKind(cls),
-                signature = cls.name,
-                line = lineOf(vf, cls.textOffset)
-            )
-        }
-
-        val methods = PsiTreeUtil.findChildrenOfType(psiFile, PsiMethod::class.java)
-        for (method in methods) {
-            if (symbols.size >= MAX_SYMBOLS_PER_FILE) break
-            symbols += SourceMapSymbol(
-                name = method.containingClass?.qualifiedName?.let { "$it.${method.name}" } ?: method.name,
-                kind = if (method.isConstructor) "constructor" else "method",
-                signature = methodSignature(method),
-                line = lineOf(vf, method.textOffset)
-            )
-        }
-
-        val fields = PsiTreeUtil.findChildrenOfType(psiFile, PsiField::class.java)
-        for (field in fields) {
-            if (symbols.size >= MAX_SYMBOLS_PER_FILE) break
-            symbols += SourceMapSymbol(
-                name = field.containingClass?.qualifiedName?.let { "$it.${field.name}" } ?: field.name,
-                kind = "field",
-                signature = "${field.type.presentableText} ${field.name}",
-                line = lineOf(vf, field.textOffset)
-            )
+        if (psiFile != null) {
+            psiFile.accept(object : PsiRecursiveElementWalkingVisitor() {
+                override fun visitElement(element: com.intellij.psi.PsiElement) {
+                    if (symbols.size >= MAX_SYMBOLS_PER_FILE) {
+                        stopWalking()
+                        return
+                    }
+                    if (element !== psiFile && element is PsiNamedElement) {
+                        val name = element.name
+                        if (!name.isNullOrBlank()) {
+                            symbols += SourceMapSymbol(
+                                name = name,
+                                kind = symbolKind(element),
+                                signature = name,
+                                line = lineOf(vf, element.textOffset)
+                            )
+                        }
+                    }
+                    super.visitElement(element)
+                }
+            })
         }
 
         return SourceMapFile(
             path = rel,
             kind = contentKind(fileIndex, vf),
-            language = "java",
-            packageName = psiFile.packageName.ifBlank { null },
-            imports = imports,
+            language = languageFor(vf),
+            packageName = null,
+            imports = emptyList(),
             symbols = symbols,
             size = vf.length
         )
     }
 
-    private fun methodSignature(method: PsiMethod): String {
-        val params = method.parameterList.parameters.joinToString(", ") { p ->
-            "${p.type.presentableText} ${p.name}"
-        }
-        val prefix = if (method.isConstructor) method.name else "${method.returnType?.presentableText ?: "void"} ${method.name}"
-        return "$prefix($params)"
-    }
-
-    private fun classKind(cls: PsiClass): String = when {
-        cls.isAnnotationType -> "annotation"
-        cls.isEnum -> "enum"
-        cls.isInterface -> "interface"
-        else -> "class"
-    }
+    private fun symbolKind(element: PsiNamedElement): String =
+        element.javaClass.simpleName
+            .removePrefix("Psi")
+            .removeSuffix("Impl")
+            .ifBlank { "symbol" }
+            .lowercase()
 
     private fun lineOf(vf: VirtualFile, offset: Int): Int? {
         if (offset < 0) return null

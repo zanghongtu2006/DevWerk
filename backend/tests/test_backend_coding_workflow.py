@@ -460,6 +460,58 @@ def test_workflow_reviewer_keeps_distinct_relative_paths():
     assert review["unplanned_changed_files"] == ["src/main/java/org/example/controller/TenantController.java"]
 
 
+def test_workflow_reviewer_rejects_missing_planned_files():
+    from app.services.workflow_engine import _review_result
+
+    plan = PlanResponse(
+        files=[
+            PlanFile(path="src/domain/a.py", nature="modified", description="Update A."),
+            PlanFile(path="src/domain/b.py", nature="modified", description="Update B."),
+        ]
+    )
+    executed = IdeChatResponse(
+        ops=[FileOp(op="update_file", path="src/domain/a.py", content="print('a')\n")],
+        done=True,
+    )
+
+    review = _review_result(plan, executed)
+
+    assert review["decision"] == "request_recoding"
+    assert review["missing_changed_files"] == ["src/domain/b.py"]
+    assert review["unplanned_changed_files"] == []
+
+
+def test_planner_rejects_directory_level_paths_from_workspace_tree():
+    plan = Planner._extract_plan(
+        {
+            "plan": {
+                "files": [
+                    {
+                        "path": "src/domain",
+                        "nature": "modified",
+                        "description": "Update the domain package.",
+                        "confidence": 0.8,
+                    }
+                ],
+                "summary": "Update domain.",
+                "warnings": [],
+            }
+        },
+        [
+            {"role": "user", "content": "Update the domain package."},
+            {
+                "role": "user",
+                "content": "workspace_summary:\n"
+                + '{"tree_preview":"./\\n  src/\\n    domain/\\n      model.py"}',
+            },
+        ],
+    )
+
+    assert plan.ok is False
+    assert plan.error_code == "PLAN_DIRECTORY_PATHS"
+    assert plan.files == []
+
+
 @pytest.mark.asyncio
 async def test_workflow_reviewer_rework_continues_until_approved(monkeypatch, tmp_path):
     db_path = tmp_path / "devwerk-workflow-rework-loop.db"

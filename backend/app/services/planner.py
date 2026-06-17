@@ -8,6 +8,7 @@ framework directory structures in backend code.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -188,6 +189,21 @@ class Planner:
         summary = str(plan_obj.get("summary") or "").strip()
         warnings_raw = plan_obj.get("warnings") or []
         warnings = [str(w) for w in warnings_raw if w]
+        directory_paths = _workspace_directory_paths(messages or [])
+        directory_plan_paths = sorted({item.path for item in files if item.path in directory_paths})
+        if directory_plan_paths:
+            _log.debug("Planner.extract_plan: rejected directory plan paths=%s", directory_plan_paths)
+            return PlanResponse(
+                ok=False,
+                files=[],
+                summary=summary,
+                warnings=warnings + ["Planner returned directory paths where file-level plan paths are required."],
+                error_code="PLAN_DIRECTORY_PATHS",
+                error_message=(
+                    "Planner produced directory-level paths instead of file-level paths: "
+                    + ", ".join(directory_plan_paths[:12])
+                ),
+            )
 
         if not files:
             fallback = _fallback_plan(raw, messages or [])
@@ -275,6 +291,49 @@ def _last_user_text(messages: list[dict]) -> str:
             if not content.startswith(("workspace_summary:", "code_context_summary:", "code_context_skill:")):
                 return content
     return ""
+
+
+def _workspace_directory_paths(messages: list[dict]) -> set[str]:
+    workspace = _last_workspace_summary(messages)
+    tree_preview = str(workspace.get("tree_preview") or "") if isinstance(workspace, dict) else ""
+    return _tree_directory_paths(tree_preview)
+
+
+def _last_workspace_summary(messages: list[dict]) -> dict[str, Any]:
+    for item in reversed(messages):
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get("content") or "")
+        if not content.startswith("workspace_summary:"):
+            continue
+        raw = content.split("workspace_summary:", 1)[1].strip()
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _tree_directory_paths(tree_preview: str) -> set[str]:
+    lines = [line.rstrip() for line in str(tree_preview or "").splitlines() if line.strip()]
+    stack: list[tuple[int, str]] = []
+    dirs: set[str] = set()
+    for line in lines:
+        stripped = line.strip()
+        is_dir = stripped.endswith("/")
+        name = stripped.rstrip("/")
+        if not is_dir or not name or name == ".":
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        stack.append((indent, name))
+        rel = "/".join(part for _, part in stack if part and part != ".")
+        normalized = _safe_rel_path(rel)
+        if normalized:
+            dirs.add(normalized)
+    return dirs
 
 
 def _mentioned_paths(text: str) -> list[str]:

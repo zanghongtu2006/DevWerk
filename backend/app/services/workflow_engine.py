@@ -352,10 +352,14 @@ def _review_result(plan_response: PlanResponse, execute_response: IdeChatRespons
 
     if execute_response.tool_requests and not changed_paths:
         decision = "request_recoding"
+    elif not execute_response.done:
+        decision = "request_recoding"
     elif not changed_paths:
         decision = "request_recoding"
     elif planned_paths and unplanned_changed_files:
         decision = "request_replan"
+    elif planned_paths and missing_changed_files:
+        decision = "request_recoding"
     else:
         decision = "approve"
 
@@ -372,7 +376,10 @@ def _review_summary(decision: str, review_result: dict[str, Any]) -> str:
     if decision == "approve":
         return "Reviewer approved generated changes for snapshot-protected apply."
     if decision == "request_recoding":
-        return "Reviewer requested recoding because no changed files were produced."
+        missing = review_result.get("missing_changed_files") or []
+        if missing:
+            return f"Reviewer requested recoding because planned files were not changed: {missing[:8]}"
+        return "Reviewer requested recoding because no complete changed-file result was produced."
     unplanned = review_result.get("unplanned_changed_files") or []
     if unplanned:
         return f"Reviewer requested replan because generated files were outside the normalized plan: {unplanned[:8]}"
