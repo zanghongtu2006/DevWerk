@@ -398,10 +398,22 @@ class HttpAiClient(
     private fun buildWorkspaceSummary(context: ChatContext): WorkspaceSummary? {
         val projectRoot = context.projectRoot
         if (projectRoot.isNullOrBlank()) return null
-        val preview = runCatching { WorkspaceTools.listDir(projectRoot, "", 6) }.getOrNull()
+        val preview = runCatching { WorkspaceTools.listDir(projectRoot, "", 6) }
+            .onFailure { error ->
+                appendDevLog(context, "[workspace] tree_preview failed: ${typeName(error)}: ${error.message}\n")
+            }
+            .getOrNull()
         val sourceMap = context.project?.let { project ->
-            runCatching { SourceMapBuilder.build(project, projectRoot) }.getOrNull()
+            runCatching { SourceMapBuilder.build(project, projectRoot) }
+                .onFailure { error ->
+                    appendDevLog(context, "[workspace] source_map failed: ${typeName(error)}: ${error.message}\n")
+                }
+                .getOrNull()
         }
+        appendDevLog(
+            context,
+            "[workspace] tree_preview_chars=${preview?.length ?: 0} source_map_files=${sourceMap?.indexedFiles ?: 0} source_map_total=${sourceMap?.totalFiles ?: 0}\n"
+        )
         return WorkspaceSummary(
             rootId = context.projectId,
             changedFiles = emptyList(),

@@ -111,12 +111,12 @@ class FakeToolLoopExecutorClient:
                 "ops": [],
                 "patch_ops": [],
                 "tool_requests": [
-                    {"id": "r1", "tool": "list_dir", "args": {"path": "test", "max_depth": 4}},
-                    {"id": "r2", "tool": "read_file", "args": {"path": "test/pom.xml", "start_line": 1, "end_line": 200}},
+                    {"id": "r1", "tool": "list_dir", "args": {"path": "", "max_depth": 4}},
+                    {"id": "r2", "tool": "read_file", "args": {"path": "pom.xml", "start_line": 1, "end_line": 200}},
                     {
                         "id": "r3",
                         "tool": "read_file",
-                        "args": {"path": "test/src/main/java/org/example/Main.java", "start_line": 1, "end_line": 200},
+                        "args": {"path": "src/main/java/org/example/Main.java", "start_line": 1, "end_line": 200},
                     },
                 ],
                 "done": False,
@@ -128,7 +128,7 @@ class FakeToolLoopExecutorClient:
             "ops": [
                 {
                     "op": "create_file",
-                    "path": "test/src/main/java/org/example/HelloController.java",
+                    "path": "src/main/java/org/example/HelloController.java",
                     "language": "java",
                     "content": "package org.example;\n\nimport org.springframework.web.bind.annotation.GetMapping;\nimport org.springframework.web.bind.annotation.RestController;\n\n@RestController\npublic class HelloController {\n    @GetMapping(\"/hello\")\n    public String hello() {\n        return \"Hello\";\n    }\n}\n",
                 }
@@ -645,7 +645,7 @@ def test_planner_extract_plan_returns_failure_when_fallback_cannot_infer_files()
 
 
 @pytest.mark.asyncio
-async def test_execute_resolves_tool_requests_and_strips_project_root_prefix(monkeypatch, tmp_path):
+async def test_execute_resolves_tool_requests_with_project_relative_paths(monkeypatch, tmp_path):
     db_path = tmp_path / "devwerk-tool-loop.db"
     project_root = tmp_path / "test"
     source_dir = project_root / "src/main/java/org/example"
@@ -681,16 +681,16 @@ async def test_execute_resolves_tool_requests_and_strips_project_root_prefix(mon
                         }
                     ],
                     "approved_paths": [
-                        "test/pom.xml",
-                        "test/src/main/java/org/example/Main.java",
-                        "test/src/main/java/org/example/HelloController.java",
+                        "pom.xml",
+                        "src/main/java/org/example/Main.java",
+                        "src/main/java/org/example/HelloController.java",
                     ],
                     "approved_ops": [],
                     "workspace": {
                         "root_id": "backend-tool-loop-smoke",
                         "changed_files": [],
                         "open_files": [],
-                        "tree_preview": "test/\n  pom.xml\n  src/\n    main/\n      java/\n        org/\n          example/\n            Main.java",
+                        "tree_preview": "./\n  pom.xml\n  src/\n    main/\n      java/\n        org/\n          example/\n            Main.java",
                         "source_map": None,
                     },
                 },

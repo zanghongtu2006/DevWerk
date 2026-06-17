@@ -11,7 +11,9 @@ object WorkspaceTools {
         if (!target.isDirectory) return "[list_dir] not a directory: $relativePath"
 
         val sb = StringBuilder()
-        sb.append(target.name.ifBlank { "." }).append("/\n")
+        val rel = normalizeRel(relativePath)
+        val label = if (rel.isBlank() || rel == ".") "." else target.name.ifBlank { "." }
+        sb.append(label).append("/\n")
         walkDir(target, sb, "", 0, maxDepth)
         return sb.toString().trimEnd()
     }

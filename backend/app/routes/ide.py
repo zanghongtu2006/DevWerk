@@ -693,9 +693,6 @@ def _canonical_rel_path(path: str, project_root: str | None = None) -> str:
     parts = [part for part in text.split("/") if part]
     if not parts or any(part == ".." for part in parts):
         return ""
-    root_name = Path(project_root).name if project_root else ""
-    if root_name and len(parts) > 1 and parts[0].lower() == root_name.lower():
-        parts = parts[1:]
     return "/".join(parts)
 
 
@@ -793,7 +790,8 @@ def _tool_list_dir(root: Path, rel: str, max_depth: int) -> str:
         return f"[list_dir] not found: {rel}"
     if not target.is_dir():
         return f"[list_dir] not a directory: {rel}"
-    lines = [f"{target.name or '.'}/"]
+    label = "." if not rel or rel == "." else (target.name or ".")
+    lines = [f"{label}/"]
 
     def walk(path: Path, depth: int, indent: str) -> None:
         if depth >= max_depth:
