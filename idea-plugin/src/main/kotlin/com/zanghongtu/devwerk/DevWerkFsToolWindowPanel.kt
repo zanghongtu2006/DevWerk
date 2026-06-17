@@ -243,31 +243,10 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
             }
 
             if (devCtx != null) {
-                runner.recordFinalSummaryAndBackup(project, devCtx, response)
                 if (response.ok) {
-                    runCatching {
-                        runner.applyResponse(project, devCtx, response)
-                    }.onSuccess {
-                        val verification = runPostApplyTools(aiClient as? HttpAiClient, updatedCtx, response, devCtx)
-                        reportApplyResult(
-                            aiClient,
-                            response,
-                            devCtx,
-                            ok = true,
-                            changedPaths = collectChangedPaths(response),
-                            verification = verification
-                        )
-                    }.onFailure { applyError ->
-                        reportApplyResult(
-                            aiClient,
-                            response,
-                            devCtx,
-                            ok = false,
-                            changedPaths = collectChangedPaths(response),
-                            errorMessage = "${applyError::class.java.simpleName}: ${applyError.message}"
-                        )
-                        throw applyError
-                    }
+                    response = applyAndVerifyWithResume(aiClient, runner, project, updatedCtx, devCtx, response)
+                } else {
+                    runner.recordFinalSummaryAndBackup(project, devCtx, response)
                 }
             } else if (response.ok) {
                 (aiClient as? HttpAiClient)?.let {
@@ -300,6 +279,62 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
 
     // ── Utilities ───────────────────────────────────────────────────────────────
 
+    private fun applyAndVerifyWithResume(
+        aiClient: AiClient,
+        runner: DevwerkOperationRunner,
+        project: Project,
+        context: ChatContext,
+        devCtx: DevwerkContext,
+        initialResponse: IdeChatResponse
+    ): IdeChatResponse {
+        var current = initialResponse
+        var resumeRounds = 0
+        val maxResumeRounds = 2
+
+        while (true) {
+            runner.recordFinalSummaryAndBackup(project, devCtx, current)
+            val actionResponse = runCatching {
+                runner.applyResponse(project, devCtx, current)
+                val verification = runPostApplyTools(aiClient as? HttpAiClient, context, current, devCtx)
+                reportApplyResult(
+                    aiClient,
+                    current,
+                    devCtx,
+                    ok = true,
+                    changedPaths = collectChangedPaths(current),
+                    verification = verification
+                )
+            }.getOrElse { applyError ->
+                reportApplyResult(
+                    aiClient,
+                    current,
+                    devCtx,
+                    ok = false,
+                    changedPaths = collectChangedPaths(current),
+                    errorMessage = "${applyError::class.java.simpleName}: ${applyError.message}"
+                )
+                throw applyError
+            }
+
+            val resume = actionResponse.optJSONObject("workflow_resume")
+            if (resume == null || resumeRounds >= maxResumeRounds) {
+                if (resume != null) {
+                    appendOpLog(devCtx, "[WARN] Verification rework limit reached; leaving task for manual retry.\n")
+                }
+                return current
+            }
+
+            val http = aiClient as? HttpAiClient ?: return current
+            val taskId = current.taskId ?: return current
+            val pollUrl = resume.optString("poll_url", "").takeIf { it.isNotBlank() } ?: return current
+            val eventsUrl = resume.optString("events_url", "").takeIf { it.isNotBlank() } ?: return current
+            appendOpLog(devCtx, "[INFO] Verification failed; waiting for backend recoding round ${resumeRounds + 1}.\n")
+            current = http.awaitWorkflowContinuation(context, taskId, pollUrl, eventsUrl)
+            if (!current.ok) return current
+            resumeRounds += 1
+        }
+    }
+
     private fun appendOpLog(devCtx: DevwerkContext?, text: String) {
         val logPath = devCtx?.opLog ?: return
         runCatching {
@@ -322,11 +357,11 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         changedPaths: List<String>,
         errorMessage: String? = null,
         verification: JSONObject = JSONObject()
-    ) {
-        val taskId = response.taskId ?: return
-        val http = aiClient as? HttpAiClient ?: return
-        runCatching {
-            http.reportApplyResult(
+    ): JSONObject {
+        val taskId = response.taskId ?: return JSONObject()
+        val http = aiClient as? HttpAiClient ?: return JSONObject()
+        return runCatching {
+            val actionResponse = http.reportApplyResult(
                 taskId = taskId,
                 ok = ok,
                 snapshotId = devCtx?.opDir?.fileName?.toString(),
@@ -336,13 +371,14 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 verification = verification
             )
             appendOpLog(devCtx, "[INFO] Kanban apply_result action reported: ok=$ok taskId=$taskId\n")
+            actionResponse
         }.onFailure { syncError ->
             syncError.printStackTrace()
             appendOpLog(devCtx, "[WARN] Kanban apply_result action failed: ${syncError::class.java.simpleName}: ${syncError.message}\n")
             SwingUtilities.invokeLater {
                 appendChatLine("[Warn] Kanban sync failed: ${syncError.message}")
             }
-        }
+        }.getOrDefault(JSONObject())
     }
 
     private fun runPostApplyTools(

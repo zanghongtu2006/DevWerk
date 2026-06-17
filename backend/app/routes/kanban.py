@@ -5,6 +5,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
+from urllib.parse import quote
 
 from app.services.kanban import (
     add_artifact,
@@ -25,6 +26,7 @@ from app.services.kanban import (
     update_task,
 )
 from app.services.session_store import read_project_memory
+from app.services.verification_policy import verification_failed, verification_has_policy
 from app.services.workflow import apply_workflow_action, current_workflow_state
 
 router = APIRouter(prefix="/kanban", tags=["Kanban"])
@@ -209,7 +211,12 @@ def kanban_task_workflow(task_id: str):
 @router.post("/tasks/{task_id}/actions")
 def kanban_task_action(task_id: str, req: WorkflowActionRequest):
     try:
-        return apply_workflow_action(task_id, req.action, req.payload)
+        result_cursor = _latest_artifact_created_at(task_id, "workflow_result")
+        result = apply_workflow_action(task_id, req.action, req.payload)
+        resume = _maybe_resume_after_apply_result(task_id, req.action, req.payload, result_cursor)
+        if resume:
+            result["workflow_resume"] = resume
+        return result
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -239,6 +246,76 @@ def kanban_add_artifact(task_id: str, req: ArtifactCreateRequest):
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+def _maybe_resume_after_apply_result(
+    task_id: str,
+    action: str,
+    payload: dict[str, Any],
+    result_cursor: str | None,
+) -> dict[str, Any] | None:
+    if str(action or "").strip().lower().replace("-", "_") != "apply_result":
+        return None
+    verification = payload.get("verification") if isinstance(payload, dict) else None
+    if not verification_has_policy(verification) or not verification_failed(verification):
+        return None
+
+    body = _latest_artifact_payload(task_id, "workflow_request_body")
+    if not body:
+        add_event(task_id, "workflow_resume_skipped", {"reason": "missing_workflow_request_body"})
+        return None
+
+    body = dict(body)
+    body["task_id"] = task_id
+    body["verification_feedback"] = verification
+    body.setdefault("messages", [])
+
+    add_artifact(task_id, artifact_type="verification_feedback", payload={"verification": verification})
+    add_event(
+        task_id,
+        "workflow_resume_queued",
+        {
+            "reason": "verification_failed",
+            "result_after": result_cursor,
+        },
+    )
+    from app.routes.ide import _start_workflow_thread  # local import avoids router import cycle
+
+    _start_workflow_thread(task_id, body)
+    query = f"?result_after={quote(result_cursor or '')}" if result_cursor else ""
+    return {
+        "ok": True,
+        "reason": "verification_failed",
+        "poll_url": f"/v1/workflows/{task_id}{query}",
+        "events_url": f"/v1/workflows/{task_id}/events{query}",
+        "result_after": result_cursor,
+    }
+
+
+def _latest_artifact_payload(task_id: str, artifact_type: str) -> dict[str, Any] | None:
+    task = get_task(task_id).get("task") or {}
+    artifacts = task.get("artifacts") if isinstance(task, dict) else None
+    if not isinstance(artifacts, list):
+        return None
+    for artifact in reversed(artifacts):
+        if isinstance(artifact, dict) and artifact.get("artifact_type") == artifact_type:
+            payload = artifact.get("payload")
+            return payload if isinstance(payload, dict) else None
+    return None
+
+
+def _latest_artifact_created_at(task_id: str, artifact_type: str) -> str | None:
+    try:
+        task = get_task(task_id).get("task") or {}
+    except KeyError:
+        return None
+    artifacts = task.get("artifacts") if isinstance(task, dict) else None
+    if not isinstance(artifacts, list):
+        return None
+    for artifact in reversed(artifacts):
+        if isinstance(artifact, dict) and artifact.get("artifact_type") == artifact_type:
+            return str(artifact.get("created_at") or "") or None
+    return None
 
 
 @ui_router.get("/kanban", response_class=HTMLResponse)

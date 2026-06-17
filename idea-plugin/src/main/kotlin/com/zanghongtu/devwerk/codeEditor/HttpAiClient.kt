@@ -328,14 +328,14 @@ class HttpAiClient(
         errorMessage: String? = null,
         projectId: String? = null,
         verification: JSONObject = JSONObject()
-    ) {
+    ): JSONObject {
         val body = JSONObject()
         body.put("ok", ok)
         body.put("snapshot_id", snapshotId ?: JSONObject.NULL)
         body.put("changed_paths", JSONArray(changedPaths))
         body.put("verification", verification)
         body.put("error_message", errorMessage ?: JSONObject.NULL)
-        postKanbanAction(taskId, "apply_result", body, projectId)
+        return JSONObject(postKanbanAction(taskId, "apply_result", body, projectId))
     }
 
     fun executeClientTools(context: ChatContext, reqs: List<ToolRequest>): List<ToolResult> {
@@ -346,11 +346,33 @@ class HttpAiClient(
         return results
     }
 
+    fun awaitWorkflowContinuation(
+        context: ChatContext,
+        taskId: String,
+        pollUrl: String,
+        eventsUrl: String
+    ): IdeChatResponse {
+        val resolvedPollUrl = resolveServerUrl(workflowsEndpoint, pollUrl)
+        val resolvedEventsUrl = resolveServerUrl(workflowsEndpoint, eventsUrl)
+        val rawResponses = mutableListOf<String>()
+        appendDevLog(context, "\n[workflow] awaiting continuation task=$taskId event_stream=$resolvedEventsUrl\n")
+        val streamed = runCatching {
+            streamWorkflowEvents(resolvedEventsUrl, resolvedPollUrl, taskId, context, rawResponses)
+        }.getOrElse { error ->
+            appendDevLog(context, "[workflow] continuation event stream failed, fallback to state polling: ${typeName(error)}: ${error.message}\n")
+            null
+        }
+        if (streamed != null) {
+            return streamed
+        }
+        return pollWorkflowResult(resolvedPollUrl, taskId, context, rawResponses)
+    }
+
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
 
-    private fun postKanbanAction(taskId: String, action: String, body: JSONObject, projectId: String? = null) {
+    private fun postKanbanAction(taskId: String, action: String, body: JSONObject, projectId: String? = null): String {
         val mediaType = "application/json; charset=utf-8".toMediaType()
         val requestJson = JSONObject()
         requestJson.put("action", action)
@@ -372,6 +394,7 @@ class HttpAiClient(
             if (!response.isSuccessful) {
                 throw RuntimeException("HTTP ${response.code} from kanban server: $respBody")
             }
+            return respBody
         }
     }
 

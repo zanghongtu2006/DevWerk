@@ -1,5 +1,7 @@
 import json
 
+from fastapi.testclient import TestClient
+
 from app.models.ide import IdeChatResponse
 from app.services.kanban import DEFAULT_COLUMNS
 
@@ -115,6 +117,145 @@ def test_workflow_action_protocol_drives_kanban_state(monkeypatch, tmp_path):
 
     retried = workflow_service.apply_workflow_action(task["id"], "retry", {"reason": "test"})
     assert retried["task"]["status_key"] == "draft"
+
+
+def test_failed_verification_returns_to_coding(monkeypatch, tmp_path):
+    import app.services.kanban as kanban_service
+    import app.services.session_store as session_store
+    import app.services.workflow as workflow_service
+
+    class FakeSettings:
+        devwerk_db_path = str(tmp_path / "verification.db")
+
+    monkeypatch.setattr(kanban_service, "settings", lambda: FakeSettings())
+    monkeypatch.setattr(session_store, "settings", lambda: FakeSettings())
+    kanban_service._initialized = False
+
+    task = kanban_service.create_task(
+        project_id="verification-smoke",
+        title="Compile checked change",
+        description="Smoke",
+        status_key="ready_to_apply",
+    )["task"]
+
+    result = workflow_service.apply_workflow_action(
+        task["id"],
+        "apply_result",
+        {
+            "ok": True,
+            "snapshot_id": "20260617-compile-fail",
+            "changed_paths": ["src/main/java/org/example/dto/TenantCreateRequest.java"],
+            "verification": {
+                "required": ["compile"],
+                "results": {"compile": "failed"},
+                "tool_results": [
+                    {
+                        "id": "compile",
+                        "tool": "run_command",
+                        "ok": False,
+                        "content": "java: illegal escape character",
+                        "error": "java: illegal escape character",
+                    }
+                ],
+            },
+        },
+    )
+
+    assert result["task"]["status_key"] == "coding"
+    task_detail = kanban_service.get_task(task["id"])["task"]
+    event_types = [event["event_type"] for event in task_detail["events"]]
+    assert "verification_failed" in event_types
+    phase_outputs = [artifact["payload"] for artifact in task_detail["artifacts"] if artifact["artifact_type"] == "workflow_phase_output"]
+    assert phase_outputs[-1]["next_action"] == "request_recoding"
+
+
+def test_kanban_apply_result_queues_resume_after_failed_verification(monkeypatch, tmp_path):
+    import app.main as main_module
+    import app.routes.ide as ide_routes
+    import app.services.kanban as kanban_service
+    import app.services.session_store as session_store
+    import app.services.usage as usage_service
+
+    class FakeSettings:
+        devwerk_db_path = str(tmp_path / "resume.db")
+
+    monkeypatch.setattr(kanban_service, "settings", lambda: FakeSettings())
+    monkeypatch.setattr(session_store, "settings", lambda: FakeSettings())
+    monkeypatch.setattr(usage_service, "settings", lambda: FakeSettings())
+    kanban_service._initialized = False
+    usage_service._initialized = False
+
+    started = []
+    monkeypatch.setattr(ide_routes, "_start_workflow_thread", lambda task_id, body: started.append((task_id, body)))
+
+    task = kanban_service.create_task(
+        project_id="resume-smoke",
+        title="Compile checked change",
+        description="Smoke",
+        status_key="ready_to_apply",
+    )["task"]
+    kanban_service.add_artifact(
+        task["id"],
+        artifact_type="workflow_request_body",
+        payload={
+            "project_id": "resume-smoke",
+            "task_id": task["id"],
+            "mode": "agent",
+            "messages": [{"role": "user", "content": "Fix compile error"}],
+            "workspace": {"tree_preview": "pom.xml\nsrc/main/java/App.java"},
+        },
+    )
+    kanban_service.add_artifact(
+        task["id"],
+        artifact_type="workflow_result",
+        payload={"ok": True, "task_id": task["id"], "status_key": "ready_to_apply"},
+    )
+
+    app = main_module.create_app()
+    with TestClient(app) as client:
+        response = client.post(
+            f"/v1/kanban/tasks/{task['id']}/actions",
+            json={
+                "action": "apply_result",
+                "payload": {
+                    "ok": True,
+                    "snapshot_id": "20260617-compile-fail",
+                    "changed_paths": ["src/main/java/App.java"],
+                    "verification": {
+                        "required": ["compile"],
+                        "results": {"compile": "failed"},
+                        "tool_results": [{"id": "compile", "tool": "run_command", "ok": False, "error": "compile failed"}],
+                    },
+                },
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["task"]["status_key"] == "coding"
+    assert body["workflow_resume"]["poll_url"].startswith(f"/v1/workflows/{task['id']}?result_after=")
+    assert started and started[0][0] == task["id"]
+    assert started[0][1]["verification_feedback"]["results"]["compile"] == "failed"
+
+
+def test_verification_policy_infers_maven_compile_from_source_map():
+    from app.services.verification_policy import infer_post_apply_tool_requests
+
+    requests = infer_post_apply_tool_requests(
+        {
+            "source_map": {
+                "files": [
+                    {"path": "pom.xml"},
+                    {"path": "mvnw.cmd"},
+                    {"path": "src/main/java/org/example/Application.java"},
+                ]
+            }
+        }
+    )
+
+    assert len(requests) == 1
+    assert requests[0].tool == "run_command"
+    assert requests[0].args["command"] == ["./mvnw", "test"]
 
 
 def test_workflow_semantic_rework_actions(monkeypatch, tmp_path):

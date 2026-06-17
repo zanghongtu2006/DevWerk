@@ -6,6 +6,11 @@ from typing import Any
 
 from app.services.kanban import add_artifact, add_event, get_project_workflow, get_task, move_task
 from app.services.session_store import record_phase_memory
+from app.services.verification_policy import (
+    verification_failed,
+    verification_has_policy,
+    verification_feedback_summary,
+)
 from app.services.workflow_definition import workflow_from_dict
 
 _log = logging.getLogger("devwerk.workflow")
@@ -194,16 +199,13 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         return move_task(task_id, "failed", force=True, payload={"phase": "apply", **payload})
 
     verification = payload.get("verification")
-    required = verification.get("required") if isinstance(verification, dict) else None
-    results = verification.get("results") if isinstance(verification, dict) else None
-    has_verification_policy = isinstance(required, list) and isinstance(results, dict)
-    passed = all(str(results.get(item)).lower() == "passed" for item in required) if has_verification_policy else True
-    auto_done = passed
+    has_verification_policy = verification_has_policy(verification)
+    passed = not verification_failed(verification) if has_verification_policy else True
     record_phase_output(
         task_id,
         phase="apply",
         agent="plugin",
-        status_key="done" if auto_done else "failed",
+        status_key="done" if passed else "coding",
         summary="Plugin applied generated changes through the snapshot-protected path.",
         outputs={
             "ok": True,
@@ -211,16 +213,37 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
             "changed_paths": payload.get("changed_paths") or [],
             "verification": verification or {},
         },
-        warnings=[] if auto_done else ["Verification requirements did not pass."],
-        next_action=None if auto_done else ACTION_RETRY,
+        warnings=[] if passed else ["Verification requirements did not pass."],
+        next_action=None if passed else ACTION_REQUEST_RECODING,
     )
 
     applied = move_task(task_id, "applied", force=True, payload=payload)
-    if auto_done:
+    if passed:
         move_task(task_id, "verified", force=True, payload={"verification": verification or {}})
         reason = "verification_passed" if has_verification_policy else "apply_completed_without_verification_policy"
         return move_task(task_id, "done", force=True, payload={"reason": reason})
-    return move_task(task_id, "failed", force=True, payload={"phase": "verify", **payload})
+
+    reason = (
+        verification_feedback_summary(verification)
+        if has_verification_policy
+        else "No verification policy was provided by the generated workflow result."
+    )
+    add_event(
+        task_id,
+        "verification_failed",
+        {
+            "phase": "verify",
+            "reason": reason,
+            "verification": verification or {},
+            "can_resume": has_verification_policy,
+        },
+    )
+    return move_task(
+        task_id,
+        "coding",
+        force=True,
+        payload={"phase": "verify", "reason": reason, **payload},
+    )
 
 
 def current_workflow_state(task_id: str) -> dict[str, Any]:

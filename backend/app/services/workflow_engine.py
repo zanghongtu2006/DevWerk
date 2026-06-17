@@ -6,11 +6,12 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from app.models.ide import IdeChatResponse
+from app.models.ide import IdeChatResponse, ToolRequest
 from app.models.plan import PlanResponse
 from app.services.coder_harness import build_code_context_summary
 from app.services.kanban import add_artifact, add_event, get_project_workflow, get_task
 from app.services.session_store import read_project_memory
+from app.services.verification_policy import infer_post_apply_tool_requests, verification_feedback_summary
 from app.services.workflow import apply_workflow_action, record_phase_output
 from app.services.workflow_definition import workflow_from_dict
 
@@ -32,11 +33,23 @@ class WorkflowEngine:
         _event(task_id, "workflow_started", {"entrypoint": "/v1/workflows", "workflow": workflow_summary})
 
         context_bundle = self._run_context_column(task_id, body, workflow_summary)
-        plan_response: PlanResponse | None = None
+        resume_feedback = _verification_resume_feedback(body)
+        plan_response: PlanResponse | None = _latest_plan_response(task_id) if resume_feedback else None
         execute_response: IdeChatResponse | None = None
-        next_phase = "planned"
-        review_feedback: dict[str, Any] | None = None
+        next_phase = "coding" if plan_response is not None else "planned"
+        review_feedback: dict[str, Any] | None = resume_feedback
         max_rework_rounds = 3
+        if resume_feedback:
+            _event(
+                task_id,
+                "workflow_resumed",
+                {
+                    "reason": "verification_failed",
+                    "next_phase": next_phase,
+                    "has_previous_plan": plan_response is not None,
+                    "summary": resume_feedback.get("summary"),
+                },
+            )
 
         for round_no in range(1, max_rework_rounds + 2):
             _log.debug("workflow loop task_id=%s round=%s next_phase=%s", task_id, round_no, next_phase)
@@ -97,8 +110,12 @@ class WorkflowEngine:
             review = self._run_review_column(task_id, body, workflow_summary, plan_response, execute_response)
             decision = str(review.get("decision") or "fail")
             if decision == "approve":
+                verification_requests = _ensure_post_apply_verification_requests(execute_response, body.get("workspace"))
                 execute_response.task_id = task_id
                 execute_response.status_key = "ready_to_apply"
+                if verification_requests:
+                    execute_response.tool_requests = verification_requests
+                execute_response.next_action = "apply_result"
                 add_artifact(task_id, artifact_type="workflow_result", payload=execute_response.model_dump())
                 _event(
                     task_id,
@@ -110,6 +127,7 @@ class WorkflowEngine:
                         "ops": len(execute_response.ops),
                         "patch_ops": len(execute_response.patch_ops),
                         "tool_requests": len(execute_response.tool_requests),
+                        "verification_required": bool(execute_response.tool_requests),
                         "round": round_no,
                     },
                 )
@@ -385,10 +403,12 @@ def _coding_phase_messages(
             ],
         },
         "review_feedback": _compact_review_feedback(review_feedback),
+        "verification_feedback": _compact_verification_feedback(review_feedback),
         "rules": [
             "Use planner_output.files as the approved writable target list, not merely as reading context.",
             "For nature=deleted, emit a delete_path operation when the file should be removed.",
             "If review_feedback is present, address missing_changed_files or unplanned_changed_files before returning done=true.",
+            "If verification_feedback is present, fix the reported compile/test/tool errors before returning done=true.",
             "If a required file is not actually needed anymore, explain why in reply and avoid inventing unrelated paths.",
         ],
     }
@@ -411,6 +431,64 @@ def _compact_review_feedback(review_feedback: dict[str, Any] | None) -> dict[str
         "normalized_plan_files": review_feedback.get("normalized_plan_files") or [],
         "normalized_changed_files": review_feedback.get("normalized_changed_files") or [],
     }
+
+
+def _compact_verification_feedback(review_feedback: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(review_feedback, dict):
+        return None
+    verification = review_feedback.get("verification")
+    if not isinstance(verification, dict):
+        return None
+    return {
+        "summary": review_feedback.get("summary"),
+        "required": verification.get("required") or [],
+        "results": verification.get("results") or {},
+        "tool_results": verification.get("tool_results") or [],
+    }
+
+
+def _verification_resume_feedback(body: dict[str, Any]) -> dict[str, Any] | None:
+    verification = body.get("verification_feedback")
+    if not isinstance(verification, dict):
+        return None
+    return {
+        "decision": "request_recoding",
+        "summary": verification_feedback_summary(verification),
+        "verification": verification,
+    }
+
+
+def _latest_plan_response(task_id: str) -> PlanResponse | None:
+    payload = _latest_task_artifact_payload(task_id, "plan_bundle")
+    if not payload:
+        return None
+    try:
+        return PlanResponse.model_validate(payload)
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("workflow resume skipped invalid plan_bundle task_id=%s error=%s", task_id, exc)
+        return None
+
+
+def _latest_task_artifact_payload(task_id: str, artifact_type: str) -> dict[str, Any] | None:
+    try:
+        task = get_task(task_id).get("task") or {}
+    except Exception:  # noqa: BLE001
+        return None
+    artifacts = task.get("artifacts") if isinstance(task, dict) else None
+    if not isinstance(artifacts, list):
+        return None
+    for artifact in reversed(artifacts):
+        if isinstance(artifact, dict) and artifact.get("artifact_type") == artifact_type:
+            payload = artifact.get("payload")
+            return payload if isinstance(payload, dict) else None
+    return None
+
+
+def _ensure_post_apply_verification_requests(response: IdeChatResponse, workspace: object) -> list[ToolRequest]:
+    by_id = {req.id: req for req in response.tool_requests}
+    for request in infer_post_apply_tool_requests(workspace):
+        by_id.setdefault(request.id, request)
+    return list(by_id.values())
 
 
 def _review_decision(plan_response: PlanResponse, execute_response: IdeChatResponse) -> str:

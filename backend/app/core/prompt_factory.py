@@ -36,6 +36,9 @@ OPENAI_SYSTEM_PROMPT = textwrap.dedent(
     7. read_file requests must include path, start_line, and end_line.
     8. Use run_command only for project-local build/test commands. Do not use
        shell wrappers such as cmd, powershell, bash, or sh.
+    9. If build manifests are visible, expect DevWerk to require a post-apply
+       compile/test command. Compilation or syntax failures are workflow
+       feedback and must be fixed in the next coding round.
 
     JSON Schema:
     __SCHEMA_JSON__

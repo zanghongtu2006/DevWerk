@@ -54,6 +54,9 @@ SYSTEM_PROMPT = textwrap.dedent(
     4. Use run_command only for project-local build/test commands, for example:
        {"id":"compile","tool":"run_command","args":{"command":["./mvnw","test"],"timeout_seconds":120}}
        Do not use shell wrappers such as cmd, powershell, bash, or sh.
+    5. If build manifests are visible, expect DevWerk to require a post-apply
+       compile/test command. Compilation or syntax failures are workflow
+       feedback and must be fixed in the next coding round.
 
     Implementation rules:
     1. When the user requests code, output real, directly applicable

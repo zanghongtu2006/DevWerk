@@ -75,6 +75,7 @@ async def start_workflow(request: Request):
     body["task_id"] = task_id
     project_id = str(body.get("project_id") or "default")
     _kanban_artifact(task_id, "workflow_request", payload=_plan_request_artifact(body))
+    _kanban_artifact(task_id, "workflow_request_body", payload=_workflow_request_body_artifact(body))
     _kanban_event(
         task_id,
         "workflow_queued",
@@ -89,14 +90,14 @@ async def start_workflow(request: Request):
 
 
 @router.get("/workflows/{task_id}")
-async def get_workflow(task_id: str):
-    return _workflow_state_payload(task_id, include_result=True)
+async def get_workflow(task_id: str, result_after: str | None = None):
+    return _workflow_state_payload(task_id, include_result=True, result_after=result_after)
 
 
 @router.get("/workflows/{task_id}/events")
-async def stream_workflow_events(task_id: str):
+async def stream_workflow_events(task_id: str, result_after: str | None = None):
     return StreamingResponse(
-        _workflow_event_stream(task_id),
+        _workflow_event_stream(task_id, result_after=result_after),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -106,8 +107,8 @@ async def stream_workflow_events(task_id: str):
 
 
 @router.get("/workflows/{task_id}/result")
-async def get_workflow_result(task_id: str):
-    return _workflow_result_payload(task_id)
+async def get_workflow_result(task_id: str, result_after: str | None = None):
+    return _workflow_result_payload(task_id, result_after=result_after)
 
 
 @router.post("/ide/attachments")
@@ -1130,13 +1131,13 @@ async def _run_coding_phase(body: dict) -> IdeChatResponse:
     return await ide_execute(_BodyRequest(body))
 
 
-def _workflow_state_payload(task_id: str, *, include_result: bool) -> dict:
+def _workflow_state_payload(task_id: str, *, include_result: bool, result_after: str | None = None) -> dict:
     try:
         task_detail = get_task(task_id)
     except KeyError:
         return {"ok": False, "task_id": task_id, "error_code": "NOT_FOUND", "error_message": "workflow task not found"}
     task = task_detail.get("task") or {}
-    result = _latest_artifact_payload(task, "workflow_result")
+    result = _latest_artifact_payload(task, "workflow_result", result_after=result_after)
     status_key = task.get("status_key")
     ready = result is not None or status_key in {"ready_to_apply", "done", "failed"}
     payload = {
@@ -1155,13 +1156,13 @@ def _workflow_state_payload(task_id: str, *, include_result: bool) -> dict:
     return payload
 
 
-async def _workflow_event_stream(task_id: str):
+async def _workflow_event_stream(task_id: str, *, result_after: str | None = None):
     sent_ids: set[str] = set()
     sent_state_status: str | None = None
     heartbeat_at = time.monotonic()
 
     while True:
-        state = _workflow_state_payload(task_id, include_result=True)
+        state = _workflow_state_payload(task_id, include_result=True, result_after=result_after)
         if not state.get("ok"):
             yield _sse("workflow_error", state)
             return
@@ -1225,8 +1226,8 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {payload}\n\n"
 
 
-def _workflow_result_payload(task_id: str) -> dict:
-    state = _workflow_state_payload(task_id, include_result=True)
+def _workflow_result_payload(task_id: str, *, result_after: str | None = None) -> dict:
+    state = _workflow_state_payload(task_id, include_result=True, result_after=result_after)
     if not state.get("ok"):
         return state
     if "result" not in state:
@@ -1246,12 +1247,15 @@ def _workflow_result_payload(task_id: str) -> dict:
     }
 
 
-def _latest_artifact_payload(task: dict, artifact_type: str) -> dict | None:
+def _latest_artifact_payload(task: dict, artifact_type: str, *, result_after: str | None = None) -> dict | None:
     artifacts = task.get("artifacts") if isinstance(task, dict) else None
     if not isinstance(artifacts, list):
         return None
     for artifact in reversed(artifacts):
         if isinstance(artifact, dict) and artifact.get("artifact_type") == artifact_type:
+            created_at = str(artifact.get("created_at") or "")
+            if result_after and created_at <= result_after:
+                continue
             payload = artifact.get("payload")
             return payload if isinstance(payload, dict) else {}
     return None
@@ -1312,6 +1316,17 @@ def _plan_request_artifact(body: dict) -> dict:
         "message_count": len(messages) if isinstance(messages, list) else 0,
         "user_request": _first_user_text_from_messages(messages),
         "workspace_summary": _workspace_debug_summary(body.get("workspace")),
+    }
+
+
+def _workflow_request_body_artifact(body: dict) -> dict:
+    return {
+        "project_id": body.get("project_id"),
+        "task_id": body.get("task_id"),
+        "mode": body.get("mode", "agent"),
+        "project_root": body.get("project_root"),
+        "messages": body.get("messages") if isinstance(body.get("messages"), list) else [],
+        "workspace": body.get("workspace") if isinstance(body.get("workspace"), dict) else None,
     }
 
 
