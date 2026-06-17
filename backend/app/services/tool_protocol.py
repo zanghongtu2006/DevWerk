@@ -4,7 +4,7 @@ from typing import Any
 
 
 BACKEND_RESEARCH_TOOLS = {"list_dir", "read_file", "search"}
-CLIENT_TOOLS = {"run_command"}
+CLIENT_TOOLS = {"run_command", "ide_syntax_check"}
 ALL_TOOLS = BACKEND_RESEARCH_TOOLS | CLIENT_TOOLS
 
 
@@ -55,6 +55,14 @@ def normalize_tool_request(raw: dict[str, Any], index: int = 0) -> dict[str, Any
         if not isinstance(command, (list, str)) or not command:
             raise ToolProtocolError(f"tool_requests[{index}].args.command missing")
         args.setdefault("timeout_seconds", 120)
+    elif tool == "ide_syntax_check":
+        paths = args.get("paths")
+        if "path" in args and not isinstance(paths, list):
+            paths = [args["path"]]
+        if not isinstance(paths, list):
+            paths = []
+        args["paths"] = paths
+        args.setdefault("max_errors", 100)
 
     return {"id": request_id, "tool": tool, "args": args}
 

@@ -1,5 +1,6 @@
 package com.zanghongtu.devwerk.codeEditor
 
+import com.intellij.openapi.application.ApplicationManager
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -7,6 +8,14 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import com.intellij.openapi.fileEditor.FileDocumentManager
+import com.intellij.openapi.project.Project
+import com.intellij.openapi.roots.ProjectFileIndex
+import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.psi.PsiErrorElement
+import com.intellij.psi.PsiManager
+import com.intellij.psi.PsiRecursiveElementWalkingVisitor
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -341,7 +350,8 @@ class HttpAiClient(
     fun executeClientTools(context: ChatContext, reqs: List<ToolRequest>): List<ToolResult> {
         if (reqs.isEmpty()) return emptyList()
         appendDevLog(context, "\n===== CLIENT TOOL REQUESTS =====\n${toolRequestsToJson(reqs)}\n")
-        val results = executeTools(context.projectRoot, reqs)
+        FileDocumentManager.getInstance().saveAllDocuments()
+        val results = executeTools(context, reqs)
         appendDevLog(context, "\n===== CLIENT TOOL RESULTS =====\n${toolResultsToJson(results)}\n")
         return results
     }
@@ -642,7 +652,8 @@ class HttpAiClient(
         return parts.size > 1 && parts.dropLast(1).any { it.startsWith(".") }
     }
 
-    private fun executeTools(projectRoot: String?, reqs: List<ToolRequest>): List<ToolResult> {
+    private fun executeTools(context: ChatContext, reqs: List<ToolRequest>): List<ToolResult> {
+        val projectRoot = context.projectRoot
         val base = projectRoot
         if (base.isNullOrBlank()) {
             return reqs.map { ToolResult(id = it.id, ok = false, error = "project_root is null") }
@@ -692,6 +703,16 @@ class HttpAiClient(
                     }
                     "run_command" -> {
                         val content = runCommandTool(base, r.args)
+                        val ok = content.first
+                        results += ToolResult(
+                            id = id,
+                            ok = ok,
+                            content = content.second,
+                            error = if (ok) null else content.second
+                        )
+                    }
+                    "ide_syntax_check" -> {
+                        val content = ideSyntaxCheck(context.project, base, r.args)
                         val ok = content.first
                         results += ToolResult(
                             id = id,
@@ -753,6 +774,58 @@ class HttpAiClient(
         return (exitCode == 0) to content
     }
 
+    private fun ideSyntaxCheck(project: Project?, basePath: String, args: Map<String, Any?>): Pair<Boolean, String> {
+        if (project == null) return false to "[ide_syntax_check] project is unavailable"
+        val base = File(basePath).canonicalFile
+        val requestedPaths = pathList(args["paths"])
+        val maxErrors = ((args["max_errors"] as? Number)?.toInt() ?: 100).coerceIn(1, 500)
+
+        val errors = ApplicationManager.getApplication().runReadAction<List<String>> {
+            val baseVf = LocalFileSystem.getInstance().findFileByIoFile(base)
+                ?: return@runReadAction listOf("[ide_syntax_check] project root is unavailable: ${base.path}")
+            val psiManager = PsiManager.getInstance(project)
+            val files = if (requestedPaths.isNotEmpty()) {
+                requestedPaths.mapNotNull { rel ->
+                    val normalized = normRel(rel)
+                    if (normalized.isBlank() || hasHiddenDirSegment(normalized)) {
+                        null
+                    } else {
+                        LocalFileSystem.getInstance().findFileByIoFile(File(base, normalized).canonicalFile)
+                    }
+                }
+            } else {
+                collectProjectFiles(project, baseVf)
+            }
+
+            val out = mutableListOf<String>()
+            for (vf in files) {
+                if (out.size >= maxErrors) break
+                if (vf.isDirectory || vf.length > 1_000_000L) continue
+                val rel = vf.path.removePrefix(baseVf.path.trimEnd('/') + "/").replace("\\", "/")
+                val psiFile = psiManager.findFile(vf) ?: continue
+                psiFile.accept(object : PsiRecursiveElementWalkingVisitor() {
+                    override fun visitErrorElement(element: PsiErrorElement) {
+                        if (out.size >= maxErrors) {
+                            stopWalking()
+                            return
+                        }
+                        out += "$rel:${lineOf(vf, element.textOffset)} ${element.errorDescription}"
+                        super.visitErrorElement(element)
+                    }
+                })
+            }
+            out
+        }
+
+        if (errors.isEmpty()) {
+            return true to "[ide_syntax_check] passed"
+        }
+        return false to buildString {
+            append("[ide_syntax_check] failed errors=").append(errors.size).append('\n')
+            errors.forEach { append(it).append('\n') }
+        }.trimEnd()
+    }
+
     private fun commandParts(args: Map<String, Any?>): List<String> {
         val raw = args["command"]
         val parts = when (raw) {
@@ -771,40 +844,18 @@ class HttpAiClient(
         return parts + extra
     }
 
-    private fun isAllowedCommand(executable: String): Boolean {
-        val normalized = executable.trim().replace("\\", "/").substringAfterLast("/").lowercase()
-        return normalized in setOf(
-            "gradlew",
-            "gradlew.bat",
-            "mvnw",
-            "mvnw.cmd",
-            "gradle",
-            "gradle.bat",
-            "mvn",
-            "mvn.cmd"
-        )
-    }
-
     private fun resolveCommand(base: File, cwd: File, command: List<String>): Pair<List<String>?, String?> {
         val rawExecutable = command.first().trim()
-        val executableName = rawExecutable.replace("\\", "/").substringAfterLast("/").lowercase()
-        if (!isAllowedCommand(rawExecutable)) {
-            return null to "[run_command] executable is not allowed: $rawExecutable"
-        }
-
         val hasPath = rawExecutable.contains("/") || rawExecutable.contains("\\")
         val args = command.drop(1)
-        val isWrapper = executableName in setOf("gradlew", "gradlew.bat", "mvnw", "mvnw.cmd")
         val isWindows = System.getProperty("os.name").lowercase().contains("win")
 
-        if (!isWrapper) {
-            if (hasPath) {
-                return null to "[run_command] path-qualified global executable is not allowed: $rawExecutable"
-            }
-            return command to null
+        if (!hasPath) {
+            return null to "[run_command] pathless global executable is not allowed: $rawExecutable; use a project-local executable path or project-configured tool"
         }
 
         val rel = rawExecutable.trimStart('.', '/', '\\')
+        val executableName = rel.replace("\\", "/").substringAfterLast("/").lowercase()
         val candidates = mutableListOf<File>()
         candidates += File(cwd, rel)
         if (!executableName.endsWith(".bat") && !executableName.endsWith(".cmd")) {
@@ -827,6 +878,32 @@ class HttpAiClient(
             listOf(target.path) + args
         }
         return resolved to null
+    }
+
+    private fun pathList(raw: Any?): List<String> = when (raw) {
+        is JSONArray -> (0 until raw.length()).mapNotNull { raw.optString(it, "").takeIf { s -> s.isNotBlank() } }
+        is List<*> -> raw.mapNotNull { it as? String }.filter { it.isNotBlank() }
+        is Array<*> -> raw.mapNotNull { it as? String }.filter { it.isNotBlank() }
+        is String -> listOf(raw).filter { it.isNotBlank() }
+        else -> emptyList()
+    }
+
+    private fun collectProjectFiles(project: Project, base: VirtualFile): List<VirtualFile> {
+        val fileIndex = ProjectFileIndex.getInstance(project)
+        val files = mutableListOf<VirtualFile>()
+        fileIndex.iterateContent { vf ->
+            if (!vf.isDirectory && vf.path.startsWith(base.path.trimEnd('/') + "/")) {
+                files += vf
+            }
+            files.size < 2_000
+        }
+        return files
+    }
+
+    private fun lineOf(vf: VirtualFile, offset: Int): Int {
+        if (offset < 0) return 1
+        val doc = FileDocumentManager.getInstance().getDocument(vf) ?: return 1
+        return doc.getLineNumber(offset) + 1
     }
 
     private fun typeName(t: Throwable): String = t::class.java.simpleName.ifBlank { "Throwable" }

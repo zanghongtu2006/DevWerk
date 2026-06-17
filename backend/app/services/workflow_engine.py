@@ -9,9 +9,9 @@ from typing import Any
 from app.models.ide import IdeChatResponse, ToolRequest
 from app.models.plan import PlanResponse
 from app.services.coder_harness import build_code_context_summary
-from app.services.kanban import add_artifact, add_event, get_project_workflow, get_task
+from app.services.kanban import add_artifact, add_event, get_project_settings, get_project_workflow, get_task
 from app.services.session_store import read_project_memory
-from app.services.verification_policy import infer_post_apply_tool_requests, verification_feedback_summary
+from app.services.verification_policy import configured_post_apply_tool_requests, verification_feedback_summary
 from app.services.workflow import apply_workflow_action, record_phase_output
 from app.services.workflow_definition import workflow_from_dict
 
@@ -110,7 +110,7 @@ class WorkflowEngine:
             review = self._run_review_column(task_id, body, workflow_summary, plan_response, execute_response)
             decision = str(review.get("decision") or "fail")
             if decision == "approve":
-                verification_requests = _ensure_post_apply_verification_requests(execute_response, body.get("workspace"))
+                verification_requests = _ensure_post_apply_verification_requests(execute_response, project_id)
                 execute_response.task_id = task_id
                 execute_response.status_key = "ready_to_apply"
                 if verification_requests:
@@ -484,9 +484,9 @@ def _latest_task_artifact_payload(task_id: str, artifact_type: str) -> dict[str,
     return None
 
 
-def _ensure_post_apply_verification_requests(response: IdeChatResponse, workspace: object) -> list[ToolRequest]:
+def _ensure_post_apply_verification_requests(response: IdeChatResponse, project_id: str) -> list[ToolRequest]:
     by_id = {req.id: req for req in response.tool_requests}
-    for request in infer_post_apply_tool_requests(workspace):
+    for request in configured_post_apply_tool_requests(get_project_settings(project_id)):
         by_id.setdefault(request.id, request)
     return list(by_id.values())
 

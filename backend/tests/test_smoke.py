@@ -238,24 +238,30 @@ def test_kanban_apply_result_queues_resume_after_failed_verification(monkeypatch
     assert started[0][1]["verification_feedback"]["results"]["compile"] == "failed"
 
 
-def test_verification_policy_infers_maven_compile_from_source_map():
-    from app.services.verification_policy import infer_post_apply_tool_requests
+def test_verification_policy_uses_project_configured_tools_only():
+    from app.services.verification_policy import configured_post_apply_tool_requests
 
-    requests = infer_post_apply_tool_requests(
+    assert configured_post_apply_tool_requests({"parameters": {}}) == []
+
+    requests = configured_post_apply_tool_requests(
         {
-            "source_map": {
-                "files": [
-                    {"path": "pom.xml"},
-                    {"path": "mvnw.cmd"},
-                    {"path": "src/main/java/org/example/Application.java"},
-                ]
+            "parameters": {
+                "verification": {
+                    "tool_requests": [
+                        {
+                            "id": "syntax",
+                            "tool": "ide_syntax_check",
+                            "args": {"paths": ["src/main/java/org/example/Application.java"]},
+                        }
+                    ]
+                }
             }
         }
     )
 
     assert len(requests) == 1
-    assert requests[0].tool == "run_command"
-    assert requests[0].args["command"] == ["./mvnw", "test"]
+    assert requests[0].tool == "ide_syntax_check"
+    assert requests[0].args["paths"] == ["src/main/java/org/example/Application.java"]
 
 
 def test_workflow_semantic_rework_actions(monkeypatch, tmp_path):

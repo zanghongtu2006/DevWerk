@@ -48,15 +48,17 @@ SYSTEM_PROMPT = textwrap.dedent(
        - search may include paths, but it does not require path.
     2. Backend research tool_requests must not be returned with ops/patch_ops in
        the same response.
-    3. Client-side post-apply tools such as run_command may be returned with
-       ops/patch_ops. The IDE applies changes first, then executes the tool and
-       reports verification to kanban.
-    4. Use run_command only for project-local build/test commands, for example:
-       {"id":"compile","tool":"run_command","args":{"command":["./mvnw","test"],"timeout_seconds":120}}
-       Do not use shell wrappers such as cmd, powershell, bash, or sh.
-    5. If build manifests are visible, expect DevWerk to require a post-apply
-       compile/test command. Compilation or syntax failures are workflow
-       feedback and must be fixed in the next coding round.
+    3. Client-side post-apply tools may be returned with ops/patch_ops. The IDE
+       applies changes first, then executes the tool and reports verification
+       to kanban.
+    4. Use ide_syntax_check for IDE-provided syntax validation. Include paths
+       when the changed files are known.
+    5. Use run_command only when project evidence or project settings make the
+       command unambiguous. Prefer project-local executable paths such as
+       ./scripts/check or ./tool-wrapper. Do not use shell wrappers such as cmd,
+       powershell, bash, or sh.
+    6. Syntax, compile, test, or tool failures are workflow feedback and must be
+       fixed in the next coding round.
 
     Implementation rules:
     1. When the user requests code, output real, directly applicable

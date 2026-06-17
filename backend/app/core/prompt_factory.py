@@ -27,18 +27,19 @@ OPENAI_SYSTEM_PROMPT = textwrap.dedent(
        guidance. Address missing_changed_files before returning done=true.
     5. Backend research tool_requests (list_dir/read_file/search) must not be
        returned with ops/patch_ops. Client-side post-apply tools such as
-       run_command may be returned with ops/patch_ops.
+       ide_syntax_check and run_command may be returned with ops/patch_ops.
        read_file args require path/start_line/end_line; list_dir path is
        optional; search requires query and may also use pattern as a query
        alias. search does not require path.
     6. patch_ops only allows apply_patch and must contain unified diff content
        with --- / +++ / @@ markers.
     7. read_file requests must include path, start_line, and end_line.
-    8. Use run_command only for project-local build/test commands. Do not use
-       shell wrappers such as cmd, powershell, bash, or sh.
-    9. If build manifests are visible, expect DevWerk to require a post-apply
-       compile/test command. Compilation or syntax failures are workflow
-       feedback and must be fixed in the next coding round.
+    8. Use ide_syntax_check for IDE-provided syntax validation. Use run_command
+       only when project evidence or project settings make the command
+       unambiguous. Prefer project-local executable paths. Do not use shell
+       wrappers such as cmd, powershell, bash, or sh.
+    9. Syntax, compile, test, or tool failures are workflow feedback and must be
+       fixed in the next coding round.
 
     JSON Schema:
     __SCHEMA_JSON__
