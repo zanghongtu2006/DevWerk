@@ -382,7 +382,7 @@ async def test_workflow_start_poll_result_smoke(monkeypatch, tmp_path):
             assert chat_response.status_code == 404
 
 
-def test_workflow_reviewer_normalizes_project_root_prefix():
+def test_workflow_reviewer_keeps_distinct_relative_paths():
     from app.services.workflow_engine import _review_result
 
     plan = PlanResponse(
@@ -407,10 +407,11 @@ def test_workflow_reviewer_normalizes_project_root_prefix():
 
     review = _review_result(plan, executed)
 
-    assert review["decision"] == "approve"
-    assert review["normalized_plan_files"] == ["src/main/java/org/example/controller/TenantController.java"]
+    assert review["decision"] == "request_replan"
+    assert review["normalized_plan_files"] == ["test/src/main/java/org/example/controller/TenantController.java"]
     assert review["normalized_changed_files"] == ["src/main/java/org/example/controller/TenantController.java"]
-    assert review["unplanned_changed_files"] == []
+    assert review["missing_changed_files"] == ["test/src/main/java/org/example/controller/TenantController.java"]
+    assert review["unplanned_changed_files"] == ["src/main/java/org/example/controller/TenantController.java"]
 
 
 @pytest.mark.asyncio

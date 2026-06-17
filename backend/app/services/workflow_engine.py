@@ -366,27 +366,11 @@ def _review_summary(decision: str, review_result: dict[str, Any]) -> str:
 
 def _normalize_review_path(path: str) -> str:
     normalized = str(path or "").replace("\\", "/").strip()
+    while "//" in normalized:
+        normalized = normalized.replace("//", "/")
     while normalized.startswith("./"):
         normalized = normalized[2:]
     normalized = normalized.lstrip("/")
-
-    for marker in ("/src/", "/backend/", "/frontend/", "/idea-plugin/"):
-        idx = normalized.find(marker)
-        if idx > 0:
-            return normalized[idx + 1:]
-
-    root_files = (
-        "pom.xml",
-        "build.gradle",
-        "settings.gradle",
-        "gradlew",
-        "gradlew.bat",
-        "README.md",
-    )
-    for filename in root_files:
-        suffix = f"/{filename}"
-        if normalized.endswith(suffix):
-            return filename
     return normalized
 
 
