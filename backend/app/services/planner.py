@@ -44,6 +44,8 @@ class Planner:
         "     Use project-relative paths from source_map/tree_preview. Never use absolute paths.\n"
         "  4. When you have enough information, respond with a JSON object containing a 'plan' key:\n"
         "     { plan: { files: [{path, nature, description, confidence}], summary, warnings } }\n"
+        "     files[] must include only writable targets that the coder should create, modify, or delete.\n"
+        "     Do not put reference-only files, tool evidence, or optional examples in files[]; put them in warnings/summary instead.\n"
         "  5. nature must be one of: new | modified | deleted.\n"
         "  6. confidence is 0.0-1.0 how sure you are this file needs to change.\n"
         "  7. Do NOT output any ops, patch_ops, or tool_requests in your final response.\n"

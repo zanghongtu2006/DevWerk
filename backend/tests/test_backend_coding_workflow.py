@@ -575,6 +575,7 @@ async def test_workflow_reviewer_rework_continues_until_approved(monkeypatch, tm
     async def coding_runner(body: dict) -> IdeChatResponse:
         nonlocal coding_calls
         coding_calls += 1
+        assert any("workflow_phase_context:" in message.get("content", "") for message in body["messages"])
         return IdeChatResponse(
             ok=True,
             done=True,
@@ -608,6 +609,85 @@ async def test_workflow_reviewer_rework_continues_until_approved(monkeypatch, tm
     assert result["payload"]["ok"] is True
     assert result["payload"]["status_key"] == "ready_to_apply"
     event_types = [event["event_type"] for event in task_detail["events"]]
+    assert "workflow_rework_loop" in event_types
+
+
+@pytest.mark.asyncio
+async def test_workflow_recoding_receives_review_feedback(monkeypatch, tmp_path):
+    db_path = tmp_path / "devwerk-workflow-recoding-feedback.db"
+    fake_settings = FakeSettings(db_path)
+
+    import app.services.kanban as kanban_service
+    import app.services.workflow_engine as workflow_engine_service
+
+    patch_service_settings(monkeypatch, fake_settings, kanban_service)
+    kanban_service._initialized = False
+
+    task = kanban_service.create_task(
+        project_id="backend-workflow-recoding-feedback",
+        title="Recoding feedback",
+        description="Smoke",
+        status_key="draft",
+    )["task"]
+    coding_calls = 0
+
+    async def plan_runner(body: dict) -> PlanResponse:
+        return PlanResponse(
+            ok=True,
+            task_id=body["task_id"],
+            files=[
+                PlanFile(path="src/domain/a.py", nature="modified", description="Update A."),
+                PlanFile(path="src/domain/b.py", nature="modified", description="Update B."),
+            ],
+            summary="Update A and B.",
+            session_id="plan-1",
+        )
+
+    async def coding_runner(body: dict) -> IdeChatResponse:
+        nonlocal coding_calls
+        coding_calls += 1
+        context_messages = [message["content"] for message in body["messages"] if "workflow_phase_context:" in message.get("content", "")]
+        assert context_messages
+        if coding_calls == 1:
+            assert '"files":[{"path":"src/domain/a.py"' in context_messages[-1]
+            return IdeChatResponse(
+                ok=True,
+                done=True,
+                task_id=body["task_id"],
+                session_id="coding-1",
+                ops=[FileOp(op="update_file", path="src/domain/a.py", content="print('a')\n")],
+            )
+
+        assert '"missing_changed_files":["src/domain/b.py"]' in context_messages[-1]
+        return IdeChatResponse(
+            ok=True,
+            done=True,
+            task_id=body["task_id"],
+            session_id="coding-2",
+            ops=[
+                FileOp(op="update_file", path="src/domain/a.py", content="print('a')\n"),
+                FileOp(op="update_file", path="src/domain/b.py", content="print('b')\n"),
+            ],
+        )
+
+    engine = workflow_engine_service.WorkflowEngine(plan_runner=plan_runner, coding_runner=coding_runner)
+    await engine.run(
+        task["id"],
+        {
+            "project_id": "backend-workflow-recoding-feedback",
+            "mode": "agent",
+            "messages": [{"role": "user", "content": "Update both files."}],
+            "workspace": {"tree_preview": "project/\n  src/\n    domain/\n      a.py\n      b.py", "source_map": None},
+        },
+    )
+
+    assert coding_calls == 2
+    task_detail = kanban_service.get_task(task["id"])["task"]
+    assert task_detail["status_key"] == "ready_to_apply"
+    result = [artifact for artifact in task_detail["artifacts"] if artifact["artifact_type"] == "workflow_result"][-1]
+    assert result["payload"]["ok"] is True
+    event_types = [event["event_type"] for event in task_detail["events"]]
+    assert event_types.count("coding_context_prepared") == 2
     assert "workflow_rework_loop" in event_types
 
 

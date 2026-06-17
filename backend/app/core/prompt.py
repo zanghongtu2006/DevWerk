@@ -19,12 +19,15 @@ SYSTEM_PROMPT = textwrap.dedent(
     Context rules:
     1. Prefer code_context_summary and workspace_summary.source_map when they
        are present. They are IDE-provided indexes, not full file content.
-    2. Use source_map to locate existing files, symbols, packages/modules,
+    2. If workflow_phase_context is present, treat planner_output as the
+       current coding contract and review_feedback as mandatory rework
+       guidance. Address missing_changed_files before returning done=true.
+    3. Use source_map to locate existing files, symbols, packages/modules,
        imports, and likely boundaries. If exact content is needed, request
        read_file before editing.
-    3. If the required path is unclear, request list_dir/search/read_file. Do
+    4. If the required path is unclear, request list_dir/search/read_file. Do
        not invent directories, package names, modules, or file names.
-    4. tree_preview is only a lightweight visual hint. It must not override
+    5. tree_preview is only a lightweight visual hint. It must not override
        source_map or tool_results.
 
     Modes:

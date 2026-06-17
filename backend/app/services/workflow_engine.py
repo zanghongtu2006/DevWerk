@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -34,14 +35,17 @@ class WorkflowEngine:
         plan_response: PlanResponse | None = None
         execute_response: IdeChatResponse | None = None
         next_phase = "planned"
+        review_feedback: dict[str, Any] | None = None
         max_rework_rounds = 3
 
         for round_no in range(1, max_rework_rounds + 2):
             _log.debug("workflow loop task_id=%s round=%s next_phase=%s", task_id, round_no, next_phase)
             _event(task_id, "workflow_round_started", {"round": round_no, "next_phase": next_phase})
+            planned_this_round = False
 
             if next_phase == "planned" or plan_response is None:
                 plan_response = await self._run_plan_column(task_id, body, workflow_summary, context_bundle)
+                planned_this_round = True
                 if not plan_response.ok:
                     response = IdeChatResponse(
                         ok=False,
@@ -72,9 +76,18 @@ class WorkflowEngine:
                     apply_workflow_action(task_id, "fail", {"phase": "planned", "reason": response.error_message})
                     _event(task_id, "workflow_finished", {"ok": False, "phase": "planned", "status_key": "failed"})
                     return
+            if planned_this_round:
+                review_feedback = None
 
             approved_paths = [file.path for file in plan_response.files]
-            execute_response = await self._run_coding_column(task_id, body, workflow_summary, approved_paths)
+            execute_response = await self._run_coding_column(
+                task_id,
+                body,
+                workflow_summary,
+                plan_response,
+                approved_paths,
+                review_feedback,
+            )
             if not execute_response.ok:
                 add_artifact(task_id, artifact_type="workflow_result", payload=execute_response.model_dump())
                 apply_workflow_action(task_id, "fail", {"phase": "coding", "reason": execute_response.error_message})
@@ -104,6 +117,7 @@ class WorkflowEngine:
 
             if decision in {"request_replan", "request_recoding"} and round_no <= max_rework_rounds:
                 next_phase = "planned" if decision == "request_replan" else "coding"
+                review_feedback = review
                 _event(
                     task_id,
                     "workflow_rework_loop",
@@ -206,21 +220,35 @@ class WorkflowEngine:
         task_id: str,
         body: dict[str, Any],
         workflow_summary: dict[str, Any],
+        plan_response: PlanResponse,
         approved_paths: list[str],
+        review_feedback: dict[str, Any] | None = None,
     ) -> IdeChatResponse:
         apply_workflow_action(task_id, "coding_started", {"phase": "coding", "approved_paths": approved_paths})
         _event(task_id, "workflow_column_started", {"status_key": "coding", "agent": "coder"})
         _event(task_id, "agent_context_built", {"phase": "coding", "agent": "coder", "context": _context_log_summary(_build_agent_context(task_id, "coding", "coder", body, workflow_summary, ["context_bundle", "code_context_summary", "plan_bundle"]))})
+        coding_messages = _coding_phase_messages(body.get("messages") or [], plan_response, review_feedback)
         execute_body = {
             "project_id": body.get("project_id"),
             "task_id": task_id,
             "mode": body.get("mode", "agent"),
             "project_root": body.get("project_root"),
-            "messages": body.get("messages") or [],
+            "messages": coding_messages,
             "workspace": body.get("workspace"),
             "approved_paths": approved_paths,
             "approved_ops": [],
         }
+        _event(
+            task_id,
+            "coding_context_prepared",
+            {
+                "plan_files": len(plan_response.files),
+                "review_feedback": bool(review_feedback),
+                "message_count": len(coding_messages),
+                "missing_changed_files": (review_feedback or {}).get("missing_changed_files") or [],
+                "unplanned_changed_files": (review_feedback or {}).get("unplanned_changed_files") or [],
+            },
+        )
         execute_response = await self.coding_runner(execute_body)
         execute_response.task_id = task_id
         add_artifact(task_id, artifact_type="code_change_bundle", payload=execute_response.model_dump())
@@ -333,6 +361,55 @@ def _build_agent_context(
         "task_events": _event_summary(task.get("events") or []),
         "project_memory": _compact_project_memory(read_project_memory(project_id)),
         "workspace": _workspace_summary(body.get("workspace")),
+    }
+
+
+def _coding_phase_messages(
+    messages: list[dict[str, Any]],
+    plan_response: PlanResponse,
+    review_feedback: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    context = {
+        "phase": "coding",
+        "planner_output": {
+            "summary": plan_response.summary,
+            "warnings": plan_response.warnings,
+            "files": [
+                {
+                    "path": file.path,
+                    "nature": file.nature,
+                    "description": file.description,
+                    "confidence": file.confidence,
+                }
+                for file in plan_response.files
+            ],
+        },
+        "review_feedback": _compact_review_feedback(review_feedback),
+        "rules": [
+            "Use planner_output.files as the approved writable target list, not merely as reading context.",
+            "For nature=deleted, emit a delete_path operation when the file should be removed.",
+            "If review_feedback is present, address missing_changed_files or unplanned_changed_files before returning done=true.",
+            "If a required file is not actually needed anymore, explain why in reply and avoid inventing unrelated paths.",
+        ],
+    }
+    return list(messages or []) + [
+        {
+            "role": "user",
+            "content": "workflow_phase_context:\n" + json.dumps(context, ensure_ascii=False, separators=(",", ":")),
+        }
+    ]
+
+
+def _compact_review_feedback(review_feedback: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(review_feedback, dict):
+        return None
+    return {
+        "decision": review_feedback.get("decision"),
+        "summary": review_feedback.get("summary"),
+        "missing_changed_files": review_feedback.get("missing_changed_files") or [],
+        "unplanned_changed_files": review_feedback.get("unplanned_changed_files") or [],
+        "normalized_plan_files": review_feedback.get("normalized_plan_files") or [],
+        "normalized_changed_files": review_feedback.get("normalized_changed_files") or [],
     }
 
 

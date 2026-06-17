@@ -22,13 +22,16 @@ OPENAI_SYSTEM_PROMPT = textwrap.dedent(
     3. Prefer code_context_summary and source_map for project structure. They
        are indexes, not full file content. Request read_file before modifying
        existing files when exact content matters.
-    4. Backend research tool_requests (list_dir/read_file/search) must not be
+    4. If workflow_phase_context is present, treat planner_output as the
+       current coding contract and review_feedback as mandatory rework
+       guidance. Address missing_changed_files before returning done=true.
+    5. Backend research tool_requests (list_dir/read_file/search) must not be
        returned with ops/patch_ops. Client-side post-apply tools such as
        run_command may be returned with ops/patch_ops.
-    5. patch_ops only allows apply_patch and must contain unified diff content
+    6. patch_ops only allows apply_patch and must contain unified diff content
        with --- / +++ / @@ markers.
-    6. read_file requests must include path, start_line, and end_line.
-    7. Use run_command only for project-local build/test commands. Do not use
+    7. read_file requests must include path, start_line, and end_line.
+    8. Use run_command only for project-local build/test commands. Do not use
        shell wrappers such as cmd, powershell, bash, or sh.
 
     JSON Schema:
