@@ -287,7 +287,7 @@ DASHBOARD_HTML = r"""
     .toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
     .grid { display: grid; gap: 12px; }
     .stats { grid-template-columns: repeat(4, minmax(140px, 1fr)); }
-    .metric, .project-row, .column, .task, .settings-box { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+    .metric, .project-row, .column, .task, .settings-box, .detail-card, .phase-card, .artifact-card { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
     .metric { padding: 12px; }
     .metric b { display: block; font-size: 22px; margin-top: 4px; }
     .muted { color: var(--muted); }
@@ -305,6 +305,21 @@ DASHBOARD_HTML = r"""
     .task p { margin: 0 0 8px; color: var(--muted); white-space: pre-wrap; }
     .task footer { display: flex; gap: 6px; flex-wrap: wrap; }
     .task footer button { height: 28px; padding: 0 8px; font-size: 12px; }
+    .detail-layout { display: grid; grid-template-columns: minmax(280px, 360px) 1fr; gap: 12px; align-items: start; }
+    .detail-card, .phase-card, .artifact-card { padding: 12px; }
+    .detail-card h3, .phase-card h3, .artifact-card h3 { margin: 0 0 8px; font-size: 14px; }
+    .detail-card p, .phase-card p { margin: 0 0 8px; white-space: pre-wrap; }
+    .detail-section { display: grid; gap: 10px; }
+    .phase-grid { display: grid; gap: 10px; }
+    .phase-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+    .phase-title { font-weight: 700; }
+    .pill { display: inline-flex; align-items: center; min-height: 22px; padding: 0 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+    .kv { display: grid; grid-template-columns: 120px 1fr; gap: 4px 10px; margin: 8px 0; font-size: 12px; }
+    .kv b { color: var(--muted); font-weight: 600; }
+    .detail-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+    .detail-list li { border: 1px solid var(--line); border-radius: 7px; padding: 7px 8px; color: var(--muted); overflow-wrap: anywhere; }
+    .detail-pre, .phase-card pre, .artifact-card pre { margin: 8px 0 0; overflow: auto; max-height: 340px; padding: 8px; border-radius: 7px; border: 1px solid var(--line); background: color-mix(in srgb, var(--bg) 80%, var(--panel)); font-size: 12px; }
+    .artifact-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
     .events { display: grid; gap: 8px; }
     .event-row { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 10px; }
     .event-head { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; flex-wrap: wrap; }
@@ -322,7 +337,7 @@ DASHBOARD_HTML = r"""
     .settings-box { padding: 12px; }
     .settings-box h3 { margin: 0 0 10px; font-size: 14px; }
     .wide { grid-column: 1 / -1; }
-    @media (max-width: 900px) { .shell, .shell.collapsed { grid-template-columns: 1fr; } aside { position: sticky; top: 0; z-index: 2; border-right: 0; border-bottom: 1px solid var(--line); } nav { grid-template-columns: repeat(6, 1fr); } .stats, .settings-grid, .memory-grid { grid-template-columns: 1fr; } .project-select { min-width: 0; width: 100%; margin-left: 0; } }
+    @media (max-width: 900px) { .shell, .shell.collapsed { grid-template-columns: 1fr; } aside { position: sticky; top: 0; z-index: 2; border-right: 0; border-bottom: 1px solid var(--line); } nav { grid-template-columns: repeat(7, 1fr); } .stats, .settings-grid, .memory-grid, .detail-layout { grid-template-columns: 1fr; } .project-select { min-width: 0; width: 100%; margin-left: 0; } }
   </style>
 </head>
 <body>
@@ -333,6 +348,7 @@ DASHBOARD_HTML = r"""
         <button data-view="stats" class="active">S <span>Statistics</span></button>
         <button data-view="projects">P <span>Projects</span></button>
         <button data-view="kanban">K <span>Kanban</span></button>
+        <button data-view="details">D <span>Details</span></button>
         <button data-view="events">E <span>Events</span></button>
         <button data-view="memory">M <span>Memory</span></button>
         <button data-view="settings">G <span>Settings</span></button>
@@ -361,6 +377,10 @@ DASHBOARD_HTML = r"""
           <div class="toolbar"><input id="taskTitle" placeholder="Task title" /><input id="taskDescription" placeholder="Description" /><button id="createTask" class="primary">Create Task</button></div>
           <div id="board" class="board"></div>
         </section>
+        <section id="view-details" class="view">
+          <div class="toolbar"><input id="detailTaskId" placeholder="Task id" /><button id="loadTaskDetail" class="primary">Load Task</button><button id="detailRefresh">Refresh Detail</button></div>
+          <div id="taskDetail" class="detail-section"><div class="muted">Select a task from Kanban or paste a task id.</div></div>
+        </section>
         <section id="view-events" class="view">
           <div class="toolbar"><input id="eventTaskId" placeholder="Filter task id" /><input id="eventLimit" placeholder="Limit" value="200" /><button id="loadEvents" class="primary">Load Events</button></div>
           <div id="eventList" class="events"></div>
@@ -387,7 +407,7 @@ DASHBOARD_HTML = r"""
   </div>
   <script>
     const $ = (id) => document.getElementById(id);
-    const state = { view: "stats", projects: [], projectId: "default", board: null, events: [], memory: null };
+    const state = { view: "stats", projects: [], projectId: "default", board: null, events: [], memory: null, taskDetail: null };
     async function api(path, options = {}) {
       const res = await fetch(path, { ...options, headers: { "Content-Type": "application/json", "X-DevWerk-Project-Id": state.projectId, ...(options.headers || {}) } });
       const text = await res.text();
@@ -420,6 +440,14 @@ DASHBOARD_HTML = r"""
       state.memory = data.memory || {};
       renderMemory();
     }
+    async function loadTaskDetail(taskId = "") {
+      const id = (taskId || $("detailTaskId").value || "").trim();
+      if (!id) { state.taskDetail = null; renderTaskDetail(); return; }
+      const data = await api(`/v1/kanban/tasks/${encodeURIComponent(id)}`);
+      state.taskDetail = data.task || {};
+      $("detailTaskId").value = id;
+      renderTaskDetail();
+    }
     async function loadGlobalSettings() {
       const data = await api("/v1/settings"); const s = data.settings || {};
       $("llmsJson").value = JSON.stringify(s.llms || {}, null, 2);
@@ -444,18 +472,97 @@ DASHBOARD_HTML = r"""
     }
     function renderTask(task, col, columns) {
       const actions = [];
+      actions.push(`<button data-task="${escapeAttr(task.id)}" data-action="detail">Details</button>`);
       if (task.status_key === "failed") actions.push(`<button data-task="${escapeAttr(task.id)}" data-action="retry">Retry</button>`);
       if (!["done", "failed"].includes(task.status_key)) actions.push(`<button data-task="${escapeAttr(task.id)}" data-action="abandon">Abandon</button>`);
       return `<article class="task"><strong>${escapeHtml(task.title)}</strong><p>${escapeHtml(task.description || "")}</p><small class="muted">${escapeHtml(task.status_key)} / ${escapeHtml(task.id)}</small><footer>${actions.join("")}</footer></article>`;
     }
+    function renderTaskDetail() {
+      const task = state.taskDetail;
+      if (!task) {
+        $("taskDetail").innerHTML = `<div class="muted">Select a task from Kanban or paste a task id.</div>`;
+        return;
+      }
+      const artifacts = task.artifacts || [];
+      const events = task.events || [];
+      const phaseOutputs = artifacts
+        .filter(a => a.artifact_type === "workflow_phase_output" && a.payload)
+        .map(a => ({ ...a.payload, created_at: a.created_at }));
+      const keyArtifacts = latestArtifacts(artifacts, [
+        "code_context_summary",
+        "context_bundle",
+        "plan_bundle",
+        "code_change_bundle",
+        "review_bundle",
+        "workflow_result",
+        "apply_result",
+        "agent_message"
+      ]);
+      const paths = collectTaskPaths(artifacts);
+      $("taskDetail").innerHTML = `
+        <div class="detail-layout">
+          <aside class="detail-card">
+            <h3>${escapeHtml(task.title || task.id)}</h3>
+            <p class="muted">${escapeHtml(task.description || "")}</p>
+            <div class="kv">
+              <b>Status</b><span>${escapeHtml(task.status_key || "")}</span>
+              <b>Task</b><span>${escapeHtml(task.id || "")}</span>
+              <b>Project</b><span>${escapeHtml(task.project_id || "")}</span>
+              <b>Priority</b><span>${escapeHtml(task.priority ?? 0)}</span>
+              <b>Created</b><span>${escapeHtml(task.created_at || "")}</span>
+              <b>Updated</b><span>${escapeHtml(task.updated_at || "")}</span>
+            </div>
+            <h3>Changed / Planned Paths</h3>
+            <ul class="detail-list">${paths.map(p => `<li>${escapeHtml(p)}</li>`).join("") || "<li>No paths recorded</li>"}</ul>
+          </aside>
+          <section class="detail-section">
+            <div class="detail-card">
+              <h3>Agent Phases</h3>
+              <div class="phase-grid">${phaseOutputs.map(renderPhaseOutput).join("") || `<div class="muted">No phase outputs recorded</div>`}</div>
+            </div>
+            <div class="detail-card">
+              <h3>Artifacts</h3>
+              <div class="artifact-grid">${keyArtifacts.map(renderArtifact).join("") || `<div class="muted">No artifacts recorded</div>`}</div>
+            </div>
+            <div class="detail-card">
+              <h3>Task Events</h3>
+              <div class="events">${events.slice().reverse().map(renderEventRow).join("") || `<div class="muted">No events</div>`}</div>
+            </div>
+          </section>
+        </div>
+      `;
+    }
+    function renderPhaseOutput(phase) {
+      const warnings = phase.warnings || [];
+      return `<article class="phase-card">
+        <div class="phase-head"><span class="phase-title">${escapeHtml(phase.phase || "phase")} / ${escapeHtml(phase.agent || "agent")}</span><span class="pill">${escapeHtml(phase.status_key || "")}</span></div>
+        <p>${escapeHtml(phase.summary || "")}</p>
+        <div class="kv">
+          <b>Decision</b><span>${escapeHtml(phase.decision || "-")}</span>
+          <b>Next</b><span>${escapeHtml(phase.next_action || "-")}</span>
+          <b>Session</b><span>${escapeHtml(phase.session_id || "-")}</span>
+          <b>Created</b><span>${escapeHtml(phase.created_at || "-")}</span>
+        </div>
+        ${warnings.length ? `<ul class="detail-list">${warnings.map(w => `<li>${escapeHtml(w)}</li>`).join("")}</ul>` : ""}
+        <details><summary>Inputs</summary><pre>${escapeHtml(prettyJson(phase.inputs || {}))}</pre></details>
+        <details><summary>Outputs</summary><pre>${escapeHtml(prettyJson(phase.outputs || {}))}</pre></details>
+      </article>`;
+    }
+    function renderArtifact(artifact) {
+      return `<article class="artifact-card">
+        <div class="phase-head"><h3>${escapeHtml(artifact.artifact_type)}</h3><span class="pill">${escapeHtml(artifact.created_at || "")}</span></div>
+        <pre>${escapeHtml(prettyJson(artifact.payload || {}))}</pre>
+      </article>`;
+    }
+    function renderEventRow(event) {
+      const payload = JSON.stringify(event.payload || {}, null, 2);
+      const flow = event.from_status || event.to_status ? `${event.from_status || "-"} -> ${event.to_status || "-"}` : "no status change";
+      const task = event.task_title ? `${event.task_title} / ${event.task_id}` : event.task_id;
+      return `<article class="event-row"><div class="event-head"><span class="event-title">${escapeHtml(event.event_type)}</span><span class="event-meta">${escapeHtml(event.created_at)}</span></div><div class="event-flow">${escapeHtml(flow)}</div><div class="event-meta">${escapeHtml(task || "")}</div><details><summary>Payload</summary><pre>${escapeHtml(payload)}</pre></details></article>`;
+    }
     function renderEvents() {
       const rows = state.events || [];
-      $("eventList").innerHTML = rows.map(event => {
-        const payload = JSON.stringify(event.payload || {}, null, 2);
-        const flow = event.from_status || event.to_status ? `${event.from_status || "-"} -> ${event.to_status || "-"}` : "no status change";
-        const task = event.task_title ? `${event.task_title} / ${event.task_id}` : event.task_id;
-        return `<article class="event-row"><div class="event-head"><span class="event-title">${escapeHtml(event.event_type)}</span><span class="event-meta">${escapeHtml(event.created_at)}</span></div><div class="event-flow">${escapeHtml(flow)}</div><div class="event-meta">${escapeHtml(task || "")}</div><details><summary>Details</summary><pre>${escapeHtml(payload)}</pre></details></article>`;
-      }).join("") || `<div class="muted">No events</div>`;
+      $("eventList").innerHTML = rows.map(renderEventRow).join("") || `<div class="muted">No events</div>`;
     }
     function renderMemory() {
       const memory = state.memory || {};
@@ -469,7 +576,7 @@ DASHBOARD_HTML = r"""
     function renderMemoryList(id, rows, labelFn) {
       $(id).innerHTML = rows.map(item => `<li>${escapeHtml(labelFn(item))}</li>`).join("") || `<li>No data</li>`;
     }
-    function renderActive() { document.querySelectorAll(".view").forEach(v => v.classList.remove("active")); document.querySelector(`#view-${state.view}`).classList.add("active"); document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b.dataset.view === state.view)); $("title").textContent = { stats: "Statistics", projects: "Projects", kanban: "Kanban", events: "Events", memory: "Memory", settings: "Settings" }[state.view]; }
+    function renderActive() { document.querySelectorAll(".view").forEach(v => v.classList.remove("active")); document.querySelector(`#view-${state.view}`).classList.add("active"); document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b.dataset.view === state.view)); $("title").textContent = { stats: "Statistics", projects: "Projects", kanban: "Kanban", details: "Task Details", events: "Events", memory: "Memory", settings: "Settings" }[state.view]; }
     async function createProject() { const projectId = $("newProjectId").value.trim(); const name = $("newProjectName").value.trim() || projectId; if (!projectId) return; await api("/v1/kanban/projects", { method: "POST", body: JSON.stringify({ project_id: projectId, name }) }); state.projectId = projectId; $("newProjectId").value = ""; $("newProjectName").value = ""; await refreshAll(); }
     async function createTask() { const title = $("taskTitle").value.trim(); if (!title) return; await api("/v1/kanban/tasks", { method: "POST", body: JSON.stringify({ project_id: state.projectId, title, description: $("taskDescription").value.trim() }) }); $("taskTitle").value = ""; $("taskDescription").value = ""; await refreshAll(); }
     async function saveGlobalSettings() { await api("/v1/settings", { method: "PUT", body: JSON.stringify({ llms: JSON.parse($("llmsJson").value || "{}"), routing: JSON.parse($("routingJson").value || "{}") }) }); await refreshAll(); }
@@ -489,14 +596,41 @@ DASHBOARD_HTML = r"""
     $("resetColumns").onclick = () => resetColumns().catch(showError);
     $("loadEvents").onclick = () => loadEvents().catch(showError);
     $("loadMemory").onclick = () => loadMemory().catch(showError);
+    $("loadTaskDetail").onclick = () => loadTaskDetail().catch(showError);
+    $("detailRefresh").onclick = () => loadTaskDetail().catch(showError);
     $("projectList").onclick = async (event) => { const btn = event.target.closest("button[data-project]"); if (!btn) return; state.projectId = btn.dataset.project; state.view = btn.dataset.action === "open-project-settings" ? "projects" : "kanban"; await refreshAll().catch(showError); };
     $("board").onclick = async (event) => {
       const btn = event.target.closest("button[data-task]");
       if (!btn) return;
+      if (btn.dataset.action === "detail") { state.view = "details"; renderActive(); await loadTaskDetail(btn.dataset.task).catch(showError); return; }
       if (btn.dataset.action === "retry") await api(`/v1/kanban/tasks/${btn.dataset.task}/actions`, { method: "POST", body: JSON.stringify({ action: "retry", payload: { reason: "user_requested_retry" } }) });
       if (btn.dataset.action === "abandon") await api(`/v1/kanban/tasks/${btn.dataset.task}/actions`, { method: "POST", body: JSON.stringify({ action: "abandon", payload: { reason: "user_abandoned_task" } }) });
       await refreshAll();
     };
+    function latestArtifacts(artifacts, types) {
+      const out = [];
+      for (const type of types) {
+        const matches = artifacts.filter(a => a.artifact_type === type);
+        if (matches.length) out.push(matches[matches.length - 1]);
+      }
+      return out;
+    }
+    function collectTaskPaths(artifacts) {
+      const paths = new Set();
+      for (const artifact of artifacts || []) {
+        const payload = artifact.payload || {};
+        const files = payload.files || payload.outputs?.files || [];
+        if (Array.isArray(files)) for (const item of files) if (item?.path) paths.add(item.path);
+        const ops = payload.ops || payload.outputs?.ops || [];
+        if (Array.isArray(ops)) for (const item of ops) if (item?.path) paths.add(item.path);
+        const changed = payload.changed_paths || payload.outputs?.changed_files || payload.changed_files || [];
+        if (Array.isArray(changed)) for (const item of changed) paths.add(String(item));
+        const planFiles = payload.plan_files || [];
+        if (Array.isArray(planFiles)) for (const item of planFiles) paths.add(String(item));
+      }
+      return [...paths].sort();
+    }
+    function prettyJson(value) { try { return JSON.stringify(value, null, 2); } catch { return String(value); } }
     function clearError() { $("error").textContent = ""; }
     function showError(err) { $("error").textContent = err.message || String(err); }
     function escapeHtml(value) { return String(value).replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[ch])); }

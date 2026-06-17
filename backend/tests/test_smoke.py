@@ -29,6 +29,17 @@ def test_default_kanban_flow_contains_required_control_points():
         assert required in statuses
 
 
+def test_dashboard_contains_task_detail_surface():
+    from app.routes.kanban import DASHBOARD_HTML
+
+    assert 'data-view="details"' in DASHBOARD_HTML
+    assert 'id="view-details"' in DASHBOARD_HTML
+    assert "loadTaskDetail" in DASHBOARD_HTML
+    assert "workflow_phase_output" in DASHBOARD_HTML
+    assert "code_context_summary" in DASHBOARD_HTML
+    assert "review_bundle" in DASHBOARD_HTML
+
+
 def test_workflow_action_protocol_drives_kanban_state(monkeypatch, tmp_path):
     import app.services.kanban as kanban_service
     import app.services.session_store as session_store
