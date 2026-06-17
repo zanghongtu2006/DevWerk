@@ -24,7 +24,7 @@ from app.core.config import settings
 from app.models.ide import IdeChatResponse, ToolRequest, ToolResult
 from app.models.plan import PlanResponse
 from app.services.coerce import coerce_to_fileops, coerce_to_patchops, coerce_to_toolrequests
-from app.services.coder_harness import build_coder_skill
+from app.services.coder_harness import build_code_context_summary, build_coder_skill
 from app.services.kanban import add_artifact, add_event, create_task, get_task, list_events, move_task
 from app.services.llm_factory import get_llm_client
 from app.services.planner import Planner as build_planner
@@ -701,14 +701,21 @@ def _append_workspace_context(messages: list[dict], workspace: object) -> list[d
         _log.debug("append_workspace_context: no workspace dict type=%s", type(workspace).__name__)
         return messages
     _log.debug("append_workspace_context: input_messages=%s workspace=%s", len(messages), _workspace_debug_summary(workspace))
+    code_context = build_code_context_summary(workspace)
     coder_skill = build_coder_skill(workspace)
     compact = json.dumps(workspace, ensure_ascii=False, separators=(",", ":"))
     injected = list(messages)
+    if code_context.get("available"):
+        code_context_json = json.dumps(code_context, ensure_ascii=False, separators=(",", ":"))
+        injected.append({"role": "user", "content": "code_context_summary:\n" + code_context_json})
+        _log.debug("append_workspace_context: injected code_context_summary chars=%s", len(code_context_json))
+    else:
+        _log.debug("append_workspace_context: code_context_summary unavailable reason=%s", code_context.get("reason"))
     if coder_skill:
         injected.append({"role": "user", "content": coder_skill})
-        _log.debug("append_workspace_context: injected coder_harness_skill chars=%s", len(coder_skill))
+        _log.debug("append_workspace_context: injected code_context_skill chars=%s", len(coder_skill))
     else:
-        _log.debug("append_workspace_context: coder_harness_skill not generated")
+        _log.debug("append_workspace_context: code_context_skill not generated")
     injected.append({"role": "user", "content": "workspace_summary:\n" + compact})
     _log.debug("append_workspace_context: injected workspace_summary chars=%s output_messages=%s", len(compact), len(injected))
     return injected
@@ -827,7 +834,7 @@ def _tool_search(root: Path, query: str, paths: list[str], max_results: int) -> 
     needle = query.strip()
     if not needle:
         return "[search] empty query"
-    roots = paths or ["src", "app", ""]
+    roots = paths or [""]
     filename_mode = _looks_like_filename_query(needle)
     results: list[str] = []
     for rel in roots:
@@ -877,7 +884,7 @@ def _has_hidden_dir_segment(rel: str) -> bool:
 def _looks_like_filename_query(query: str) -> bool:
     if any(ch in query for ch in ("/", "\\", "\n", "\t")) or "." not in query:
         return False
-    return query.lower().endswith((".java", ".kt", ".xml", ".yml", ".yaml", ".gradle", ".properties", ".json"))
+    return bool(re.fullmatch(r"[^./\\\s][^/\\\s]*\.[^./\\\s][^/\\\s]*", query.strip()))
 
 
 def _int_arg(value: object, default: int, minimum: int, maximum: int) -> int:

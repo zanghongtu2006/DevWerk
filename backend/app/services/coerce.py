@@ -11,6 +11,7 @@ _EXT_SPACE_RE = re.compile(r"\.\s+([A-Za-z0-9]{1,8})$")
 _SLASH_SPACE_RE = re.compile(r"/\s+")
 _SPACE_SLASH_RE = re.compile(r"\s+/")
 
+
 def _normalize_rel_path(p: str) -> str:
     s = (p or "").strip().replace("\\", "/")
     while s.startswith("/"):
@@ -20,29 +21,22 @@ def _normalize_rel_path(p: str) -> str:
 
 def _canonicalize_for_match(p: str) -> str:
     """
-    用于“对齐匹配”的 canonical key（尽量保守）：
-    - 统一斜杠
-    - 去掉扩展名前的空格：Main. java -> Main.java
-    - 去掉斜杠两侧的多余空格：test/ Main.java -> test/Main.java
-      （仅用于匹配，不会直接改写真实路径，真实写回用 candidates 里的路径）
+    Conservative canonical key for matching paths only.
+
+    It normalizes slashes, removes whitespace around slashes, and fixes a space
+    before an extension. The real path written back still comes from the
+    verified candidate list when possible.
     """
     s = _normalize_rel_path(p)
-
-    #  修正 "/ Main.java" 这种
-    s = _SLASH_SPACE_RE.sub("/", s)   # "/   " -> "/"
-    s = _SPACE_SLASH_RE.sub("/", s)   # "   /" -> "/"
-
-    #  只修扩展名空格 ". java"
-    s = _EXT_SPACE_RE.sub(r".\1", s)
-    return s
+    s = _SLASH_SPACE_RE.sub("/", s)
+    s = _SPACE_SLASH_RE.sub("/", s)
+    return _EXT_SPACE_RE.sub(r".\1", s)
 
 
 def _extract_paths_from_tool_results(tool_results: List[ToolResult]) -> Set[str]:
     """
-    WorkspaceTools.search 的返回你现在是纯路径逐行输出：
-      src/Main.java
-      src/main/java/...
-    这里尽量保守解析：过滤掉 [search] no hits 等。
+    Workspace search returns plain project-relative paths, one per line.
+    Parse conservatively and ignore marker lines such as [search] no hits.
     """
     out: Set[str] = set()
     for tr in tool_results or []:
@@ -50,12 +44,8 @@ def _extract_paths_from_tool_results(tool_results: List[ToolResult]) -> Set[str]
             continue
         for line in tr.content.splitlines():
             s = line.strip()
-            if not s:
+            if not s or s.startswith("["):
                 continue
-            if s.startswith("["):  # 比如 [search] no hits
-                continue
-            # 保守：只收“看起来像相对路径”的行
-            # 允许包含空格（理论上路径可以有空格），但我们不在这里做额外改写
             s = _normalize_rel_path(s)
             if s:
                 out.add(s)
@@ -64,12 +54,9 @@ def _extract_paths_from_tool_results(tool_results: List[ToolResult]) -> Set[str]
 
 def _align_delete_paths(ops: List[FileOp], tool_results: Optional[List[ToolResult]]) -> List[FileOp]:
     """
-    对齐规则（保守）：
-    - 只对 delete_path 生效
-    - 如果 delete_path.path 不在 tool_results 的候选路径中：
-        * 尝试把 ". java" 修成 ".java" 再匹配
-        * 若匹配成功，用真实路径替换
-      （避免出现你 log 里那种 Main. java 导致删不到）
+    Align delete_path operations with exact tool-result paths when available.
+    This avoids deleting guessed paths while still tolerating minor model
+    formatting issues such as spaces around slashes or before extensions.
     """
     if not tool_results:
         return ops
@@ -78,11 +65,9 @@ def _align_delete_paths(ops: List[FileOp], tool_results: Optional[List[ToolResul
     if not candidates:
         return ops
 
-    # 构建 canonical -> real 的映射（同一个 canonical 多个真实值时，保持第一个）
     canon_to_real: Dict[str, str] = {}
     for p in candidates:
-        k = _canonicalize_for_match(p)
-        canon_to_real.setdefault(k, p)
+        canon_to_real.setdefault(_canonicalize_for_match(p), p)
 
     aligned: List[FileOp] = []
     for op in ops:
@@ -91,24 +76,14 @@ def _align_delete_paths(ops: List[FileOp], tool_results: Optional[List[ToolResul
             continue
 
         raw = _normalize_rel_path(op.path or "")
-        if not raw:
+        if not raw or raw in candidates:
             aligned.append(op)
             continue
 
-        # 1) 直接命中
-        if raw in candidates:
-            aligned.append(op)
-            continue
-
-        # 2) canonical 命中（修 ". java"）
-        k = _canonicalize_for_match(raw)
-        real = canon_to_real.get(k)
+        real = canon_to_real.get(_canonicalize_for_match(raw))
         if real:
-            aligned.append(
-                FileOp(op=op.op, path=real, language=op.language, content=op.content)
-            )
+            aligned.append(FileOp(op=op.op, path=real, language=op.language, content=op.content))
         else:
-            # 找不到就原样返回（不做危险猜测）
             aligned.append(op)
 
     return aligned
@@ -129,8 +104,6 @@ def coerce_to_fileops(
         for o in (obj_ops or [])
         if isinstance(o, dict)
     ]
-
-    #  关键：对齐 delete_path
     return _align_delete_paths(ops, tool_results)
 
 

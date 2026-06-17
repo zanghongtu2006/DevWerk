@@ -8,7 +8,7 @@ from typing import Dict, List
 from app.core.prompt_factory import build_system_prompt
 from app.core.schema import MODEL_RESPONSE_SCHEMA
 from app.models.ide import IdeChatRequest
-from app.services.coder_harness import build_coder_skill
+from app.services.coder_harness import build_code_context_summary, build_coder_skill
 
 _log = logging.getLogger("devwerk.prompt_builder")
 
@@ -47,12 +47,23 @@ def build_model_messages(req: IdeChatRequest, provider: str) -> List[Dict[str, s
     if req.workspace is not None:
         workspace_obj = req.workspace.model_dump(exclude_none=True)
         _log.debug("build_model_messages: workspace_summary=%s", _workspace_debug_summary(workspace_obj))
+        code_context = build_code_context_summary(workspace_obj)
+        if code_context.get("available"):
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "code_context_summary:\n" + json.dumps(code_context, ensure_ascii=False, separators=(",", ":")),
+                }
+            )
+            _log.debug("build_model_messages: injected code_context_summary")
+        else:
+            _log.debug("build_model_messages: code_context_summary unavailable reason=%s", code_context.get("reason"))
         coder_skill = build_coder_skill(workspace_obj)
         if coder_skill:
             messages.append({"role": "user", "content": coder_skill})
-            _log.debug("build_model_messages: injected coder_harness_skill chars=%s", len(coder_skill))
+            _log.debug("build_model_messages: injected code_context_skill chars=%s", len(coder_skill))
         else:
-            _log.debug("build_model_messages: coder_harness_skill not generated")
+            _log.debug("build_model_messages: code_context_skill not generated")
 
         messages.append(
             {

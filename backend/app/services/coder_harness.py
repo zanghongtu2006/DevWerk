@@ -1,189 +1,119 @@
 """
-Coder harness agent.
+Source-map driven code context helpers.
 
-This is the first backend-owned coding harness. It consumes the IDE-provided
-source map, identifies the current project/framework shape, and produces a
-per-request writing skill for the model. Future versions can replace the local
-heuristics with a memory-backed framework recognition agent.
+The backend must not hard-code framework or business layout decisions. This
+module turns the IDE-provided source_map into a compact, factual summary that
+agents can use as evidence when planning and writing code.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import dataclass
+from collections import Counter
 from typing import Any
 
 _log = logging.getLogger("devwerk.coder_harness")
 
-
-@dataclass(frozen=True)
-class FrameworkProfile:
-    name: str
-    confidence: float
-    evidence: list[str]
-    languages: list[str]
-    build_systems: list[str]
+MAX_REPRESENTATIVE_FILES = 40
+MAX_SYMBOLS = 160
+MAX_IMPORTS = 120
+MAX_DIRECTORIES = 100
 
 
 class CoderHarness:
     """
-    Build a local, zero-token coder skill from source_map.
+    Build a local, zero-token code context from source_map.
 
-    The skill is intentionally textual because it is injected into the same
-    message stream as workspace_summary and can be consumed by any LLM adapter.
+    The public build_skill name is retained for existing call sites, but the
+    content is now generic and evidence-only. It does not classify frameworks
+    or invent writing rules from backend heuristics.
     """
 
     def build_skill(self, workspace: dict[str, Any] | None) -> str | None:
-        _log.debug("CoderHarness.build_skill: start workspace_type=%s", type(workspace).__name__)
-        source_map = _extract_source_map(workspace)
-        if not source_map:
-            _log.debug("CoderHarness.build_skill: no source_map found; skip coder skill")
+        summary = build_code_context_summary(workspace)
+        if not summary.get("available"):
+            _log.debug("CoderHarness.build_skill: summary unavailable reason=%s", summary.get("reason"))
             return None
-
-        _log_source_map(source_map)
-        files = _source_files(source_map)
-        _log.debug("CoderHarness.build_skill: normalized_files_count=%s", len(files))
-        profile = self._detect_framework(files)
-        skill = self._render_skill(profile, files)
-        _log.debug(
-            "CoderHarness.build_skill: generated framework=%s confidence=%.2f evidence=%s skill_chars=%s",
-            profile.name,
-            profile.confidence,
-            profile.evidence,
-            len(skill),
-        )
-        return skill
-
-    def _detect_framework(self, files: list[dict[str, Any]]) -> FrameworkProfile:
-        _log.debug("CoderHarness.detect: start files=%s", len(files))
-        paths = {str(f.get("path") or "").replace("\\", "/") for f in files}
-        imports = {
-            str(imp)
-            for f in files
-            for imp in (f.get("imports") or [])
-            if imp
+        guidance = {
+            "role": "coder",
+            "source": "IDE source_map",
+            "rules": summary.get("path_policy") or [],
+            "representative_paths": [
+                item.get("path")
+                for item in (summary.get("representative_files") or [])[:20]
+                if isinstance(item, dict) and item.get("path")
+            ],
         }
-        languages = sorted({
-            str(f.get("language") or "").lower()
-            for f in files
-            if f.get("language")
-        })
-
-        _log.debug("CoderHarness.detect: languages=%s", languages)
-        _log.debug("CoderHarness.detect: sample_paths=%s", sorted(p for p in paths if p)[:30])
-        _log.debug("CoderHarness.detect: sample_imports=%s", sorted(imports)[:30])
-
-        evidence: list[str] = []
-        build_systems: list[str] = []
-
-        if "pom.xml" in paths:
-            build_systems.append("maven")
-            evidence.append("pom.xml")
-            _log.debug("CoderHarness.detect: build signal maven via pom.xml")
-        if any(p.endswith("build.gradle") or p.endswith("build.gradle.kts") for p in paths):
-            build_systems.append("gradle")
-            evidence.append("Gradle build file")
-            _log.debug("CoderHarness.detect: build signal gradle via build.gradle(.kts)")
-        if "package.json" in paths:
-            build_systems.append("npm")
-            evidence.append("package.json")
-            _log.debug("CoderHarness.detect: build signal npm via package.json")
-
-        has_intellij_plugin = (
-            "src/main/resources/META-INF/plugin.xml" in paths
-            or "idea-plugin/src/main/resources/META-INF/plugin.xml" in paths
-        )
-        has_fastapi_like_backend = (
-            any(p.endswith("app/main.py") for p in paths)
-            and any("/routes/" in f"/{p}" or p.endswith("routes/ide.py") for p in paths)
-        )
-        _log.debug(
-            "CoderHarness.detect: feature_flags intellij_plugin=%s fastapi_like_backend=%s",
-            has_intellij_plugin,
-            has_fastapi_like_backend,
-        )
-
-        if has_intellij_plugin and has_fastapi_like_backend:
-            evidence.extend(["IntelliJ plugin.xml", "FastAPI-style backend layout"])
-            _log.debug("CoderHarness.detect: matched devwerk-monorepo evidence=%s", evidence)
-            return FrameworkProfile("devwerk-monorepo", 0.9, evidence, languages, build_systems)
-
-        if any(i.startswith("org.springframework") for i in imports):
-            evidence.append("Spring imports")
-            _log.debug("CoderHarness.detect: matched spring-boot evidence=%s", evidence)
-            return FrameworkProfile("spring-boot", 0.9, evidence, languages, build_systems)
-
-        if has_intellij_plugin:
-            evidence.append("IntelliJ plugin.xml")
-            _log.debug("CoderHarness.detect: matched intellij-plugin evidence=%s", evidence)
-            return FrameworkProfile("intellij-plugin", 0.9, evidence, languages, build_systems)
-
-        if has_fastapi_like_backend or (
-            any(p.endswith("app/main.py") for p in paths)
-            and any("fastapi" in p.lower() for p in paths | imports)
-        ):
-            evidence.append("FastAPI-style app entrypoint")
-            _log.debug("CoderHarness.detect: matched fastapi evidence=%s", evidence)
-            return FrameworkProfile("fastapi", 0.85, evidence, languages, build_systems)
-
-        if any(p.endswith(".tsx") or p.endswith(".jsx") for p in paths):
-            evidence.append("React-style JSX/TSX files")
-            _log.debug("CoderHarness.detect: matched react evidence=%s", evidence)
-            return FrameworkProfile("react", 0.7, evidence, languages, build_systems)
-
-        if any(p.endswith(".vue") for p in paths):
-            evidence.append("Vue single-file components")
-            _log.debug("CoderHarness.detect: matched vue evidence=%s", evidence)
-            return FrameworkProfile("vue", 0.75, evidence, languages, build_systems)
-
-        if "py" in languages:
-            evidence.append("Python source files")
-            _log.debug("CoderHarness.detect: matched python evidence=%s", evidence)
-            return FrameworkProfile("python", 0.55, evidence, languages, build_systems)
-
-        if "java" in languages or "kt" in languages or "kts" in languages:
-            evidence.append("JVM source files")
-            _log.debug("CoderHarness.detect: matched jvm evidence=%s", evidence)
-            return FrameworkProfile("jvm", 0.55, evidence, languages, build_systems)
-
-        evidence.append("No framework-specific signals")
-        _log.debug("CoderHarness.detect: matched generic evidence=%s", evidence)
-        return FrameworkProfile("generic", 0.35, evidence, languages, build_systems)
-
-    def _render_skill(self, profile: FrameworkProfile, files: list[dict[str, Any]]) -> str:
-        top_paths = _representative_paths(files)
-        rules = _framework_rules(profile.name)
-        _log.debug(
-            "CoderHarness.render: framework=%s representative_paths=%s rules_count=%s",
-            profile.name,
-            top_paths,
-            len(rules),
-        )
-
-        return "\n".join([
-            "coder_harness_skill:",
-            f"  role: coder",
-            f"  framework: {profile.name}",
-            f"  confidence: {profile.confidence:.2f}",
-            f"  languages: {', '.join(profile.languages) if profile.languages else 'unknown'}",
-            f"  build_systems: {', '.join(profile.build_systems) if profile.build_systems else 'unknown'}",
-            "  evidence:",
-            *[f"    - {item}" for item in profile.evidence[:8]],
-            "  representative_paths:",
-            *[f"    - {path}" for path in top_paths],
-            "  writing_rules:",
-            *[f"    - {rule}" for rule in rules],
-            "  invariant_rules:",
-            "    - Treat source_map as an index, not full source content.",
-            "    - Use source_map first to locate likely files, then request read_file for exact content before editing.",
-            "    - Prefer patch_ops.apply_patch for existing files; use file ops only for creates/deletes or whole-file generation.",
-            "    - Do not write outside approved frontend paths during execute.",
-            "    - Preserve project-local architecture, package names, naming style, and build boundaries.",
-        ])
+        rendered = "code_context_skill:\n" + json.dumps(guidance, ensure_ascii=False, separators=(",", ":"))
+        _log.debug("CoderHarness.build_skill: rendered chars=%s", len(rendered))
+        return rendered
 
 
 def build_coder_skill(workspace: dict[str, Any] | None) -> str | None:
     return CoderHarness().build_skill(workspace)
+
+
+def build_code_context_summary(workspace: dict[str, Any] | None) -> dict[str, Any]:
+    source_map = _extract_source_map(workspace)
+    if not source_map:
+        return {
+            "available": False,
+            "reason": "source_map_missing",
+            "warnings": ["No IDE source_map was provided; agents must request exact context before choosing paths."],
+        }
+
+    _log_source_map(source_map)
+    files = _source_files(source_map)
+    normalized = [_normalize_file(item) for item in files]
+    normalized = [item for item in normalized if item.get("path")]
+    language_counts = Counter(str(item.get("language") or "unknown") for item in normalized)
+    kind_counts = Counter(str(item.get("kind") or "unknown") for item in normalized)
+    top_dirs = Counter(_top_level_dir(str(item["path"])) for item in normalized)
+    directory_index = Counter(_parent_dir(str(item["path"])) for item in normalized)
+    import_counts = Counter(
+        str(imp)
+        for item in normalized
+        for imp in (item.get("imports") or [])
+        if isinstance(imp, str) and imp.strip()
+    )
+    symbols = _symbol_index(normalized)
+    representative_files = _representative_files(normalized)
+
+    summary = {
+        "available": True,
+        "source_map": {
+            "root": source_map.get("root"),
+            "generated_at": source_map.get("generated_at"),
+            "total_files": source_map.get("total_files"),
+            "indexed_files": source_map.get("indexed_files"),
+            "skipped_files": source_map.get("skipped_files"),
+            "files_payload_count": len(normalized),
+        },
+        "languages": _counter_items(language_counts),
+        "file_kinds": _counter_items(kind_counts),
+        "top_level_dirs": _counter_items(top_dirs),
+        "directory_index": _counter_items(directory_index, limit=MAX_DIRECTORIES),
+        "representative_files": representative_files,
+        "symbol_index": symbols,
+        "common_imports": _counter_items(import_counts, limit=MAX_IMPORTS),
+        "path_policy": [
+            "All paths are project-root relative and use forward slashes.",
+            "Use source_map and tool results as evidence; do not invent directories or package names.",
+            "If source_map lacks exact content, request read_file before modifying existing files.",
+            "If source_map is missing or insufficient, request list_dir/search/read_file instead of guessing.",
+        ],
+        "warnings": _summary_warnings(source_map, normalized),
+    }
+    _log.debug(
+        "CoderHarness.code_context_summary: files=%s languages=%s dirs=%s symbols=%s representative=%s",
+        len(normalized),
+        summary["languages"],
+        len(summary["directory_index"]),
+        len(symbols),
+        len(representative_files),
+    )
+    return summary
 
 
 def _extract_source_map(workspace: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -195,7 +125,7 @@ def _extract_source_map(workspace: dict[str, Any] | None) -> dict[str, Any] | No
         _log.debug("CoderHarness.extract_source_map: source_map missing or invalid type=%s", type(source_map).__name__)
         return None
     _log.debug("CoderHarness.extract_source_map: source_map found")
-    return source_map if isinstance(source_map, dict) else None
+    return source_map
 
 
 def _source_files(source_map: dict[str, Any]) -> list[dict[str, Any]]:
@@ -208,6 +138,112 @@ def _source_files(source_map: dict[str, Any]) -> list[dict[str, Any]]:
         (len(files) - len(normalized)) if isinstance(files, list) else "unknown",
     )
     return normalized
+
+
+def _normalize_file(item: dict[str, Any]) -> dict[str, Any]:
+    path = _normalize_path(item.get("path"))
+    symbols = [symbol for symbol in (item.get("symbols") or []) if isinstance(symbol, dict)]
+    imports = [str(value).strip() for value in (item.get("imports") or []) if str(value).strip()]
+    return {
+        "path": path,
+        "kind": str(item.get("kind") or "unknown").lower(),
+        "language": str(item.get("language") or "unknown").lower(),
+        "package": item.get("package"),
+        "size": item.get("size"),
+        "imports": imports,
+        "symbols": symbols,
+    }
+
+
+def _normalize_path(value: object) -> str:
+    path = str(value or "").strip().replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    path = path.lstrip("/")
+    parts = [part for part in path.split("/") if part]
+    if not parts or any(part == ".." for part in parts):
+        return ""
+    return "/".join(parts)
+
+
+def _top_level_dir(path: str) -> str:
+    parts = [part for part in path.split("/") if part]
+    if len(parts) <= 1:
+        return "."
+    return parts[0]
+
+
+def _parent_dir(path: str) -> str:
+    parts = [part for part in path.split("/") if part]
+    if len(parts) <= 1:
+        return "."
+    return "/".join(parts[:-1])
+
+
+def _representative_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    scored: list[tuple[int, str, dict[str, Any]]] = []
+    for item in files:
+        path = str(item.get("path") or "")
+        if not path:
+            continue
+        depth = path.count("/")
+        symbol_count = len(item.get("symbols") or [])
+        import_count = len(item.get("imports") or [])
+        size = int(item.get("size") or 0)
+        score = symbol_count * 5 + import_count * 2 + max(0, 8 - depth)
+        if size:
+            score += min(size // 2000, 5)
+        scored.append((score, path, item))
+    scored.sort(key=lambda row: (-row[0], row[1]))
+    out: list[dict[str, Any]] = []
+    for _, _, item in scored[:MAX_REPRESENTATIVE_FILES]:
+        out.append({
+            "path": item["path"],
+            "language": item.get("language"),
+            "kind": item.get("kind"),
+            "package": item.get("package"),
+            "symbol_count": len(item.get("symbols") or []),
+            "import_count": len(item.get("imports") or []),
+        })
+    return out
+
+
+def _symbol_index(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for item in files:
+        path = str(item.get("path") or "")
+        for symbol in item.get("symbols") or []:
+            name = str(symbol.get("name") or "").strip()
+            if not name:
+                continue
+            out.append({
+                "path": path,
+                "name": name,
+                "kind": symbol.get("kind"),
+                "line": symbol.get("line"),
+            })
+            if len(out) >= MAX_SYMBOLS:
+                return out
+    return out
+
+
+def _counter_items(counter: Counter[str], limit: int = 50) -> list[dict[str, Any]]:
+    return [
+        {"name": name, "count": count}
+        for name, count in counter.most_common(limit)
+        if name
+    ]
+
+
+def _summary_warnings(source_map: dict[str, Any], files: list[dict[str, Any]]) -> list[str]:
+    warnings: list[str] = []
+    total = int(source_map.get("total_files") or 0)
+    indexed = int(source_map.get("indexed_files") or 0)
+    if total and indexed < total:
+        warnings.append(f"source_map indexed {indexed}/{total} files; missing files may require list_dir/search.")
+    if not files:
+        warnings.append("source_map contains no file payload; agents must request workspace tools before planning paths.")
+    return warnings
 
 
 def _log_source_map(source_map: dict[str, Any]) -> None:
@@ -224,92 +260,14 @@ def _log_source_map(source_map: dict[str, Any]) -> None:
     )
     if isinstance(files, list):
         samples = []
-        for f in files[:20]:
-            if not isinstance(f, dict):
+        for item in files[:20]:
+            if not isinstance(item, dict):
                 continue
             samples.append({
-                "path": f.get("path"),
-                "language": f.get("language"),
-                "kind": f.get("kind"),
-                "symbols": len(f.get("symbols") or []),
-                "imports": len(f.get("imports") or []),
+                "path": item.get("path"),
+                "language": item.get("language"),
+                "kind": item.get("kind"),
+                "symbols": len(item.get("symbols") or []),
+                "imports": len(item.get("imports") or []),
             })
         _log.debug("CoderHarness.source_map: sample_files=%s", samples)
-
-
-def _representative_paths(files: list[dict[str, Any]]) -> list[str]:
-    preferred = []
-    for f in files:
-        path = str(f.get("path") or "")
-        if not path:
-            continue
-        if path.endswith((
-            "pom.xml",
-            "build.gradle",
-            "build.gradle.kts",
-            "package.json",
-            "plugin.xml",
-            "main.py",
-            "settings.gradle.kts",
-        )):
-            preferred.append(path)
-    if preferred:
-        return sorted(dict.fromkeys(preferred))[:12]
-
-    return sorted(
-        str(f.get("path") or "")
-        for f in files
-        if f.get("path")
-    )[:12]
-
-
-def _framework_rules(name: str) -> list[str]:
-    common = [
-        "Keep changes small and aligned with the existing module boundaries.",
-        "Do not introduce a new framework or dependency unless the user explicitly asks for it.",
-    ]
-    specific = {
-        "spring-boot": [
-            "Follow existing package structure under src/main/java and src/test/java.",
-            "Keep controller/service/repository responsibilities separated.",
-            "Prefer constructor injection and existing Spring annotations already used in the project.",
-        ],
-        "devwerk-monorepo": [
-            "Keep IntelliJ plugin code under idea-plugin and backend harness/service code under backend/app.",
-            "Plugin changes should only collect IDE context, source maps, attachments, user approvals, and apply guarded CodeOps results.",
-            "Backend changes should own model orchestration, coder harness rules, prompt construction, and framework intelligence.",
-            "Do not reintroduce direct model clients or prompt engineering into the plugin.",
-            "Do not bypass frontend snapshot and path-guard execution flow.",
-        ],
-        "intellij-plugin": [
-            "Use IntelliJ Platform APIs and keep write actions inside WriteCommandAction.",
-            "Keep UI work on Swing components and preserve tool-window responsiveness.",
-            "Do not bypass DevWerk snapshot and path-guard execution flow.",
-        ],
-        "fastapi": [
-            "Keep FastAPI routes thin; put reusable behavior in services.",
-            "Use Pydantic models for request/response shape changes.",
-            "Avoid filesystem writes outside configured local storage roots.",
-        ],
-        "react": [
-            "Follow existing component and state-management conventions.",
-            "Keep UI state local unless the app already uses a shared store.",
-        ],
-        "vue": [
-            "Follow existing component/script/style organization.",
-            "Keep props/events compatible with surrounding components.",
-        ],
-        "python": [
-            "Keep route, service, model, and utility boundaries explicit.",
-            "Prefer typed helper functions and avoid global mutable state.",
-        ],
-        "jvm": [
-            "Follow existing package and Gradle/Maven module structure.",
-            "Prefer small classes/functions and existing JVM idioms in the project.",
-        ],
-        "generic": [
-            "Infer structure from source_map, tree_preview, and read_file before editing.",
-            "If framework is unclear, make the least invasive change possible.",
-        ],
-    }
-    return common + specific.get(name, specific["generic"])

@@ -188,47 +188,17 @@ def _has_structured_output(obj: dict[str, Any]) -> bool:
 
 
 def _fallback_structured_response(messages: list[dict[str, str]], raw_text: str) -> dict[str, Any]:
-    combined = "\n".join(str(item.get("content") or "") for item in messages if isinstance(item, dict)).lower()
-    if "springboot" in combined or "spring boot" in combined or "spring-boot" in combined:
-        return {
-            "reply": "Generated a deterministic Spring Boot Java 21 REST scaffold because the model returned non-JSON text.",
-            "code_tree": "settings.gradle\nbuild.gradle\nsrc/main/java/com/devwerk/demo/DemoApplication.java\nsrc/main/java/com/devwerk/demo/HelloController.java",
-            "ops": [
-                {
-                    "op": "create_file",
-                    "path": "settings.gradle",
-                    "language": "groovy",
-                    "content": 'pluginManagement { repositories { gradlePluginPortal(); mavenCentral() } }\nrootProject.name = "devwerk-smoke"\n',
-                },
-                {
-                    "op": "create_file",
-                    "path": "build.gradle",
-                    "language": "groovy",
-                    "content": "plugins {\n    id 'java'\n    id 'org.springframework.boot' version '3.3.5'\n    id 'io.spring.dependency-management' version '1.1.6'\n}\n\njava { toolchain { languageVersion = JavaLanguageVersion.of(21) } }\n\nrepositories { mavenCentral() }\n\ndependencies { implementation 'org.springframework.boot:spring-boot-starter-web' }\n",
-                },
-                {
-                    "op": "create_file",
-                    "path": "src/main/java/com/devwerk/demo/DemoApplication.java",
-                    "language": "java",
-                    "content": "package com.devwerk.demo;\n\nimport org.springframework.boot.SpringApplication;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\n\n@SpringBootApplication\npublic class DemoApplication {\n    public static void main(String[] args) {\n        SpringApplication.run(DemoApplication.class, args);\n    }\n}\n",
-                },
-                {
-                    "op": "create_file",
-                    "path": "src/main/java/com/devwerk/demo/HelloController.java",
-                    "language": "java",
-                    "content": "package com.devwerk.demo;\n\nimport org.springframework.web.bind.annotation.GetMapping;\nimport org.springframework.web.bind.annotation.RestController;\n\n@RestController\npublic class HelloController {\n    @GetMapping(\"/hello\")\n    public String hello() {\n        return \"Hello, DevWerk\";\n    }\n}\n",
-                },
-            ],
-            "tool_requests": [],
-            "patch_ops": [],
-            "done": True,
-            "raw_model_text": raw_text[:1000],
-        }
+    _log.debug(
+        "Anthropic-compatible structured fallback: non_json_text messages=%s raw_chars=%s",
+        len(messages),
+        len(raw_text),
+    )
     return {
-        "reply": raw_text,
+        "reply": raw_text[:1000],
         "code_tree": None,
         "ops": [],
         "tool_requests": [],
         "patch_ops": [],
-        "done": True,
+        "done": False,
+        "raw_model_text": raw_text[:1000],
     }

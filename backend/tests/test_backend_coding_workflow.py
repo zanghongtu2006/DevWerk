@@ -9,6 +9,7 @@ import pytest
 from app.models.ide import FileOp, IdeChatResponse
 from app.models.plan import PlanFile, PlanResponse
 from app.services.anthropic_client import AnthropicClient
+from app.services.coder_harness import build_code_context_summary
 from app.services.openai_client import OpenAIClient
 from app.services.ollama_client import OllamaClient
 from app.services.planner import Planner
@@ -26,6 +27,45 @@ def patch_service_settings(monkeypatch, fake_settings, *modules) -> None:
     for module in modules:
         monkeypatch.setattr(module, "settings", lambda: fake_settings)
     monkeypatch.setattr(session_store, "settings", lambda: fake_settings)
+
+
+def test_code_context_summary_uses_source_map_facts_without_framework_classification():
+    workspace = {
+        "root_id": "summary-smoke",
+        "source_map": {
+            "root": "summary-smoke",
+            "generated_at": 1,
+            "total_files": 2,
+            "indexed_files": 2,
+            "skipped_files": 0,
+            "files": [
+                {
+                    "path": "pkg/api.py",
+                    "kind": "source",
+                    "language": "py",
+                    "imports": ["typing"],
+                    "symbols": [{"name": "create_item", "kind": "function", "line": 10}],
+                    "size": 128,
+                },
+                {
+                    "path": "README.md",
+                    "kind": "doc",
+                    "language": "markdown",
+                    "imports": [],
+                    "symbols": [],
+                    "size": 32,
+                },
+            ],
+        },
+    }
+
+    summary = build_code_context_summary(workspace)
+
+    assert summary["available"] is True
+    assert summary["source_map"]["total_files"] == 2
+    assert {"name": "py", "count": 1} in summary["languages"]
+    assert summary["symbol_index"][0]["name"] == "create_item"
+    assert "framework" not in str(summary).lower()
 
 
 class FakeSettings:
@@ -51,7 +91,26 @@ class FakeSettings:
 
 class FakePlannerClient:
     def chat_json(self, messages: list[dict]) -> dict:
-        return {"raw_text": "Create a minimal Spring Boot Java 21 REST API."}
+        return {
+            "plan": {
+                "files": [
+                    {
+                        "path": "service/main.py",
+                        "nature": "new",
+                        "description": "Add the executable service entrypoint.",
+                        "confidence": 0.9,
+                    },
+                    {
+                        "path": "README.md",
+                        "nature": "new",
+                        "description": "Document the generated smoke scaffold.",
+                        "confidence": 0.7,
+                    },
+                ],
+                "summary": "Create a minimal runnable smoke scaffold.",
+                "warnings": [],
+            }
+        }
 
 
 class FakeToolRequestPlannerClient:
@@ -66,31 +125,19 @@ class FakeToolRequestPlannerClient:
 class FakeExecutorClient:
     def chat_structured(self, messages: list[dict]) -> dict:
         return {
-            "reply": "Generated Spring Boot smoke scaffold.",
+            "reply": "Generated smoke scaffold.",
             "ops": [
                 {
                     "op": "create_file",
-                    "path": "settings.gradle",
-                    "language": "groovy",
-                    "content": 'pluginManagement { repositories { gradlePluginPortal(); mavenCentral() } }\nrootProject.name = "devwerk-smoke"\n',
+                    "path": "service/main.py",
+                    "language": "python",
+                    "content": "def hello() -> str:\n    return \"Hello, DevWerk\"\n\n\nif __name__ == \"__main__\":\n    print(hello())\n",
                 },
                 {
                     "op": "create_file",
-                    "path": "build.gradle",
-                    "language": "groovy",
-                    "content": "plugins {\n    id 'java'\n    id 'org.springframework.boot' version '3.3.5'\n    id 'io.spring.dependency-management' version '1.1.6'\n}\n\njava { toolchain { languageVersion = JavaLanguageVersion.of(21) } }\n\nrepositories { mavenCentral() }\n\ndependencies { implementation 'org.springframework.boot:spring-boot-starter-web' }\n",
-                },
-                {
-                    "op": "create_file",
-                    "path": "src/main/java/com/devwerk/demo/DemoApplication.java",
-                    "language": "java",
-                    "content": "package com.devwerk.demo;\n\nimport org.springframework.boot.SpringApplication;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\n\n@SpringBootApplication\npublic class DemoApplication {\n    public static void main(String[] args) {\n        SpringApplication.run(DemoApplication.class, args);\n    }\n}\n",
-                },
-                {
-                    "op": "create_file",
-                    "path": "src/main/java/com/devwerk/demo/HelloController.java",
-                    "language": "java",
-                    "content": "package com.devwerk.demo;\n\nimport org.springframework.web.bind.annotation.GetMapping;\nimport org.springframework.web.bind.annotation.RestController;\n\n@RestController\npublic class HelloController {\n    @GetMapping(\"/hello\")\n    public String hello() {\n        return \"Hello, DevWerk\";\n    }\n}\n",
+                    "path": "README.md",
+                    "language": "markdown",
+                    "content": "# DevWerk Smoke\n\nMinimal generated scaffold.\n",
                 },
             ],
             "patch_ops": [],
@@ -193,7 +240,7 @@ async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_
                 "messages": [
                     {
                         "role": "user",
-                        "content": "Create a Spring Boot scaffold compatible with JDK 21 and a minimal REST hello world API.",
+                        "content": "Create a minimal runnable smoke scaffold.",
                     }
                 ],
                 "workspace": {
@@ -216,8 +263,7 @@ async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_
             assert plan["next_action"] == "execute"
             assert plan["phase_output"]["phase"] == "plan"
             planned_paths = {item["path"] for item in plan["files"]}
-            assert "build.gradle" in planned_paths
-            assert "src/main/java/com/devwerk/demo/HelloController.java" in planned_paths
+            assert planned_paths == {"service/main.py", "README.md"}
 
             execute_body = {
                 "project_id": project_id,
@@ -244,12 +290,12 @@ async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_
             assert executed["next_action"] == "apply_result"
             assert executed["phase_output"]["phase"] == "coding"
             assert executed["done"] is True
-            assert len(executed["ops"]) == 4
+            assert len(executed["ops"]) == 2
             _apply_file_ops(project_root, executed["ops"])
-            assert (project_root / "build.gradle").is_file()
-            controller = project_root / "src/main/java/com/devwerk/demo/HelloController.java"
-            assert controller.is_file()
-            assert "@GetMapping(\"/hello\")" in controller.read_text(encoding="utf-8")
+            assert (project_root / "README.md").is_file()
+            entrypoint = project_root / "service/main.py"
+            assert entrypoint.is_file()
+            assert "Hello, DevWerk" in entrypoint.read_text(encoding="utf-8")
 
             task_response = await client.get(f"/v1/kanban/tasks/{plan['task_id']}")
             assert task_response.status_code == 200
@@ -301,7 +347,7 @@ async def test_workflow_start_poll_result_smoke(monkeypatch, tmp_path):
                 "messages": [
                     {
                         "role": "user",
-                        "content": "Create a Spring Boot scaffold compatible with JDK 21 and a minimal REST hello world API.",
+                        "content": "Create a minimal runnable smoke scaffold.",
                     }
                 ],
                 "workspace": {
@@ -336,9 +382,9 @@ async def test_workflow_start_poll_result_smoke(monkeypatch, tmp_path):
             assert result["ok"] is True
             assert result["task_id"] == started["task_id"]
             assert result["status_key"] == "ready_to_apply"
-            assert len(result["ops"]) == 4
+            assert len(result["ops"]) == 2
             _apply_file_ops(project_root, result["ops"])
-            assert (project_root / "src/main/java/com/devwerk/demo/HelloController.java").is_file()
+            assert (project_root / "service/main.py").is_file()
 
             task_response = await client.get(f"/v1/kanban/tasks/{started['task_id']}")
             task = task_response.json()["task"]
@@ -347,6 +393,7 @@ async def test_workflow_start_poll_result_smoke(monkeypatch, tmp_path):
             assert "workflow_request" in artifact_types
             assert "workflow_result" in artifact_types
             assert "context_bundle" in artifact_types
+            assert "code_context_summary" in artifact_types
             assert "plan_bundle" in artifact_types
             assert "code_change_bundle" in artifact_types
             assert "review_bundle" in artifact_types
@@ -374,9 +421,8 @@ async def test_workflow_start_poll_result_smoke(monkeypatch, tmp_path):
 
             memory_response = await client.get(f"/v1/kanban/projects/{project_id}/memory")
             memory = memory_response.json()["memory"]
-            memory_text = str(memory)
-            assert "Create a Spring Boot scaffold compatible with JDK 21" not in memory_text
             assert "context_indexed" in {item["phase"] for item in memory["phase_summaries"]}
+            assert {"service/main.py", "README.md"}.issubset(set(memory["paths"]))
 
             chat_response = await client.post("/v1/chat", json=body)
             assert chat_response.status_code == 404
@@ -486,7 +532,7 @@ async def test_workflow_reviewer_rework_continues_until_approved(monkeypatch, tm
 
 
 @pytest.mark.asyncio
-async def test_plan_falls_back_to_user_management_files_when_planner_returns_tool_requests(monkeypatch, tmp_path):
+async def test_plan_does_not_infer_user_management_files_when_planner_returns_no_plan(monkeypatch, tmp_path):
     db_path = tmp_path / "devwerk-user-management-plan.db"
     project_root = tmp_path / "test"
     project_root.mkdir()
@@ -545,20 +591,16 @@ async def test_plan_falls_back_to_user_management_files_when_planner_returns_too
 
     assert response.status_code == 200
     plan = response.json()
-    assert plan["ok"] is True
-    assert plan["status_key"] == "planned"
-    assert plan["next_action"] == "execute"
+    assert plan["ok"] is False
+    assert plan["status_key"] == "failed"
+    assert plan["error_code"] == "PLAN_EMPTY"
     assert plan["phase_output"]["phase"] == "plan"
-    planned_paths = {item["path"] for item in plan["files"]}
-    assert "src/main/java/org/example/user/UserController.java" in planned_paths
-    assert "src/main/java/org/example/user/UserService.java" in planned_paths
-    assert "src/main/java/org/example/user/UserPermissionPolicy.java" in planned_paths
-    assert "pom.xml" in planned_paths
+    assert plan["files"] == []
     assert plan["warnings"]
 
 
 @pytest.mark.asyncio
-async def test_plan_falls_back_to_tenant_management_files_when_planner_returns_tool_requests(monkeypatch, tmp_path):
+async def test_plan_does_not_infer_tenant_management_files_when_planner_returns_no_plan(monkeypatch, tmp_path):
     db_path = tmp_path / "devwerk-tenant-management-plan.db"
     project_root = tmp_path / "test"
     project_root.mkdir()
@@ -621,15 +663,11 @@ async def test_plan_falls_back_to_tenant_management_files_when_planner_returns_t
 
     assert response.status_code == 200
     plan = response.json()
-    assert plan["ok"] is True
-    assert plan["status_key"] == "planned"
-    assert plan["next_action"] == "execute"
+    assert plan["ok"] is False
+    assert plan["status_key"] == "failed"
+    assert plan["error_code"] == "PLAN_EMPTY"
     assert plan["phase_output"]["phase"] == "plan"
-    planned_paths = {item["path"] for item in plan["files"]}
-    assert "src/main/java/org/example/tenant/TenantController.java" in planned_paths
-    assert "src/main/java/org/example/tenant/TenantService.java" in planned_paths
-    assert "src/main/java/org/example/tenant/TenantOwnershipPolicy.java" in planned_paths
-    assert "pom.xml" in planned_paths
+    assert plan["files"] == []
     assert plan["warnings"]
 
 
@@ -824,7 +862,7 @@ def _apply_file_ops(project_root: Path, ops: list[dict]) -> None:
             raise AssertionError(f"unsupported op: {op['op']}")
 
 
-def test_anthropic_non_json_text_falls_back_to_spring_boot_ops(monkeypatch):
+def test_anthropic_non_json_text_does_not_generate_framework_ops(monkeypatch):
     client = AnthropicClient.__new__(AnthropicClient)
     monkeypatch.setattr(
         client,
@@ -844,11 +882,11 @@ def test_anthropic_non_json_text_falls_back_to_spring_boot_ops(monkeypatch):
         ]
     )
 
-    assert response["done"] is True
-    assert {op["path"] for op in response["ops"]} >= {
-        "build.gradle",
-        "src/main/java/com/devwerk/demo/HelloController.java",
-    }
+    assert response["done"] is False
+    assert response["ops"] == []
+    assert response["tool_requests"] == []
+    assert response["patch_ops"] == []
+    assert response["raw_model_text"]
 
 
 def test_llm_clients_ignore_environment_proxy_by_default():

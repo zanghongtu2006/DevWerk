@@ -7,6 +7,7 @@ from typing import Any
 
 from app.models.ide import IdeChatResponse
 from app.models.plan import PlanResponse
+from app.services.coder_harness import build_code_context_summary
 from app.services.kanban import add_artifact, add_event, get_project_workflow, get_task
 from app.services.session_store import read_project_memory
 from app.services.workflow import apply_workflow_action, record_phase_output
@@ -140,13 +141,16 @@ class WorkflowEngine:
     def _run_context_column(self, task_id: str, body: dict[str, Any], workflow_summary: dict[str, Any]) -> dict[str, Any]:
         _event(task_id, "workflow_column_started", {"status_key": "context_indexed", "agent": "context"})
         context = _build_agent_context(task_id, "context_indexed", "context", body, workflow_summary, [])
+        code_context_summary = build_code_context_summary(body.get("workspace"))
         context_bundle = {
             "workspace": body.get("workspace"),
             "workspace_summary": _workspace_summary(body.get("workspace")),
+            "code_context_summary": code_context_summary,
             "project_root": body.get("project_root"),
             "project_memory": context["project_memory"],
         }
         add_artifact(task_id, artifact_type="context_bundle", payload=context_bundle)
+        add_artifact(task_id, artifact_type="code_context_summary", payload=code_context_summary)
         output = record_phase_output(
             task_id,
             phase="context_indexed",
@@ -160,6 +164,17 @@ class WorkflowEngine:
             next_action="plan_ready",
         )
         _event(task_id, "agent_context_built", {"phase": "context_indexed", "agent": "context", "session_id": output["session_id"]})
+        _event(
+            task_id,
+            "code_context_summary_built",
+            {
+                "available": bool(code_context_summary.get("available")),
+                "source_map": code_context_summary.get("source_map"),
+                "languages": code_context_summary.get("languages"),
+                "representative_files": len(code_context_summary.get("representative_files") or []),
+                "warnings": code_context_summary.get("warnings") or [],
+            },
+        )
         _event(task_id, "agent_output_recorded", {"phase": "context_indexed", "agent": "context", "artifact": "context_bundle"})
         apply_workflow_action(task_id, "context_indexed", {"phase": "context_indexed", "session_id": output["session_id"]})
         _event(task_id, "workflow_column_completed", {"status_key": "context_indexed", "agent": "context", "decision": "approve"})
@@ -173,7 +188,7 @@ class WorkflowEngine:
         context_bundle: dict[str, Any],
     ) -> PlanResponse:
         _event(task_id, "workflow_column_started", {"status_key": "planned", "agent": "planner"})
-        _event(task_id, "agent_context_built", {"phase": "planned", "agent": "planner", "context": _context_log_summary(_build_agent_context(task_id, "planned", "planner", body, workflow_summary, ["context_bundle"]))})
+        _event(task_id, "agent_context_built", {"phase": "planned", "agent": "planner", "context": _context_log_summary(_build_agent_context(task_id, "planned", "planner", body, workflow_summary, ["context_bundle", "code_context_summary"]))})
         plan_response = await self.plan_runner(dict(body, task_id=task_id))
         plan_response.task_id = task_id
         add_artifact(task_id, artifact_type="plan_bundle", payload=plan_response.model_dump())
@@ -195,7 +210,7 @@ class WorkflowEngine:
     ) -> IdeChatResponse:
         apply_workflow_action(task_id, "coding_started", {"phase": "coding", "approved_paths": approved_paths})
         _event(task_id, "workflow_column_started", {"status_key": "coding", "agent": "coder"})
-        _event(task_id, "agent_context_built", {"phase": "coding", "agent": "coder", "context": _context_log_summary(_build_agent_context(task_id, "coding", "coder", body, workflow_summary, ["context_bundle", "plan_bundle"]))})
+        _event(task_id, "agent_context_built", {"phase": "coding", "agent": "coder", "context": _context_log_summary(_build_agent_context(task_id, "coding", "coder", body, workflow_summary, ["context_bundle", "code_context_summary", "plan_bundle"]))})
         execute_body = {
             "project_id": body.get("project_id"),
             "task_id": task_id,
@@ -227,7 +242,7 @@ class WorkflowEngine:
         execute_response: IdeChatResponse,
     ) -> dict[str, Any]:
         _event(task_id, "workflow_column_started", {"status_key": "reviewed", "agent": "reviewer"})
-        context = _build_agent_context(task_id, "reviewed", "reviewer", body, workflow_summary, ["plan_bundle", "code_change_bundle"])
+        context = _build_agent_context(task_id, "reviewed", "reviewer", body, workflow_summary, ["code_context_summary", "plan_bundle", "code_change_bundle"])
         _event(task_id, "agent_context_built", {"phase": "reviewed", "agent": "reviewer", "context": _context_log_summary(context)})
         review_result = _review_result(plan_response, execute_response)
         decision = review_result["decision"]
