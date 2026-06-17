@@ -248,7 +248,7 @@ async def ide_plan(request: Request) -> PlanResponse:
     _kanban_event(task_id, "plan_started", {"mode": mode, "agent": planner_agent})
 
     try:
-        result = p.plan(messages=messages, mode=mode)
+        result = p.plan(messages=messages, mode=mode, project_root=body.get("project_root"))
         if result.ok:
             _kanban_artifact(task_id, "plan_response", payload=result.model_dump())
             phase_output = _record_phase_output(

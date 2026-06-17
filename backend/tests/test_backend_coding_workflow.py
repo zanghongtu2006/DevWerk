@@ -113,12 +113,40 @@ class FakePlannerClient:
         }
 
 
-class FakeToolRequestPlannerClient:
+class FakeNoPlanPlannerClient:
     def chat_json(self, messages: list[dict]) -> dict:
+        return {"raw_text": "I need more concrete source evidence before producing a file-level plan."}
+
+
+class FakePlannerResearchClient:
+    def __init__(self, requested_path: str):
+        self.requested_path = requested_path
+        self.calls = 0
+
+    def chat_json(self, messages: list[dict]) -> dict:
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "raw_text": (
+                    "I'll inspect the current tenant code before planning.]<]minimax[>[\n"
+                    f'{{"name":"read_file","arguments":{{"file_path":"{self.requested_path}","start_line":1,"end_line":120}}}}\n'
+                )
+            }
+
+        assert any("tool_results:" in message.get("content", "") for message in messages)
         return {
-            "tool_requests": [
-                {"id": "p1", "tool": "read_file", "args": {"path": "pom.xml", "start_line": 1, "end_line": 200}}
-            ]
+            "plan": {
+                "files": [
+                    {
+                        "path": "src/domain/Tenant.py",
+                        "nature": "modified",
+                        "description": "Align tenant with the project structure found from source_map and file content.",
+                        "confidence": 0.92,
+                    }
+                ],
+                "summary": "Refactor tenant in the existing project path.",
+                "warnings": [],
+            }
         }
 
 
@@ -598,7 +626,7 @@ async def test_plan_does_not_infer_user_management_files_when_planner_returns_no
 
     patch_service_settings(monkeypatch, fake_settings, main_module, ide_routes, kanban_service, usage_service)
     reset_service_dbs(kanban_service, usage_service)
-    monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": FakeToolRequestPlannerClient())
+    monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": FakeNoPlanPlannerClient())
 
     app = main_module.create_app()
     transport = httpx.ASGITransport(app=app)
@@ -666,7 +694,7 @@ async def test_plan_does_not_infer_tenant_management_files_when_planner_returns_
 
     patch_service_settings(monkeypatch, fake_settings, main_module, ide_routes, kanban_service, usage_service)
     reset_service_dbs(kanban_service, usage_service)
-    monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": FakeToolRequestPlannerClient())
+    monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": FakeNoPlanPlannerClient())
 
     app = main_module.create_app()
     transport = httpx.ASGITransport(app=app)
@@ -732,6 +760,65 @@ def test_planner_extract_plan_returns_failure_when_fallback_cannot_infer_files()
     assert plan.ok is False
     assert plan.error_code == "PLAN_EMPTY"
     assert plan.files == []
+
+
+def test_planner_executes_minimax_text_tool_requests_before_planning(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    source_dir = project_root / "src/domain"
+    source_dir.mkdir(parents=True)
+    (source_dir / "Tenant.py").write_text("class Tenant:\n    pass\n", encoding="utf-8")
+    fake_client = FakePlannerResearchClient("src/domain/Tenant.py")
+
+    import app.services.planner as planner_service
+
+    monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": fake_client)
+    events: list[tuple[str, dict]] = []
+    planner = Planner(event_sink=lambda event_type, payload: events.append((event_type, payload)))
+    plan = planner.plan(
+        messages=[
+            {"role": "user", "content": "Refactor tenant to match the project structure."},
+            {
+                "role": "user",
+                "content": "workspace_summary:\n"
+                + '{"source_map":{"files":[{"path":"src/domain/Tenant.py","kind":"source","language":"python"}]},"tree_preview":"./\\n  src/\\n    domain/\\n      Tenant.py"}',
+            },
+        ],
+        project_root=str(project_root),
+    )
+
+    assert fake_client.calls == 2
+    assert plan.ok is True
+    assert [item.path for item in plan.files] == ["src/domain/Tenant.py"]
+    assert "plan_tool_requests" in [event_type for event_type, _ in events]
+    assert "plan_tool_results" in [event_type for event_type, _ in events]
+
+
+def test_planner_normalizes_foreign_absolute_tool_paths_by_source_map_suffix(monkeypatch, tmp_path):
+    project_root = tmp_path / "test"
+    source_dir = project_root / "src/domain"
+    source_dir.mkdir(parents=True)
+    (source_dir / "Tenant.py").write_text("class Tenant:\n    tenant_id: str\n", encoding="utf-8")
+    fake_client = FakePlannerResearchClient("/Users/jonathan/work/code/sandbox/ai-coding/test/src/domain/Tenant.py")
+
+    import app.services.planner as planner_service
+
+    monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": fake_client)
+    planner = Planner()
+    plan = planner.plan(
+        messages=[
+            {"role": "user", "content": "Tenant structure does not match the generic structure."},
+            {
+                "role": "user",
+                "content": "workspace_summary:\n"
+                + '{"source_map":{"files":[{"path":"src/domain/Tenant.py","kind":"source","language":"python"}]},"tree_preview":"./\\n  src/\\n    domain/\\n      Tenant.py"}',
+            },
+        ],
+        project_root=str(project_root),
+    )
+
+    assert fake_client.calls == 2
+    assert plan.ok is True
+    assert plan.files[0].path == "src/domain/Tenant.py"
 
 
 @pytest.mark.asyncio
