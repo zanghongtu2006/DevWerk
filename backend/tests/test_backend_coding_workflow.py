@@ -6,6 +6,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from app.models.ide import FileOp, IdeChatResponse
+from app.models.plan import PlanFile, PlanResponse
 from app.services.anthropic_client import AnthropicClient
 from app.services.openai_client import OpenAIClient
 from app.services.ollama_client import OllamaClient
@@ -378,6 +380,108 @@ async def test_workflow_start_poll_result_smoke(monkeypatch, tmp_path):
 
             chat_response = await client.post("/v1/chat", json=body)
             assert chat_response.status_code == 404
+
+
+def test_workflow_reviewer_normalizes_project_root_prefix():
+    from app.services.workflow_engine import _review_result
+
+    plan = PlanResponse(
+        files=[
+            PlanFile(
+                path="test/src/main/java/org/example/controller/TenantController.java",
+                nature="new",
+                description="Add tenant controller.",
+            )
+        ]
+    )
+    executed = IdeChatResponse(
+        ops=[
+            FileOp(
+                op="create_file",
+                path="src/main/java/org/example/controller/TenantController.java",
+                content="class TenantController {}",
+            )
+        ],
+        done=True,
+    )
+
+    review = _review_result(plan, executed)
+
+    assert review["decision"] == "approve"
+    assert review["normalized_plan_files"] == ["src/main/java/org/example/controller/TenantController.java"]
+    assert review["normalized_changed_files"] == ["src/main/java/org/example/controller/TenantController.java"]
+    assert review["unplanned_changed_files"] == []
+
+
+@pytest.mark.asyncio
+async def test_workflow_reviewer_rework_continues_until_approved(monkeypatch, tmp_path):
+    db_path = tmp_path / "devwerk-workflow-rework-loop.db"
+    fake_settings = FakeSettings(db_path)
+
+    import app.services.kanban as kanban_service
+    import app.services.workflow_engine as workflow_engine_service
+
+    patch_service_settings(monkeypatch, fake_settings, kanban_service)
+    kanban_service._initialized = False
+
+    task = kanban_service.create_task(
+        project_id="backend-workflow-rework-loop",
+        title="Rework loop",
+        description="Smoke",
+        status_key="draft",
+    )["task"]
+    plan_calls = 0
+    coding_calls = 0
+
+    async def plan_runner(body: dict) -> PlanResponse:
+        nonlocal plan_calls
+        plan_calls += 1
+        planned_path = "src/main/java/org/example/First.java" if plan_calls == 1 else "src/main/java/org/example/Second.java"
+        return PlanResponse(
+            ok=True,
+            task_id=body["task_id"],
+            files=[PlanFile(path=planned_path, nature="new", description="Generated test plan.")],
+            summary="Plan",
+            session_id=f"plan-{plan_calls}",
+        )
+
+    async def coding_runner(body: dict) -> IdeChatResponse:
+        nonlocal coding_calls
+        coding_calls += 1
+        return IdeChatResponse(
+            ok=True,
+            done=True,
+            task_id=body["task_id"],
+            session_id=f"coding-{coding_calls}",
+            ops=[
+                FileOp(
+                    op="create_file",
+                    path="src/main/java/org/example/Second.java",
+                    content="class Second {}",
+                )
+            ],
+        )
+
+    engine = workflow_engine_service.WorkflowEngine(plan_runner=plan_runner, coding_runner=coding_runner)
+    await engine.run(
+        task["id"],
+        {
+            "project_id": "backend-workflow-rework-loop",
+            "mode": "agent",
+            "messages": [{"role": "user", "content": "Add a class."}],
+            "workspace": {"tree_preview": "test/\n  src/\n    main/\n      java/\n", "source_map": None},
+        },
+    )
+
+    assert plan_calls == 2
+    assert coding_calls == 2
+    task_detail = kanban_service.get_task(task["id"])["task"]
+    assert task_detail["status_key"] == "ready_to_apply"
+    result = [artifact for artifact in task_detail["artifacts"] if artifact["artifact_type"] == "workflow_result"][-1]
+    assert result["payload"]["ok"] is True
+    assert result["payload"]["status_key"] == "ready_to_apply"
+    event_types = [event["event_type"] for event in task_detail["events"]]
+    assert "workflow_rework_loop" in event_types
 
 
 @pytest.mark.asyncio

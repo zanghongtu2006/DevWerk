@@ -26,80 +26,116 @@ class WorkflowEngine:
     async def run(self, task_id: str, body: dict[str, Any]) -> None:
         project_id = str(body.get("project_id") or "default")
         definition = workflow_from_dict(get_project_workflow(project_id).get("workflow") or {})
-        _event(task_id, "workflow_started", {"entrypoint": "/v1/workflows", "workflow": definition.summary()})
+        workflow_summary = definition.summary()
+        _event(task_id, "workflow_started", {"entrypoint": "/v1/workflows", "workflow": workflow_summary})
 
-        context_bundle = self._run_context_column(task_id, body, definition.summary())
+        context_bundle = self._run_context_column(task_id, body, workflow_summary)
+        plan_response: PlanResponse | None = None
+        execute_response: IdeChatResponse | None = None
+        next_phase = "planned"
+        max_rework_rounds = 3
 
-        plan_response = await self._run_plan_column(task_id, body, definition.summary(), context_bundle)
-        if not plan_response.ok:
-            response = IdeChatResponse(
-                ok=False,
-                reply="",
-                done=True,
-                task_id=task_id,
-                status_key=plan_response.status_key or "failed",
-                error_code=plan_response.error_code or "PLAN_ERROR",
-                error_message=plan_response.error_message or "Planning failed.",
-                retryable=True,
-            )
-            add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
-            _event(task_id, "workflow_finished", {"ok": False, "phase": "planned", "status_key": response.status_key})
-            return
+        for round_no in range(1, max_rework_rounds + 2):
+            _log.debug("workflow loop task_id=%s round=%s next_phase=%s", task_id, round_no, next_phase)
+            _event(task_id, "workflow_round_started", {"round": round_no, "next_phase": next_phase})
 
-        approved_paths = [file.path for file in plan_response.files]
-        if not approved_paths:
-            response = IdeChatResponse(
-                ok=False,
-                reply="",
-                done=True,
-                task_id=task_id,
-                status_key="failed",
-                error_code="EMPTY_PLAN",
-                error_message="Planner produced no files for a coding workflow.",
-                retryable=True,
-            )
-            add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
-            apply_workflow_action(task_id, "fail", {"phase": "planned", "reason": response.error_message})
-            _event(task_id, "workflow_finished", {"ok": False, "phase": "planned", "status_key": "failed"})
-            return
+            if next_phase == "planned" or plan_response is None:
+                plan_response = await self._run_plan_column(task_id, body, workflow_summary, context_bundle)
+                if not plan_response.ok:
+                    response = IdeChatResponse(
+                        ok=False,
+                        reply="",
+                        done=True,
+                        task_id=task_id,
+                        status_key=plan_response.status_key or "failed",
+                        error_code=plan_response.error_code or "PLAN_ERROR",
+                        error_message=plan_response.error_message or "Planning failed.",
+                        retryable=True,
+                    )
+                    add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
+                    _event(task_id, "workflow_finished", {"ok": False, "phase": "planned", "status_key": response.status_key})
+                    return
 
-        execute_response = await self._run_coding_column(task_id, body, definition.summary(), approved_paths)
-        if not execute_response.ok:
-            add_artifact(task_id, artifact_type="workflow_result", payload=execute_response.model_dump())
-            apply_workflow_action(task_id, "fail", {"phase": "coding", "reason": execute_response.error_message})
-            _event(task_id, "workflow_finished", {"ok": False, "phase": "coding", "status_key": "failed"})
-            return
+                if not plan_response.files:
+                    response = IdeChatResponse(
+                        ok=False,
+                        reply="",
+                        done=True,
+                        task_id=task_id,
+                        status_key="failed",
+                        error_code="EMPTY_PLAN",
+                        error_message="Planner produced no files for a coding workflow.",
+                        retryable=True,
+                    )
+                    add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
+                    apply_workflow_action(task_id, "fail", {"phase": "planned", "reason": response.error_message})
+                    _event(task_id, "workflow_finished", {"ok": False, "phase": "planned", "status_key": "failed"})
+                    return
 
-        review = self._run_review_column(task_id, body, definition.summary(), plan_response, execute_response)
-        if review.get("decision") != "approve":
-            action = str(review.get("decision") or "fail")
+            approved_paths = [file.path for file in plan_response.files]
+            execute_response = await self._run_coding_column(task_id, body, workflow_summary, approved_paths)
+            if not execute_response.ok:
+                add_artifact(task_id, artifact_type="workflow_result", payload=execute_response.model_dump())
+                apply_workflow_action(task_id, "fail", {"phase": "coding", "reason": execute_response.error_message})
+                _event(task_id, "workflow_finished", {"ok": False, "phase": "coding", "status_key": "failed"})
+                return
+
+            review = self._run_review_column(task_id, body, workflow_summary, plan_response, execute_response)
+            decision = str(review.get("decision") or "fail")
+            if decision == "approve":
+                execute_response.task_id = task_id
+                execute_response.status_key = "ready_to_apply"
+                add_artifact(task_id, artifact_type="workflow_result", payload=execute_response.model_dump())
+                _event(
+                    task_id,
+                    "workflow_finished",
+                    {
+                        "ok": execute_response.ok,
+                        "phase": "reviewed",
+                        "status_key": execute_response.status_key,
+                        "ops": len(execute_response.ops),
+                        "patch_ops": len(execute_response.patch_ops),
+                        "tool_requests": len(execute_response.tool_requests),
+                        "round": round_no,
+                    },
+                )
+                return
+
+            if decision in {"request_replan", "request_recoding"} and round_no <= max_rework_rounds:
+                next_phase = "planned" if decision == "request_replan" else "coding"
+                _event(
+                    task_id,
+                    "workflow_rework_loop",
+                    {"round": round_no, "decision": decision, "next_phase": next_phase, "review": review},
+                )
+                continue
+
             response = execute_response.model_copy(update={
                 "ok": False,
                 "done": True,
-                "status_key": "failed" if action == "fail" else action,
-                "error_code": "REVIEW_REWORK",
-                "error_message": str(review.get("summary") or "Reviewer requested rework."),
+                "status_key": "failed",
+                "error_code": "REVIEW_REWORK_LIMIT",
+                "error_message": str(review.get("summary") or "Reviewer requested rework too many times."),
                 "retryable": True,
             })
             add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
-            _event(task_id, "workflow_finished", {"ok": False, "phase": "reviewed", "status_key": response.status_key})
+            apply_workflow_action(task_id, "fail", {"phase": "reviewed", "reason": response.error_message, "review": review})
+            _event(task_id, "workflow_finished", {"ok": False, "phase": "reviewed", "status_key": "failed", "round": round_no})
             return
 
-        execute_response.task_id = task_id
-        execute_response.status_key = "ready_to_apply"
-        add_artifact(task_id, artifact_type="workflow_result", payload=execute_response.model_dump())
-        _event(
-            task_id,
-            "workflow_finished",
-            {
-                "ok": execute_response.ok,
-                "phase": "reviewed",
-                "status_key": execute_response.status_key,
-                "ops": len(execute_response.ops),
-                "patch_ops": len(execute_response.patch_ops),
-                "tool_requests": len(execute_response.tool_requests),
-            },
+        response = IdeChatResponse(
+            ok=False,
+            reply="",
+            done=True,
+            task_id=task_id,
+            status_key="failed",
+            error_code="WORKFLOW_LOOP_EXHAUSTED",
+            error_message="Workflow exhausted without producing a result.",
+            retryable=True,
         )
+        add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
+        apply_workflow_action(task_id, "fail", {"phase": "workflow", "reason": response.error_message})
+        _event(task_id, "workflow_finished", {"ok": False, "phase": "workflow", "status_key": "failed"})
 
     def _run_context_column(self, task_id: str, body: dict[str, Any], workflow_summary: dict[str, Any]) -> dict[str, Any]:
         _event(task_id, "workflow_column_started", {"status_key": "context_indexed", "agent": "context"})
@@ -193,15 +229,30 @@ class WorkflowEngine:
         _event(task_id, "workflow_column_started", {"status_key": "reviewed", "agent": "reviewer"})
         context = _build_agent_context(task_id, "reviewed", "reviewer", body, workflow_summary, ["plan_bundle", "code_change_bundle"])
         _event(task_id, "agent_context_built", {"phase": "reviewed", "agent": "reviewer", "context": _context_log_summary(context)})
-        decision = _review_decision(plan_response, execute_response)
+        review_result = _review_result(plan_response, execute_response)
+        decision = review_result["decision"]
         review_bundle = {
             "decision": decision,
-            "summary": "Reviewer approved generated changes for snapshot-protected apply." if decision == "approve" else "Reviewer requested rework.",
+            "summary": _review_summary(decision, review_result),
             "plan_files": [file.path for file in plan_response.files],
+            "changed_files": [op.path for op in execute_response.ops] + _patch_paths(execute_response),
+            "normalized_plan_files": review_result["normalized_plan_files"],
+            "normalized_changed_files": review_result["normalized_changed_files"],
+            "missing_changed_files": review_result["missing_changed_files"],
+            "unplanned_changed_files": review_result["unplanned_changed_files"],
             "ops": len(execute_response.ops),
             "patch_ops": len(execute_response.patch_ops),
             "tool_requests": len(execute_response.tool_requests),
         }
+        _log.debug(
+            "workflow review decision task_id=%s decision=%s plan=%s changed=%s missing=%s unplanned=%s",
+            task_id,
+            decision,
+            review_result["normalized_plan_files"],
+            review_result["normalized_changed_files"],
+            review_result["missing_changed_files"],
+            review_result["unplanned_changed_files"],
+        )
         add_artifact(task_id, artifact_type="review_bundle", payload=review_bundle)
         output = record_phase_output(
             task_id,
@@ -271,15 +322,72 @@ def _build_agent_context(
 
 
 def _review_decision(plan_response: PlanResponse, execute_response: IdeChatResponse) -> str:
-    planned_paths = {file.path for file in plan_response.files}
-    changed_paths = {op.path for op in execute_response.ops} | set(_patch_paths(execute_response))
+    return _review_result(plan_response, execute_response)["decision"]
+
+
+def _review_result(plan_response: PlanResponse, execute_response: IdeChatResponse) -> dict[str, Any]:
+    planned_paths = {_normalize_review_path(file.path) for file in plan_response.files if file.path}
+    changed_paths = {
+        _normalize_review_path(path)
+        for path in ([op.path for op in execute_response.ops] + _patch_paths(execute_response))
+        if path
+    }
+    missing_changed_files = sorted(planned_paths - changed_paths)
+    unplanned_changed_files = sorted(changed_paths - planned_paths)
+
     if execute_response.tool_requests and not changed_paths:
-        return "request_recoding"
-    if not changed_paths:
-        return "request_recoding"
-    if planned_paths and not changed_paths.issubset(planned_paths):
-        return "request_replan"
-    return "approve"
+        decision = "request_recoding"
+    elif not changed_paths:
+        decision = "request_recoding"
+    elif planned_paths and unplanned_changed_files:
+        decision = "request_replan"
+    else:
+        decision = "approve"
+
+    return {
+        "decision": decision,
+        "normalized_plan_files": sorted(planned_paths),
+        "normalized_changed_files": sorted(changed_paths),
+        "missing_changed_files": missing_changed_files,
+        "unplanned_changed_files": unplanned_changed_files,
+    }
+
+
+def _review_summary(decision: str, review_result: dict[str, Any]) -> str:
+    if decision == "approve":
+        return "Reviewer approved generated changes for snapshot-protected apply."
+    if decision == "request_recoding":
+        return "Reviewer requested recoding because no changed files were produced."
+    unplanned = review_result.get("unplanned_changed_files") or []
+    if unplanned:
+        return f"Reviewer requested replan because generated files were outside the normalized plan: {unplanned[:8]}"
+    return "Reviewer requested rework."
+
+
+def _normalize_review_path(path: str) -> str:
+    normalized = str(path or "").replace("\\", "/").strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    normalized = normalized.lstrip("/")
+
+    for marker in ("/src/", "/backend/", "/frontend/", "/idea-plugin/"):
+        idx = normalized.find(marker)
+        if idx > 0:
+            return normalized[idx + 1:]
+
+    root_files = (
+        "pom.xml",
+        "build.gradle",
+        "settings.gradle",
+        "gradlew",
+        "gradlew.bat",
+        "README.md",
+    )
+    for filename in root_files:
+        suffix = f"/{filename}"
+        if normalized.endswith(suffix):
+            return filename
+    return normalized
 
 
 def _patch_paths(response: IdeChatResponse) -> list[str]:
