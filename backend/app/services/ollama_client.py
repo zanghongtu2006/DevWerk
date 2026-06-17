@@ -13,7 +13,7 @@ from typing import Any, Dict, List
 import requests as http_requests
 
 from app.core.schema import MODEL_RESPONSE_SCHEMA
-from app.services.validation import validate_model_response
+from app.services.validation import ModelResponseValidationError, validate_model_response
 
 _log = logging.getLogger("devwerk.llm.ollama")
 
@@ -58,7 +58,10 @@ class OllamaClient:
 
     def chat_structured(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
         obj = self.chat_json(messages, schema=MODEL_RESPONSE_SCHEMA if self.enable_schema else None)
-        validate_model_response(obj)
+        try:
+            validate_model_response(obj)
+        except ValueError as exc:
+            raise ModelResponseValidationError(str(exc), obj=obj) from exc
         return obj
 
     def chat_json(self, messages: List[Dict[str, str]], schema: dict | None = None) -> Dict[str, Any]:

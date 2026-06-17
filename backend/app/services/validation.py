@@ -3,10 +3,16 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from app.services.tool_protocol import BACKEND_RESEARCH_TOOLS, normalize_tool_requests
 
 ALLOWED_FILE_OPS = {"create_dir", "create_file", "update_file", "delete_path"}
-BACKEND_RESEARCH_TOOLS = {"list_dir", "read_file", "search"}
 ALLOWED_PATCH_OPS = {"apply_patch"}
+
+
+class ModelResponseValidationError(ValueError):
+    def __init__(self, message: str, obj: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.obj = obj or {}
 
 
 def _validate_rel_path(p: str, where: str) -> None:
@@ -54,6 +60,8 @@ def validate_model_response(obj: Dict[str, Any]) -> None:
     if tool_requests is not None:
         if not isinstance(tool_requests, list):
             raise ValueError("tool_requests must be array or null")
+        tool_requests = normalize_tool_requests(tool_requests)
+        obj["tool_requests"] = tool_requests
         for i, tr in enumerate(tool_requests):
             if not isinstance(tr, dict):
                 raise ValueError(f"tool_requests[{i}] must be object")

@@ -5,6 +5,7 @@ import re
 from typing import Any, Dict, List, Optional, Set
 
 from app.models.ide import FileOp, PatchOp, ToolRequest, ToolResult
+from app.services.tool_protocol import normalize_tool_request
 
 
 _EXT_SPACE_RE = re.compile(r"\.\s+([A-Za-z0-9]{1,8})$")
@@ -108,15 +109,13 @@ def coerce_to_fileops(
 
 
 def coerce_to_toolrequests(obj_reqs: List[Dict[str, Any]]) -> List[ToolRequest]:
-    return [
-        ToolRequest(
-            id=r.get("id", ""),
-            tool=r.get("tool", ""),
-            args=r.get("args") if isinstance(r.get("args"), dict) else {},
-        )
-        for r in (obj_reqs or [])
-        if isinstance(r, dict)
-    ]
+    requests: List[ToolRequest] = []
+    for index, raw in enumerate(obj_reqs or []):
+        if not isinstance(raw, dict):
+            continue
+        normalized = normalize_tool_request(raw, index)
+        requests.append(ToolRequest(id=normalized["id"], tool=normalized["tool"], args=normalized["args"]))
+    return requests
 
 
 def coerce_to_patchops(obj_ops: List[Dict[str, Any]]) -> List[PatchOp]:

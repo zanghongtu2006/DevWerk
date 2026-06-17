@@ -42,6 +42,10 @@ SYSTEM_PROMPT = textwrap.dedent(
 
     Tool request rules:
     1. Backend research tools are list_dir, read_file, and search.
+       - read_file args: path, start_line, end_line.
+       - list_dir args: path is optional and defaults to project root.
+       - search args: query is required. pattern is accepted as an alias for query.
+       - search may include paths, but it does not require path.
     2. Backend research tool_requests must not be returned with ops/patch_ops in
        the same response.
     3. Client-side post-apply tools such as run_command may be returned with

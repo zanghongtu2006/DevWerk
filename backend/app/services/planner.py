@@ -19,6 +19,7 @@ from typing import Any
 from app.models.ide import ToolRequest, ToolResult
 from app.models.plan import PlanFile, PlanResponse
 from app.services.llm_factory import get_llm_client
+from app.services.tool_protocol import ToolProtocolError, normalize_tool_request
 
 _log = logging.getLogger("devwerk.planner")
 
@@ -41,6 +42,7 @@ class Planner:
         "  2. Do not invent directories, packages, modules, or framework conventions. If the exact target path is unclear, request tools or return no plan.\n"
         "  3. You may call tools (list_dir, read_file, search) to understand the codebase.\n"
         "     Tool calls must be JSON only: {\"tool_requests\":[{\"id\":\"p1\",\"tool\":\"read_file\",\"args\":{\"path\":\"relative/path.ext\",\"start_line\":1,\"end_line\":200}}]}.\n"
+        "     search uses args.query; args.pattern is tolerated as a query alias. search does not require path.\n"
         "     Use project-relative paths from source_map/tree_preview. Never use absolute paths.\n"
         "  4. When you have enough information, respond with a JSON object containing a 'plan' key:\n"
         "     { plan: { files: [{path, nature, description, confidence}], summary, warnings } }\n"
@@ -329,6 +331,15 @@ def _extract_tool_requests(raw: dict, messages: list[dict], project_root: str | 
         args = dict(args) if isinstance(args, dict) else {}
         if "path" not in args and "file_path" in args:
             args["path"] = args.get("file_path")
+        try:
+            normalized_item = normalize_tool_request(
+                {"id": item.get("id") or f"p{len(requests) + 1}", "tool": tool, "args": args},
+                index - 1,
+            )
+        except ToolProtocolError:
+            continue
+        tool = normalized_item["tool"]
+        args = dict(normalized_item["args"])
         if "paths" in args and isinstance(args["paths"], list):
             args["paths"] = [
                 normalized

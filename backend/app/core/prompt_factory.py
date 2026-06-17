@@ -28,6 +28,9 @@ OPENAI_SYSTEM_PROMPT = textwrap.dedent(
     5. Backend research tool_requests (list_dir/read_file/search) must not be
        returned with ops/patch_ops. Client-side post-apply tools such as
        run_command may be returned with ops/patch_ops.
+       read_file args require path/start_line/end_line; list_dir path is
+       optional; search requires query and may also use pattern as a query
+       alias. search does not require path.
     6. patch_ops only allows apply_patch and must contain unified diff content
        with --- / +++ / @@ markers.
     7. read_file requests must include path, start_line, and end_line.

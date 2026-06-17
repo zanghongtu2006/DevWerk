@@ -238,6 +238,44 @@ class FakeClientToolExecutorClient:
         }
 
 
+class FakeProtocolRepairExecutorClient:
+    def __init__(self):
+        self.calls = 0
+
+    def chat_structured(self, messages: list[dict]) -> dict:
+        from app.services.validation import ModelResponseValidationError
+
+        self.calls += 1
+        if self.calls == 1:
+            raise ModelResponseValidationError(
+                "patch_ops[0] must be unified diff",
+                obj={
+                    "reply": "I tried to patch the file.",
+                    "code_tree": None,
+                    "ops": [],
+                    "tool_requests": [],
+                    "patch_ops": [{"op": "apply_patch", "content": "not a unified diff"}],
+                    "done": False,
+                },
+            )
+
+        assert any("protocol_error:" in message.get("content", "") for message in messages)
+        return {
+            "reply": "Generated repaired file op.",
+            "ops": [
+                {
+                    "op": "update_file",
+                    "path": "src/domain/a.py",
+                    "language": "python",
+                    "content": "print('a')\n",
+                }
+            ],
+            "patch_ops": [],
+            "tool_requests": [],
+            "done": True,
+        }
+
+
 @pytest.mark.asyncio
 async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_path):
     db_path = tmp_path / "devwerk-smoke.db"
@@ -901,6 +939,29 @@ def test_planner_normalizes_foreign_absolute_tool_paths_by_source_map_suffix(mon
     assert plan.files[0].path == "src/domain/Tenant.py"
 
 
+def test_tool_protocol_accepts_search_pattern_without_path():
+    from app.services.coerce import coerce_to_toolrequests
+    from app.services.validation import validate_model_response
+
+    obj = {
+        "reply": "Searching first.",
+        "code_tree": None,
+        "ops": [],
+        "tool_requests": [
+            {"id": "s1", "tool": "search", "args": {"pattern": "class TenantServiceImpl"}},
+        ],
+        "patch_ops": [],
+        "done": False,
+    }
+
+    validate_model_response(obj)
+    assert obj["tool_requests"][0]["args"]["query"] == "class TenantServiceImpl"
+    requests = coerce_to_toolrequests(obj["tool_requests"])
+    assert requests[0].tool == "search"
+    assert requests[0].args["query"] == "class TenantServiceImpl"
+    assert requests[0].args["paths"] == []
+
+
 @pytest.mark.asyncio
 async def test_execute_resolves_tool_requests_with_project_relative_paths(monkeypatch, tmp_path):
     db_path = tmp_path / "devwerk-tool-loop.db"
@@ -960,6 +1021,55 @@ async def test_execute_resolves_tool_requests_with_project_relative_paths(monkey
     assert executed["tool_requests"] == []
     assert fake_executor.calls == 2
     assert executed["ops"][0]["path"] == "src/main/java/org/example/HelloController.java"
+
+
+@pytest.mark.asyncio
+async def test_execute_repairs_model_protocol_errors(monkeypatch, tmp_path):
+    db_path = tmp_path / "devwerk-protocol-repair.db"
+    project_root = tmp_path / "protocol-project"
+    (project_root / "src/domain").mkdir(parents=True)
+    (project_root / "src/domain/a.py").write_text("print('old')\n", encoding="utf-8")
+    fake_settings = FakeSettings(db_path)
+    fake_executor = FakeProtocolRepairExecutorClient()
+
+    import app.main as main_module
+    import app.routes.ide as ide_routes
+    import app.services.kanban as kanban_service
+    import app.services.usage as usage_service
+
+    patch_service_settings(monkeypatch, fake_settings, main_module, ide_routes, kanban_service, usage_service)
+    reset_service_dbs(kanban_service, usage_service)
+    monkeypatch.setattr(ide_routes, "get_llm_client", lambda agent="executor": fake_executor)
+
+    app = main_module.create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            execute_response = await client.post(
+                "/v1/execute",
+                json={
+                    "project_id": "backend-protocol-repair-smoke",
+                    "mode": "agent",
+                    "project_root": str(project_root),
+                    "messages": [{"role": "user", "content": "Update src/domain/a.py."}],
+                    "approved_paths": ["src/domain/a.py"],
+                    "approved_ops": [],
+                    "workspace": {
+                        "root_id": "backend-protocol-repair-smoke",
+                        "changed_files": [],
+                        "open_files": [],
+                        "tree_preview": "./\n  src/\n    domain/\n      a.py",
+                        "source_map": None,
+                    },
+                },
+            )
+
+    assert execute_response.status_code == 200
+    executed = execute_response.json()
+    assert fake_executor.calls == 2
+    assert executed["ok"] is True
+    assert executed["ops"][0]["path"] == "src/domain/a.py"
+    assert executed["status_key"] == "ready_to_apply"
 
 
 @pytest.mark.asyncio

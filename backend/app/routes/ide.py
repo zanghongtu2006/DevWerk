@@ -30,6 +30,7 @@ from app.services.llm_factory import get_llm_client
 from app.services.planner import Planner as build_planner
 from app.services.prompt_builder import build_model_messages
 from app.services.usage import clear_request, finish_request, start_request, usage_summary
+from app.services.validation import ModelResponseValidationError
 from app.services.workflow import apply_workflow_action, record_phase_output
 from app.services.workflow_engine import WorkflowEngine
 
@@ -452,16 +453,62 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                         },
                     },
                 )
-                obj = client.chat_structured(
-                    build_model_messages(
-                        _ChatProxy(
-                            messages,
-                            project_root=body.get("project_root"),
-                            tool_results=tool_results,
-                        ),
-                        provider=cfg.get_llm_config("executor").get("protocol", cfg.llm_provider_name),
+                try:
+                    obj = client.chat_structured(
+                        build_model_messages(
+                            _ChatProxy(
+                                messages,
+                                project_root=body.get("project_root"),
+                                tool_results=tool_results,
+                            ),
+                            provider=cfg.get_llm_config("executor").get("protocol", cfg.llm_provider_name),
+                        )
                     )
-                )
+                except ModelResponseValidationError as exc:
+                    invalid_obj = exc.obj if isinstance(exc.obj, dict) else {}
+                    summary = _model_response_summary(invalid_obj)
+                    _kanban_event(
+                        task_id,
+                        "execute_protocol_error",
+                        {
+                            "round": tool_round + 1,
+                            "attempt": attempt + 1,
+                            "agent": "executor",
+                            "error": str(exc),
+                            "output": summary,
+                        },
+                    )
+                    _log.debug(
+                        "ide_execute: protocol_error round=%s error=%s output=%s",
+                        tool_round + 1,
+                        exc,
+                        summary,
+                    )
+                    messages = messages + [
+                        {
+                            "role": "assistant",
+                            "content": "invalid_model_response:\n"
+                            + json.dumps(_truncate_invalid_response(invalid_obj), ensure_ascii=False),
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                "protocol_error:\n"
+                                + json.dumps(
+                                    {
+                                        "error": str(exc),
+                                        "required_action": (
+                                            "Return one valid DevWerk JSON object. If using patch_ops, content must be unified diff "
+                                            "with --- / +++ / @@ markers. If requesting search, use args.query or args.pattern. "
+                                            "If requesting read_file, include args.path."
+                                        ),
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            ),
+                        },
+                    ]
+                    continue
                 _kanban_event(
                     task_id,
                     "execute_llm_round_result",
@@ -933,6 +980,24 @@ def _model_response_summary(obj: object) -> dict:
         ] if isinstance(tool_requests, list) else [],
         "done": bool(obj.get("done") or False),
     }
+
+
+def _truncate_invalid_response(obj: object) -> dict:
+    if not isinstance(obj, dict):
+        return {"type": type(obj).__name__}
+    out: dict[str, object] = {}
+    for key in ("reply", "code_tree", "done", "raw_model_text"):
+        if key in obj:
+            value = obj.get(key)
+            if isinstance(value, str):
+                out[key] = value[:1000]
+            else:
+                out[key] = value
+    for key in ("ops", "patch_ops", "tool_requests"):
+        value = obj.get(key)
+        if isinstance(value, list):
+            out[key] = value[:5]
+    return out
 
 
 def _body_task_id(body: dict) -> str | None:

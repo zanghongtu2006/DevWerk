@@ -16,7 +16,7 @@ from typing import Any, Dict, List
 
 import requests as http_requests
 
-from app.services.validation import validate_model_response
+from app.services.validation import ModelResponseValidationError, validate_model_response
 
 _log = logging.getLogger("devwerk.llm.anthropic")
 
@@ -71,7 +71,10 @@ class AnthropicClient:
         obj = self.chat_json(messages)
         if obj.get("raw_text") and not _has_structured_output(obj):
             obj = _fallback_structured_response(messages, str(obj.get("raw_text") or ""))
-        validate_model_response(obj)
+        try:
+            validate_model_response(obj)
+        except ValueError as exc:
+            raise ModelResponseValidationError(str(exc), obj=obj) from exc
         return obj
 
     def chat_json(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
