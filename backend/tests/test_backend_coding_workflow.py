@@ -6,6 +6,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+import requests
 
 from app.models.ide import FileOp, IdeChatResponse
 from app.models.plan import PlanFile, PlanResponse
@@ -14,6 +15,7 @@ from app.services.coder_harness import build_code_context_summary
 from app.services.openai_client import OpenAIClient
 from app.services.ollama_client import OllamaClient
 from app.services.planner import Planner
+from app.services.provider_errors import LLMProviderError, ProviderErrorDetails, classify_provider_response
 from app.services.usage import _normalize_usage
 
 
@@ -261,6 +263,41 @@ class FakeExecutorClient:
         }
 
 
+class FakeRetryableProviderErrorExecutorClient:
+    def __init__(self):
+        self.calls = 0
+
+    def chat_structured(self, messages: list[dict]) -> dict:
+        self.calls += 1
+        if self.calls == 1:
+            raise LLMProviderError(
+                ProviderErrorDetails(
+                    provider="anthropic",
+                    api_name="minimax",
+                    status_code=529,
+                    error_code="LLM_OVERLOADED",
+                    message="The API is temporarily overloaded.",
+                    retryable=True,
+                    provider_error_type="overloaded_error",
+                    body_snippet='{"type":"error","error":{"type":"overloaded_error"}}',
+                )
+            )
+        return {
+            "reply": "Recovered after provider retry.",
+            "ops": [
+                {
+                    "op": "create_file",
+                    "path": "service/retry.py",
+                    "language": "python",
+                    "content": "print('retry ok')\n",
+                }
+            ],
+            "patch_ops": [],
+            "tool_requests": [],
+            "done": True,
+        }
+
+
 class FakeToolLoopExecutorClient:
     def __init__(self):
         self.calls = 0
@@ -468,6 +505,60 @@ async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_
             assert "execute_llm_round_started" in event_types
             assert "execute_llm_round_result" in event_types
             assert "execute_response_ready" in event_types
+
+
+@pytest.mark.asyncio
+async def test_execute_retries_retryable_provider_error(monkeypatch, tmp_path):
+    db_path = tmp_path / "devwerk-provider-retry.db"
+    project_root = tmp_path / "retry-project"
+    project_root.mkdir()
+    fake_settings = FakeSettings(db_path)
+    fake_executor = FakeRetryableProviderErrorExecutorClient()
+
+    import app.main as main_module
+    import app.routes.ide as ide_routes
+    import app.services.kanban as kanban_service
+    import app.services.usage as usage_service
+
+    patch_service_settings(monkeypatch, fake_settings, main_module, ide_routes, kanban_service, usage_service)
+    reset_service_dbs(kanban_service, usage_service)
+    monkeypatch.setattr(ide_routes, "get_llm_client", lambda agent="executor": fake_executor)
+    task = kanban_service.create_task(
+        project_id="backend-provider-retry",
+        title="Retry provider error",
+        description="Smoke",
+        status_key="planned",
+    )["task"]
+
+    app = main_module.create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(
+                "/v1/execute",
+                json={
+                    "project_id": "backend-provider-retry",
+                    "task_id": task["id"],
+                    "mode": "agent",
+                    "project_root": str(project_root),
+                    "messages": [{"role": "user", "content": "Create retry file."}],
+                    "approved_paths": ["service/retry.py"],
+                    "approved_ops": [],
+                    "workspace": {"root_id": "backend-provider-retry", "source_map": None},
+                },
+                headers={"X-DevWerk-Project-Id": "backend-provider-retry"},
+            )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["ops"][0]["path"] == "service/retry.py"
+    assert fake_executor.calls == 2
+    events = kanban_service.list_events(project_id="backend-provider-retry", task_id=task["id"], limit=100)["events"]
+    retry_events = [event for event in events if event["event_type"] == "execute_llm_round_retry"]
+    assert retry_events
+    assert retry_events[0]["payload"]["error_code"] == "LLM_OVERLOADED"
+    assert retry_events[0]["payload"]["provider_error"]["status_code"] == 529
 
 
 @pytest.mark.asyncio
@@ -1553,6 +1644,37 @@ def test_anthropic_non_json_text_does_not_generate_framework_ops(monkeypatch):
     assert response["tool_requests"] == []
     assert response["patch_ops"] == []
     assert response["raw_model_text"]
+
+
+def test_minimax_anthropic_529_is_retryable_overloaded_error():
+    response = requests.Response()
+    response.status_code = 529
+    response.reason = "Unknown Status Code"
+    response.url = "https://api.minimaxi.com/anthropic/v1/messages"
+    response._content = b'{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}'
+    response.headers["request-id"] = "mini-req-1"
+
+    details = classify_provider_response(response, provider="anthropic", api_name="minimax")
+
+    assert details.error_code == "LLM_OVERLOADED"
+    assert details.retryable is True
+    assert details.status_code == 529
+    assert details.provider_error_type == "overloaded_error"
+    assert details.request_id == "mini-req-1"
+
+
+def test_minimax_business_error_code_is_classified():
+    response = requests.Response()
+    response.status_code = 200
+    response.reason = "OK"
+    response.url = "https://api.minimaxi.com/v1/text/chatcompletion_v2"
+    response._content = b'{"base_resp":{"status_code":1002,"status_msg":"rate limit"}}'
+
+    details = classify_provider_response(response, provider="openai", api_name="minimax")
+
+    assert details.error_code == "LLM_RATE_LIMITED"
+    assert details.provider_code == 1002
+    assert details.retryable is True
 
 
 def test_llm_clients_ignore_environment_proxy_by_default():

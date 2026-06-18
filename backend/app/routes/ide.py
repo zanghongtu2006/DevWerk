@@ -28,6 +28,13 @@ from app.services.coder_harness import build_code_context_summary, build_coder_s
 from app.services.kanban import add_artifact, add_event, create_task, get_task, list_events, move_task
 from app.services.llm_factory import get_llm_client
 from app.services.planner import Planner as build_planner
+from app.services.provider_errors import (
+    LLMProviderError,
+    is_retryable_llm_error,
+    llm_error_code,
+    llm_error_log_payload,
+    llm_error_message,
+)
 from app.services.prompt_builder import build_model_messages
 from app.services.usage import clear_request, finish_request, start_request, usage_summary
 from app.services.validation import ModelResponseValidationError
@@ -676,25 +683,61 @@ async def ide_execute(request: Request) -> IdeChatResponse:
             )
 
         except Exception as exc:  # noqa: BLE001
-            is_timeout = (
-                "ReadTimeout" in type(exc).__name__
-                or "timeout" in str(exc).lower()
-            )
-            if attempt < max_retries and is_timeout:
+            retryable = is_retryable_llm_error(exc)
+            if attempt < max_retries and retryable:
+                _kanban_event(
+                    task_id,
+                    "execute_llm_round_retry",
+                    {
+                        "attempt": attempt + 1,
+                        "max_retries": max_retries,
+                        "agent": "executor",
+                        "error_code": llm_error_code(exc),
+                        "provider_error": llm_error_log_payload(exc),
+                    },
+                )
                 time.sleep(backoff * (attempt + 1))
                 continue
 
-            _log.exception("Execute LLM call failed (attempt %s/%s)", attempt, max_retries)
-            move("failed", {"phase": "execute", "error": f"{type(exc).__name__}: {exc}"})
+            if isinstance(exc, LLMProviderError):
+                _log.warning(
+                    "Execute LLM provider error attempt=%s/%s details=%s",
+                    attempt,
+                    max_retries,
+                    llm_error_log_payload(exc),
+                )
+            else:
+                _log.exception(
+                    "Execute LLM call failed (attempt %s/%s) error=%s",
+                    attempt,
+                    max_retries,
+                    llm_error_log_payload(exc),
+                )
+            error_message = llm_error_message(exc)
+            error_code = llm_error_code(exc)
+            _kanban_event(
+                task_id,
+                "execute_llm_round_failed",
+                {
+                    "attempt": attempt + 1,
+                    "max_retries": max_retries,
+                    "agent": "executor",
+                    "error": error_message,
+                    "error_code": error_code,
+                    "retryable": False,
+                    "provider_error": llm_error_log_payload(exc),
+                },
+            )
+            move("failed", {"phase": "execute", "error": error_message, "error_code": error_code})
             return IdeChatResponse(
                 ok=False,
                 reply="",
                 done=True,
                 task_id=task_id,
                 status_key="failed",
-                error_code="MODEL_ERROR",
-                error_message=f"{type(exc).__name__}: {exc}",
-                retryable=(attempt < max_retries),
+                error_code=error_code,
+                error_message=error_message,
+                retryable=(attempt < max_retries and retryable),
             )
 
     return IdeChatResponse(ok=False, reply="", done=True, task_id=task_id, status_key="failed", error_code="UNKNOWN")

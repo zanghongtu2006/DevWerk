@@ -14,6 +14,7 @@ from app.core.config import settings
 from app.services.anthropic_client import AnthropicClient
 from app.services.ollama_client import OllamaClient
 from app.services.openai_client import OpenAIClient
+from app.services.provider_errors import LLMProviderError
 from app.services.usage import record_llm_usage
 
 
@@ -57,7 +58,16 @@ class UsageTrackedClient:
             success = True
             return result
         except Exception as exc:  # noqa: BLE001
-            error_type = type(exc).__name__
+            if isinstance(exc, LLMProviderError):
+                details = exc.details
+                parts = [details.error_code]
+                if details.status_code is not None:
+                    parts.append(f"http_{details.status_code}")
+                if details.provider_code is not None:
+                    parts.append(f"provider_{details.provider_code}")
+                error_type = ":".join(parts)
+            else:
+                error_type = type(exc).__name__
             raise
         finally:
             duration_ms = int((time.monotonic() - started) * 1000)

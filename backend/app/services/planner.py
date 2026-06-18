@@ -19,6 +19,7 @@ from typing import Any
 from app.models.ide import ToolRequest, ToolResult
 from app.models.plan import PlanFile, PlanResponse
 from app.services.llm_factory import get_llm_client
+from app.services.provider_errors import is_retryable_llm_error, llm_error_code, llm_error_log_payload, llm_error_message
 from app.services.tool_protocol import ToolProtocolError, normalize_tool_request
 
 _log = logging.getLogger("devwerk.planner")
@@ -170,8 +171,8 @@ class Planner:
 
                 return plan
             except Exception as exc:  # noqa: BLE001
-                is_timeout = "ReadTimeout" in type(exc).__name__ or "timeout" in str(exc).lower()
-                if attempt < max_rounds - 1 and is_timeout:
+                retryable = is_retryable_llm_error(exc)
+                if attempt < max_rounds - 1 and retryable:
                     time.sleep(backoff * (attempt + 1))
                     continue
 
@@ -181,15 +182,17 @@ class Planner:
                     {
                         "round": attempt + 1,
                         "agent": self.agent_name,
-                        "error": f"{type(exc).__name__}: {exc}",
-                        "retryable": attempt < max_rounds - 1 and is_timeout,
+                        "error": llm_error_message(exc),
+                        "error_code": llm_error_code(exc, "PLAN_ERROR"),
+                        "retryable": attempt < max_rounds - 1 and retryable,
+                        "provider_error": llm_error_log_payload(exc),
                     },
                 )
                 return PlanResponse(
                     ok=False,
                     files=[],
-                    error_code="PLAN_ERROR",
-                    error_message=f"{type(exc).__name__}: {exc}",
+                    error_code=llm_error_code(exc, "PLAN_ERROR"),
+                    error_message=llm_error_message(exc),
                 )
 
         if last_plan is not None:

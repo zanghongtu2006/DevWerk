@@ -16,6 +16,7 @@ from typing import Any, Dict, List
 
 import requests as http_requests
 
+from app.services.provider_errors import raise_for_provider_payload, raise_for_provider_response
 from app.services.validation import ModelResponseValidationError, validate_model_response
 
 _log = logging.getLogger("devwerk.llm.anthropic")
@@ -104,9 +105,16 @@ class AnthropicClient:
             payload["metadata"] = metadata
 
         resp = self.session.post(self.url, json=payload, headers=headers, timeout=self.timeout)
-        resp.raise_for_status()
+        raise_for_provider_response(resp, provider="anthropic", api_name=self.api_name)
 
         data = resp.json()
+        raise_for_provider_payload(
+            data,
+            provider="anthropic",
+            api_name=self.api_name,
+            status_code=resp.status_code,
+            request_id=resp.headers.get("request-id") or resp.headers.get("x-request-id"),
+        )
         self.last_usage = self._extract_usage(data)
         content = self._extract_text(data)
         obj = self._parse_json_object(content)
