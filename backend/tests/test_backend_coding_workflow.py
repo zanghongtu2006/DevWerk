@@ -338,6 +338,32 @@ class FakeToolLoopExecutorClient:
         }
 
 
+class FakeIncrementalExecutorClient:
+    def __init__(self):
+        self.calls = 0
+
+    def chat_structured(self, messages: list[dict]) -> dict:
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "reply": "Fixed the first file; inspecting the dependency next.",
+                "ops": [{"op": "update_file", "path": "src/a.py", "content": "A = 2\n"}],
+                "patch_ops": [],
+                "tool_requests": [{"id": "read-b", "tool": "read_file", "args": {"path": "src/b.py"}}],
+                "done": False,
+            }
+
+        assert any("tool_results:" in message.get("content", "") for message in messages)
+        assert any("candidate_revision_state:" in message.get("content", "") for message in messages)
+        return {
+            "reply": "Completed both related fixes.",
+            "ops": [{"op": "update_file", "path": "src/b.py", "content": "B = 2\n"}],
+            "patch_ops": [],
+            "tool_requests": [],
+            "done": True,
+        }
+
+
 class FakeClientToolExecutorClient:
     def chat_structured(self, messages: list[dict]) -> dict:
         return {
@@ -584,6 +610,11 @@ async def test_workflow_start_poll_result_smoke(monkeypatch, tmp_path):
     monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": FakePlannerClient())
     monkeypatch.setattr(ide_routes, "get_llm_client", lambda agent="executor": FakeExecutorClient())
 
+    async def approve_review(body: dict) -> dict:
+        return {"decision": "approve", "summary": "Candidate satisfies the plan.", "findings": [], "warnings": []}
+
+    monkeypatch.setattr(ide_routes, "_run_review_phase", approve_review)
+
     app = main_module.create_app()
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
@@ -743,6 +774,20 @@ async def test_workflow_message_api_confirms_plan_without_starting_new_task(monk
             conversation = kanban_service.get_conversation(task_id)
             assert [message["message_type"] for message in conversation["messages"]].count("plan_confirmation") == 1
 
+            failed_task = kanban_service.create_task(
+                project_id="conversation-api",
+                title="Terminal task",
+                description="Must not be resumed implicitly.",
+                status_key="failed",
+            )["task"]
+            rejected = (await client.post(
+                f"/v1/workflows/{failed_task['id']}/messages",
+                json={"action": "confirm_plan", "message": "Do not replay this."},
+            )).json()
+            assert rejected["ok"] is False
+            assert rejected["error_code"] == "WORKFLOW_TERMINAL"
+            assert rejected["retryable"] is False
+
 
 def test_workflow_reviewer_keeps_distinct_relative_paths():
     from app.services.workflow_engine import _review_result
@@ -798,7 +843,7 @@ def test_workflow_reviewer_accepts_unchanged_candidate_paths():
     assert review["unplanned_changed_files"] == []
 
 
-def test_workflow_reviewer_rejects_missing_required_file():
+def test_workflow_reviewer_treats_required_file_as_semantic_review_evidence():
     from app.services.workflow_engine import _review_result
 
     plan = PlanResponse(
@@ -814,7 +859,7 @@ def test_workflow_reviewer_rejects_missing_required_file():
 
     review = _review_result(plan, executed)
 
-    assert review["decision"] == "request_recoding"
+    assert review["decision"] == "approve"
     assert review["required_missing_files"] == ["src/domain/b.py"]
 
 
@@ -941,6 +986,7 @@ async def test_workflow_recoding_receives_review_feedback(monkeypatch, tmp_path)
         status_key="draft",
     )["task"]
     coding_calls = 0
+    review_calls = 0
 
     async def plan_runner(body: dict) -> PlanResponse:
         return PlanResponse(
@@ -981,7 +1027,18 @@ async def test_workflow_recoding_receives_review_feedback(monkeypatch, tmp_path)
             ],
         )
 
-    engine = workflow_engine_service.WorkflowEngine(plan_runner=plan_runner, coding_runner=coding_runner)
+    async def review_runner(body: dict) -> dict:
+        nonlocal review_calls
+        review_calls += 1
+        if review_calls == 1:
+            return {"decision": "request_recoding", "summary": "The requested second module is still incomplete."}
+        return {"decision": "approve", "summary": "Both requested modules are complete."}
+
+    engine = workflow_engine_service.WorkflowEngine(
+        plan_runner=plan_runner,
+        coding_runner=coding_runner,
+        review_runner=review_runner,
+    )
     await engine.run(
         task["id"],
         {
@@ -1639,6 +1696,64 @@ async def test_execute_resolves_tool_requests_with_project_relative_paths(monkey
     assert executed["tool_requests"] == []
     assert fake_executor.calls == 2
     assert executed["ops"][0]["path"] == "src/main/java/org/example/HelloController.java"
+
+
+@pytest.mark.asyncio
+async def test_execute_preserves_candidate_changes_across_research_rounds(monkeypatch, tmp_path):
+    db_path = tmp_path / "devwerk-incremental-tool-loop.db"
+    project_root = tmp_path / "incremental"
+    (project_root / "src").mkdir(parents=True)
+    (project_root / "src/a.py").write_text("A = 1\n", encoding="utf-8")
+    (project_root / "src/b.py").write_text("B = 1\n", encoding="utf-8")
+    fake_settings = FakeSettings(db_path)
+    fake_executor = FakeIncrementalExecutorClient()
+
+    import app.main as main_module
+    import app.routes.ide as ide_routes
+    import app.services.kanban as kanban_service
+    import app.services.usage as usage_service
+
+    patch_service_settings(monkeypatch, fake_settings, main_module, ide_routes, kanban_service, usage_service)
+    reset_service_dbs(kanban_service, usage_service)
+    monkeypatch.setattr(ide_routes, "get_llm_client", lambda agent="executor": fake_executor)
+
+    app = main_module.create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(
+                "/v1/execute",
+                json={
+                    "project_id": "incremental-project",
+                    "mode": "agent",
+                    "project_root": str(project_root),
+                    "messages": [{"role": "user", "content": "Fix both modules."}],
+                    "approved_paths": ["src/a.py", "src/b.py"],
+                    "workspace": {"tree_preview": "./\n  src/\n    a.py\n    b.py"},
+                },
+            )
+
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["done"] is True
+    assert fake_executor.calls == 2
+    assert [op["path"] for op in payload["ops"]] == ["src/a.py", "src/b.py"]
+
+
+def test_coding_rework_context_includes_previous_revision():
+    from app.services.workflow_engine import _coding_phase_messages
+
+    plan = PlanResponse(files=[PlanFile(path="src/a.py", nature="modified", description="Fix A")])
+    previous = IdeChatResponse(
+        reply="First attempt",
+        done=True,
+        ops=[FileOp(op="update_file", path="src/a.py", content="A = 1\n")],
+    )
+
+    messages = _coding_phase_messages([], plan, {"decision": "request_recoding"}, previous_revision=previous)
+
+    assert '"previous_revision"' in messages[-1]["content"]
+    assert '"content":"A = 1\\n"' in messages[-1]["content"]
 
 
 @pytest.mark.asyncio

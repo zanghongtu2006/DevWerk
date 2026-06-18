@@ -466,6 +466,7 @@ class WorkflowEngine:
             conversation_context.get("messages") or body.get("messages") or [],
             state.plan_response,
             state.review_feedback,
+            previous_revision=state.execute_response,
             phase=column.status_key,
         )
         execute_body = {
@@ -677,6 +678,7 @@ def _coding_phase_messages(
     plan_response: PlanResponse,
     review_feedback: dict[str, Any] | None = None,
     *,
+    previous_revision: IdeChatResponse | None = None,
     phase: str = "coding",
 ) -> list[dict[str, str]]:
     context = {
@@ -698,11 +700,12 @@ def _coding_phase_messages(
         },
         "review_feedback": _compact_review_feedback(review_feedback),
         "verification_feedback": _compact_verification_feedback(review_feedback),
+        "previous_revision": _compact_previous_revision(previous_revision),
         "rules": [
             "Treat intent=create/modify/delete paths as approved candidates; inspect paths are read-only evidence.",
             "A candidate path is not a requirement to edit it unless required=true.",
             "For nature=deleted, emit a delete_path operation when the file should be removed.",
-            "If review_feedback is present, address semantic defects, required_missing_files, or unplanned_changed_files before returning done=true.",
+            "If review_feedback is present, continue from previous_revision and address semantic defects or unplanned_changed_files before returning done=true.",
             "If verification_feedback is present, fix the reported compile/test/tool errors before returning done=true.",
             "If a required file is not actually needed anymore, explain why in reply and avoid inventing unrelated paths.",
         ],
@@ -713,6 +716,18 @@ def _coding_phase_messages(
             "content": "workflow_phase_context:\n" + json.dumps(context, ensure_ascii=False, separators=(",", ":")),
         }
     ]
+
+
+def _compact_previous_revision(response: IdeChatResponse | None) -> dict[str, Any] | None:
+    if response is None:
+        return None
+    return {
+        "reply": response.reply,
+        "done": response.done,
+        "ops": [op.model_dump() for op in response.ops],
+        "patch_ops": [op.model_dump() for op in response.patch_ops],
+        "tool_requests": [request.model_dump() for request in response.tool_requests],
+    }
 
 
 def _compact_review_feedback(review_feedback: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -809,7 +824,7 @@ def _failure_response(task_id: str, error_code: str, error_message: str, *, stat
         status_key=status_key,
         error_code=error_code,
         error_message=error_message,
-        retryable=True,
+        retryable=False,
     )
 
 
@@ -854,8 +869,6 @@ def _review_result(plan_response: PlanResponse, execute_response: IdeChatRespons
         decision = "request_recoding"
     elif planned_paths and unplanned_changed_files:
         decision = "request_replan"
-    elif required_missing_files:
-        decision = "request_recoding"
     else:
         decision = "approve"
 
@@ -873,9 +886,6 @@ def _review_summary(decision: str, review_result: dict[str, Any]) -> str:
     if decision == "approve":
         return "Reviewer approved generated changes for snapshot-protected apply."
     if decision == "request_recoding":
-        required_missing = review_result.get("required_missing_files") or []
-        if required_missing:
-            return f"Reviewer requested recoding because required changes were not produced: {required_missing[:8]}"
         return "Reviewer requested recoding because no complete changed-file result was produced."
     unplanned = review_result.get("unplanned_changed_files") or []
     if unplanned:

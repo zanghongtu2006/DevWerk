@@ -33,6 +33,7 @@ from app.services.kanban import (
     create_task,
     ensure_conversation,
     get_conversation,
+    get_project_settings,
     get_task,
     get_workflow_runtime_state,
     list_events,
@@ -57,6 +58,15 @@ from app.services.workflow_engine import WorkflowEngine
 
 router = APIRouter()
 _log = logging.getLogger("devwerk.ide")
+
+
+def _positive_int(value: object, default: int, *, maximum: int | None = None) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    parsed = parsed if parsed > 0 else default
+    return min(parsed, maximum) if maximum is not None else parsed
 
 
 @router.post("/debug/raw")
@@ -134,6 +144,17 @@ async def continue_workflow(task_id: str, request: Request):
     action = str(incoming.get("action") or "message").strip().lower().replace("-", "_")
     if action not in {"message", "confirm_plan", "revise_plan", "cancel", "tool_result"}:
         return {"ok": False, "task_id": task_id, "error_code": "BAD_ACTION", "error_message": f"unsupported conversation action: {action}"}
+    task = detail.get("task") or {}
+    status_key = str(task.get("status_key") or "")
+    if status_key in {"done", "failed"}:
+        return {
+            "ok": False,
+            "task_id": task_id,
+            "status_key": status_key,
+            "error_code": "WORKFLOW_TERMINAL",
+            "error_message": f"Workflow task is already terminal ({status_key}); create a new task or use the explicit retry action.",
+            "retryable": False,
+        }
     if action == "cancel":
         apply_workflow_action(task_id, "abandon", {"reason": str(incoming.get("message") or "user cancelled")})
         update_conversation(task_id, state="cancelled", waiting_for=None)
@@ -149,7 +170,6 @@ async def continue_workflow(task_id: str, request: Request):
             metadata={"action": action},
         )
 
-    task = detail.get("task") or {}
     previous_body = _latest_artifact_payload(task, "workflow_request_body") or {}
     conversation = get_conversation(task_id) or {}
     body = dict(previous_body)
@@ -531,8 +551,13 @@ async def ide_execute(request: Request) -> IdeChatResponse:
     max_retries = 2
     backoff = 0.8
 
-    tool_results: list[ToolResult] = []
-    max_tool_rounds = 6
+    tool_results_by_id: dict[str, ToolResult] = {}
+    candidate_ops: dict[str, dict] = {}
+    candidate_patch_ops: list[dict] = []
+    project_settings_payload = get_project_settings(str(body.get("project_id") or "default"))
+    project_settings = project_settings_payload.get("settings") if isinstance(project_settings_payload, dict) else {}
+    parameters = project_settings.get("parameters") if isinstance(project_settings, dict) else {}
+    max_tool_rounds = _positive_int(parameters.get("agent_tool_max_rounds"), 12, maximum=40)
 
     for attempt in range(max_retries + 1):
         try:
@@ -547,7 +572,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                         "agent": "executor",
                         "input": {
                             "message_count": len(messages),
-                            "tool_result_count": len(tool_results),
+                            "tool_result_count": len(tool_results_by_id),
                             "approved_paths": sorted(approved_set),
                             "roles": [str(m.get("role") or "") for m in messages],
                         },
@@ -559,7 +584,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                             _ChatProxy(
                                 messages,
                                 project_root=body.get("project_root"),
-                                tool_results=tool_results,
+                                tool_results=list(tool_results_by_id.values()),
                             ),
                             provider=cfg.get_llm_config("executor").get("protocol", cfg.llm_provider_name),
                         )
@@ -631,6 +656,11 @@ async def ide_execute(request: Request) -> IdeChatResponse:
 
                 ops = _filter_ops(obj.get("ops") or [], approved_set, body.get("project_root"))
                 patch_ops = _filter_patch_ops(obj.get("patch_ops") or [], approved_set, body.get("project_root"))
+                for op in ops:
+                    candidate_ops[str(op.get("path") or "")] = op
+                for patch_op in patch_ops:
+                    if patch_op not in candidate_patch_ops:
+                        candidate_patch_ops.append(patch_op)
                 tool_requests = coerce_to_toolrequests(obj.get("tool_requests") or [])
                 backend_tool_requests = [req for req in tool_requests if _is_backend_tool_request(req)]
                 client_tool_requests = [req for req in tool_requests if not _is_backend_tool_request(req)]
@@ -644,13 +674,15 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                     sorted(approved_set),
                 )
 
-                if backend_tool_requests and mode == "agent" and not ops and not patch_ops:
+                if backend_tool_requests and mode == "agent":
                     _kanban_event(
                         task_id,
                         "execute_tool_requests",
                         {"round": tool_round + 1, "count": len(backend_tool_requests)},
                     )
-                    tool_results = _execute_tool_requests(body.get("project_root"), backend_tool_requests)
+                    round_tool_results = _execute_tool_requests(body.get("project_root"), backend_tool_requests)
+                    for result in round_tool_results:
+                        tool_results_by_id[result.id] = result
                     _kanban_event(
                         task_id,
                         "execute_tool_results",
@@ -658,7 +690,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                             "round": tool_round + 1,
                             "results": [
                                 {"id": r.id, "ok": r.ok, "content_chars": len(r.content or ""), "error": r.error}
-                                for r in tool_results
+                                for r in round_tool_results
                             ],
                         },
                     )
@@ -667,7 +699,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                         tool_round + 1,
                         [
                             {"id": r.id, "ok": r.ok, "content_chars": len(r.content or ""), "error": r.error}
-                            for r in tool_results
+                            for r in round_tool_results
                         ],
                     )
                     messages = messages + [
@@ -675,7 +707,36 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                             "role": "assistant",
                             "content": "tool_requests:\n"
                             + json.dumps([r.model_dump(exclude_none=True) for r in backend_tool_requests], ensure_ascii=False),
-                        }
+                        },
+                        {
+                            "role": "user",
+                            "content": "candidate_revision_state:\n"
+                            + json.dumps(
+                                {
+                                    "changed_paths": sorted(candidate_ops),
+                                    "patch_ops": len(candidate_patch_ops),
+                                    "instruction": "Continue from this candidate; do not discard completed changes while researching remaining errors.",
+                                },
+                                ensure_ascii=False,
+                            ),
+                        },
+                    ]
+                    continue
+
+                if (ops or patch_ops) and not bool(obj.get("done") or False) and not client_tool_requests:
+                    messages = messages + [
+                        {
+                            "role": "assistant",
+                            "content": "candidate_revision:\n"
+                            + json.dumps(
+                                {"ops": list(candidate_ops.values()), "patch_ops": candidate_patch_ops},
+                                ensure_ascii=False,
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": "Continue the same coding revision. Return done=true only after the requested implementation is complete, or request concrete tools for missing evidence.",
+                        },
                     ]
                     continue
 
@@ -685,9 +746,9 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                     task_id=task_id,
                     status_key="ready_to_apply",
                     code_tree=obj.get("code_tree"),
-                    ops=coerce_to_fileops(ops, tool_results=[]),
+                    ops=coerce_to_fileops(list(candidate_ops.values()), tool_results=[]),
                     tool_requests=client_tool_requests,
-                    patch_ops=coerce_to_patchops(patch_ops),
+                    patch_ops=coerce_to_patchops(candidate_patch_ops),
                     done=bool(obj.get("done") or False),
                 )
                 phase_output = _record_phase_output(
@@ -748,7 +809,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
             _log.debug(
                 "ide_execute: tool loop exhausted rounds=%s last_tool_results=%s",
                 max_tool_rounds,
-                len(tool_results),
+                len(tool_results_by_id),
             )
             move("failed", {"phase": "execute", "error": "tool loop exhausted"})
             return IdeChatResponse(
@@ -758,8 +819,8 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                 task_id=task_id,
                 status_key="failed",
                 error_code="TOOL_LOOP_EXHAUSTED",
-                error_message=f"Executor requested tools for {max_tool_rounds} rounds without producing file operations.",
-                retryable=True,
+                error_message=f"Executor research did not converge after {max_tool_rounds} evidence rounds.",
+                retryable=False,
             )
 
         except Exception as exc:  # noqa: BLE001

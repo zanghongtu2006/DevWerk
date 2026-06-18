@@ -57,6 +57,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
     private val attachmentPanel = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
     @Volatile private var activeTaskId: String? = null
     @Volatile private var waitingFor: String? = null
+    @Volatile private var activeDevCtx: DevwerkContext? = null
 
     init {
         initUi()
@@ -237,16 +238,19 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         try {
             val basePath = project.basePath
             val runner = DevwerkOperationRunner()
-            val devCtx = if (!basePath.isNullOrBlank()) runner.beginOperation(project, Paths.get(basePath)) else null
+            var devCtx = activeDevCtx ?: if (!basePath.isNullOrBlank()) {
+                runner.beginInteraction(project, Paths.get(basePath), chatCtx.taskId)
+            } else null
 
-            val updatedCtx = chatCtx.copy(devCtx = devCtx)
+            var updatedCtx = chatCtx.copy(devCtx = devCtx)
             val aiClient = AiClientFactory.create(project)
 
             var response = aiClient.sendWorkflow(updatedCtx, userMessage)
-
-            if (!response.ok && response.retryable) {
-                appendOpLog(devCtx, "\n[INFO] retry once\n")
-                response = aiClient.sendWorkflow(updatedCtx.copy(history = history.toList()), userMessage)
+            val responseTaskId = response.taskId
+            if (devCtx != null && !responseTaskId.isNullOrBlank()) {
+                devCtx = runner.bindTask(devCtx, responseTaskId)
+                activeDevCtx = devCtx
+                updatedCtx = updatedCtx.copy(devCtx = devCtx, taskId = responseTaskId)
             }
 
             history += ChatMessage("user", userMessage)
@@ -291,6 +295,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 if (resp.waitingFor == null && (resp.done || resp.statusKey in setOf("ready_to_apply", "done", "failed"))) {
                     activeTaskId = null
                     waitingFor = null
+                    activeDevCtx = null
                 }
                 setState(State.IDLE)
             }
@@ -319,14 +324,15 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         val maxResumeRounds = 2
 
         while (true) {
-            runner.recordFinalSummaryAndBackup(project, devCtx, current)
+            val snapshotCtx = runner.beginSnapshot(devCtx)
+            runner.recordFinalSummaryAndBackup(project, snapshotCtx, current)
             val actionResponse = runCatching {
-                runner.applyResponse(project, devCtx, current)
-                val verification = runPostApplyTools(aiClient as? HttpAiClient, context, current, devCtx)
+                runner.applyResponse(project, snapshotCtx, current)
+                val verification = runPostApplyTools(aiClient as? HttpAiClient, context, current, snapshotCtx)
                 reportApplyResult(
                     aiClient,
                     current,
-                    devCtx,
+                    snapshotCtx,
                     ok = true,
                     changedPaths = collectChangedPaths(current),
                     verification = verification
@@ -335,7 +341,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 reportApplyResult(
                     aiClient,
                     current,
-                    devCtx,
+                    snapshotCtx,
                     ok = false,
                     changedPaths = collectChangedPaths(current),
                     errorMessage = "${applyError::class.java.simpleName}: ${applyError.message}"

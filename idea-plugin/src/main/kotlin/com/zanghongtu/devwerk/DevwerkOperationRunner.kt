@@ -9,25 +9,51 @@ import com.zanghongtu.devwerk.codeEditor.FsScaffolder
 import com.zanghongtu.devwerk.codeEditor.PatchApplier
 import java.nio.charset.StandardCharsets
 import java.nio.file.*
-import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.util.UUID
-import kotlin.streams.asSequence
 
 class DevwerkOperationRunner {
 
-    fun beginOperation(project: Project, projectRootPath: Path): DevwerkContext {
-        val ctx = ensureDevwerkAndCreateOpDir(projectRootPath)
-
-        Files.createDirectories(ctx.opDir.resolve("before"))
-        Files.createDirectories(ctx.opDir.resolve("after"))
-
-        appendLog(ctx.opLog, "=== DevWerk Operation Started: ${ctx.opDir.fileName} ===\n")
+    fun beginInteraction(project: Project, projectRootPath: Path, taskId: String? = null): DevwerkContext {
+        val ctx = ensureDevwerkAndCreateTaskDir(projectRootPath, taskId)
+        appendLog(ctx.opLog, "=== DevWerk Workflow Interaction Started ===\n")
         appendLog(ctx.opLog, "[INFO] projectRoot=${ctx.projectRoot}\n")
 
         refreshVfs(projectRootPath)
         return ctx
+    }
+
+    fun bindTask(ctx: DevwerkContext, taskId: String): DevwerkContext {
+        val safeTaskId = taskId.trim().takeIf { it.matches(Regex("[A-Za-z0-9._-]+")) } ?: return ctx
+        val taskDir = ctx.devwerkDir.resolve("tasks").resolve(safeTaskId)
+        val taskLog = taskDir.resolve("operation.log")
+        if (ctx.opLog.normalize() == taskLog.normalize()) return ctx
+
+        Files.createDirectories(taskDir)
+        if (Files.exists(ctx.opLog)) {
+            Files.writeString(
+                taskLog,
+                Files.readString(ctx.opLog, StandardCharsets.UTF_8),
+                StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.APPEND
+            )
+            Files.deleteIfExists(ctx.opLog)
+            runCatching { Files.deleteIfExists(ctx.opDir) }
+        }
+        val bound = ctx.copy(opDir = taskDir, opLog = taskLog)
+        appendLog(bound.opLog, "[INFO] workflowTaskId=$safeTaskId\n")
+        return bound
+    }
+
+    fun beginSnapshot(ctx: DevwerkContext): DevwerkContext {
+        val snapshotId = LocalDateTime.now().format(SNAPSHOT_TIME_FORMAT) + "-" + UUID.randomUUID()
+        val snapshotDir = ctx.opDir.resolve("snapshots").resolve(snapshotId)
+        Files.createDirectories(snapshotDir.resolve("before"))
+        Files.createDirectories(snapshotDir.resolve("after"))
+        appendLog(ctx.opLog, "[INFO] Snapshot started: $snapshotId\n")
+        return ctx.copy(opDir = snapshotDir)
     }
 
     fun recordFinalSummaryAndBackup(project: Project, ctx: DevwerkContext, response: IdeChatResponse) {
@@ -217,13 +243,18 @@ class DevwerkOperationRunner {
         }
     }
 
-    private fun ensureDevwerkAndCreateOpDir(projectRoot: Path): DevwerkContext {
+    private fun ensureDevwerkAndCreateTaskDir(projectRoot: Path, taskId: String?): DevwerkContext {
         val devwerkDir = projectRoot.resolve(".devwerk")
         Files.createDirectories(devwerkDir)
 
         ensureGitignoreContainsDevwerk(projectRoot)
 
-        val opDir = createNextOperationDir(devwerkDir)
+        val safeTaskId = taskId?.trim()?.takeIf { it.matches(Regex("[A-Za-z0-9._-]+")) }
+        val opDir = if (safeTaskId != null) {
+            devwerkDir.resolve("tasks").resolve(safeTaskId)
+        } else {
+            devwerkDir.resolve("pending").resolve(UUID.randomUUID().toString())
+        }
         Files.createDirectories(opDir)
 
         val opLog = opDir.resolve("operation.log")
@@ -264,28 +295,6 @@ class DevwerkOperationRunner {
                 StandardOpenOption.APPEND
             )
         }
-    }
-
-    private fun createNextOperationDir(devwerkDir: Path): Path {
-        val dateStr = LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE) // YYYYMMDD
-
-        val maxIndex = Files.list(devwerkDir).use { stream ->
-            stream.asSequence()
-                .filter { Files.isDirectory(it) }
-                .map { it.fileName.toString() }
-                .mapNotNull { name ->
-                    if (!name.startsWith("$dateStr-")) return@mapNotNull null
-                    val parts = name.split("-", limit = 3)
-                    if (parts.size < 3) return@mapNotNull null
-                    parts[1].toIntOrNull()
-                }
-                .maxOrNull() ?: 0
-        }
-
-        val nextIndex = maxIndex + 1
-        val indexStr = "%04d".format(nextIndex)
-        val uuid = UUID.randomUUID().toString()
-        return devwerkDir.resolve("$dateStr-$indexStr-$uuid")
     }
 
     private fun appendLog(logFile: Path, text: String) {
@@ -332,5 +341,6 @@ class DevwerkOperationRunner {
 
     companion object {
         private val LOG_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
+        private val SNAPSHOT_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS")
     }
 }

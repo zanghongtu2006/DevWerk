@@ -28,6 +28,12 @@ Filesystem JSONL is an audit mirror only. It is not used to resume work.
 7. Failed verification returns evidence to Coding; successful verification
    advances to Done.
 
+The IntelliJ client stores the complete interaction log at
+`.devwerk/tasks/<task_id>/operation.log`. Each actual write receives a separate
+`.devwerk/tasks/<task_id>/snapshots/<timestamp-uuid>/before|after` pair, so
+conversation turns are grouped without allowing later recoding rounds to
+overwrite an earlier safety snapshot.
+
 Old messages are compacted into a rolling summary when the project context
 budget is exceeded. Recent turns remain verbatim. Project memory receives only
 compact reusable engineering facts, never the raw transcript.
