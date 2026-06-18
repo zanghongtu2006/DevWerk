@@ -189,6 +189,8 @@ async def continue_workflow(task_id: str, request: Request):
         body["workspace"] = incoming["workspace"]
     if isinstance(incoming.get("tool_results"), list):
         body["tool_results"] = incoming["tool_results"]
+    if isinstance(incoming.get("client_capabilities"), dict):
+        body["client_capabilities"] = incoming["client_capabilities"]
     cursor = _latest_artifact_created_at(task, "workflow_result")
     update_conversation(task_id, state="queued", waiting_for=None)
     _kanban_event(task_id, "workflow_resume_queued", {"action": body["resume_action"], "result_after": cursor})
@@ -765,6 +767,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                     outputs={
                         "ops": [{"op": op.op, "path": op.path, "language": op.language} for op in response.ops],
                         "patch_ops": len(response.patch_ops),
+                        "research_evidence": _compact_tool_evidence(tool_results_by_id.values()),
                         "client_tool_requests": [
                             {"id": req.id, "tool": req.tool, "args": req.args}
                             for req in response.tool_requests
@@ -1193,6 +1196,27 @@ def _model_response_summary(obj: object) -> dict:
     }
 
 
+def _compact_tool_evidence(results: object, *, max_items: int = 12, max_chars: int = 24000) -> list[dict]:
+    evidence: list[dict] = []
+    remaining = max_chars
+    for result in list(results)[:max_items]:
+        content = str(result.content or "")
+        excerpt = content[: min(remaining, 6000)]
+        remaining -= len(excerpt)
+        evidence.append(
+            {
+                "id": result.id,
+                "ok": result.ok,
+                "content": excerpt,
+                "content_truncated": len(excerpt) < len(content),
+                "error": result.error,
+            }
+        )
+        if remaining <= 0:
+            break
+    return evidence
+
+
 def _truncate_invalid_response(obj: object) -> dict:
     if not isinstance(obj, dict):
         return {"type": type(obj).__name__}
@@ -1565,6 +1589,7 @@ def _workflow_request_body_artifact(body: dict) -> dict:
         "project_root": body.get("project_root"),
         "messages": body.get("messages") if isinstance(body.get("messages"), list) else [],
         "workspace": body.get("workspace") if isinstance(body.get("workspace"), dict) else None,
+        "client_capabilities": body.get("client_capabilities") if isinstance(body.get("client_capabilities"), dict) else {},
     }
 
 

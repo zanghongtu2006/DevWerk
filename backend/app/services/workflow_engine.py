@@ -557,11 +557,21 @@ class WorkflowEngine:
                     "candidate_revision": state.execute_response.model_dump(),
                     "workspace_summary": context.get("workspace"),
                     "verification_feedback": _compact_verification_feedback(state.review_feedback),
+                    "client_capabilities": body.get("client_capabilities") or {},
                 }
             )
             semantic_decision = str(semantic_review.get("decision") or "approve").strip().lower()
             if semantic_decision in {"approve", "request_recoding", "request_replan", "fail"}:
                 review_result["decision"] = semantic_decision
+            verification_requests = _allowed_client_tool_requests(
+                semantic_review.get("verification_tool_requests"),
+                body.get("client_capabilities"),
+            )
+            if verification_requests:
+                by_id = {request.id: request for request in state.execute_response.tool_requests}
+                for request in verification_requests:
+                    by_id[request.id] = request
+                state.execute_response.tool_requests = list(by_id.values())
         decision = review_result["decision"]
         action = (column.success_action or "approve") if decision == "approve" else decision
         review_bundle = {
@@ -579,6 +589,7 @@ class WorkflowEngine:
             "tool_requests": len(state.execute_response.tool_requests),
             "protocol_decision": protocol_decision,
             "semantic_review": semantic_review,
+            "verification_tool_requests": [request.model_dump() for request in state.execute_response.tool_requests],
         }
         state.review_feedback = review_bundle
         _log.debug(
@@ -728,6 +739,29 @@ def _compact_previous_revision(response: IdeChatResponse | None) -> dict[str, An
         "patch_ops": [op.model_dump() for op in response.patch_ops],
         "tool_requests": [request.model_dump() for request in response.tool_requests],
     }
+
+
+def _allowed_client_tool_requests(value: object, capabilities: object) -> list[ToolRequest]:
+    tools = capabilities.get("tools") if isinstance(capabilities, dict) else None
+    allowed = {str(tool).strip() for tool in tools or [] if str(tool).strip()} if isinstance(tools, list) else set()
+    if not isinstance(value, list) or not allowed:
+        return []
+    requests: list[ToolRequest] = []
+    seen_ids: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict) or str(item.get("tool") or "").strip() not in allowed:
+            continue
+        try:
+            request = ToolRequest.model_validate(item)
+        except Exception:  # noqa: BLE001
+            continue
+        if request.id in seen_ids:
+            continue
+        requests.append(request)
+        seen_ids.add(request.id)
+        if len(requests) >= 8:
+            break
+    return requests
 
 
 def _compact_review_feedback(review_feedback: dict[str, Any] | None) -> dict[str, Any] | None:

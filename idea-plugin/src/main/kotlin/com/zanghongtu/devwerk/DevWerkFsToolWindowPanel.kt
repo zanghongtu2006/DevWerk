@@ -255,7 +255,9 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
 
             history += ChatMessage("user", userMessage)
             if (response.ok) {
-                history += ChatMessage("assistant", response.reply)
+                if (response.waitingFor != "user_guidance") {
+                    history += ChatMessage("assistant", response.reply)
+                }
             } else {
                 SwingUtilities.invokeLater {
                     appendChatLine("[System] AI error: ${response.errorCode ?: "UNKNOWN"} ${response.errorMessage ?: ""}")
@@ -279,7 +281,12 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
 
             val resp = response
             SwingUtilities.invokeLater {
-                if (resp.ok) appendChatLine("Bot: ${resp.reply}")
+                if (resp.ok && resp.waitingFor == "user_guidance") {
+                    appendChatLine("[Review] ${resp.reply}")
+                    appendChatLine("[System] Workflow paused because the agents need additional guidance.")
+                } else if (resp.ok) {
+                    appendChatLine("Bot: ${resp.reply}")
+                }
                 if (resp.ok && resp.waitingFor == "plan_confirmation") {
                     appendChatLine("[System] Workflow paused at Planned and is waiting for confirmation.")
                 }

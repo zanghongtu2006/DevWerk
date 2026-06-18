@@ -1096,13 +1096,27 @@ async def test_interactive_workflow_pauses_for_plan_confirmation_and_resumes(mon
             ops=[FileOp(op="create_file", path="src/module.py", content="VALUE = 1\n")],
         )
 
-    engine = workflow_engine_service.WorkflowEngine(plan_runner=plan_runner, coding_runner=coding_runner)
+    async def review_runner(body: dict) -> dict:
+        return {
+            "decision": "approve",
+            "summary": "Apply, then run the project check.",
+            "verification_tool_requests": [
+                {"id": "project-check", "tool": "run_command", "args": {"command": ["./project-check"]}}
+            ],
+        }
+
+    engine = workflow_engine_service.WorkflowEngine(
+        plan_runner=plan_runner,
+        coding_runner=coding_runner,
+        review_runner=review_runner,
+    )
     body = {
         "project_id": "interactive-project",
         "mode": "agent",
         "interaction_mode": "confirm_plan",
         "messages": [{"role": "user", "content": "Create a module."}],
         "workspace": {"tree_preview": "project/", "source_map": None},
+        "client_capabilities": {"tools": ["run_command", "ide_syntax_check"]},
     }
     await engine.run(task["id"], body)
 
@@ -1122,6 +1136,12 @@ async def test_interactive_workflow_pauses_for_plan_confirmation_and_resumes(mon
     completed_task = kanban_service.get_task(task["id"])["task"]
     assert completed_task["status_key"] == "ready_to_apply"
     assert coding_calls == 1
+    completed_result = [
+        item for item in completed_task["artifacts"] if item["artifact_type"] == "workflow_result"
+    ][-1]["payload"]
+    assert completed_result["tool_requests"] == [
+        {"id": "project-check", "tool": "run_command", "args": {"command": ["./project-check"]}}
+    ]
     revision_events = [event for event in completed_task["events"] if event["event_type"] == "revision_created"]
     assert len(revision_events) == 1
 
@@ -1656,6 +1676,12 @@ async def test_execute_resolves_tool_requests_with_project_relative_paths(monkey
     patch_service_settings(monkeypatch, fake_settings, main_module, ide_routes, kanban_service, usage_service)
     reset_service_dbs(kanban_service, usage_service)
     monkeypatch.setattr(ide_routes, "get_llm_client", lambda agent="executor": fake_executor)
+    task = kanban_service.create_task(
+        project_id="backend-tool-loop-smoke",
+        title="Tool evidence",
+        description="Retain research evidence for review.",
+        status_key="planned",
+    )["task"]
 
     app = main_module.create_app()
     transport = httpx.ASGITransport(app=app)
@@ -1665,6 +1691,7 @@ async def test_execute_resolves_tool_requests_with_project_relative_paths(monkey
                 "/v1/execute",
                 json={
                     "project_id": "backend-tool-loop-smoke",
+                    "task_id": task["id"],
                     "mode": "agent",
                     "project_root": str(project_root),
                     "messages": [
@@ -1696,6 +1723,9 @@ async def test_execute_resolves_tool_requests_with_project_relative_paths(monkey
     assert executed["tool_requests"] == []
     assert fake_executor.calls == 2
     assert executed["ops"][0]["path"] == "src/main/java/org/example/HelloController.java"
+    evidence = executed["phase_output"]["outputs"]["research_evidence"]
+    assert {item["id"] for item in evidence} == {"r1", "r2", "r3"}
+    assert all(item["ok"] for item in evidence)
 
 
 @pytest.mark.asyncio
@@ -1754,6 +1784,41 @@ def test_coding_rework_context_includes_previous_revision():
 
     assert '"previous_revision"' in messages[-1]["content"]
     assert '"content":"A = 1\\n"' in messages[-1]["content"]
+
+
+def test_reviewer_verification_requests_are_capability_bounded():
+    from app.services.reviewer import _normalize_review
+
+    review = _normalize_review(
+        {
+            "decision": "approve",
+            "summary": "Apply under snapshot protection, then verify.",
+            "verification_tool_requests": [
+                {"id": "compile", "tool": "run_command", "args": {"command": ["./project-check"]}},
+                {"id": "write", "tool": "apply_ops", "args": {}},
+            ],
+        },
+        {"run_command"},
+    )
+
+    assert review["decision"] == "approve"
+    assert review["verification_tool_requests"] == [
+        {"id": "compile", "tool": "run_command", "args": {"command": ["./project-check"]}}
+    ]
+
+
+def test_workflow_filters_reviewer_tools_against_client_capabilities():
+    from app.services.workflow_engine import _allowed_client_tool_requests
+
+    requests = _allowed_client_tool_requests(
+        [
+            {"id": "syntax", "tool": "ide_syntax_check", "args": {"paths": ["src/a.py"]}},
+            {"id": "unknown", "tool": "remote_exec", "args": {}},
+        ],
+        {"tools": ["ide_syntax_check"]},
+    )
+
+    assert [request.id for request in requests] == ["syntax"]
 
 
 @pytest.mark.asyncio

@@ -48,7 +48,10 @@ compact reusable engineering facts, never the raw transcript.
   recent transcript; it emits file operations and client tool requests.
 - `reviewed` -> reviewer: plan + candidate revision + workspace summary; protocol
   checks enforce path safety, then the configured reviewer model performs
-  semantic review.
+  semantic review. Backend research evidence used by the coder is retained in
+  the revision context. Missing compile/test evidence alone is not a recoding
+  reason: the reviewer approves snapshot-protected apply and emits
+  capability-bounded `verification_tool_requests` selected from project facts.
 - `verified` is driven by client tool evidence after snapshot-protected apply.
 
 Columns and agents remain independent concepts. `default.json` or a project DB
