@@ -671,6 +671,7 @@ async def test_workflow_reviewer_rework_continues_until_approved(monkeypatch, tm
     fake_settings = FakeSettings(db_path)
 
     import app.services.kanban as kanban_service
+    import app.services.workflow as workflow_service
     import app.services.workflow_engine as workflow_engine_service
 
     patch_service_settings(monkeypatch, fake_settings, kanban_service)
@@ -743,6 +744,7 @@ async def test_workflow_recoding_receives_review_feedback(monkeypatch, tmp_path)
     fake_settings = FakeSettings(db_path)
 
     import app.services.kanban as kanban_service
+    import app.services.workflow as workflow_service
     import app.services.workflow_engine as workflow_engine_service
 
     patch_service_settings(monkeypatch, fake_settings, kanban_service)
@@ -814,6 +816,150 @@ async def test_workflow_recoding_receives_review_feedback(monkeypatch, tmp_path)
     event_types = [event["event_type"] for event in task_detail["events"]]
     assert event_types.count("coding_context_prepared") == 2
     assert "workflow_rework_loop" in event_types
+
+
+@pytest.mark.asyncio
+async def test_workflow_engine_runs_project_defined_custom_columns(monkeypatch, tmp_path):
+    db_path = tmp_path / "devwerk-custom-workflow.db"
+    fake_settings = FakeSettings(db_path)
+
+    import app.services.kanban as kanban_service
+    import app.services.workflow as workflow_service
+    import app.services.workflow_engine as workflow_engine_service
+
+    patch_service_settings(monkeypatch, fake_settings, kanban_service)
+    kanban_service._initialized = False
+
+    project_id = "backend-custom-workflow"
+    custom_workflow = {
+        "name": "custom",
+        "version": 7,
+        "columns": [
+            {"status_key": "draft", "title": "Draft", "position": 10, "transition_to": ["indexed", "failed"]},
+            {
+                "status_key": "indexed",
+                "title": "Indexed",
+                "position": 20,
+                "transition_to": ["design", "failed"],
+                "agent": "context",
+                "input_artifacts": ["workflow_request"],
+                "output_artifact": "context_bundle",
+                "success_action": "context_done",
+                "failure_actions": ["fail"],
+            },
+            {
+                "status_key": "design",
+                "title": "Design",
+                "position": 30,
+                "transition_to": ["build", "failed"],
+                "agent": "planner",
+                "input_artifacts": ["context_bundle"],
+                "output_artifact": "plan_bundle",
+                "success_action": "design_done",
+                "failure_actions": ["fail"],
+            },
+            {
+                "status_key": "build",
+                "title": "Build",
+                "position": 40,
+                "transition_to": ["quality", "design", "failed"],
+                "agent": "coder",
+                "input_artifacts": ["plan_bundle"],
+                "output_artifact": "code_change_bundle",
+                "success_action": "build_done",
+                "failure_actions": ["fail"],
+            },
+            {
+                "status_key": "quality",
+                "title": "Quality",
+                "position": 50,
+                "transition_to": ["ready_to_apply", "build", "design", "failed"],
+                "agent": "reviewer",
+                "input_artifacts": ["plan_bundle", "code_change_bundle"],
+                "output_artifact": "review_bundle",
+                "success_action": "quality_passed",
+                "failure_actions": ["request_recoding", "request_replan", "fail"],
+            },
+            {"status_key": "ready_to_apply", "title": "Ready", "position": 60, "transition_to": ["done", "failed"]},
+            {"status_key": "done", "title": "Done", "position": 70, "transition_to": []},
+            {"status_key": "failed", "title": "Failed", "position": 80, "transition_to": ["draft"]},
+        ],
+        "actions": {
+            "context_done": {"to": "indexed"},
+            "design_done": {"to": "design"},
+            "build_started": {"to": "build"},
+            "build_done": {"to": "quality"},
+            "quality_passed": {"to": "ready_to_apply"},
+            "apply_succeeded": {"to": "done"},
+            "request_recoding": {"to": "build"},
+            "request_replan": {"to": "design"},
+            "fail": {"to": "failed"},
+            "retry": {"to": "draft"},
+            "abandon": {"to": "failed"},
+        },
+    }
+    kanban_service.update_project_workflow(project_id, custom_workflow)
+    task = kanban_service.create_task(
+        project_id=project_id,
+        title="Custom workflow",
+        description="Smoke",
+        status_key="draft",
+    )["task"]
+
+    async def plan_runner(body: dict) -> PlanResponse:
+        return PlanResponse(
+            ok=True,
+            task_id=body["task_id"],
+            files=[PlanFile(path="src/custom.py", nature="new", description="Create custom file.")],
+            summary="Custom plan.",
+            session_id="custom-plan",
+        )
+
+    async def coding_runner(body: dict) -> IdeChatResponse:
+        phase_contexts = [message["content"] for message in body["messages"] if "workflow_phase_context:" in message.get("content", "")]
+        assert phase_contexts and '"phase":"build"' in phase_contexts[-1]
+        assert body["approved_paths"] == ["src/custom.py"]
+        return IdeChatResponse(
+            ok=True,
+            done=True,
+            task_id=body["task_id"],
+            session_id="custom-code",
+            ops=[FileOp(op="create_file", path="src/custom.py", content="print('custom')\n")],
+        )
+
+    engine = workflow_engine_service.WorkflowEngine(plan_runner=plan_runner, coding_runner=coding_runner)
+    await engine.run(
+        task["id"],
+        {
+            "project_id": project_id,
+            "mode": "agent",
+            "messages": [{"role": "user", "content": "Create custom file."}],
+            "workspace": {"tree_preview": "project/\n  src/\n", "source_map": None},
+        },
+    )
+
+    task_detail = kanban_service.get_task(task["id"])["task"]
+    assert task_detail["status_key"] == "ready_to_apply"
+    moved_to = [event["to_status"] for event in task_detail["events"] if event["event_type"] == "task_moved"]
+    assert ["indexed", "design", "build", "quality", "ready_to_apply"] == moved_to[-5:]
+    assert "planned" not in moved_to
+    assert "coding" not in moved_to
+    assert "reviewed" not in moved_to
+    completed_columns = [
+        event["payload"]["status_key"]
+        for event in task_detail["events"]
+        if event["event_type"] == "workflow_column_completed"
+    ]
+    assert completed_columns == ["indexed", "design", "build", "quality"]
+    artifact_types = [artifact["artifact_type"] for artifact in task_detail["artifacts"]]
+    assert {"context_bundle", "plan_bundle", "code_change_bundle", "review_bundle"}.issubset(artifact_types)
+    result = [artifact for artifact in task_detail["artifacts"] if artifact["artifact_type"] == "workflow_result"][-1]
+    assert result["payload"]["ok"] is True
+    assert result["payload"]["status_key"] == "ready_to_apply"
+    state = workflow_service.current_workflow_state(task["id"])
+    assert state["actions"] == ["apply_result", "abandon"]
+    with pytest.raises(ValueError, match="cannot move"):
+        workflow_service.apply_workflow_action(task["id"], "design_done", {"reason": "invalid jump"})
 
 
 @pytest.mark.asyncio

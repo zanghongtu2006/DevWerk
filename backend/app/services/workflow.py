@@ -11,7 +11,7 @@ from app.services.verification_policy import (
     verification_has_policy,
     verification_feedback_summary,
 )
-from app.services.workflow_definition import workflow_from_dict
+from app.services.workflow_definition import WorkflowDefinition, workflow_from_dict
 
 _log = logging.getLogger("devwerk.workflow")
 
@@ -31,6 +31,12 @@ ACTION_NEED_CLIENT_TOOL = "need_client_tool"
 ACTION_APPLY_RESULT = "apply_result"
 ACTION_RETRY = "retry"
 ACTION_ABANDON = "abandon"
+ACTION_APPLY_SUCCEEDED = "apply_succeeded"
+ACTION_VERIFICATION_PASSED = "verification_passed"
+ACTION_VERIFICATION_FAILED = "verification_failed"
+ACTION_WORKFLOW_DONE = "workflow_done"
+
+CLIENT_VISIBLE_ACTIONS = {ACTION_RETRY, ACTION_ABANDON}
 
 
 def record_phase_output(
@@ -114,35 +120,21 @@ def apply_workflow_action(task_id: str, action: str, payload: dict[str, Any] | N
     if action_key == ACTION_APPLY_RESULT:
         return _apply_result(task_id, data)
 
-    semantic = {
-        ACTION_CONTEXT_INDEXED,
-        ACTION_PLAN_READY,
-        ACTION_PLAN_FAILED,
-        ACTION_CODING_STARTED,
-        ACTION_CODING_READY,
-        ACTION_READY_TO_APPLY,
-        ACTION_CODING_FAILED,
-        ACTION_REQUEST_RECODING,
-        ACTION_REQUEST_REPLAN,
-        ACTION_APPROVE,
-        ACTION_FAIL,
-        ACTION_NEED_CLIENT_TOOL,
-        ACTION_RETRY,
-        ACTION_ABANDON,
-    }
-    if action_key in semantic:
+    if _workflow_has_action(task_id, action_key):
         return _transition_by_definition(task_id, action_key, data)
 
     raise ValueError(f"unknown workflow action: {action}")
 
 
+def _workflow_has_action(task_id: str, action: str) -> bool:
+    return _definition_for_task(task_id).action(action) is not None
+
+
 def _transition_by_definition(task_id: str, action: str, payload: dict[str, Any]) -> dict[str, Any]:
     task_detail = get_task(task_id)
     task = task_detail.get("task") or {}
-    project_id = str(task.get("project_id") or "default")
     current_status = str(task.get("status_key") or "")
-    workflow_payload = get_project_workflow(project_id).get("workflow") or {}
-    definition = workflow_from_dict(workflow_payload)
+    definition = _definition_from_task_record(task)
     action_rule = definition.action(action)
     if action_rule is None:
         raise ValueError(f"unknown workflow action for project workflow: {action}")
@@ -150,6 +142,11 @@ def _transition_by_definition(task_id: str, action: str, payload: dict[str, Any]
     to_status = str(action_rule.get("to") or "").strip().lower()
     if not to_status:
         raise ValueError(f"workflow action {action!r} has no target status")
+    current_column = definition.column(current_status)
+    if current_column is not None and not _target_allowed(current_column, to_status):
+        raise ValueError(
+            f"workflow action {action!r} cannot move from {current_status!r} to {to_status!r}"
+        )
 
     data = dict(payload or {})
     data.setdefault("action", action)
@@ -177,15 +174,17 @@ def _transition_by_definition(task_id: str, action: str, payload: dict[str, Any]
 
 def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     ok = bool(payload.get("ok", True))
+    definition = _definition_for_task(task_id)
     add_artifact(task_id, artifact_type="apply_result", payload=payload)
     add_event(task_id, "apply_result_received", payload)
 
     if not ok:
+        status_key = _action_target(definition, ACTION_FAIL) or "failed"
         record_phase_output(
             task_id,
             phase="apply",
             agent="plugin",
-            status_key="failed",
+            status_key=status_key,
             summary=str(payload.get("error_message") or "Plugin failed to apply generated changes."),
             outputs={
                 "ok": False,
@@ -196,16 +195,21 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
             warnings=[str(payload.get("error_message") or "apply failed")],
             next_action=ACTION_RETRY,
         )
-        return move_task(task_id, "failed", force=True, payload={"phase": "apply", **payload})
+        return _apply_configured_action(task_id, definition, ACTION_FAIL, {"phase": "apply", **payload})
 
     verification = payload.get("verification")
     has_verification_policy = verification_has_policy(verification)
     passed = not verification_failed(verification) if has_verification_policy else True
+    status_key = (
+        _first_action_target(definition, [ACTION_WORKFLOW_DONE, ACTION_VERIFICATION_PASSED, ACTION_APPLY_SUCCEEDED])
+        if passed
+        else _first_action_target(definition, [ACTION_VERIFICATION_FAILED, ACTION_FAIL])
+    )
     record_phase_output(
         task_id,
         phase="apply",
         agent="plugin",
-        status_key="done" if passed else "coding",
+        status_key=status_key or ("done" if passed else "failed"),
         summary="Plugin applied generated changes through the snapshot-protected path.",
         outputs={
             "ok": True,
@@ -217,11 +221,19 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         next_action=None if passed else ACTION_REQUEST_RECODING,
     )
 
-    applied = move_task(task_id, "applied", force=True, payload=payload)
+    latest = _apply_configured_action(task_id, definition, ACTION_APPLY_SUCCEEDED, {"phase": "apply", **payload})
     if passed:
-        move_task(task_id, "verified", force=True, payload={"verification": verification or {}})
+        verified = _apply_optional_action(
+            task_id,
+            definition,
+            ACTION_VERIFICATION_PASSED,
+            {"phase": "verify", "verification": verification or {}},
+        )
+        if verified is not None:
+            latest = verified
         reason = "verification_passed" if has_verification_policy else "apply_completed_without_verification_policy"
-        return move_task(task_id, "done", force=True, payload={"reason": reason})
+        done = _apply_optional_action(task_id, definition, ACTION_WORKFLOW_DONE, {"phase": "workflow", "reason": reason})
+        return done or latest
 
     reason = (
         verification_feedback_summary(verification)
@@ -238,36 +250,124 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
             "can_resume": has_verification_policy,
         },
     )
-    return move_task(
+    failed = _apply_optional_action(
         task_id,
-        "coding",
-        force=True,
-        payload={"phase": "verify", "reason": reason, **payload},
+        definition,
+        ACTION_VERIFICATION_FAILED,
+        {"phase": "verify", "reason": reason, **payload},
     )
+    if failed is not None:
+        return failed
+    return _apply_configured_action(task_id, definition, ACTION_FAIL, {"phase": "verify", "reason": reason, **payload})
 
 
 def current_workflow_state(task_id: str) -> dict[str, Any]:
     task = get_task(task_id)
-    status = task.get("task", {}).get("status_key")
+    task_record = task.get("task", {}) or {}
+    status = task_record.get("status_key")
+    definition = _definition_from_task_record(task_record)
     return {
         "ok": True,
         "task_id": task_id,
         "status_key": status,
         "task": task.get("task"),
-        "actions": available_actions_for_status(str(status or "")),
+        "actions": available_actions_for_status(str(status or ""), definition),
     }
 
 
-def available_actions_for_status(status_key: str) -> list[str]:
+def available_actions_for_status(status_key: str, definition: WorkflowDefinition | None = None) -> list[str]:
+    definition = definition or workflow_from_dict({})
     status = str(status_key or "").strip().lower()
-    if status == "failed":
-        return [ACTION_RETRY, ACTION_ABANDON]
-    if status == "ready_to_apply":
-        return [ACTION_APPLY_RESULT, ACTION_ABANDON]
-    if status == "reviewed":
-        return [ACTION_APPROVE, ACTION_REQUEST_RECODING, ACTION_REQUEST_REPLAN, ACTION_ABANDON]
-    if status in {"planned", "coding", "ready_to_apply", "applied", "verified"}:
-        return [ACTION_ABANDON]
-    if status in {"done"}:
+    column = definition.column(status)
+    if column is None:
         return []
-    return [ACTION_ABANDON]
+
+    actions: list[str] = []
+    if _can_apply_result_from(definition, column):
+        actions.append(ACTION_APPLY_RESULT)
+
+    for action, rule in definition.actions.items():
+        if not _is_client_visible_action(action, rule):
+            continue
+        target = _rule_target(rule)
+        if target and _target_allowed(column, target):
+            actions.append(action)
+    return _dedupe(actions)
+
+
+def _definition_for_task(task_id: str) -> WorkflowDefinition:
+    task_detail = get_task(task_id)
+    return _definition_from_task_record(task_detail.get("task") or {})
+
+
+def _definition_from_task_record(task: dict[str, Any]) -> WorkflowDefinition:
+    project_id = str(task.get("project_id") or "default")
+    workflow_payload = get_project_workflow(project_id).get("workflow") or {}
+    return workflow_from_dict(workflow_payload)
+
+
+def _apply_configured_action(
+    task_id: str,
+    definition: WorkflowDefinition,
+    action: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    if definition.action(action) is None:
+        raise ValueError(f"project workflow does not define required action: {action}")
+    return _transition_by_definition(task_id, action, payload)
+
+
+def _action_target(definition: WorkflowDefinition, action: str) -> str | None:
+    rule = definition.action(action)
+    if rule is None:
+        return None
+    return _rule_target(rule)
+
+
+def _first_action_target(definition: WorkflowDefinition, actions: list[str]) -> str | None:
+    for action in actions:
+        target = _action_target(definition, action)
+        if target:
+            return target
+    return None
+
+
+def _apply_optional_action(
+    task_id: str,
+    definition: WorkflowDefinition,
+    action: str,
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    if definition.action(action) is None:
+        return None
+    return _transition_by_definition(task_id, action, payload)
+
+
+def _rule_target(rule: dict[str, Any]) -> str | None:
+    target = str(rule.get("to") or "").strip().lower()
+    return target or None
+
+
+def _can_apply_result_from(definition: WorkflowDefinition, column: Any) -> bool:
+    target = _action_target(definition, ACTION_APPLY_SUCCEEDED)
+    return bool(target and _target_allowed(column, target))
+
+
+def _is_client_visible_action(action: str, rule: dict[str, Any]) -> bool:
+    return bool(rule.get("client_visible")) or action in CLIENT_VISIBLE_ACTIONS
+
+
+def _target_allowed(column: Any, target: str) -> bool:
+    allowed = set(column.transition_to or [])
+    return target == column.status_key or target in allowed
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result

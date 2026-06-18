@@ -196,12 +196,18 @@ async def ide_plan(request: Request) -> PlanResponse:
         _workspace_debug_summary(body.get("workspace")),
     )
     _kanban_artifact(task_id, "plan_request", payload=_plan_request_artifact(body))
-    _kanban_move(task_id, "context_indexed", {"workspace": _workspace_debug_summary(body.get("workspace"))})
+    workflow_managed = bool(body.get("_workflow_engine_managed"))
+
+    def move(status_key: str, payload: dict) -> None:
+        if not workflow_managed:
+            _kanban_move(task_id, status_key, payload)
+
+    move("context_indexed", {"workspace": _workspace_debug_summary(body.get("workspace"))})
     messages = _append_workspace_context(messages, body.get("workspace"))
     _log.debug("ide_plan: messages_after_workspace_context=%s", len(messages))
 
     if not any(m.get("role", "").lower() == "user" for m in messages):
-        _kanban_move(task_id, "failed", {"phase": "plan", "error": "messages must contain at least one user message"})
+        move("failed", {"phase": "plan", "error": "messages must contain at least one user message"})
         return PlanResponse(
             ok=False,
             task_id=task_id,
@@ -221,7 +227,7 @@ async def ide_plan(request: Request) -> PlanResponse:
             cfg.validate_provider(planner_agent)
         except ValueError as coder_ve:
             _log.warning("Provider validation failed: %s", coder_ve)
-            _kanban_move(task_id, "failed", {"phase": "plan", "error": str(coder_ve)})
+            move("failed", {"phase": "plan", "error": str(coder_ve)})
             return PlanResponse(
                 ok=False,
                 task_id=task_id,
@@ -237,7 +243,7 @@ async def ide_plan(request: Request) -> PlanResponse:
         )
     except (ValueError, NotImplementedError) as exc:
         _log.warning("Planner creation failed: %s", exc)
-        _kanban_move(task_id, "failed", {"phase": "plan", "error": str(exc)})
+        move("failed", {"phase": "plan", "error": str(exc)})
         return PlanResponse(
             ok=False,
             task_id=task_id,
@@ -271,7 +277,7 @@ async def ide_plan(request: Request) -> PlanResponse:
                 warnings=result.warnings,
                 next_action="execute",
             )
-            _kanban_move(task_id, "planned", {"files": len(result.files), "warnings": len(result.warnings), "session_id": phase_output.get("session_id") if phase_output else None})
+            move("planned", {"files": len(result.files), "warnings": len(result.warnings), "session_id": phase_output.get("session_id") if phase_output else None})
             result.task_id = task_id
             result.status_key = "planned"
             if phase_output:
@@ -299,7 +305,7 @@ async def ide_plan(request: Request) -> PlanResponse:
                 warnings=result.warnings,
                 next_action="retry",
             )
-            _kanban_move(task_id, "failed", {"phase": "plan", "error_code": result.error_code})
+            move("failed", {"phase": "plan", "error_code": result.error_code})
             result.task_id = task_id
             result.status_key = "failed"
             if phase_output:
@@ -316,7 +322,7 @@ async def ide_plan(request: Request) -> PlanResponse:
         return result
     except Exception as exc:  # noqa: BLE001
         _log.exception("Planner raised unhandled exception")
-        _kanban_move(task_id, "failed", {"phase": "plan", "error": f"{type(exc).__name__}: {exc}"})
+        move("failed", {"phase": "plan", "error": f"{type(exc).__name__}: {exc}"})
         return PlanResponse(
             ok=False,
             task_id=task_id,
@@ -426,8 +432,14 @@ async def ide_execute(request: Request) -> IdeChatResponse:
     _log.debug("ide_execute: appended_execution_guard approved_count=%s final_messages=%s", len(approved_set), len(messages))
 
     mode = str(body.get("mode", "agent")).strip().lower() or "agent"
+    workflow_managed = bool(body.get("_workflow_engine_managed"))
+
+    def move(status_key: str, payload: dict) -> None:
+        if not workflow_managed:
+            _kanban_move(task_id, status_key, payload)
+
     _kanban_event(task_id, "execute_started", {"mode": mode, "approved_paths": approved_paths})
-    _kanban_move(task_id, "coding", {"approved_paths": approved_paths})
+    move("coding", {"approved_paths": approved_paths})
 
     max_retries = 2
     backoff = 0.8
@@ -634,8 +646,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                         "done": response.done,
                     },
                 )
-                _kanban_move(
-                    task_id,
+                move(
                     "ready_to_apply",
                     {
                         "ops": len(response.ops),
@@ -652,7 +663,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                 max_tool_rounds,
                 len(tool_results),
             )
-            _kanban_move(task_id, "failed", {"phase": "execute", "error": "tool loop exhausted"})
+            move("failed", {"phase": "execute", "error": "tool loop exhausted"})
             return IdeChatResponse(
                 ok=False,
                 reply="",
@@ -674,7 +685,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                 continue
 
             _log.exception("Execute LLM call failed (attempt %s/%s)", attempt, max_retries)
-            _kanban_move(task_id, "failed", {"phase": "execute", "error": f"{type(exc).__name__}: {exc}"})
+            move("failed", {"phase": "execute", "error": f"{type(exc).__name__}: {exc}"})
             return IdeChatResponse(
                 ok=False,
                 reply="",
@@ -1077,14 +1088,16 @@ def _kanban_move(task_id: str | None, status_key: str, payload: dict) -> None:
     if not task_id:
         return
     try:
-        action = _workflow_action_for_status(status_key, payload)
-        if action:
-            apply_workflow_action(task_id, action, payload)
+        actions = _workflow_actions_for_status(task_id, status_key, payload)
+        if actions:
+            result = None
+            for action in actions:
+                result = apply_workflow_action(task_id, action, payload)
+            return result
         else:
             move_task(task_id, status_key, force=True, payload=payload)
     except Exception as exc:  # noqa: BLE001
         _log.debug("kanban move skipped task_id=%s status=%s error=%s", task_id, status_key, exc)
-
 
 class _BodyRequest:
     def __init__(self, body: dict):
@@ -1276,22 +1289,27 @@ def _latest_artifact_payload(task: dict, artifact_type: str, *, result_after: st
     return None
 
 
-def _workflow_action_for_status(status_key: str, payload: dict) -> str | None:
+def _workflow_actions_for_status(task_id: str, status_key: str, payload: dict) -> list[str]:
     status = str(status_key or "").strip().lower()
     if status == "context_indexed":
-        return "context_indexed"
+        return ["context_indexed"]
     if status == "planned":
-        return "plan_ready"
+        return ["plan_ready"]
     if status == "coding":
-        return "coding_started"
+        return ["coding_started"]
     if status == "ready_to_apply":
-        return "ready_to_apply"
+        current = str((get_task(task_id).get("task") or {}).get("status_key") or "").strip().lower()
+        if current == "coding":
+            return ["coding_ready", "approve"]
+        if current == "reviewed":
+            return ["approve"]
+        return ["ready_to_apply"]
     if status == "failed":
         phase = str((payload or {}).get("phase") or "").strip().lower()
         if phase == "plan":
-            return "plan_failed"
-        return "coding_failed"
-    return None
+            return ["plan_failed"]
+        return ["coding_failed"]
+    return []
 
 
 # ---------------------------------------------------------------------------

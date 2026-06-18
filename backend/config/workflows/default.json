@@ -16,7 +16,7 @@
       "agent": "context",
       "input_artifacts": ["workflow_request"],
       "output_artifact": "context_bundle",
-      "success_action": "plan_ready",
+      "success_action": "context_indexed",
       "failure_actions": ["fail"],
       "context_policy": {"use_workspace": true, "use_project_memory": true}
     },
@@ -28,7 +28,7 @@
       "agent": "planner",
       "input_artifacts": ["context_bundle"],
       "output_artifact": "plan_bundle",
-      "success_action": "coding_started",
+      "success_action": "plan_ready",
       "failure_actions": ["request_replan", "fail"],
       "context_policy": {"use_workspace": true, "use_project_memory": true}
     },
@@ -40,7 +40,7 @@
       "agent": "coder",
       "input_artifacts": ["context_bundle", "plan_bundle"],
       "output_artifact": "code_change_bundle",
-      "success_action": "approve",
+      "success_action": "coding_ready",
       "failure_actions": ["request_replan", "fail"],
       "context_policy": {"use_workspace": true, "use_project_memory": true}
     },
@@ -95,6 +95,10 @@
     "coding_ready": {"to": "reviewed"},
     "approve": {"to": "ready_to_apply"},
     "ready_to_apply": {"to": "ready_to_apply"},
+    "apply_succeeded": {"to": "applied"},
+    "verification_passed": {"to": "verified"},
+    "verification_failed": {"to": "coding"},
+    "workflow_done": {"to": "done"},
     "request_recoding": {"to": "coding"},
     "request_replan": {"to": "planned"},
     "fail": {"to": "failed"},

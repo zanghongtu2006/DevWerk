@@ -75,6 +75,7 @@ def test_workflow_action_protocol_drives_kanban_state(monkeypatch, tmp_path):
     assert applied["task"]["status_key"] == "done"
     state = workflow_service.current_workflow_state(task["id"])
     assert state["status_key"] == "done"
+    assert state["actions"] == []
     events = kanban_service.list_events(project_id="workflow-smoke", task_id=task["id"], limit=50)["events"]
     event_types = [event["event_type"] for event in events]
     assert "task_moved" in event_types
@@ -112,10 +113,16 @@ def test_workflow_action_protocol_drives_kanban_state(monkeypatch, tmp_path):
     assert "src/main/java/App.java" in project_memory["paths"]
     assert any(item["phase"] == "apply" and item["status_key"] == "done" for item in project_memory["phase_summaries"])
 
-    abandoned = workflow_service.apply_workflow_action(task["id"], "abandon", {"reason": "test"})
+    failed_task = kanban_service.create_task(
+        project_id="workflow-smoke",
+        title="Failed task",
+        description="Smoke",
+        status_key="failed",
+    )["task"]
+    abandoned = workflow_service.apply_workflow_action(failed_task["id"], "abandon", {"reason": "test"})
     assert abandoned["task"]["status_key"] == "failed"
 
-    retried = workflow_service.apply_workflow_action(task["id"], "retry", {"reason": "test"})
+    retried = workflow_service.apply_workflow_action(failed_task["id"], "retry", {"reason": "test"})
     assert retried["task"]["status_key"] == "draft"
 
 

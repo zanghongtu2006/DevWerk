@@ -68,7 +68,7 @@ class WorkflowDefinition:
 def default_workflow_definition() -> WorkflowDefinition:
     path = _default_workflow_path()
     if path.is_file():
-        return workflow_from_dict(json.loads(path.read_text(encoding="utf-8-sig")))
+        return workflow_from_dict(json.loads(path.read_text(encoding="utf-8")))
     return workflow_from_dict(_embedded_default_workflow())
 
 
@@ -120,10 +120,54 @@ def _none_if_blank(value: object) -> str | None:
 def _fallback_columns() -> list[dict[str, Any]]:
     return [
         {"status_key": "draft", "title": "Draft", "position": 10, "transition_to": ["context_indexed", "failed"]},
-        {"status_key": "context_indexed", "title": "Context Indexed", "position": 20, "transition_to": ["planned", "failed"]},
-        {"status_key": "planned", "title": "Planned", "position": 30, "transition_to": ["coding", "draft", "failed"]},
-        {"status_key": "coding", "title": "Coding", "position": 40, "transition_to": ["reviewed", "planned", "failed"]},
-        {"status_key": "reviewed", "title": "Reviewed", "position": 45, "transition_to": ["ready_to_apply", "coding", "planned", "failed"]},
+        {
+            "status_key": "context_indexed",
+            "title": "Context Indexed",
+            "position": 20,
+            "transition_to": ["planned", "failed"],
+            "agent": "context",
+            "input_artifacts": ["workflow_request"],
+            "output_artifact": "context_bundle",
+            "success_action": "context_indexed",
+            "failure_actions": ["fail"],
+            "context_policy": {"use_workspace": True, "use_project_memory": True},
+        },
+        {
+            "status_key": "planned",
+            "title": "Planned",
+            "position": 30,
+            "transition_to": ["coding", "draft", "failed"],
+            "agent": "planner",
+            "input_artifacts": ["context_bundle"],
+            "output_artifact": "plan_bundle",
+            "success_action": "plan_ready",
+            "failure_actions": ["request_replan", "fail"],
+            "context_policy": {"use_workspace": True, "use_project_memory": True},
+        },
+        {
+            "status_key": "coding",
+            "title": "Coding",
+            "position": 40,
+            "transition_to": ["reviewed", "planned", "failed"],
+            "agent": "coder",
+            "input_artifacts": ["context_bundle", "plan_bundle"],
+            "output_artifact": "code_change_bundle",
+            "success_action": "coding_ready",
+            "failure_actions": ["request_replan", "fail"],
+            "context_policy": {"use_workspace": True, "use_project_memory": True},
+        },
+        {
+            "status_key": "reviewed",
+            "title": "Reviewed",
+            "position": 45,
+            "transition_to": ["ready_to_apply", "coding", "planned", "failed"],
+            "agent": "reviewer",
+            "input_artifacts": ["plan_bundle", "code_change_bundle"],
+            "output_artifact": "review_bundle",
+            "success_action": "approve",
+            "failure_actions": ["request_recoding", "request_replan", "fail"],
+            "context_policy": {"use_project_memory": True},
+        },
         {"status_key": "ready_to_apply", "title": "Ready To Apply", "position": 50, "transition_to": ["applied", "coding", "failed"]},
         {"status_key": "applied", "title": "Applied", "position": 60, "transition_to": ["verified", "coding", "planned", "failed"]},
         {"status_key": "verified", "title": "Verified", "position": 70, "transition_to": ["done", "applied", "failed"]},
@@ -144,6 +188,10 @@ def _embedded_default_workflow() -> dict[str, Any]:
             "coding_ready": {"to": "reviewed"},
             "approve": {"to": "ready_to_apply"},
             "ready_to_apply": {"to": "ready_to_apply"},
+            "apply_succeeded": {"to": "applied"},
+            "verification_passed": {"to": "verified"},
+            "verification_failed": {"to": "coding"},
+            "workflow_done": {"to": "done"},
             "request_recoding": {"to": "coding"},
             "request_replan": {"to": "planned"},
             "fail": {"to": "failed"},

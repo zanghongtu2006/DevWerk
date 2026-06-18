@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import logging
 import json
+import logging
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 from app.models.ide import IdeChatResponse, ToolRequest
@@ -13,7 +14,7 @@ from app.services.kanban import add_artifact, add_event, get_project_settings, g
 from app.services.session_store import read_project_memory
 from app.services.verification_policy import configured_post_apply_tool_requests, verification_feedback_summary
 from app.services.workflow import apply_workflow_action, record_phase_output
-from app.services.workflow_definition import workflow_from_dict
+from app.services.workflow_definition import WorkflowColumn, WorkflowDefinition, workflow_from_dict
 
 _log = logging.getLogger("devwerk.workflow_engine")
 
@@ -21,158 +22,224 @@ PlanRunner = Callable[[dict[str, Any]], Awaitable[PlanResponse]]
 CodingRunner = Callable[[dict[str, Any]], Awaitable[IdeChatResponse]]
 
 
+@dataclass
+class WorkflowRunState:
+    context_bundle: dict[str, Any] = field(default_factory=dict)
+    plan_response: PlanResponse | None = None
+    execute_response: IdeChatResponse | None = None
+    review_feedback: dict[str, Any] | None = None
+    rework_rounds: int = 0
+
+
+@dataclass
+class ColumnResult:
+    action: str
+    decision: str = "approve"
+    response: IdeChatResponse | None = None
+    target_status: str | None = None
+
+
 class WorkflowEngine:
     def __init__(self, *, plan_runner: PlanRunner, coding_runner: CodingRunner):
         self.plan_runner = plan_runner
         self.coding_runner = coding_runner
+        self._agent_handlers = {
+            "context": self._run_context_column,
+            "planner": self._run_plan_column,
+            "coder": self._run_coding_column,
+            "reviewer": self._run_review_column,
+        }
 
     async def run(self, task_id: str, body: dict[str, Any]) -> None:
         project_id = str(body.get("project_id") or "default")
         definition = workflow_from_dict(get_project_workflow(project_id).get("workflow") or {})
         workflow_summary = definition.summary()
-        _event(task_id, "workflow_started", {"entrypoint": "/v1/workflows", "workflow": workflow_summary})
+        executable = _executable_columns(definition)
+        _event(
+            task_id,
+            "workflow_started",
+            {
+                "entrypoint": "/v1/workflows",
+                "workflow": workflow_summary,
+                "executable_columns": [
+                    {"status_key": col.status_key, "agent": col.agent, "success_action": col.success_action}
+                    for col in executable
+                ],
+            },
+        )
 
-        context_bundle = self._run_context_column(task_id, body, workflow_summary)
+        if not executable:
+            response = _failure_response(task_id, "WORKFLOW_EMPTY", "Workflow has no executable columns.")
+            add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
+            apply_workflow_action(task_id, "fail", {"phase": "workflow", "reason": response.error_message})
+            _event(task_id, "workflow_finished", {"ok": False, "phase": "workflow", "status_key": "failed"})
+            return
+
+        state = WorkflowRunState()
         resume_feedback = _verification_resume_feedback(body)
-        plan_response: PlanResponse | None = _latest_plan_response(task_id) if resume_feedback else None
-        execute_response: IdeChatResponse | None = None
-        next_phase = "coding" if plan_response is not None else "planned"
-        review_feedback: dict[str, Any] | None = resume_feedback
-        max_rework_rounds = 3
         if resume_feedback:
+            state.plan_response = _latest_plan_response(task_id)
+            state.review_feedback = resume_feedback
             _event(
                 task_id,
                 "workflow_resumed",
                 {
                     "reason": "verification_failed",
-                    "next_phase": next_phase,
-                    "has_previous_plan": plan_response is not None,
+                    "has_previous_plan": state.plan_response is not None,
                     "summary": resume_feedback.get("summary"),
                 },
             )
 
-        for round_no in range(1, max_rework_rounds + 2):
-            _log.debug("workflow loop task_id=%s round=%s next_phase=%s", task_id, round_no, next_phase)
-            _event(task_id, "workflow_round_started", {"round": round_no, "next_phase": next_phase})
-            planned_this_round = False
+        current = _resume_column(definition, state) if resume_feedback else executable[0]
+        if current is None:
+            current = executable[0]
 
-            if next_phase == "planned" or plan_response is None:
-                plan_response = await self._run_plan_column(task_id, body, workflow_summary, context_bundle)
-                planned_this_round = True
-                if not plan_response.ok:
-                    response = IdeChatResponse(
-                        ok=False,
-                        reply="",
-                        done=True,
-                        task_id=task_id,
-                        status_key=plan_response.status_key or "failed",
-                        error_code=plan_response.error_code or "PLAN_ERROR",
-                        error_message=plan_response.error_message or "Planning failed.",
-                        retryable=True,
-                    )
-                    add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
-                    _event(task_id, "workflow_finished", {"ok": False, "phase": "planned", "status_key": response.status_key})
-                    return
-
-                if not plan_response.files:
-                    response = IdeChatResponse(
-                        ok=False,
-                        reply="",
-                        done=True,
-                        task_id=task_id,
-                        status_key="failed",
-                        error_code="EMPTY_PLAN",
-                        error_message="Planner produced no files for a coding workflow.",
-                        retryable=True,
-                    )
-                    add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
-                    apply_workflow_action(task_id, "fail", {"phase": "planned", "reason": response.error_message})
-                    _event(task_id, "workflow_finished", {"ok": False, "phase": "planned", "status_key": "failed"})
-                    return
-            if planned_this_round:
-                review_feedback = None
-
-            approved_paths = [file.path for file in plan_response.files]
-            execute_response = await self._run_coding_column(
+        max_rounds = 16
+        max_rework_rounds = 3
+        for round_no in range(1, max_rounds + 1):
+            _log.debug(
+                "workflow loop task_id=%s round=%s status_key=%s agent=%s",
                 task_id,
-                body,
-                workflow_summary,
-                plan_response,
-                approved_paths,
-                review_feedback,
+                round_no,
+                current.status_key,
+                current.agent,
             )
-            if not execute_response.ok:
-                add_artifact(task_id, artifact_type="workflow_result", payload=execute_response.model_dump())
-                apply_workflow_action(task_id, "fail", {"phase": "coding", "reason": execute_response.error_message})
-                _event(task_id, "workflow_finished", {"ok": False, "phase": "coding", "status_key": "failed"})
+            _event(
+                task_id,
+                "workflow_round_started",
+                {"round": round_no, "status_key": current.status_key, "agent": current.agent},
+            )
+
+            try:
+                result = await self._run_column(task_id, body, definition, workflow_summary, current, state)
+            except UnsupportedAgentError as exc:
+                response = _failure_response(task_id, "UNSUPPORTED_WORKFLOW_AGENT", str(exc))
+                add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
+                apply_workflow_action(task_id, "fail", {"phase": current.status_key, "reason": response.error_message})
+                _event(task_id, "workflow_finished", {"ok": False, "phase": current.status_key, "status_key": "failed"})
                 return
 
-            review = self._run_review_column(task_id, body, workflow_summary, plan_response, execute_response)
-            decision = str(review.get("decision") or "fail")
-            if decision == "approve":
-                verification_requests = _ensure_post_apply_verification_requests(execute_response, project_id)
-                execute_response.task_id = task_id
-                execute_response.status_key = "ready_to_apply"
-                if verification_requests:
-                    execute_response.tool_requests = verification_requests
-                execute_response.next_action = "apply_result"
-                add_artifact(task_id, artifact_type="workflow_result", payload=execute_response.model_dump())
+            target_status = result.target_status or _action_target(definition, result.action)
+            if result.response is not None:
+                add_artifact(task_id, artifact_type="workflow_result", payload=result.response.model_dump())
                 _event(
                     task_id,
                     "workflow_finished",
                     {
-                        "ok": execute_response.ok,
-                        "phase": "reviewed",
-                        "status_key": execute_response.status_key,
-                        "ops": len(execute_response.ops),
-                        "patch_ops": len(execute_response.patch_ops),
-                        "tool_requests": len(execute_response.tool_requests),
-                        "verification_required": bool(execute_response.tool_requests),
+                        "ok": result.response.ok,
+                        "phase": current.status_key,
+                        "status_key": result.response.status_key,
+                        "action": result.action,
                         "round": round_no,
                     },
                 )
                 return
 
-            if decision in {"request_replan", "request_recoding"} and round_no <= max_rework_rounds:
-                next_phase = "planned" if decision == "request_replan" else "coding"
-                review_feedback = review
+            if result.action in {"request_replan", "request_recoding"}:
+                state.rework_rounds += 1
+                if state.rework_rounds > max_rework_rounds:
+                    response = _failure_response(
+                        task_id,
+                        "REVIEW_REWORK_LIMIT",
+                        str((state.review_feedback or {}).get("summary") or "Workflow requested rework too many times."),
+                    )
+                    add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
+                    apply_workflow_action(
+                        task_id,
+                        "fail",
+                        {"phase": current.status_key, "reason": response.error_message, "review": state.review_feedback or {}},
+                    )
+                    _event(task_id, "workflow_finished", {"ok": False, "phase": current.status_key, "status_key": "failed"})
+                    return
                 _event(
                     task_id,
                     "workflow_rework_loop",
-                    {"round": round_no, "decision": decision, "next_phase": next_phase, "review": review},
+                    {
+                        "round": round_no,
+                        "decision": result.action,
+                        "target_status": target_status,
+                        "review": state.review_feedback or {},
+                    },
                 )
-                continue
 
-            response = execute_response.model_copy(update={
-                "ok": False,
-                "done": True,
-                "status_key": "failed",
-                "error_code": "REVIEW_REWORK_LIMIT",
-                "error_message": str(review.get("summary") or "Reviewer requested rework too many times."),
-                "retryable": True,
-            })
-            add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
-            apply_workflow_action(task_id, "fail", {"phase": "reviewed", "reason": response.error_message, "review": review})
-            _event(task_id, "workflow_finished", {"ok": False, "phase": "reviewed", "status_key": "failed", "round": round_no})
-            return
+            if not target_status:
+                response = _failure_response(task_id, "WORKFLOW_BAD_ACTION", f"Workflow action {result.action!r} has no target.")
+                add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
+                apply_workflow_action(task_id, "fail", {"phase": current.status_key, "reason": response.error_message})
+                _event(task_id, "workflow_finished", {"ok": False, "phase": current.status_key, "status_key": "failed"})
+                return
 
-        response = IdeChatResponse(
-            ok=False,
-            reply="",
-            done=True,
-            task_id=task_id,
-            status_key="failed",
-            error_code="WORKFLOW_LOOP_EXHAUSTED",
-            error_message="Workflow exhausted without producing a result.",
-            retryable=True,
-        )
+            next_column = _next_executable_after_transition(definition, target_status, current)
+            if next_column is None:
+                if state.execute_response is not None and result.decision == "approve":
+                    response = _ready_response(task_id, project_id, target_status, state.execute_response)
+                    add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
+                    _event(
+                        task_id,
+                        "workflow_finished",
+                        {
+                            "ok": response.ok,
+                            "phase": current.status_key,
+                            "status_key": response.status_key,
+                            "ops": len(response.ops),
+                            "patch_ops": len(response.patch_ops),
+                            "tool_requests": len(response.tool_requests),
+                            "verification_required": bool(response.tool_requests),
+                            "round": round_no,
+                        },
+                    )
+                    return
+
+                response = _failure_response(
+                    task_id,
+                    "WORKFLOW_NO_NEXT_COLUMN",
+                    f"Workflow stopped at {target_status!r} without a code result.",
+                )
+                add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
+                apply_workflow_action(task_id, "fail", {"phase": current.status_key, "reason": response.error_message})
+                _event(task_id, "workflow_finished", {"ok": False, "phase": current.status_key, "status_key": "failed"})
+                return
+
+            if _agent_kind(next_column.agent) == "planner" and result.action != "request_replan":
+                state.review_feedback = None
+            current = next_column
+
+        response = _failure_response(task_id, "WORKFLOW_LOOP_EXHAUSTED", "Workflow exhausted without producing a result.")
         add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
         apply_workflow_action(task_id, "fail", {"phase": "workflow", "reason": response.error_message})
         _event(task_id, "workflow_finished", {"ok": False, "phase": "workflow", "status_key": "failed"})
 
-    def _run_context_column(self, task_id: str, body: dict[str, Any], workflow_summary: dict[str, Any]) -> dict[str, Any]:
-        _event(task_id, "workflow_column_started", {"status_key": "context_indexed", "agent": "context"})
-        context = _build_agent_context(task_id, "context_indexed", "context", body, workflow_summary, [])
+    async def _run_column(
+        self,
+        task_id: str,
+        body: dict[str, Any],
+        definition: WorkflowDefinition,
+        workflow_summary: dict[str, Any],
+        column: WorkflowColumn,
+        state: WorkflowRunState,
+    ) -> ColumnResult:
+        agent = _agent_kind(column.agent)
+        handler = self._agent_handlers.get(agent)
+        if handler is None:
+            raise UnsupportedAgentError(f"Unsupported workflow agent {column.agent!r} on column {column.status_key!r}.")
+        if agent == "coder":
+            return await handler(task_id, body, definition, workflow_summary, column, state)
+        result = handler(task_id, body, workflow_summary, column, state)
+        if isinstance(result, Awaitable):
+            return await result
+        return result
+
+    def _run_context_column(
+        self,
+        task_id: str,
+        body: dict[str, Any],
+        workflow_summary: dict[str, Any],
+        column: WorkflowColumn,
+        state: WorkflowRunState,
+    ) -> ColumnResult:
+        agent = column.agent or "context"
+        _event(task_id, "workflow_column_started", {"status_key": column.status_key, "agent": agent})
+        context = _build_agent_context(task_id, column.status_key, agent, body, workflow_summary, column.input_artifacts or [])
         code_context_summary = build_code_context_summary(body.get("workspace"))
         context_bundle = {
             "workspace": body.get("workspace"),
@@ -181,21 +248,22 @@ class WorkflowEngine:
             "project_root": body.get("project_root"),
             "project_memory": context["project_memory"],
         }
-        add_artifact(task_id, artifact_type="context_bundle", payload=context_bundle)
+        state.context_bundle = context_bundle
+        add_artifact(task_id, artifact_type=column.output_artifact or "context_bundle", payload=context_bundle)
         add_artifact(task_id, artifact_type="code_context_summary", payload=code_context_summary)
         output = record_phase_output(
             task_id,
-            phase="context_indexed",
-            agent="context",
-            status_key="context_indexed",
-            summary="Indexed IDE-provided workspace context and project memory for downstream agents.",
+            phase=column.status_key,
+            agent=agent,
+            status_key=column.status_key,
+            summary="Indexed client-provided workspace context and project memory for downstream agents.",
             inputs=context,
             outputs=context_bundle,
             warnings=[],
             decision="approve",
-            next_action="plan_ready",
+            next_action=column.success_action,
         )
-        _event(task_id, "agent_context_built", {"phase": "context_indexed", "agent": "context", "session_id": output["session_id"]})
+        _event(task_id, "agent_context_built", {"phase": column.status_key, "agent": agent, "session_id": output["session_id"]})
         _event(
             task_id,
             "code_context_summary_built",
@@ -207,45 +275,107 @@ class WorkflowEngine:
                 "warnings": code_context_summary.get("warnings") or [],
             },
         )
-        _event(task_id, "agent_output_recorded", {"phase": "context_indexed", "agent": "context", "artifact": "context_bundle"})
-        apply_workflow_action(task_id, "context_indexed", {"phase": "context_indexed", "session_id": output["session_id"]})
-        _event(task_id, "workflow_column_completed", {"status_key": "context_indexed", "agent": "context", "decision": "approve"})
-        return context_bundle
+        _event(task_id, "agent_output_recorded", {"phase": column.status_key, "agent": agent, "artifact": column.output_artifact or "context_bundle"})
+        action = column.success_action or column.status_key
+        moved = apply_workflow_action(task_id, action, {"phase": column.status_key, "session_id": output["session_id"]})
+        _event(task_id, "workflow_column_completed", {"status_key": column.status_key, "agent": agent, "decision": "approve"})
+        return ColumnResult(action=action, target_status=(moved.get("task") or {}).get("status_key"), decision="approve")
 
     async def _run_plan_column(
         self,
         task_id: str,
         body: dict[str, Any],
         workflow_summary: dict[str, Any],
-        context_bundle: dict[str, Any],
-    ) -> PlanResponse:
-        _event(task_id, "workflow_column_started", {"status_key": "planned", "agent": "planner"})
-        _event(task_id, "agent_context_built", {"phase": "planned", "agent": "planner", "context": _context_log_summary(_build_agent_context(task_id, "planned", "planner", body, workflow_summary, ["context_bundle", "code_context_summary"]))})
-        plan_response = await self.plan_runner(dict(body, task_id=task_id))
+        column: WorkflowColumn,
+        state: WorkflowRunState,
+    ) -> ColumnResult:
+        agent = column.agent or "planner"
+        _event(task_id, "workflow_column_started", {"status_key": column.status_key, "agent": agent})
+        _event(
+            task_id,
+            "agent_context_built",
+            {
+                "phase": column.status_key,
+                "agent": agent,
+                "context": _context_log_summary(
+                    _build_agent_context(task_id, column.status_key, agent, body, workflow_summary, column.input_artifacts or [])
+                ),
+            },
+        )
+        plan_response = await self.plan_runner(dict(body, task_id=task_id, _workflow_engine_managed=True))
         plan_response.task_id = task_id
-        add_artifact(task_id, artifact_type="plan_bundle", payload=plan_response.model_dump())
-        _event(task_id, "agent_output_recorded", {"phase": "planned", "agent": "planner", "artifact": "plan_bundle"})
-        if plan_response.ok:
-            apply_workflow_action(task_id, "plan_ready", {"phase": "planned", "files": len(plan_response.files), "session_id": plan_response.session_id})
-            _event(task_id, "workflow_column_completed", {"status_key": "planned", "agent": "planner", "decision": "approve"})
-        else:
-            apply_workflow_action(task_id, "fail", {"phase": "planned", "reason": plan_response.error_message})
-            _event(task_id, "workflow_column_completed", {"status_key": "planned", "agent": "planner", "decision": "fail"})
-        return plan_response
+        state.plan_response = plan_response
+        add_artifact(task_id, artifact_type=column.output_artifact or "plan_bundle", payload=plan_response.model_dump())
+        _event(task_id, "agent_output_recorded", {"phase": column.status_key, "agent": agent, "artifact": column.output_artifact or "plan_bundle"})
+        if not plan_response.ok:
+            action = _failure_action(column)
+            moved = apply_workflow_action(task_id, action, {"phase": column.status_key, "reason": plan_response.error_message})
+            _event(task_id, "workflow_column_completed", {"status_key": column.status_key, "agent": agent, "decision": "fail"})
+            response = IdeChatResponse(
+                ok=False,
+                reply="",
+                done=True,
+                task_id=task_id,
+                status_key=(moved.get("task") or {}).get("status_key") or plan_response.status_key or "failed",
+                error_code=plan_response.error_code or "PLAN_ERROR",
+                error_message=plan_response.error_message or "Planning failed.",
+                retryable=True,
+            )
+            return ColumnResult(action=action, decision="fail", response=response, target_status=response.status_key)
+
+        if not plan_response.files:
+            action = _failure_action(column)
+            message = "Planner produced no files for a coding workflow."
+            moved = apply_workflow_action(task_id, action, {"phase": column.status_key, "reason": message})
+            _event(task_id, "workflow_column_completed", {"status_key": column.status_key, "agent": agent, "decision": "fail"})
+            response = _failure_response(task_id, "EMPTY_PLAN", message, status_key=(moved.get("task") or {}).get("status_key") or "failed")
+            return ColumnResult(action=action, decision="fail", response=response, target_status=response.status_key)
+
+        action = column.success_action or "plan_ready"
+        moved = apply_workflow_action(
+            task_id,
+            action,
+            {"phase": column.status_key, "files": len(plan_response.files), "session_id": plan_response.session_id},
+        )
+        state.review_feedback = None
+        _event(task_id, "workflow_column_completed", {"status_key": column.status_key, "agent": agent, "decision": "approve"})
+        return ColumnResult(action=action, target_status=(moved.get("task") or {}).get("status_key"), decision="approve")
 
     async def _run_coding_column(
         self,
         task_id: str,
         body: dict[str, Any],
+        definition: WorkflowDefinition,
         workflow_summary: dict[str, Any],
-        plan_response: PlanResponse,
-        approved_paths: list[str],
-        review_feedback: dict[str, Any] | None = None,
-    ) -> IdeChatResponse:
-        apply_workflow_action(task_id, "coding_started", {"phase": "coding", "approved_paths": approved_paths})
-        _event(task_id, "workflow_column_started", {"status_key": "coding", "agent": "coder"})
-        _event(task_id, "agent_context_built", {"phase": "coding", "agent": "coder", "context": _context_log_summary(_build_agent_context(task_id, "coding", "coder", body, workflow_summary, ["context_bundle", "code_context_summary", "plan_bundle"]))})
-        coding_messages = _coding_phase_messages(body.get("messages") or [], plan_response, review_feedback)
+        column: WorkflowColumn,
+        state: WorkflowRunState,
+    ) -> ColumnResult:
+        if state.plan_response is None:
+            action = _failure_action(column)
+            message = "Coder column cannot run without a plan artifact."
+            moved = apply_workflow_action(task_id, action, {"phase": column.status_key, "reason": message})
+            response = _failure_response(task_id, "MISSING_PLAN", message, status_key=(moved.get("task") or {}).get("status_key") or "failed")
+            return ColumnResult(action=action, decision="fail", response=response, target_status=response.status_key)
+
+        agent = column.agent or "coder"
+        enter_action = _entry_action_for_status(definition, column.status_key)
+        if enter_action and _current_status(task_id) != column.status_key:
+            apply_workflow_action(task_id, enter_action, {"phase": column.status_key, "approved_paths": [file.path for file in state.plan_response.files]})
+
+        _event(task_id, "workflow_column_started", {"status_key": column.status_key, "agent": agent})
+        _event(
+            task_id,
+            "agent_context_built",
+            {
+                "phase": column.status_key,
+                "agent": agent,
+                "context": _context_log_summary(
+                    _build_agent_context(task_id, column.status_key, agent, body, workflow_summary, column.input_artifacts or [])
+                ),
+            },
+        )
+        approved_paths = [file.path for file in state.plan_response.files]
+        coding_messages = _coding_phase_messages(body.get("messages") or [], state.plan_response, state.review_feedback, phase=column.status_key)
         execute_body = {
             "project_id": body.get("project_id"),
             "task_id": task_id,
@@ -255,82 +385,117 @@ class WorkflowEngine:
             "workspace": body.get("workspace"),
             "approved_paths": approved_paths,
             "approved_ops": [],
+            "_workflow_engine_managed": True,
         }
         _event(
             task_id,
             "coding_context_prepared",
             {
-                "plan_files": len(plan_response.files),
-                "review_feedback": bool(review_feedback),
+                "phase": column.status_key,
+                "plan_files": len(state.plan_response.files),
+                "review_feedback": bool(state.review_feedback),
                 "message_count": len(coding_messages),
-                "missing_changed_files": (review_feedback or {}).get("missing_changed_files") or [],
-                "unplanned_changed_files": (review_feedback or {}).get("unplanned_changed_files") or [],
+                "missing_changed_files": (state.review_feedback or {}).get("missing_changed_files") or [],
+                "unplanned_changed_files": (state.review_feedback or {}).get("unplanned_changed_files") or [],
             },
         )
         execute_response = await self.coding_runner(execute_body)
         execute_response.task_id = task_id
-        add_artifact(task_id, artifact_type="code_change_bundle", payload=execute_response.model_dump())
-        _event(task_id, "agent_output_recorded", {"phase": "coding", "agent": "coder", "artifact": "code_change_bundle"})
-        if execute_response.ok:
-            apply_workflow_action(task_id, "coding_ready", {"phase": "coding", "ops": len(execute_response.ops), "patch_ops": len(execute_response.patch_ops), "session_id": execute_response.session_id})
-            _event(task_id, "workflow_column_completed", {"status_key": "coding", "agent": "coder", "decision": "approve"})
-        else:
-            apply_workflow_action(task_id, "fail", {"phase": "coding", "reason": execute_response.error_message})
-            _event(task_id, "workflow_column_completed", {"status_key": "coding", "agent": "coder", "decision": "fail"})
-        return execute_response
+        state.execute_response = execute_response
+        add_artifact(task_id, artifact_type=column.output_artifact or "code_change_bundle", payload=execute_response.model_dump())
+        _event(task_id, "agent_output_recorded", {"phase": column.status_key, "agent": agent, "artifact": column.output_artifact or "code_change_bundle"})
+        if not execute_response.ok:
+            action = _failure_action(column)
+            moved = apply_workflow_action(task_id, action, {"phase": column.status_key, "reason": execute_response.error_message})
+            _event(task_id, "workflow_column_completed", {"status_key": column.status_key, "agent": agent, "decision": "fail"})
+            execute_response.status_key = (moved.get("task") or {}).get("status_key") or "failed"
+            return ColumnResult(action=action, decision="fail", response=execute_response, target_status=execute_response.status_key)
+
+        action = column.success_action or "coding_ready"
+        moved = apply_workflow_action(
+            task_id,
+            action,
+            {
+                "phase": column.status_key,
+                "ops": len(execute_response.ops),
+                "patch_ops": len(execute_response.patch_ops),
+                "session_id": execute_response.session_id,
+            },
+        )
+        _event(task_id, "workflow_column_completed", {"status_key": column.status_key, "agent": agent, "decision": "approve"})
+        return ColumnResult(action=action, target_status=(moved.get("task") or {}).get("status_key"), decision="approve")
 
     def _run_review_column(
         self,
         task_id: str,
         body: dict[str, Any],
         workflow_summary: dict[str, Any],
-        plan_response: PlanResponse,
-        execute_response: IdeChatResponse,
-    ) -> dict[str, Any]:
-        _event(task_id, "workflow_column_started", {"status_key": "reviewed", "agent": "reviewer"})
-        context = _build_agent_context(task_id, "reviewed", "reviewer", body, workflow_summary, ["code_context_summary", "plan_bundle", "code_change_bundle"])
-        _event(task_id, "agent_context_built", {"phase": "reviewed", "agent": "reviewer", "context": _context_log_summary(context)})
-        review_result = _review_result(plan_response, execute_response)
+        column: WorkflowColumn,
+        state: WorkflowRunState,
+    ) -> ColumnResult:
+        if state.plan_response is None or state.execute_response is None:
+            action = _failure_action(column)
+            message = "Reviewer column requires plan and code-change artifacts."
+            moved = apply_workflow_action(task_id, action, {"phase": column.status_key, "reason": message})
+            response = _failure_response(task_id, "MISSING_REVIEW_INPUT", message, status_key=(moved.get("task") or {}).get("status_key") or "failed")
+            return ColumnResult(action=action, decision="fail", response=response, target_status=response.status_key)
+
+        agent = column.agent or "reviewer"
+        _event(task_id, "workflow_column_started", {"status_key": column.status_key, "agent": agent})
+        context = _build_agent_context(task_id, column.status_key, agent, body, workflow_summary, column.input_artifacts or [])
+        _event(task_id, "agent_context_built", {"phase": column.status_key, "agent": agent, "context": _context_log_summary(context)})
+        review_result = _review_result(state.plan_response, state.execute_response)
         decision = review_result["decision"]
+        action = (column.success_action or "approve") if decision == "approve" else decision
         review_bundle = {
-            "decision": decision,
+            "decision": action,
             "summary": _review_summary(decision, review_result),
-            "plan_files": [file.path for file in plan_response.files],
-            "changed_files": [op.path for op in execute_response.ops] + _patch_paths(execute_response),
+            "plan_files": [file.path for file in state.plan_response.files],
+            "changed_files": [op.path for op in state.execute_response.ops] + _patch_paths(state.execute_response),
             "normalized_plan_files": review_result["normalized_plan_files"],
             "normalized_changed_files": review_result["normalized_changed_files"],
             "missing_changed_files": review_result["missing_changed_files"],
             "unplanned_changed_files": review_result["unplanned_changed_files"],
-            "ops": len(execute_response.ops),
-            "patch_ops": len(execute_response.patch_ops),
-            "tool_requests": len(execute_response.tool_requests),
+            "ops": len(state.execute_response.ops),
+            "patch_ops": len(state.execute_response.patch_ops),
+            "tool_requests": len(state.execute_response.tool_requests),
         }
+        state.review_feedback = review_bundle
         _log.debug(
-            "workflow review decision task_id=%s decision=%s plan=%s changed=%s missing=%s unplanned=%s",
+            "workflow review decision task_id=%s decision=%s action=%s plan=%s changed=%s missing=%s unplanned=%s",
             task_id,
             decision,
+            action,
             review_result["normalized_plan_files"],
             review_result["normalized_changed_files"],
             review_result["missing_changed_files"],
             review_result["unplanned_changed_files"],
         )
-        add_artifact(task_id, artifact_type="review_bundle", payload=review_bundle)
+        add_artifact(task_id, artifact_type=column.output_artifact or "review_bundle", payload=review_bundle)
         output = record_phase_output(
             task_id,
-            phase="reviewed",
-            agent="reviewer",
+            phase=column.status_key,
+            agent=agent,
             status_key="ready_to_apply" if decision == "approve" else decision,
             summary=review_bundle["summary"],
             inputs=context,
             outputs=review_bundle,
             warnings=[],
-            decision=decision,
-            next_action="apply_result" if decision == "approve" else decision,
+            decision=action,
+            next_action="apply_result" if decision == "approve" else action,
         )
-        _event(task_id, "agent_output_recorded", {"phase": "reviewed", "agent": "reviewer", "artifact": "review_bundle", "session_id": output["session_id"]})
-        apply_workflow_action(task_id, decision, {"phase": "reviewed", "reason": review_bundle["summary"], "session_id": output["session_id"]})
-        _event(task_id, "workflow_column_completed", {"status_key": "reviewed", "agent": "reviewer", "decision": decision})
-        return review_bundle
+        _event(
+            task_id,
+            "agent_output_recorded",
+            {"phase": column.status_key, "agent": agent, "artifact": column.output_artifact or "review_bundle", "session_id": output["session_id"]},
+        )
+        moved = apply_workflow_action(task_id, action, {"phase": column.status_key, "reason": review_bundle["summary"], "session_id": output["session_id"]})
+        _event(task_id, "workflow_column_completed", {"status_key": column.status_key, "agent": agent, "decision": action})
+        return ColumnResult(action=action, target_status=(moved.get("task") or {}).get("status_key"), decision=decision)
+
+
+class UnsupportedAgentError(ValueError):
+    pass
 
 
 def record_agent_message(
@@ -386,9 +551,11 @@ def _coding_phase_messages(
     messages: list[dict[str, Any]],
     plan_response: PlanResponse,
     review_feedback: dict[str, Any] | None = None,
+    *,
+    phase: str = "coding",
 ) -> list[dict[str, str]]:
     context = {
-        "phase": "coding",
+        "phase": phase,
         "planner_output": {
             "summary": plan_response.summary,
             "warnings": plan_response.warnings,
@@ -484,6 +651,17 @@ def _latest_task_artifact_payload(task_id: str, artifact_type: str) -> dict[str,
     return None
 
 
+def _ready_response(task_id: str, project_id: str, status_key: str, execute_response: IdeChatResponse) -> IdeChatResponse:
+    response = execute_response.model_copy(deep=True)
+    response.task_id = task_id
+    response.status_key = status_key or "ready_to_apply"
+    response.next_action = "apply_result"
+    verification_requests = _ensure_post_apply_verification_requests(response, project_id)
+    if verification_requests:
+        response.tool_requests = verification_requests
+    return response
+
+
 def _ensure_post_apply_verification_requests(response: IdeChatResponse, project_id: str) -> list[ToolRequest]:
     by_id = {req.id: req for req in response.tool_requests}
     for request in configured_post_apply_tool_requests(get_project_settings(project_id)):
@@ -491,8 +669,17 @@ def _ensure_post_apply_verification_requests(response: IdeChatResponse, project_
     return list(by_id.values())
 
 
-def _review_decision(plan_response: PlanResponse, execute_response: IdeChatResponse) -> str:
-    return _review_result(plan_response, execute_response)["decision"]
+def _failure_response(task_id: str, error_code: str, error_message: str, *, status_key: str = "failed") -> IdeChatResponse:
+    return IdeChatResponse(
+        ok=False,
+        reply="",
+        done=True,
+        task_id=task_id,
+        status_key=status_key,
+        error_code=error_code,
+        error_message=error_message,
+        retryable=True,
+    )
 
 
 def _review_result(plan_response: PlanResponse, execute_response: IdeChatResponse) -> dict[str, Any]:
@@ -627,6 +814,99 @@ def _first_user_text(messages: list[Any]) -> str:
         if isinstance(item, dict) and str(item.get("role") or "").lower() == "user":
             return str(item.get("content") or "")
     return ""
+
+
+def _executable_columns(definition: WorkflowDefinition) -> list[WorkflowColumn]:
+    return sorted([column for column in definition.columns if column.executable], key=lambda col: col.position)
+
+
+def _first_executable_at_or_after(definition: WorkflowDefinition, status_key: str) -> WorkflowColumn | None:
+    status = str(status_key or "").strip().lower()
+    columns = sorted(definition.columns, key=lambda col: col.position)
+    anchor = next((col for col in columns if col.status_key == status), None)
+    if anchor is None:
+        return None
+    return next((col for col in columns if col.executable and col.position >= anchor.position), None)
+
+
+def _next_executable_after_transition(
+    definition: WorkflowDefinition,
+    status_key: str,
+    current: WorkflowColumn,
+) -> WorkflowColumn | None:
+    status = str(status_key or "").strip().lower()
+    columns = sorted(definition.columns, key=lambda col: col.position)
+    anchor = next((col for col in columns if col.status_key == status), None)
+    if anchor is None:
+        return None
+    minimum = anchor.position + 1 if anchor.status_key == current.status_key else anchor.position
+    return next((col for col in columns if col.executable and col.position >= minimum), None)
+
+
+def _resume_column(definition: WorkflowDefinition, state: WorkflowRunState) -> WorkflowColumn | None:
+    if state.plan_response is not None:
+        return _first_column_by_agent(definition, {"coder", "executor", "coding"})
+    return _first_column_by_agent(definition, {"planner", "plan"})
+
+
+def _first_column_by_agent(definition: WorkflowDefinition, agents: set[str]) -> WorkflowColumn | None:
+    for column in _executable_columns(definition):
+        if str(column.agent or "").strip().lower() in agents:
+            return column
+    return None
+
+
+def _action_target(definition: WorkflowDefinition, action: str) -> str | None:
+    rule = definition.action(action)
+    if not isinstance(rule, dict):
+        return None
+    target = str(rule.get("to") or "").strip().lower()
+    return target or None
+
+
+def _entry_action_for_status(definition: WorkflowDefinition, status_key: str) -> str | None:
+    status = str(status_key or "").strip().lower()
+    candidates = []
+    for action, rule in definition.actions.items():
+        if str(rule.get("to") or "").strip().lower() == status:
+            candidates.append(action)
+    preferred = [f"{status}_started", f"start_{status}", status]
+    for name in preferred:
+        if name in candidates:
+            return name
+    for action in candidates:
+        if action.endswith("_started"):
+            return action
+    return None
+
+
+def _failure_action(column: WorkflowColumn) -> str:
+    actions = column.failure_actions or []
+    return "fail" if "fail" in actions else (actions[0] if actions else "fail")
+
+
+def _agent_kind(agent: str | None) -> str:
+    value = str(agent or "").strip().lower()
+    aliases = {
+        "local_context": "context",
+        "context_agent": "context",
+        "plan": "planner",
+        "planning": "planner",
+        "executor": "coder",
+        "coding": "coder",
+        "code": "coder",
+        "review": "reviewer",
+        "quality": "reviewer",
+        "quality_gate": "reviewer",
+    }
+    return aliases.get(value, value)
+
+
+def _current_status(task_id: str) -> str:
+    try:
+        return str((get_task(task_id).get("task") or {}).get("status_key") or "")
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _event(task_id: str, event_type: str, payload: dict[str, Any]) -> None:
