@@ -171,7 +171,7 @@ def _extract_syntax_diagnostics(workspace: dict[str, Any] | None) -> list[dict[s
             continue
         path = _normalize_path(item.get("path"))
         message = str(item.get("message") or "").strip()
-        if not path or not message:
+        if not path or _has_hidden_dir_segment(path) or not message:
             continue
         diagnostics.append(
             {
@@ -212,6 +212,11 @@ def _normalize_path(value: object) -> str:
     if not parts or any(part == ".." for part in parts):
         return ""
     return "/".join(parts)
+
+
+def _has_hidden_dir_segment(path: str) -> bool:
+    parts = [part for part in str(path or "").replace("\\", "/").split("/") if part]
+    return len(parts) > 1 and any(part.startswith(".") for part in parts[:-1])
 
 
 def _optional_int(value: object) -> int | None:

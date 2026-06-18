@@ -522,8 +522,11 @@ def _diagnostic_paths(messages: list[dict]) -> list[str]:
     for item in diagnostics:
         if not isinstance(item, dict):
             continue
-        path = _normalize_tool_path(item.get("path"), source_paths=source_paths)
-        if not path or path in seen:
+        raw_path = str(item.get("path") or "").replace("\\", "/").strip()
+        if _has_hidden_dir_segment(raw_path):
+            continue
+        path = _normalize_tool_path(raw_path, source_paths=source_paths)
+        if not path or _has_hidden_dir_segment(path) or path in seen:
             continue
         seen.add(path)
         out.append(path)
@@ -848,3 +851,8 @@ def _safe_rel_path(value: object) -> str:
     if not parts or any(part == ".." for part in parts):
         return ""
     return "/".join(parts)
+
+
+def _has_hidden_dir_segment(path: str) -> bool:
+    parts = [part for part in str(path or "").replace("\\", "/").split("/") if part]
+    return len(parts) > 1 and any(part.startswith(".") for part in parts[:-1])

@@ -844,7 +844,17 @@ class HttpAiClient(
         val isWindows = System.getProperty("os.name").lowercase().contains("win")
 
         if (!hasPath) {
-            return null to "[run_command] pathless global executable is not allowed: $rawExecutable; use a project-local executable path or project-configured tool"
+            if (isShellWrapper(rawExecutable)) {
+                return null to "[run_command] shell wrapper is not allowed: $rawExecutable"
+            }
+            val resolvedGlobal = resolvePathExecutable(rawExecutable, isWindows)
+                ?: return null to "[run_command] executable not found on IDE PATH: $rawExecutable"
+            val resolved = if (isWindows && resolvedGlobal.extension.lowercase() in setOf("bat", "cmd")) {
+                listOf("cmd.exe", "/c", resolvedGlobal.path) + args
+            } else {
+                listOf(resolvedGlobal.path) + args
+            }
+            return resolved to null
         }
 
         val rel = rawExecutable.trimStart('.', '/', '\\')
@@ -873,6 +883,32 @@ class HttpAiClient(
         return resolved to null
     }
 
+    private fun isShellWrapper(executable: String): Boolean {
+        return executable.lowercase() in setOf("cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe", "bash", "sh")
+    }
+
+    private fun resolvePathExecutable(executable: String, isWindows: Boolean): File? {
+        val path = System.getenv("PATH") ?: return null
+        val extensions = if (isWindows) {
+            val raw = System.getenv("PATHEXT") ?: ".COM;.EXE;.BAT;.CMD"
+            raw.split(";").map { it.trim().lowercase() }.filter { it.isNotBlank() }
+        } else {
+            listOf("")
+        }
+        val names = if (isWindows && !executable.contains(".")) {
+            extensions.map { executable + it.lowercase() }
+        } else {
+            listOf(executable)
+        }
+        for (dir in path.split(File.pathSeparator).filter { it.isNotBlank() }) {
+            for (name in names) {
+                val candidate = runCatching { File(dir, name).canonicalFile }.getOrNull() ?: continue
+                if (candidate.exists() && candidate.isFile) return candidate
+            }
+        }
+        return null
+    }
+
     private fun pathList(raw: Any?): List<String> = when (raw) {
         is JSONArray -> (0 until raw.length()).mapNotNull { raw.optString(it, "").takeIf { s -> s.isNotBlank() } }
         is List<*> -> raw.mapNotNull { it as? String }.filter { it.isNotBlank() }
@@ -885,7 +921,8 @@ class HttpAiClient(
         val fileIndex = ProjectFileIndex.getInstance(project)
         val files = mutableListOf<VirtualFile>()
         fileIndex.iterateContent { vf ->
-            if (!vf.isDirectory && vf.path.startsWith(base.path.trimEnd('/') + "/")) {
+            val rel = vf.path.removePrefix(base.path.trimEnd('/') + "/").replace("\\", "/")
+            if (!vf.isDirectory && vf.path.startsWith(base.path.trimEnd('/') + "/") && !hasHiddenDirSegment(rel)) {
                 files += vf
             }
             files.size < 2_000

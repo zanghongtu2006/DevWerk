@@ -387,7 +387,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         response: IdeChatResponse,
         devCtx: DevwerkContext?
     ): JSONObject {
-        val requests = response.toolRequests
+        val requests = postApplyRequests(response)
         if (http == null || requests.isEmpty()) return JSONObject()
 
         appendOpLog(devCtx, "[INFO] Executing ${requests.size} post-apply tool request(s).\n")
@@ -416,6 +416,26 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
             .put("required", required)
             .put("results", resultMap)
             .put("tool_results", details)
+    }
+
+    private fun postApplyRequests(response: IdeChatResponse): List<ToolRequest> {
+        val changedPaths = collectChangedPaths(response)
+        if (changedPaths.isEmpty()) return response.toolRequests
+
+        val requests = response.toolRequests.toMutableList()
+        val hasIdeSyntaxCheck = requests.any { it.tool == "ide_syntax_check" }
+        if (!hasIdeSyntaxCheck) {
+            requests += ToolRequest(
+                id = "ide_syntax_check",
+                tool = "ide_syntax_check",
+                args = mapOf(
+                    "paths" to emptyList<String>(),
+                    "max_errors" to 200,
+                    "reason" to "Default post-apply IDE diagnostics across the project."
+                )
+            )
+        }
+        return requests
     }
 
     private fun collectChangedPaths(response: IdeChatResponse): List<String> {

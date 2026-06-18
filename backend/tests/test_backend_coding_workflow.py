@@ -96,6 +96,13 @@ def test_code_context_summary_includes_ide_syntax_diagnostics():
                 "column": 34,
                 "message": "Illegal escape character in string literal",
                 "source": "ide_psi",
+            },
+            {
+                "path": ".devwerk/20260618/after/src/main/java/org/example/dto/TenantCreateRequest.java",
+                "line": 28,
+                "column": 34,
+                "message": "Snapshot copy should not be treated as source.",
+                "source": "ide_psi",
             }
         ],
     }
@@ -103,7 +110,9 @@ def test_code_context_summary_includes_ide_syntax_diagnostics():
     summary = build_code_context_summary(workspace)
 
     assert summary["available"] is True
-    assert summary["syntax_diagnostics"][0]["path"] == "src/main/java/org/example/dto/TenantCreateRequest.java"
+    assert [item["path"] for item in summary["syntax_diagnostics"]] == [
+        "src/main/java/org/example/dto/TenantCreateRequest.java"
+    ]
     assert "direct file evidence" in " ".join(summary["path_policy"])
 
 
@@ -983,6 +992,12 @@ def test_planner_fallback_uses_ide_diagnostic_paths_without_framework_guessing()
                             ]
                         },
                         "syntax_diagnostics": [
+                            {
+                                "path": ".devwerk/20260618/after/src/main/java/org/example/service/impl/OrganizationServiceImpl.java",
+                                "line": 84,
+                                "column": 60,
+                                "message": "Snapshot copy should be ignored.",
+                            },
                             {
                                 "path": "src/main/java/org/example/dto/TenantCreateRequest.java",
                                 "line": 28,
