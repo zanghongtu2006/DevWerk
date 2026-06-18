@@ -184,6 +184,10 @@ def _normalize_project_memory(project_id: str, data: dict[str, Any]) -> dict[str
     for key in ("tasks_seen", "frameworks", "paths", "commands", "rules", "phase_summaries"):
         if not isinstance(memory.get(key), list):
             memory[key] = []
+    memory["frameworks"] = [
+        item for item in memory["frameworks"]
+        if str(item).strip().lower() not in _SOURCE_MAP_KINDS
+    ]
     return memory
 
 
@@ -235,10 +239,14 @@ def _extract_frameworks(inputs: dict[str, Any], outputs: dict[str, Any]) -> list
                 frameworks.append(value.strip())
             elif isinstance(value, list):
                 frameworks.extend(str(entry).strip() for entry in value if str(entry).strip())
-        kind = item.get("kind")
-        if isinstance(kind, str) and kind.strip():
-            frameworks.append(kind.strip())
     return _dedupe(frameworks, limit=20)
+
+
+_SOURCE_MAP_KINDS = {
+    "content", "source", "test", "resource", "doc", "xmltag", "xmlattribute",
+    "class", "interface", "enum", "record", "method", "function", "constructor",
+    "parameter", "typeparameter", "field", "property", "localvariable", "patternvariable",
+}
 
 
 def _extract_rules(inputs: dict[str, Any], outputs: dict[str, Any]) -> list[str]:

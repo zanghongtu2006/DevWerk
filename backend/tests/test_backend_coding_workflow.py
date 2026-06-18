@@ -1052,6 +1052,7 @@ async def test_interactive_workflow_pauses_for_plan_confirmation_and_resumes(mon
     waiting_task = kanban_service.get_task(task["id"])["task"]
     waiting_result = [item for item in waiting_task["artifacts"] if item["artifact_type"] == "workflow_result"][-1]["payload"]
     assert waiting_result["waiting_for"] == "plan_confirmation"
+    assert "Waiting for plan confirmation" in waiting_result["reply"]
     assert waiting_task["status_key"] == "planned"
     assert coding_calls == 0
     assert kanban_service.get_conversation(task["id"])["state"] == "waiting_user"

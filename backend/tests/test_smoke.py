@@ -110,6 +110,17 @@ def test_workflow_action_protocol_drives_kanban_state(monkeypatch, tmp_path):
     assert retried["task"]["status_key"] == "draft"
 
 
+def test_project_memory_does_not_treat_source_map_symbol_kinds_as_frameworks():
+    from app.services.session_store import _normalize_project_memory
+
+    memory = _normalize_project_memory(
+        "memory-smoke",
+        {"frameworks": ["class", "method", "source", "Spring Boot"]},
+    )
+
+    assert memory["frameworks"] == ["Spring Boot"]
+
+
 def test_failed_verification_returns_to_coding(monkeypatch, tmp_path):
     import app.services.kanban as kanban_service
     import app.services.session_store as session_store

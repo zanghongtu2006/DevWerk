@@ -49,7 +49,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
     private val chatArea       = JTextArea()
     private val inputArea       = PromptTextArea("Message DevWerk...  Ctrl+Enter to send", 4, 20)
     private val sendButton      = JButton("Send")
-    private val confirmPlanButton = JButton("Confirm plan")
+    private val confirmPlanButton = JButton("Confirm & Code")
     private val attachBtn       = JButton("+")
     private val clearAttachBtn  = JButton("Clear")
     private val settingsBtn     = JButton("\u2699")
@@ -276,6 +276,9 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
             val resp = response
             SwingUtilities.invokeLater {
                 if (resp.ok) appendChatLine("Bot: ${resp.reply}")
+                if (resp.ok && resp.waitingFor == "plan_confirmation") {
+                    appendChatLine("[System] Workflow paused at Planned and is waiting for confirmation.")
+                }
                 resp.codeTree?.takeIf { it.isNotBlank() }?.let {
                     appendChatLine("=== Code Tree ==="); appendChatLine(it)
                 }

@@ -402,7 +402,7 @@ class WorkflowEngine:
         state.review_feedback = None
         _event(task_id, "workflow_column_completed", {"status_key": column.status_key, "agent": agent, "decision": "approve"})
         if _requires_plan_confirmation(body):
-            reply = plan_response.summary or _plan_confirmation_text(plan_response)
+            reply = _plan_confirmation_text(plan_response)
             append_conversation_message(
                 task_id,
                 role="assistant",
@@ -1024,11 +1024,17 @@ def _requires_plan_confirmation(body: dict[str, Any]) -> bool:
 
 def _plan_confirmation_text(plan: PlanResponse) -> str:
     paths = [file.path for file in plan.files if file.intent != "inspect"]
-    if not paths:
-        return "The plan is ready for confirmation."
-    sample = ", ".join(paths[:8])
-    suffix = "..." if len(paths) > 8 else ""
-    return f"The plan is ready. Proposed change candidates: {sample}{suffix}"
+    lines = [plan.summary or "The implementation plan is ready."]
+    if paths:
+        lines.append("\nPlanned change candidates:")
+        lines.extend(f"- {path}" for path in paths[:16])
+        if len(paths) > 16:
+            lines.append(f"- ... and {len(paths) - 16} more")
+    if plan.warnings:
+        lines.append("\nOpen questions / missing evidence:")
+        lines.extend(f"- {warning}" for warning in plan.warnings[:8])
+    lines.append("\nWaiting for plan confirmation. Confirm to start coding, or send corrections to revise the plan.")
+    return "\n".join(lines)
 
 
 def _positive_int(value: Any, default: int) -> int:
