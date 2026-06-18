@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import httpx
@@ -145,6 +146,45 @@ class FakePlannerResearchClient:
                     }
                 ],
                 "summary": "Refactor tenant in the existing project path.",
+                "warnings": [],
+            }
+        }
+
+
+class FakePlannerNaturalLanguageSearchClient:
+    def __init__(self):
+        self.calls = 0
+
+    def chat_json(self, messages: list[dict]) -> dict:
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "tool_requests": [
+                    {"id": "p1", "tool": "list_dir", "args": {"path": "src/main/java/org/example/dto", "max_depth": 2}}
+                ]
+            }
+        if self.calls == 2:
+            assert any("tool_results:" in message.get("content", "") for message in messages)
+            return {
+                "raw_text": (
+                    'Let me search for regex annotations. Common causes include `Pattern.compile` '
+                    'and `@Pattern` string literal escapes.'
+                )
+            }
+
+        tool_results = "\n".join(message.get("content", "") for message in messages if "tool_results:" in message.get("content", ""))
+        assert "TenantCreateRequest.java" in tool_results
+        return {
+            "plan": {
+                "files": [
+                    {
+                        "path": "src/main/java/org/example/dto/TenantCreateRequest.java",
+                        "nature": "modified",
+                        "description": "Fix the regex/string literal syntax error found by search evidence.",
+                        "confidence": 0.91,
+                    }
+                ],
+                "summary": "Fix syntax errors in TenantCreateRequest validation pattern.",
                 "warnings": [],
             }
         }
@@ -909,6 +949,61 @@ def test_planner_executes_minimax_text_tool_requests_before_planning(monkeypatch
     assert [item.path for item in plan.files] == ["src/domain/Tenant.py"]
     assert "plan_tool_requests" in [event_type for event_type, _ in events]
     assert "plan_tool_results" in [event_type for event_type, _ in events]
+
+
+def test_planner_recovers_natural_language_search_intent(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    dto_dir = project_root / "src/main/java/org/example/dto"
+    dto_dir.mkdir(parents=True)
+    (dto_dir / "TenantCreateRequest.java").write_text(
+        "package org.example.dto;\n\n"
+        "import jakarta.validation.constraints.Pattern;\n\n"
+        "public class TenantCreateRequest {\n"
+        "    @Pattern(regexp = \"^$|^[0-9+\\- ]{6,32}$\")\n"
+        "    private String contactPhone;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    fake_client = FakePlannerNaturalLanguageSearchClient()
+
+    import app.services.planner as planner_service
+
+    monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": fake_client)
+    events: list[tuple[str, dict]] = []
+    planner = Planner(event_sink=lambda event_type, payload: events.append((event_type, payload)))
+    plan = planner.plan(
+        messages=[
+            {"role": "user", "content": "Unclosed character class\nIllegal escape character in string literal"},
+            {
+                "role": "user",
+                "content": "workspace_summary:\n"
+                + json.dumps(
+                    {
+                        "source_map": {
+                            "files": [
+                                {
+                                    "path": "src/main/java/org/example/dto/TenantCreateRequest.java",
+                                    "kind": "source",
+                                    "language": "java",
+                                }
+                            ]
+                        },
+                        "tree_preview": "./\n  src/\n    main/\n      java/\n        org/\n          example/\n            dto/\n              TenantCreateRequest.java",
+                    }
+                ),
+            },
+        ],
+        project_root=str(project_root),
+    )
+
+    assert fake_client.calls == 3
+    assert plan.ok is True
+    assert [item.path for item in plan.files] == ["src/main/java/org/example/dto/TenantCreateRequest.java"]
+    tool_request_events = [payload for event_type, payload in events if event_type == "plan_tool_requests"]
+    assert any(
+        any(req["tool"] == "search" and req["args"]["query"] in {"@Pattern", "Pattern.compile", "Pattern"} for req in event["requests"])
+        for event in tool_request_events
+    )
 
 
 def test_planner_normalizes_foreign_absolute_tool_paths_by_source_map_suffix(monkeypatch, tmp_path):

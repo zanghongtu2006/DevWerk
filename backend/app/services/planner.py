@@ -320,6 +320,8 @@ def _extract_tool_requests(raw: dict, messages: list[dict], project_root: str | 
     text = str(raw.get("raw_text") or raw.get("reply") or raw.get("content") or "") if isinstance(raw, dict) else ""
     raw_requests.extend(_json_tool_calls_from_text(text))
     raw_requests.extend(_xml_tool_calls_from_text(text))
+    if not raw_requests:
+        raw_requests.extend(_search_tool_calls_from_text(text, messages))
 
     requests: list[ToolRequest] = []
     seen: set[tuple[str, str, str]] = set()
@@ -415,6 +417,78 @@ def _xml_tool_calls_from_text(text: str) -> list[dict[str, Any]]:
         if len(out) >= 30:
             break
     return out
+
+
+def _search_tool_calls_from_text(text: str, messages: list[dict]) -> list[dict[str, Any]]:
+    if not text or not _looks_like_search_intent(text):
+        return []
+    terms = _candidate_search_terms(_last_user_text(messages), text)
+    return [
+        {"id": f"p{i + 1}", "tool": "search", "args": {"query": term, "max_results": 80}}
+        for i, term in enumerate(terms[:6])
+    ]
+
+
+def _looks_like_search_intent(text: str) -> bool:
+    lower = text.lower()
+    return any(word in lower for word in ("search", "inspect", "find", "look for", "scan"))
+
+
+def _candidate_search_terms(user_text: str, model_text: str) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    def add(term: object) -> None:
+        value = str(term or "").strip().strip("`'\".,;:()[]{}")
+        if len(value) < 3 or len(value) > 80:
+            return
+        if value.lower() in _SEARCH_STOP_WORDS:
+            return
+        if value not in seen:
+            seen.add(value)
+            terms.append(value)
+
+    for snippet in re.findall(r"`([^`]{3,80})`", model_text + "\n" + user_text):
+        add(snippet)
+        if "." in snippet:
+            add(snippet.split(".", 1)[0])
+
+    for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_.]{2,}\b", model_text):
+        if any(ch.isupper() for ch in token) or "." in token or "_" in token:
+            add(token)
+            if "." in token:
+                add(token.split(".", 1)[0])
+
+    quoted_errors = re.findall(r"\"([^\"]{3,80})\"", user_text)
+    for error in quoted_errors:
+        for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_.]{2,}\b", error):
+            add(token)
+
+    return terms
+
+
+_SEARCH_STOP_WORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "this",
+    "that",
+    "these",
+    "those",
+    "user",
+    "errors",
+    "error",
+    "source",
+    "files",
+    "string",
+    "literal",
+    "character",
+    "class",
+    "unclosed",
+    "illegal",
+    "escape",
+}
 
 
 def _strip_tool_text(value: str) -> str:
