@@ -443,16 +443,24 @@ class HttpAiClient(
                 }
                 .getOrNull()
         }
+        val syntaxDiagnostics = context.project?.let { project ->
+            runCatching { collectIdeSyntaxDiagnostics(project, projectRoot, emptyList(), 200) }
+                .onFailure { error ->
+                    appendDevLog(context, "[workspace] syntax_diagnostics failed: ${typeName(error)}: ${error.message}\n")
+                }
+                .getOrDefault(emptyList())
+        } ?: emptyList()
         appendDevLog(
             context,
-            "[workspace] tree_preview_chars=${preview?.length ?: 0} source_map_files=${sourceMap?.indexedFiles ?: 0} source_map_total=${sourceMap?.totalFiles ?: 0}\n"
+            "[workspace] tree_preview_chars=${preview?.length ?: 0} source_map_files=${sourceMap?.indexedFiles ?: 0} source_map_total=${sourceMap?.totalFiles ?: 0} syntax_diagnostics=${syntaxDiagnostics.size}\n"
         )
         return WorkspaceSummary(
             rootId = context.projectId,
             changedFiles = emptyList(),
             openFiles = emptyList(),
             treePreview = preview,
-            sourceMap = sourceMap
+            sourceMap = sourceMap,
+            syntaxDiagnostics = syntaxDiagnostics
         )
     }
 
@@ -509,6 +517,18 @@ class HttpAiClient(
             w.put("open_files", open)
             w.put("tree_preview", workspace.treePreview ?: JSONObject.NULL)
             w.put("source_map", sourceMapToJson(workspace.sourceMap))
+            val diagnostics = JSONArray()
+            for (d in workspace.syntaxDiagnostics) {
+                val diagnostic = JSONObject()
+                diagnostic.put("path", d.path)
+                diagnostic.put("line", d.line ?: JSONObject.NULL)
+                diagnostic.put("column", d.column ?: JSONObject.NULL)
+                diagnostic.put("severity", d.severity)
+                diagnostic.put("message", d.message)
+                diagnostic.put("source", d.source)
+                diagnostics.put(diagnostic)
+            }
+            w.put("syntax_diagnostics", diagnostics)
             root.put("workspace", w)
         } else {
             root.put("workspace", JSONObject.NULL)
@@ -777,44 +797,17 @@ class HttpAiClient(
     private fun ideSyntaxCheck(project: Project?, basePath: String, args: Map<String, Any?>): Pair<Boolean, String> {
         if (project == null) return false to "[ide_syntax_check] project is unavailable"
         val base = File(basePath).canonicalFile
+        if (!base.exists() || !base.isDirectory) {
+            return false to "[ide_syntax_check] project root is unavailable: ${base.path}"
+        }
         val requestedPaths = pathList(args["paths"])
         val maxErrors = ((args["max_errors"] as? Number)?.toInt() ?: 100).coerceIn(1, 500)
 
-        val errors = ApplicationManager.getApplication().runReadAction<List<String>> {
-            val baseVf = LocalFileSystem.getInstance().findFileByIoFile(base)
-                ?: return@runReadAction listOf("[ide_syntax_check] project root is unavailable: ${base.path}")
-            val psiManager = PsiManager.getInstance(project)
-            val files = if (requestedPaths.isNotEmpty()) {
-                requestedPaths.mapNotNull { rel ->
-                    val normalized = normRel(rel)
-                    if (normalized.isBlank() || hasHiddenDirSegment(normalized)) {
-                        null
-                    } else {
-                        LocalFileSystem.getInstance().findFileByIoFile(File(base, normalized).canonicalFile)
-                    }
-                }
-            } else {
-                collectProjectFiles(project, baseVf)
-            }
-
-            val out = mutableListOf<String>()
-            for (vf in files) {
-                if (out.size >= maxErrors) break
-                if (vf.isDirectory || vf.length > 1_000_000L) continue
-                val rel = vf.path.removePrefix(baseVf.path.trimEnd('/') + "/").replace("\\", "/")
-                val psiFile = psiManager.findFile(vf) ?: continue
-                psiFile.accept(object : PsiRecursiveElementWalkingVisitor() {
-                    override fun visitErrorElement(element: PsiErrorElement) {
-                        if (out.size >= maxErrors) {
-                            stopWalking()
-                            return
-                        }
-                        out += "$rel:${lineOf(vf, element.textOffset)} ${element.errorDescription}"
-                        super.visitErrorElement(element)
-                    }
-                })
-            }
-            out
+        val diagnostics = collectIdeSyntaxDiagnostics(project, base.path, requestedPaths, maxErrors)
+        val errors = diagnostics.map { diagnostic ->
+            val line = diagnostic.line ?: 1
+            val column = diagnostic.column?.let { ":$it" } ?: ""
+            "${diagnostic.path}:$line$column ${diagnostic.message}"
         }
 
         if (errors.isEmpty()) {
@@ -900,10 +893,69 @@ class HttpAiClient(
         return files
     }
 
+    private fun collectIdeSyntaxDiagnostics(
+        project: Project,
+        basePath: String,
+        requestedPaths: List<String>,
+        maxErrors: Int
+    ): List<SyntaxDiagnostic> {
+        val base = File(basePath).canonicalFile
+        return ApplicationManager.getApplication().runReadAction<List<SyntaxDiagnostic>> {
+            val baseVf = LocalFileSystem.getInstance().findFileByIoFile(base)
+                ?: return@runReadAction emptyList()
+            val psiManager = PsiManager.getInstance(project)
+            val files = if (requestedPaths.isNotEmpty()) {
+                requestedPaths.mapNotNull { rel ->
+                    val normalized = normRel(rel)
+                    if (normalized.isBlank() || hasHiddenDirSegment(normalized)) {
+                        null
+                    } else {
+                        LocalFileSystem.getInstance().findFileByIoFile(File(base, normalized).canonicalFile)
+                    }
+                }
+            } else {
+                collectProjectFiles(project, baseVf)
+            }
+
+            val out = mutableListOf<SyntaxDiagnostic>()
+            for (vf in files) {
+                if (out.size >= maxErrors) break
+                if (vf.isDirectory || vf.length > 1_000_000L) continue
+                val rel = vf.path.removePrefix(baseVf.path.trimEnd('/') + "/").replace("\\", "/")
+                val psiFile = psiManager.findFile(vf) ?: continue
+                psiFile.accept(object : PsiRecursiveElementWalkingVisitor() {
+                    override fun visitErrorElement(element: PsiErrorElement) {
+                        if (out.size >= maxErrors) {
+                            stopWalking()
+                            return
+                        }
+                        out += SyntaxDiagnostic(
+                            path = rel,
+                            line = lineOf(vf, element.textOffset),
+                            column = columnOf(vf, element.textOffset),
+                            severity = "error",
+                            message = element.errorDescription,
+                            source = "ide_psi"
+                        )
+                        super.visitErrorElement(element)
+                    }
+                })
+            }
+            out
+        }
+    }
+
     private fun lineOf(vf: VirtualFile, offset: Int): Int {
         if (offset < 0) return 1
         val doc = FileDocumentManager.getInstance().getDocument(vf) ?: return 1
         return doc.getLineNumber(offset) + 1
+    }
+
+    private fun columnOf(vf: VirtualFile, offset: Int): Int {
+        if (offset < 0) return 1
+        val doc = FileDocumentManager.getInstance().getDocument(vf) ?: return 1
+        val line = doc.getLineNumber(offset)
+        return offset - doc.getLineStartOffset(line) + 1
     }
 
     private fun typeName(t: Throwable): String = t::class.java.simpleName.ifBlank { "Throwable" }

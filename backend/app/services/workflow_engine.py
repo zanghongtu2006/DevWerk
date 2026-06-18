@@ -576,6 +576,7 @@ def _workspace_summary(workspace: object) -> dict[str, Any]:
     if not isinstance(workspace, dict):
         return {"present": False}
     source_map = workspace.get("source_map") if isinstance(workspace.get("source_map"), dict) else None
+    diagnostics = workspace.get("syntax_diagnostics")
     return {
         "present": True,
         "root_id": workspace.get("root_id"),
@@ -583,6 +584,7 @@ def _workspace_summary(workspace: object) -> dict[str, Any]:
         "source_map_present": bool(source_map),
         "source_map_total_files": source_map.get("total_files") if source_map else None,
         "source_map_indexed_files": source_map.get("indexed_files") if source_map else None,
+        "syntax_diagnostics_count": len(diagnostics) if isinstance(diagnostics, list) else 0,
     }
 
 

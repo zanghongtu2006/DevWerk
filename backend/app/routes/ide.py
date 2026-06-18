@@ -774,11 +774,24 @@ def _workspace_debug_summary(workspace: object) -> dict[str, object]:
         return {"type": type(workspace).__name__, "present": False}
     source_map = workspace.get("source_map")
     files = source_map.get("files") if isinstance(source_map, dict) else None
+    diagnostics = workspace.get("syntax_diagnostics")
     sample_paths = []
     if isinstance(files, list):
         for item in files[:12]:
             if isinstance(item, dict) and item.get("path"):
                 sample_paths.append(item.get("path"))
+    sample_diagnostics = []
+    if isinstance(diagnostics, list):
+        for item in diagnostics[:8]:
+            if isinstance(item, dict) and item.get("path"):
+                sample_diagnostics.append(
+                    {
+                        "path": item.get("path"),
+                        "line": item.get("line"),
+                        "column": item.get("column"),
+                        "message": str(item.get("message") or "")[:120],
+                    }
+                )
     return {
         "present": True,
         "keys": sorted(workspace.keys()),
@@ -788,6 +801,8 @@ def _workspace_debug_summary(workspace: object) -> dict[str, object]:
         "source_map_total_files": source_map.get("total_files") if isinstance(source_map, dict) else None,
         "source_map_indexed_files": source_map.get("indexed_files") if isinstance(source_map, dict) else None,
         "source_map_files_payload": len(files) if isinstance(files, list) else 0,
+        "syntax_diagnostics_count": len(diagnostics) if isinstance(diagnostics, list) else 0,
+        "syntax_diagnostics_sample": sample_diagnostics,
         "sample_paths": sample_paths,
     }
 

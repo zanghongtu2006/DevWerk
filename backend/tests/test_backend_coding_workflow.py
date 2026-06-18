@@ -69,6 +69,44 @@ def test_code_context_summary_uses_source_map_facts_without_framework_classifica
     assert "framework" not in str(summary).lower()
 
 
+def test_code_context_summary_includes_ide_syntax_diagnostics():
+    workspace = {
+        "root_id": "diagnostic-smoke",
+        "source_map": {
+            "root": "diagnostic-smoke",
+            "generated_at": 1,
+            "total_files": 1,
+            "indexed_files": 1,
+            "skipped_files": 0,
+            "files": [
+                {
+                    "path": "src/main/java/org/example/dto/TenantCreateRequest.java",
+                    "kind": "source",
+                    "language": "java",
+                    "symbols": [],
+                    "imports": [],
+                    "size": 128,
+                }
+            ],
+        },
+        "syntax_diagnostics": [
+            {
+                "path": "src/main/java/org/example/dto/TenantCreateRequest.java",
+                "line": 28,
+                "column": 34,
+                "message": "Illegal escape character in string literal",
+                "source": "ide_psi",
+            }
+        ],
+    }
+
+    summary = build_code_context_summary(workspace)
+
+    assert summary["available"] is True
+    assert summary["syntax_diagnostics"][0]["path"] == "src/main/java/org/example/dto/TenantCreateRequest.java"
+    assert "direct file evidence" in " ".join(summary["path_policy"])
+
+
 class FakeSettings:
     app_env = "test"
     llm_provider_name = "stub"
@@ -918,6 +956,49 @@ def test_planner_extract_plan_returns_failure_when_fallback_cannot_infer_files()
     assert plan.ok is False
     assert plan.error_code == "PLAN_EMPTY"
     assert plan.files == []
+
+
+def test_planner_fallback_uses_ide_diagnostic_paths_without_framework_guessing():
+    plan = Planner._extract_plan(
+        {"raw_text": "I need to inspect before planning."},
+        [
+            {"role": "user", "content": "Unclosed character class\nIllegal escape character in string literal"},
+            {
+                "role": "user",
+                "content": "workspace_summary:\n"
+                + json.dumps(
+                    {
+                        "source_map": {
+                            "files": [
+                                {
+                                    "path": "src/main/java/org/example/dto/TenantCreateRequest.java",
+                                    "kind": "source",
+                                    "language": "java",
+                                },
+                                {
+                                    "path": "src/main/java/org/example/service/impl/OrganizationServiceImpl.java",
+                                    "kind": "source",
+                                    "language": "java",
+                                },
+                            ]
+                        },
+                        "syntax_diagnostics": [
+                            {
+                                "path": "src/main/java/org/example/dto/TenantCreateRequest.java",
+                                "line": 28,
+                                "column": 34,
+                                "message": "Illegal escape character in string literal",
+                            }
+                        ],
+                    }
+                ),
+            },
+        ],
+    )
+
+    assert plan.ok is True
+    assert [item.path for item in plan.files] == ["src/main/java/org/example/dto/TenantCreateRequest.java"]
+    assert "diagnostic" in plan.summary.lower()
 
 
 def test_planner_executes_minimax_text_tool_requests_before_planning(monkeypatch, tmp_path):

@@ -39,6 +39,7 @@ class Planner:
         "and produce a FILE-LEVEL change plan - NOT to write any files.\n\n"
         "Rules:\n"
         "  1. Use code_context_summary/source_map first when available. They are IDE-provided facts, not full file contents.\n"
+        "     If syntax_diagnostics are present, their paths/messages are direct IDE evidence for syntax-fix tasks.\n"
         "  2. Do not invent directories, packages, modules, or framework conventions. If the exact target path is unclear, request tools or return no plan.\n"
         "  3. You may call tools (list_dir, read_file, search) to understand the codebase.\n"
         "     Tool calls must be JSON only: {\"tool_requests\":[{\"id\":\"p1\",\"tool\":\"read_file\",\"args\":{\"path\":\"relative/path.ext\",\"start_line\":1,\"end_line\":200}}]}.\n"
@@ -510,6 +511,29 @@ def _source_map_paths(messages: list[dict]) -> set[str]:
     return out
 
 
+def _diagnostic_paths(messages: list[dict]) -> list[str]:
+    workspace = _last_workspace_summary(messages)
+    diagnostics = workspace.get("syntax_diagnostics") if isinstance(workspace, dict) else None
+    if not isinstance(diagnostics, list):
+        return []
+    source_paths = _source_map_paths(messages)
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in diagnostics:
+        if not isinstance(item, dict):
+            continue
+        path = _normalize_tool_path(item.get("path"), source_paths=source_paths)
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+        if len(out) >= 20:
+            break
+    if out:
+        _log.debug("Planner.diagnostic_paths: paths=%s source_paths=%s", out, len(source_paths))
+    return out
+
+
 def _normalize_tool_path(value: object, *, source_paths: set[str], project_root: str | None = None) -> str:
     original = str(value or "").strip().replace("\\", "/")
     if not original:
@@ -712,6 +736,25 @@ def _fallback_plan(raw: dict, messages: list[dict]) -> PlanResponse:
             ],
             summary="Plan limited to explicitly referenced project paths.",
             warnings=["Planner returned no structured file plan; DevWerk did not infer any additional paths."],
+        )
+
+    diagnostic_paths = _diagnostic_paths(messages)
+    if diagnostic_paths:
+        return PlanResponse(
+            ok=True,
+            files=[
+                PlanFile(
+                    path=path,
+                    nature="modified",
+                    description="IDE syntax diagnostics identify this file as a required investigation/fix target.",
+                    confidence=0.75,
+                )
+                for path in diagnostic_paths
+            ],
+            summary="Plan based on IDE syntax diagnostic file evidence.",
+            warnings=[
+                "Planner returned no structured file plan; DevWerk used IDE diagnostic paths only and did not infer framework paths."
+            ],
         )
 
     return PlanResponse(

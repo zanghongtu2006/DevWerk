@@ -55,8 +55,24 @@ def build_coder_skill(workspace: dict[str, Any] | None) -> str | None:
 
 
 def build_code_context_summary(workspace: dict[str, Any] | None) -> dict[str, Any]:
+    diagnostics = _extract_syntax_diagnostics(workspace)
     source_map = _extract_source_map(workspace)
     if not source_map:
+        if diagnostics:
+            return {
+                "available": True,
+                "source_map": None,
+                "syntax_diagnostics": diagnostics,
+                "path_policy": [
+                    "All paths are project-root relative and use forward slashes.",
+                    "IDE syntax diagnostics are direct file evidence for syntax-fix tasks.",
+                    "Use tool results for exact content before modifying existing files.",
+                    "Do not invent directories or package names from diagnostics alone.",
+                ],
+                "warnings": [
+                    "No IDE source_map was provided; syntax diagnostics are available but agents may need list_dir/search/read_file.",
+                ],
+            }
         return {
             "available": False,
             "reason": "source_map_missing",
@@ -97,21 +113,24 @@ def build_code_context_summary(workspace: dict[str, Any] | None) -> dict[str, An
         "representative_files": representative_files,
         "symbol_index": symbols,
         "common_imports": _counter_items(import_counts, limit=MAX_IMPORTS),
+        "syntax_diagnostics": diagnostics,
         "path_policy": [
             "All paths are project-root relative and use forward slashes.",
             "Use source_map and tool results as evidence; do not invent directories or package names.",
+            "If syntax_diagnostics are present, treat their paths/messages as direct file evidence stronger than broad search hits.",
             "If source_map lacks exact content, request read_file before modifying existing files.",
             "If source_map is missing or insufficient, request list_dir/search/read_file instead of guessing.",
         ],
         "warnings": _summary_warnings(source_map, normalized),
     }
     _log.debug(
-        "CoderHarness.code_context_summary: files=%s languages=%s dirs=%s symbols=%s representative=%s",
+        "CoderHarness.code_context_summary: files=%s languages=%s dirs=%s symbols=%s representative=%s diagnostics=%s",
         len(normalized),
         summary["languages"],
         len(summary["directory_index"]),
         len(symbols),
         len(representative_files),
+        len(diagnostics),
     )
     return summary
 
@@ -140,6 +159,35 @@ def _source_files(source_map: dict[str, Any]) -> list[dict[str, Any]]:
     return normalized
 
 
+def _extract_syntax_diagnostics(workspace: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(workspace, dict):
+        return []
+    raw = workspace.get("syntax_diagnostics") or []
+    if not isinstance(raw, list):
+        return []
+    diagnostics: list[dict[str, Any]] = []
+    for item in raw[:200]:
+        if not isinstance(item, dict):
+            continue
+        path = _normalize_path(item.get("path"))
+        message = str(item.get("message") or "").strip()
+        if not path or not message:
+            continue
+        diagnostics.append(
+            {
+                "path": path,
+                "line": _optional_int(item.get("line")),
+                "column": _optional_int(item.get("column")),
+                "severity": str(item.get("severity") or "error"),
+                "message": message[:500],
+                "source": str(item.get("source") or "ide"),
+            }
+        )
+    if diagnostics:
+        _log.debug("CoderHarness.syntax_diagnostics: count=%s sample=%s", len(diagnostics), diagnostics[:10])
+    return diagnostics
+
+
 def _normalize_file(item: dict[str, Any]) -> dict[str, Any]:
     path = _normalize_path(item.get("path"))
     symbols = [symbol for symbol in (item.get("symbols") or []) if isinstance(symbol, dict)]
@@ -164,6 +212,15 @@ def _normalize_path(value: object) -> str:
     if not parts or any(part == ".." for part in parts):
         return ""
     return "/".join(parts)
+
+
+def _optional_int(value: object) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
 
 
 def _top_level_dir(path: str) -> str:

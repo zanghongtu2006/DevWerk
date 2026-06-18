@@ -27,7 +27,17 @@ data class WorkspaceSummary(
     val changedFiles: List<WorkspaceFile> = emptyList(),
     val openFiles: List<String> = emptyList(),
     val treePreview: String? = null,
-    val sourceMap: SourceMap? = null
+    val sourceMap: SourceMap? = null,
+    val syntaxDiagnostics: List<SyntaxDiagnostic> = emptyList()
+)
+
+data class SyntaxDiagnostic(
+    val path: String,
+    val line: Int? = null,
+    val column: Int? = null,
+    val severity: String = "error",
+    val message: String,
+    val source: String = "ide"
 )
 
 data class SourceMap(

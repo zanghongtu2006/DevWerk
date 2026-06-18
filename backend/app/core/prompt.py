@@ -68,7 +68,9 @@ SYSTEM_PROMPT = textwrap.dedent(
        execution guard.
     3. If you need to delete or rename by a fuzzy name, search first and copy
        exact matched paths from tool_results.
-    4. reply must be a short status sentence.
+    4. For existing files, prefer patch_ops. Use update_file only after reading
+       the full file and when a whole-file replacement is clearly safer.
+    5. reply must be a short status sentence.
 
     JSON Schema:
     __SCHEMA_JSON__

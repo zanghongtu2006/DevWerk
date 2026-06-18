@@ -102,6 +102,7 @@ def build_model_messages(req: IdeChatRequest, provider: str) -> List[Dict[str, s
 def _workspace_debug_summary(workspace: dict) -> dict[str, object]:
     source_map = workspace.get("source_map")
     files = source_map.get("files") if isinstance(source_map, dict) else None
+    diagnostics = workspace.get("syntax_diagnostics")
     sample_paths = []
     if isinstance(files, list):
         for item in files[:12]:
@@ -115,5 +116,6 @@ def _workspace_debug_summary(workspace: dict) -> dict[str, object]:
         "source_map_total_files": source_map.get("total_files") if isinstance(source_map, dict) else None,
         "source_map_indexed_files": source_map.get("indexed_files") if isinstance(source_map, dict) else None,
         "source_map_files_payload": len(files) if isinstance(files, list) else 0,
+        "syntax_diagnostics_count": len(diagnostics) if isinstance(diagnostics, list) else 0,
         "sample_paths": sample_paths,
     }

@@ -43,13 +43,23 @@ class SourceMap(BaseModel):
     files: List[SourceMapFile] = []
 
 
+class SyntaxDiagnostic(BaseModel):
+    path: str
+    line: Optional[int] = None
+    column: Optional[int] = None
+    severity: str = "error"
+    message: str
+    source: str = "ide"
+
+
 class WorkspaceSummary(BaseModel):
-    # 插件发“摘要 + 增量”，不要发全量文件内容
+    # The IDE sends compact workspace facts, not full project contents.
     root_id: Optional[str] = None
     changed_files: List[WorkspaceFile] = []
     open_files: List[str] = []
     tree_preview: Optional[str] = None
     source_map: Optional[SourceMap] = None
+    syntax_diagnostics: List[SyntaxDiagnostic] = []
 
 
 class ToolRequest(BaseModel):
@@ -66,11 +76,10 @@ class ToolResult(BaseModel):
 
 
 class PatchOp(BaseModel):
-    op: str  # apply_patch
-    content: str  # unified diff
+    op: str
+    content: str
 
 
-# -------- scaffold 旧模式：文件 CRUD --------
 class FileOp(BaseModel):
     op: str
     path: str
@@ -79,13 +88,12 @@ class FileOp(BaseModel):
 
 
 class IdeChatRequest(BaseModel):
-    mode: str  # scaffold | agent
+    mode: str
     project_id: Optional[str] = None
     task_id: Optional[str] = None
     project_root: Optional[str] = None
     messages: List[Message]
 
-    # agent 模式需要的摘要与工具回传
     workspace: Optional[WorkspaceSummary] = None
     tool_results: List[ToolResult] = []
 
@@ -99,18 +107,15 @@ class IdeChatResponse(BaseModel):
     phase_output: Optional[Dict[str, Any]] = None
     next_action: Optional[str] = None
 
-    # scaffold（可选）
     code_tree: Optional[str] = None
     ops: List[FileOp] = []
 
-    # agent（可选）
     tool_requests: List[ToolRequest] = []
     patch_ops: List[PatchOp] = []
 
     done: bool = False
 
-    #  新增：错误信息（可选）
     ok: bool = True
-    error_code: Optional[str] = None  # e.g. "MODEL_TIMEOUT" / "MODEL_UNAVAILABLE"
+    error_code: Optional[str] = None
     error_message: Optional[str] = None
     retryable: bool = False
