@@ -81,32 +81,16 @@ def test_workflow_action_protocol_drives_kanban_state(monkeypatch, tmp_path):
     assert "task_moved" in event_types
     assert "apply_result_received" in event_types
     assert events[0]["task_title"] == "Implement feature"
-    task_log = tmp_path / "sessions" / "workflow-smoke" / task["id"] / "events.jsonl"
-    latest_memory = tmp_path / "sessions" / "workflow-smoke" / task["id"] / "latest_memory.json"
+    audit_log = tmp_path / "sessions" / "workflow-smoke" / "audit_events.jsonl"
+    legacy_task_dir = tmp_path / "sessions" / "workflow-smoke" / task["id"]
     project_memory_path = tmp_path / "sessions" / "workflow-smoke" / "project_memory.json"
     project_memory_log = tmp_path / "sessions" / "workflow-smoke" / "project_memory.jsonl"
-    assert task_log.is_file()
-    assert latest_memory.is_file()
+    assert audit_log.is_file()
+    assert not legacy_task_dir.exists()
     assert project_memory_path.is_file()
     assert project_memory_log.is_file()
-    task_events = [json.loads(line) for line in task_log.read_text(encoding="utf-8").splitlines()]
+    task_events = [json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines()]
     assert any(event["event_type"] == "task_moved" for event in task_events)
-    memory = json.loads(latest_memory.read_text(encoding="utf-8"))
-    assert memory["task_id"] == task["id"]
-    assert memory["phase"] == "apply"
-    assert memory["status_key"] == "done"
-    session_events = (
-        tmp_path
-        / "sessions"
-        / "workflow-smoke"
-        / task["id"]
-        / "sessions"
-        / memory["session_id"]
-        / "events.jsonl"
-    )
-    session_memory = session_events.parent / "memory.json"
-    assert session_events.is_file()
-    assert session_memory.is_file()
     project_memory = session_store.read_project_memory("workflow-smoke")
     assert project_memory["project_id"] == "workflow-smoke"
     assert task["id"] in project_memory["tasks_seen"]

@@ -39,21 +39,22 @@ Coverage:
 
 - Uses an isolated SQLite database under pytest `tmp_path`.
 - Uses stub LLM clients, so no real provider credentials or tokens are required.
-- Calls `POST /v1/plan` with a normal user coding request and workspace summary.
-- Verifies `/v1/plan` returns `task_id`, `status_key=planned`, and file-level plan data.
-- Calls `POST /v1/execute` with the same `task_id` and approved paths.
-- Verifies `/v1/execute` returns `ok=true`, `status_key=ready_to_apply`, `done=true`, and file ops.
-- Verifies `/v1/execute` can return client-side `tool_requests` such as
-  `run_command` together with file ops.
+- Calls `POST /v1/workflows` with a normal coding request and workspace summary.
+- Verifies automatic workflow execution reaches `ready_to_apply` with file ops.
+- Verifies interactive execution pauses at `planned`, then the same task resumes
+  through `POST /v1/workflows/{task_id}/messages` after plan confirmation.
+- Verifies durable conversation messages, column runs, candidate revisions,
+  context compression, and result-cursor behavior.
+- Verifies client-side `tool_requests` can accompany generated changes.
 - Verifies a simulated plugin `apply_result` with passing verification moves the
   same kanban task to `done`.
-- Verifies the kanban task is still the same task and contains `plan_request`,
-  `plan_response`, and `execute_response` artifacts.
+- Verifies candidate plan paths are optional unless `required=true`, while
+  unplanned writes and missing required changes still trigger rework.
 
 Expected result:
 
 ```text
-5 passed
+All coding workflow tests passed
 ```
 
 ## Backend Full Test Smoke
@@ -192,8 +193,8 @@ Coverage:
 - Runs plugin `compileKotlin`.
 - Starts backend with `startup.bat`.
 - Verifies `/docs`.
-- Verifies backend API contract for `/v1/plan`, `/v1/execute`, and
-  `/v1/ide/attachments`.
+- Verifies backend API contract for `/v1/workflows`, workflow event/result
+  endpoints, multi-turn messages, and `/v1/ide/attachments`.
 - Starts real `runIde` and requires it to stay alive for the configured window.
 - Cleans backend and IDE processes after the run.
 

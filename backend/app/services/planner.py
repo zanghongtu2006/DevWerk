@@ -47,10 +47,11 @@ class Planner:
         "     search uses args.query; args.pattern is tolerated as a query alias. search does not require path.\n"
         "     Use project-relative paths from source_map/tree_preview. Never use absolute paths.\n"
         "  4. When you have enough information, respond with a JSON object containing a 'plan' key:\n"
-        "     { plan: { files: [{path, nature, description, confidence}], summary, warnings } }\n"
+        "     { plan: { files: [{path, nature, intent, required, description, confidence}], summary, warnings } }\n"
         "     files[] must include only writable targets that the coder should create, modify, or delete.\n"
         "     Do not put reference-only files, tool evidence, or optional examples in files[]; put them in warnings/summary instead.\n"
-        "  5. nature must be one of: new | modified | deleted.\n"
+        "  5. nature must be one of: new | modified | deleted. intent must be create | modify | delete.\n"
+        "     required=true only when the outcome cannot be correct unless that exact path changes. Candidate paths should use required=false.\n"
         "  6. confidence is 0.0-1.0 how sure you are this file needs to change.\n"
         "  7. Do NOT output any ops, patch_ops, or tool_requests in your final response.\n"
         "  8. summary is one line; warnings[] lists any risky or missing context.\n"
@@ -254,6 +255,8 @@ class Planner:
                             nature=item.get("nature") or "modified",
                             description=str(item.get("description") or "").strip(),
                             confidence=float(item.get("confidence") or 0.8),
+                            intent=str(item.get("intent") or _intent_from_nature(item.get("nature"))),
+                            required=bool(item.get("required", False)),
                         )
                     )
                 except Exception:
@@ -713,6 +716,10 @@ def _int_arg(value: object, default: int, minimum: int, maximum: int) -> int:
     except Exception:
         parsed = default
     return max(minimum, min(maximum, parsed))
+
+
+def _intent_from_nature(value: Any) -> str:
+    return {"new": "create", "deleted": "delete"}.get(str(value or "modified").strip().lower(), "modify")
 
 
 def _fallback_plan(raw: dict, messages: list[dict]) -> PlanResponse:

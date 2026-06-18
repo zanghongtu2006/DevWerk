@@ -562,6 +562,9 @@ DASHBOARD_HTML = r"""
       }
       const artifacts = task.artifacts || [];
       const events = task.events || [];
+      const conversation = task.conversation || {};
+      const columnRuns = task.column_runs || [];
+      const revisions = task.revisions || [];
       const phaseOutputs = artifacts
         .filter(a => a.artifact_type === "workflow_phase_output" && a.payload)
         .map(a => ({ ...a.payload, created_at: a.created_at }));
@@ -588,11 +591,27 @@ DASHBOARD_HTML = r"""
               <b>Priority</b><span>${escapeHtml(task.priority ?? 0)}</span>
               <b>Created</b><span>${escapeHtml(task.created_at || "")}</span>
               <b>Updated</b><span>${escapeHtml(task.updated_at || "")}</span>
+              <b>Conversation</b><span>${escapeHtml(conversation.state || "-")}</span>
+              <b>Waiting For</b><span>${escapeHtml(conversation.waiting_for || "-")}</span>
             </div>
             <h3>Changed / Planned Paths</h3>
             <ul class="detail-list">${paths.map(p => `<li>${escapeHtml(p)}</li>`).join("") || "<li>No paths recorded</li>"}</ul>
           </aside>
           <section class="detail-section">
+            <div class="detail-card">
+              <h3>Conversation</h3>
+              <div class="kv"><b>Summary Version</b><span>${escapeHtml(conversation.summary_version ?? 0)}</span><b>Token Estimate</b><span>${escapeHtml(conversation.token_estimate ?? 0)}</span></div>
+              <details><summary>Rolling Summary</summary><pre>${escapeHtml(conversation.summary || "No compressed summary")}</pre></details>
+              <div class="events">${(conversation.messages || []).slice().reverse().map(message => `<article class="event-row"><div class="event-head"><span class="event-title">${escapeHtml(message.role)} / ${escapeHtml(message.message_type)}</span><span class="event-meta">#${escapeHtml(message.sequence)}</span></div><div>${escapeHtml(message.content)}</div></article>`).join("") || `<div class="muted">No conversation messages</div>`}</div>
+            </div>
+            <div class="detail-card">
+              <h3>Column Runs</h3>
+              <div class="artifact-grid">${columnRuns.map(run => `<article class="artifact-card"><div class="phase-head"><h3>${escapeHtml(run.status_key)} / ${escapeHtml(run.agent)}</h3><span class="pill">${escapeHtml(run.state)}</span></div><div class="kv"><b>Run</b><span>${escapeHtml(run.run_no)}</span><b>Started</b><span>${escapeHtml(run.created_at)}</span></div><pre>${escapeHtml(prettyJson(run.checkpoint || {}))}</pre></article>`).join("") || `<div class="muted">No column runs</div>`}</div>
+            </div>
+            <div class="detail-card">
+              <h3>Candidate Revisions</h3>
+              <div class="artifact-grid">${revisions.slice().reverse().map(revision => `<article class="artifact-card"><div class="phase-head"><h3>Revision ${escapeHtml(revision.sequence)}</h3><span class="pill">${escapeHtml(revision.state)}</span></div><p>${escapeHtml(revision.summary || "")}</p><pre>${escapeHtml(prettyJson({changed_paths: revision.changed_paths, verification: revision.verification}))}</pre></article>`).join("") || `<div class="muted">No revisions</div>`}</div>
+            </div>
             <div class="detail-card">
               <h3>Agent Phases</h3>
               <div class="phase-grid">${phaseOutputs.map(renderPhaseOutput).join("") || `<div class="muted">No phase outputs recorded</div>`}</div>

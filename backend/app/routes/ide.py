@@ -15,6 +15,7 @@ import re
 import threading
 import time
 import uuid
+from urllib.parse import quote
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, Request, UploadFile
@@ -25,7 +26,19 @@ from app.models.ide import IdeChatResponse, ToolRequest, ToolResult
 from app.models.plan import PlanResponse
 from app.services.coerce import coerce_to_fileops, coerce_to_patchops, coerce_to_toolrequests
 from app.services.coder_harness import build_code_context_summary, build_coder_skill
-from app.services.kanban import add_artifact, add_event, create_task, get_task, list_events, move_task
+from app.services.kanban import (
+    add_artifact,
+    add_event,
+    append_conversation_message,
+    create_task,
+    ensure_conversation,
+    get_conversation,
+    get_task,
+    get_workflow_runtime_state,
+    list_events,
+    move_task,
+    update_conversation,
+)
 from app.services.llm_factory import get_llm_client
 from app.services.planner import Planner as build_planner
 from app.services.provider_errors import (
@@ -36,6 +49,7 @@ from app.services.provider_errors import (
     llm_error_message,
 )
 from app.services.prompt_builder import build_model_messages
+from app.services.reviewer import Reviewer
 from app.services.usage import clear_request, finish_request, start_request, usage_summary
 from app.services.validation import ModelResponseValidationError
 from app.services.workflow import apply_workflow_action, record_phase_output
@@ -81,6 +95,16 @@ async def start_workflow(request: Request):
     task_id = _ensure_workflow_task(body)
     body["task_id"] = task_id
     project_id = str(body.get("project_id") or "default")
+    ensure_conversation(task_id, metadata={"interaction_mode": body.get("interaction_mode", "auto")})
+    conversation = get_conversation(task_id) or {}
+    if not conversation.get("messages"):
+        for message in messages:
+            if isinstance(message, dict) and str(message.get("content") or "").strip():
+                append_conversation_message(
+                    task_id,
+                    role=str(message.get("role") or "user"),
+                    content=str(message.get("content") or ""),
+                )
     _kanban_artifact(task_id, "workflow_request", payload=_plan_request_artifact(body))
     _kanban_artifact(task_id, "workflow_request_body", payload=_workflow_request_body_artifact(body))
     _kanban_event(
@@ -94,6 +118,62 @@ async def start_workflow(request: Request):
     )
     _start_workflow_thread(task_id, body)
     return _workflow_state_payload(task_id, include_result=False)
+
+
+@router.post("/workflows/{task_id}/messages")
+async def continue_workflow(task_id: str, request: Request):
+    try:
+        incoming = await request.json()
+    except Exception as exc:
+        return {"ok": False, "task_id": task_id, "error_code": "BAD_REQUEST", "error_message": f"Failed to parse JSON: {exc}"}
+    try:
+        detail = get_task(task_id)
+    except KeyError:
+        return {"ok": False, "task_id": task_id, "error_code": "NOT_FOUND", "error_message": "workflow task not found"}
+
+    action = str(incoming.get("action") or "message").strip().lower().replace("-", "_")
+    if action not in {"message", "confirm_plan", "revise_plan", "cancel", "tool_result"}:
+        return {"ok": False, "task_id": task_id, "error_code": "BAD_ACTION", "error_message": f"unsupported conversation action: {action}"}
+    if action == "cancel":
+        apply_workflow_action(task_id, "abandon", {"reason": str(incoming.get("message") or "user cancelled")})
+        update_conversation(task_id, state="cancelled", waiting_for=None)
+        return _workflow_state_payload(task_id, include_result=True)
+
+    content = str(incoming.get("message") or "").strip()
+    if content or action == "confirm_plan":
+        append_conversation_message(
+            task_id,
+            role="user",
+            content=content or "Confirm the proposed plan and continue.",
+            message_type="plan_confirmation" if action == "confirm_plan" else "message",
+            metadata={"action": action},
+        )
+
+    task = detail.get("task") or {}
+    previous_body = _latest_artifact_payload(task, "workflow_request_body") or {}
+    conversation = get_conversation(task_id) or {}
+    body = dict(previous_body)
+    body.update(
+        {
+            "task_id": task_id,
+            "project_id": task.get("project_id"),
+            "resume_action": "revise_plan" if action == "message" and conversation.get("waiting_for") == "plan_confirmation" else action,
+            "messages": [
+                {"role": item.get("role"), "content": item.get("content")}
+                for item in conversation.get("messages") or []
+                if not item.get("compressed")
+            ],
+        }
+    )
+    if isinstance(incoming.get("workspace"), dict):
+        body["workspace"] = incoming["workspace"]
+    if isinstance(incoming.get("tool_results"), list):
+        body["tool_results"] = incoming["tool_results"]
+    cursor = _latest_artifact_created_at(task, "workflow_result")
+    update_conversation(task_id, state="queued", waiting_for=None)
+    _kanban_event(task_id, "workflow_resume_queued", {"action": body["resume_action"], "result_after": cursor})
+    _start_workflow_thread(task_id, body)
+    return _workflow_state_payload(task_id, include_result=False, result_after=cursor)
 
 
 @router.get("/workflows/{task_id}")
@@ -1190,6 +1270,7 @@ async def _run_workflow(task_id: str, body: dict) -> None:
     engine = WorkflowEngine(
         plan_runner=_run_plan_phase,
         coding_runner=_run_coding_phase,
+        review_runner=_run_review_phase,
     )
     await engine.run(task_id, body)
 
@@ -1202,15 +1283,21 @@ async def _run_coding_phase(body: dict) -> IdeChatResponse:
     return await ide_execute(_BodyRequest(body))
 
 
+async def _run_review_phase(body: dict) -> dict:
+    return Reviewer().review(body)
+
+
 def _workflow_state_payload(task_id: str, *, include_result: bool, result_after: str | None = None) -> dict:
     try:
-        task_detail = get_task(task_id)
+        runtime = get_workflow_runtime_state(task_id, result_after=result_after)
     except KeyError:
         return {"ok": False, "task_id": task_id, "error_code": "NOT_FOUND", "error_message": "workflow task not found"}
-    task = task_detail.get("task") or {}
-    result = _latest_artifact_payload(task, "workflow_result", result_after=result_after)
+    task = runtime.get("task") or {}
+    result = runtime.get("result")
     status_key = task.get("status_key")
     ready = result is not None or status_key in {"ready_to_apply", "done", "failed"}
+    conversation = runtime.get("conversation") or {}
+    query = f"?result_after={quote(result_after)}" if result_after else ""
     payload = {
         "ok": True,
         "task_id": task_id,
@@ -1218,9 +1305,11 @@ def _workflow_state_payload(task_id: str, *, include_result: bool, result_after:
         "status_key": status_key,
         "ready": ready,
         "done": status_key in {"done", "failed"},
-        "poll_url": f"/v1/workflows/{task_id}",
-        "result_url": f"/v1/workflows/{task_id}/result",
-        "events_url": f"/v1/workflows/{task_id}/events",
+        "conversation_state": conversation.get("state"),
+        "waiting_for": conversation.get("waiting_for"),
+        "poll_url": f"/v1/workflows/{task_id}{query}",
+        "result_url": f"/v1/workflows/{task_id}/result{query}",
+        "events_url": f"/v1/workflows/{task_id}/events{query}",
     }
     if include_result and result is not None:
         payload["result"] = result
@@ -1284,6 +1373,8 @@ def _workflow_public_state(state: dict) -> dict:
         "status_key": state.get("status_key"),
         "ready": bool(state.get("ready")),
         "done": bool(state.get("done")),
+        "conversation_state": state.get("conversation_state"),
+        "waiting_for": state.get("waiting_for"),
         "poll_url": state.get("poll_url"),
         "result_url": state.get("result_url"),
         "events_url": state.get("events_url"),
@@ -1329,6 +1420,16 @@ def _latest_artifact_payload(task: dict, artifact_type: str, *, result_after: st
                 continue
             payload = artifact.get("payload")
             return payload if isinstance(payload, dict) else {}
+    return None
+
+
+def _latest_artifact_created_at(task: dict, artifact_type: str) -> str | None:
+    artifacts = task.get("artifacts") if isinstance(task, dict) else None
+    if not isinstance(artifacts, list):
+        return None
+    for artifact in reversed(artifacts):
+        if isinstance(artifact, dict) and artifact.get("artifact_type") == artifact_type:
+            return str(artifact.get("created_at") or "") or None
     return None
 
 

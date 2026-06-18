@@ -23,6 +23,10 @@ T_COLUMNS = f"{TABLE_NAME_PREFIX}columns"
 T_TASKS = f"{TABLE_NAME_PREFIX}tasks"
 T_EVENTS = f"{TABLE_NAME_PREFIX}events"
 T_ARTIFACTS = f"{TABLE_NAME_PREFIX}artifacts"
+T_CONVERSATIONS = f"{TABLE_NAME_PREFIX}conversations"
+T_MESSAGES = f"{TABLE_NAME_PREFIX}messages"
+T_COLUMN_RUNS = f"{TABLE_NAME_PREFIX}column_runs"
+T_REVISIONS = f"{TABLE_NAME_PREFIX}revisions"
 DEFAULT_COLUMNS: list[dict[str, Any]] = default_columns()
 
 
@@ -118,6 +122,80 @@ def init_kanban_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_kb_artifacts_task
                 ON kb_artifacts(task_id);
+
+            CREATE TABLE IF NOT EXISTS kb_conversations (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL UNIQUE,
+                project_id TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'active',
+                active_column TEXT,
+                waiting_for TEXT,
+                summary TEXT NOT NULL DEFAULT '',
+                summary_version INTEGER NOT NULL DEFAULT 0,
+                token_estimate INTEGER NOT NULL DEFAULT 0,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_kb_conversations_project_time
+                ON kb_conversations(project_id, updated_at);
+
+            CREATE TABLE IF NOT EXISTS kb_messages (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                message_type TEXT NOT NULL DEFAULT 'message',
+                content TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                compressed INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                UNIQUE(conversation_id, sequence)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_kb_messages_conversation_sequence
+                ON kb_messages(conversation_id, sequence);
+
+            CREATE TABLE IF NOT EXISTS kb_column_runs (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                status_key TEXT NOT NULL,
+                agent TEXT NOT NULL,
+                run_no INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                checkpoint_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                UNIQUE(task_id, status_key, run_no)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_kb_column_runs_task
+                ON kb_column_runs(task_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS kb_revisions (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                parent_revision_id TEXT,
+                state TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                ops_json TEXT NOT NULL DEFAULT '[]',
+                patch_ops_json TEXT NOT NULL DEFAULT '[]',
+                changed_paths_json TEXT NOT NULL DEFAULT '[]',
+                verification_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(task_id, sequence)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_kb_revisions_task_sequence
+                ON kb_revisions(task_id, sequence);
             """
         )
         _ensure_column(conn, T_PROJECT_SETTINGS, "workflow_json", "TEXT NOT NULL DEFAULT '{}'")
@@ -387,10 +465,232 @@ def get_task(task_id: str) -> dict[str, Any]:
             "SELECT * FROM kb_artifacts WHERE task_id = ? ORDER BY created_at ASC",
             (task_id,),
         ).fetchall()
+        conversation_row = conn.execute("SELECT * FROM kb_conversations WHERE task_id = ?", (task_id,)).fetchone()
+        messages = []
+        if conversation_row is not None:
+            messages = conn.execute(
+                "SELECT * FROM kb_messages WHERE conversation_id = ? ORDER BY sequence ASC",
+                (conversation_row["id"],),
+            ).fetchall()
+        column_runs = conn.execute(
+            "SELECT * FROM kb_column_runs WHERE task_id = ? ORDER BY created_at ASC", (task_id,)
+        ).fetchall()
+        revisions = conn.execute(
+            "SELECT * FROM kb_revisions WHERE task_id = ? ORDER BY sequence ASC", (task_id,)
+        ).fetchall()
     task = _task_dict(row)
     task["events"] = [_event_dict(e) for e in events]
     task["artifacts"] = [_artifact_dict(a) for a in artifacts]
+    task["conversation"] = _conversation_dict(conversation_row) if conversation_row is not None else None
+    if task["conversation"] is not None:
+        task["conversation"]["messages"] = [_message_dict(item) for item in messages]
+    task["column_runs"] = [_column_run_dict(item) for item in column_runs]
+    task["revisions"] = [_revision_dict(item) for item in revisions]
     return {"ok": True, "task": task}
+
+
+def get_workflow_runtime_state(task_id: str, *, result_after: str | None = None) -> dict[str, Any]:
+    """Read the hot workflow poll path without loading full events, artifacts, messages, or revisions."""
+    with _conn() as conn:
+        task = conn.execute(
+            "SELECT id, project_id, status_key, created_at, updated_at FROM kb_tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if task is None:
+            raise KeyError(f"task not found: {task_id}")
+        conversation = conn.execute(
+            "SELECT state, active_column, waiting_for, updated_at FROM kb_conversations WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        sql = "SELECT payload_json, created_at FROM kb_artifacts WHERE task_id = ? AND artifact_type = 'workflow_result'"
+        params: list[Any] = [task_id]
+        if result_after:
+            sql += " AND created_at > ?"
+            params.append(result_after)
+        sql += " ORDER BY created_at DESC LIMIT 1"
+        result_row = conn.execute(sql, params).fetchone()
+    return {
+        "task": {
+            "id": task["id"],
+            "project_id": task["project_id"],
+            "status_key": task["status_key"],
+            "created_at": task["created_at"],
+            "updated_at": task["updated_at"],
+        },
+        "conversation": {
+            "state": conversation["state"],
+            "active_column": conversation["active_column"],
+            "waiting_for": conversation["waiting_for"],
+            "updated_at": conversation["updated_at"],
+        } if conversation is not None else None,
+        "result": _loads(result_row["payload_json"], {}) if result_row is not None else None,
+        "result_created_at": result_row["created_at"] if result_row is not None else None,
+    }
+
+
+def ensure_conversation(task_id: str, *, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    with _conn() as conn:
+        task = conn.execute("SELECT project_id, status_key FROM kb_tasks WHERE id = ?", (task_id,)).fetchone()
+        if task is None:
+            raise KeyError(f"task not found: {task_id}")
+        row = conn.execute("SELECT * FROM kb_conversations WHERE task_id = ?", (task_id,)).fetchone()
+        if row is None:
+            now = _now()
+            conversation_id = str(uuid.uuid4())
+            conn.execute(
+                """
+                INSERT INTO kb_conversations (
+                    id, task_id, project_id, state, active_column, metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?)
+                """,
+                (conversation_id, task_id, task["project_id"], task["status_key"], _json(metadata or {}), now, now),
+            )
+            row = conn.execute("SELECT * FROM kb_conversations WHERE id = ?", (conversation_id,)).fetchone()
+    return _conversation_dict(row)
+
+
+def get_conversation(task_id: str, *, include_messages: bool = True) -> dict[str, Any] | None:
+    with _conn() as conn:
+        row = conn.execute("SELECT * FROM kb_conversations WHERE task_id = ?", (task_id,)).fetchone()
+        if row is None:
+            return None
+        result = _conversation_dict(row)
+        if include_messages:
+            messages = conn.execute(
+                "SELECT * FROM kb_messages WHERE conversation_id = ? ORDER BY sequence ASC", (row["id"],)
+            ).fetchall()
+            result["messages"] = [_message_dict(item) for item in messages]
+    return result
+
+
+def update_conversation(task_id: str, **fields: Any) -> dict[str, Any]:
+    allowed = {"state", "active_column", "waiting_for", "summary", "summary_version", "token_estimate", "metadata"}
+    values = {key: value for key, value in fields.items() if key in allowed}
+    ensure_conversation(task_id)
+    if values:
+        assignments: list[str] = []
+        params: list[Any] = []
+        for key, value in values.items():
+            column = "metadata_json" if key == "metadata" else key
+            assignments.append(f"{column} = ?")
+            params.append(_json(value or {}) if key == "metadata" else value)
+        assignments.append("updated_at = ?")
+        params.extend([_now(), task_id])
+        with _conn() as conn:
+            conn.execute(f"UPDATE kb_conversations SET {', '.join(assignments)} WHERE task_id = ?", params)
+    return get_conversation(task_id) or {}
+
+
+def append_conversation_message(
+    task_id: str,
+    *,
+    role: str,
+    content: str,
+    message_type: str = "message",
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    conversation = ensure_conversation(task_id)
+    with _conn() as conn:
+        next_sequence = conn.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM kb_messages WHERE conversation_id = ?",
+            (conversation["id"],),
+        ).fetchone()["value"]
+        message_id = str(uuid.uuid4())
+        conn.execute(
+            """
+            INSERT INTO kb_messages (
+                id, conversation_id, task_id, project_id, sequence, role, message_type,
+                content, metadata_json, compressed, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            """,
+            (
+                message_id, conversation["id"], task_id, conversation["project_id"], next_sequence,
+                str(role or "user"), str(message_type or "message"), str(content or ""),
+                _json(metadata or {}), _now(),
+            ),
+        )
+        row = conn.execute("SELECT * FROM kb_messages WHERE id = ?", (message_id,)).fetchone()
+    add_event(task_id, "conversation_message_recorded", {"message_id": message_id, "role": role, "message_type": message_type})
+    return _message_dict(row)
+
+
+def compress_conversation_messages(task_id: str, *, through_sequence: int, summary: str, token_estimate: int) -> dict[str, Any]:
+    conversation = ensure_conversation(task_id)
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE kb_messages SET compressed = 1 WHERE conversation_id = ? AND sequence <= ?",
+            (conversation["id"], int(through_sequence)),
+        )
+        conn.execute(
+            """
+            UPDATE kb_conversations
+               SET summary = ?, summary_version = summary_version + 1, token_estimate = ?, updated_at = ?
+             WHERE task_id = ?
+            """,
+            (summary, int(token_estimate), _now(), task_id),
+        )
+    add_event(task_id, "context_compressed", {"through_sequence": through_sequence, "token_estimate": token_estimate})
+    return get_conversation(task_id) or {}
+
+
+def start_column_run(task_id: str, *, status_key: str, agent: str, checkpoint: dict[str, Any] | None = None) -> dict[str, Any]:
+    conversation = ensure_conversation(task_id)
+    with _conn() as conn:
+        run_no = conn.execute(
+            "SELECT COALESCE(MAX(run_no), 0) + 1 AS value FROM kb_column_runs WHERE task_id = ? AND status_key = ?",
+            (task_id, status_key),
+        ).fetchone()["value"]
+        run_id = str(uuid.uuid4())
+        now = _now()
+        conn.execute(
+            """
+            INSERT INTO kb_column_runs (id, task_id, project_id, status_key, agent, run_no, state, checkpoint_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
+            """,
+            (run_id, task_id, conversation["project_id"], status_key, agent, run_no, _json(checkpoint or {}), now, now),
+        )
+        row = conn.execute("SELECT * FROM kb_column_runs WHERE id = ?", (run_id,)).fetchone()
+    update_conversation(task_id, state="running", active_column=status_key, waiting_for=None)
+    return _column_run_dict(row)
+
+
+def finish_column_run(run_id: str, *, state: str, checkpoint: dict[str, Any] | None = None) -> dict[str, Any]:
+    now = _now()
+    completed_at = now if state in {"completed", "failed", "cancelled"} else None
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE kb_column_runs SET state = ?, checkpoint_json = ?, updated_at = ?, completed_at = ? WHERE id = ?",
+            (state, _json(checkpoint or {}), now, completed_at, run_id),
+        )
+        row = conn.execute("SELECT * FROM kb_column_runs WHERE id = ?", (run_id,)).fetchone()
+    if row is None:
+        raise KeyError(f"column run not found: {run_id}")
+    return _column_run_dict(row)
+
+
+def create_revision(task_id: str, *, summary: str, ops: list[Any], patch_ops: list[Any], changed_paths: list[str]) -> dict[str, Any]:
+    conversation = ensure_conversation(task_id)
+    with _conn() as conn:
+        previous = conn.execute(
+            "SELECT id, sequence FROM kb_revisions WHERE task_id = ? ORDER BY sequence DESC LIMIT 1", (task_id,)
+        ).fetchone()
+        sequence = int(previous["sequence"]) + 1 if previous else 1
+        revision_id = str(uuid.uuid4())
+        now = _now()
+        conn.execute(
+            """
+            INSERT INTO kb_revisions (
+                id, task_id, project_id, sequence, parent_revision_id, state, summary,
+                ops_json, patch_ops_json, changed_paths_json, verification_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'candidate', ?, ?, ?, ?, '{}', ?, ?)
+            """,
+            (
+                revision_id, task_id, conversation["project_id"], sequence,
+                previous["id"] if previous else None, summary, _json(ops), _json(patch_ops),
+                _json(changed_paths), now, now,
+            ),
+        )
+        row = conn.execute("SELECT * FROM kb_revisions WHERE id = ?", (revision_id,)).fetchone()
+    add_event(task_id, "revision_created", {"revision_id": revision_id, "sequence": sequence, "changed_paths": changed_paths})
+    return _revision_dict(row)
 
 
 def update_task(task_id: str, fields: dict[str, Any]) -> dict[str, Any]:
@@ -460,7 +760,7 @@ def move_task(task_id: str, to_status: str, *, force: bool = False, payload: dic
             payload=payload or {},
         )
     _log.debug("kanban task moved task_id=%s from=%s to=%s force=%s", task_id, from_status, to_status, force)
-    return get_task(task_id)
+    return _task_record_response(task_id)
 
 
 def add_event(task_id: str, event_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -477,7 +777,7 @@ def add_event(task_id: str, event_type: str, payload: dict[str, Any] | None = No
             to_status=row["status_key"],
             payload=payload or {},
         )
-    return get_task(task_id)
+    return _task_record_response(task_id)
 
 
 def list_events(
@@ -553,7 +853,7 @@ def add_artifact(
             to_status=row["status_key"],
             payload={"artifact_type": artifact_type, "path": path},
         )
-    return get_task(task_id)
+    return _task_record_response(task_id)
 
 
 def ensure_default_columns(project_id: str | None = None) -> None:
@@ -879,6 +1179,14 @@ def _task_dict(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _task_record_response(task_id: str) -> dict[str, Any]:
+    with _conn() as conn:
+        row = conn.execute("SELECT * FROM kb_tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        raise KeyError(f"task not found: {task_id}")
+    return {"ok": True, "task": _task_dict(row)}
+
+
 def _event_dict(row: sqlite3.Row) -> dict[str, Any]:
     event = {
         "id": row["id"],
@@ -907,6 +1215,73 @@ def _artifact_dict(row: sqlite3.Row) -> dict[str, Any]:
         "path": row["path"],
         "payload": _loads(row["payload_json"], {}),
         "created_at": row["created_at"],
+    }
+
+
+def _conversation_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "task_id": row["task_id"],
+        "project_id": row["project_id"],
+        "state": row["state"],
+        "active_column": row["active_column"],
+        "waiting_for": row["waiting_for"],
+        "summary": row["summary"],
+        "summary_version": row["summary_version"],
+        "token_estimate": row["token_estimate"],
+        "metadata": _loads(row["metadata_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _message_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "conversation_id": row["conversation_id"],
+        "task_id": row["task_id"],
+        "project_id": row["project_id"],
+        "sequence": row["sequence"],
+        "role": row["role"],
+        "message_type": row["message_type"],
+        "content": row["content"],
+        "metadata": _loads(row["metadata_json"], {}),
+        "compressed": bool(row["compressed"]),
+        "created_at": row["created_at"],
+    }
+
+
+def _column_run_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "task_id": row["task_id"],
+        "project_id": row["project_id"],
+        "status_key": row["status_key"],
+        "agent": row["agent"],
+        "run_no": row["run_no"],
+        "state": row["state"],
+        "checkpoint": _loads(row["checkpoint_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "completed_at": row["completed_at"],
+    }
+
+
+def _revision_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "task_id": row["task_id"],
+        "project_id": row["project_id"],
+        "sequence": row["sequence"],
+        "parent_revision_id": row["parent_revision_id"],
+        "state": row["state"],
+        "summary": row["summary"],
+        "ops": _loads(row["ops_json"], []),
+        "patch_ops": _loads(row["patch_ops_json"], []),
+        "changed_paths": _loads(row["changed_paths_json"], []),
+        "verification": _loads(row["verification_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
     }
 
 

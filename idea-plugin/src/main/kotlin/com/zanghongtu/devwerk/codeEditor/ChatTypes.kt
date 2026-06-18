@@ -12,6 +12,7 @@ data class ChatContext(
     val history: List<ChatMessage>,
     val projectId: String? = null,
     val taskId: String? = null,
+    val workflowAction: String? = null,
     val project: Project? = null,
     val devCtx: DevwerkContext? = null
 )
@@ -112,6 +113,8 @@ data class IdeChatResponse(
     val errorCode: String? = null,
     val errorMessage: String? = null,
     val retryable: Boolean = false,
+    val waitingFor: String? = null,
+    val interaction: Map<String, Any?> = emptyMap(),
     val rawResponses: List<String> = emptyList()
 )
 

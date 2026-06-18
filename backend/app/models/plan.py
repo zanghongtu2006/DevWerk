@@ -31,6 +31,19 @@ class PlanFile(BaseModel):
         description="LLM confidence that this file actually needs to change.",
     )
 
+    intent: Literal["inspect", "create", "modify", "delete"] = Field(
+        default="modify",
+        description="How the planner expects the coder to use this file.",
+    )
+
+    required: bool = Field(
+        default=False,
+        description=(
+            "Whether the requested outcome requires this exact file to change. "
+            "Most plan paths are candidates and must not be treated as a path-coverage assertion."
+        ),
+    )
+
 
 class PlanResponse(BaseModel):
     """

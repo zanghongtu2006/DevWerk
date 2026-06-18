@@ -53,12 +53,17 @@ class HttpAiClient(
 
     override fun sendWorkflow(context: ChatContext, userMessage: String): IdeChatResponse {
         val (mode, cleanMsg) = parseMode(userMessage)
-        val messages = buildMessages(context, cleanMsg)
         val workspace = buildWorkspaceSummary(context)
-        val bodyJson = buildWorkflowStartBody(context, messages, mode, context.projectRoot, workspace)
+        val continuing = !context.taskId.isNullOrBlank()
+        val endpoint = if (continuing) "${workflowsEndpoint.trimEnd('/')}/${context.taskId}/messages" else workflowsEndpoint
+        val bodyJson = if (continuing) {
+            buildWorkflowContinueBody(context, cleanMsg, workspace)
+        } else {
+            buildWorkflowStartBody(context, buildMessages(context, cleanMsg), mode, context.projectRoot, workspace)
+        }
 
-        appendDevLog(context, "\n===== WORKFLOW START REQUEST ($workflowsEndpoint) =====\n$bodyJson\n")
-        val startBody = postJson(workflowsEndpoint, bodyJson, context)
+        appendDevLog(context, "\n===== WORKFLOW ${if (continuing) "CONTINUE" else "START"} REQUEST ($endpoint) =====\n$bodyJson\n")
+        val startBody = postJson(endpoint, bodyJson, context)
         appendDevLog(context, "\n===== WORKFLOW START RESPONSE =====\n$startBody\n")
 
         val startObj = JSONObject(startBody)
@@ -497,6 +502,7 @@ class HttpAiClient(
         root.put("project_id", context.projectId ?: JSONObject.NULL)
         root.put("task_id", context.taskId ?: JSONObject.NULL)
         root.put("mode", mode)
+        root.put("interaction_mode", "confirm_plan")
         root.put("project_root", projectRoot ?: JSONObject.NULL)
         root.put("messages", messagesJson)
 
@@ -534,7 +540,48 @@ class HttpAiClient(
             root.put("workspace", JSONObject.NULL)
         }
         root.put("tool_results", JSONArray())
+        root.put("client_capabilities", clientCapabilities())
         return root.toString()
+    }
+
+    private fun buildWorkflowContinueBody(
+        context: ChatContext,
+        userMessage: String,
+        workspace: WorkspaceSummary?
+    ): String {
+        val root = JSONObject()
+        root.put("action", context.workflowAction ?: "revise_plan")
+        root.put("message", userMessage)
+        root.put("client_capabilities", clientCapabilities())
+        root.put("workspace", workspace?.let { workspaceToJson(it, context) } ?: JSONObject.NULL)
+        return root.toString()
+    }
+
+    private fun clientCapabilities(): JSONObject = JSONObject()
+        .put("protocol_version", 1)
+        .put("transport", "http_sse")
+        .put(
+            "tools",
+            JSONArray(
+                listOf(
+                    "list_dir", "read_file", "search", "apply_ops", "apply_patch",
+                    "create_snapshot", "ide_syntax_check", "run_command"
+                )
+            )
+        )
+
+    private fun workspaceToJson(workspace: WorkspaceSummary, context: ChatContext): JSONObject {
+        val root = JSONObject()
+        root.put("root_id", workspace.rootId ?: context.projectId ?: JSONObject.NULL)
+        root.put("changed_files", JSONArray(workspace.changedFiles.map { JSONObject().put("path", it.path).put("sha1", it.sha1 ?: JSONObject.NULL).put("size", it.size ?: JSONObject.NULL) }))
+        root.put("open_files", JSONArray(workspace.openFiles))
+        root.put("tree_preview", workspace.treePreview ?: JSONObject.NULL)
+        root.put("source_map", sourceMapToJson(workspace.sourceMap))
+        root.put("syntax_diagnostics", JSONArray(workspace.syntaxDiagnostics.map { d ->
+            JSONObject().put("path", d.path).put("line", d.line ?: JSONObject.NULL).put("column", d.column ?: JSONObject.NULL)
+                .put("severity", d.severity).put("message", d.message).put("source", d.source)
+        }))
+        return root
     }
 
     private fun postJson(endpoint: String, bodyJson: String, context: ChatContext): String {
@@ -1011,6 +1058,10 @@ class HttpAiClient(
         val errorCode = if (obj.has("error_code") && !obj.isNull("error_code")) obj.getString("error_code") else null
         val errorMessage = if (obj.has("error_message") && !obj.isNull("error_message")) obj.getString("error_message") else null
         val retryable = obj.optBoolean("retryable", false)
+        val waitingFor = if (obj.has("waiting_for") && !obj.isNull("waiting_for")) obj.getString("waiting_for") else null
+        val interactionObj = obj.optJSONObject("interaction")
+        val interaction = mutableMapOf<String, Any?>()
+        if (interactionObj != null) for (key in interactionObj.keys()) interaction[key] = interactionObj.get(key).let { if (it == JSONObject.NULL) null else it }
 
         val reply = obj.optString("reply", "")
         val taskId = if (obj.has("task_id") && !obj.isNull("task_id")) obj.getString("task_id") else null
@@ -1059,7 +1110,8 @@ class HttpAiClient(
             reply = reply, taskId = taskId, statusKey = statusKey,
             codeTree = codeTree, ops = ops,
             toolRequests = toolReqs, patchOps = patchOps, done = done,
-            ok = ok, errorCode = errorCode, errorMessage = errorMessage, retryable = retryable
+            ok = ok, errorCode = errorCode, errorMessage = errorMessage, retryable = retryable,
+            waitingFor = waitingFor, interaction = interaction
         )
     }
 }

@@ -106,6 +106,8 @@ class IdeChatResponse(BaseModel):
     session_id: Optional[str] = None
     phase_output: Optional[Dict[str, Any]] = None
     next_action: Optional[str] = None
+    interaction: Optional[Dict[str, Any]] = None
+    waiting_for: Optional[str] = None
 
     code_tree: Optional[str] = None
     ops: List[FileOp] = []

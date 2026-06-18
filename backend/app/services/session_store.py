@@ -20,14 +20,8 @@ def append_task_event(
     payload: dict[str, Any] | None = None,
 ) -> None:
     """
-    Persist the durable task event log outside SQLite.
-
-    Rules:
-    - Every kanban event appends to task/events.jsonl.
-    - If payload.session_id exists, the same event is also appended to that
-      session's events.jsonl.
-    - Payload is stored as JSON, so no Python object pickles or process memory
-      are required to reconstruct the workflow.
+    Append a project-level audit copy. SQLite is the source of truth for
+    conversation, column-run, revision, artifact, and event state.
     """
     data = {
         "created_at": _now(),
@@ -38,11 +32,7 @@ def append_task_event(
         "to_status": to_status,
         "payload": payload or {},
     }
-    _append_jsonl(_task_dir(project_id, task_id) / "events.jsonl", data)
-
-    session_id = _session_id_from_payload(payload or {})
-    if session_id:
-        _append_jsonl(_session_dir(project_id, task_id, session_id) / "events.jsonl", data)
+    _append_jsonl(session_root() / _safe_segment(project_id) / "audit_events.jsonl", data)
 
 
 def record_phase_memory(
@@ -52,19 +42,16 @@ def record_phase_memory(
     phase_output: dict[str, Any],
 ) -> None:
     """
-    Persist the current session memory snapshot.
+    Update compact project memory from a phase output.
 
-    This is intentionally small and deterministic: phase inputs/outputs,
-    summary, warnings, status, and next action. It is not a vector memory or a
-    long-term framework memory yet; it is durable task/session memory for the
-    current kanban loop.
+    Runtime session state is stored in kb_conversations/kb_messages and
+    kb_column_runs. This function deliberately does not create per-task or
+    per-agent filesystem session trees.
     """
     session_id = str(phase_output.get("session_id") or "").strip()
     if not session_id:
         return
 
-    task_dir = _task_dir(project_id, task_id)
-    session_dir = _session_dir(project_id, task_id, session_id)
     payload = {
         "updated_at": _now(),
         "project_id": project_id,
@@ -81,10 +68,6 @@ def record_phase_memory(
         "next_action": phase_output.get("next_action"),
     }
 
-    _write_json(session_dir / "memory.json", payload)
-    _append_jsonl(session_dir / "phase_outputs.jsonl", payload)
-    _append_jsonl(task_dir / "memory.jsonl", payload)
-    _write_json(task_dir / "latest_memory.json", payload)
     record_project_memory(project_id=project_id, task_id=task_id, phase_output=payload)
 
 
@@ -93,7 +76,7 @@ def read_project_memory(project_id: str) -> dict[str, Any]:
     if not path.is_file():
         return _default_project_memory(project_id)
     try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return _default_project_memory(project_id)
     if not isinstance(data, dict):

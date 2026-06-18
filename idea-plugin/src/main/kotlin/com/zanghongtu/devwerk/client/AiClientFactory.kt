@@ -24,12 +24,7 @@ object AiClientFactory {
         var s = input.trim().trimEnd('/')
         val suffixes = listOf(
             "/v1/ide/attachments",
-            "/v1/ide/plan",
-            "/v1/ide/execute",
             "/v1/workflows",
-            "/v1/plan",
-            "/v1/execute",
-            "/v1/ide",
             "/v1"
         )
         for (suffix in suffixes) {

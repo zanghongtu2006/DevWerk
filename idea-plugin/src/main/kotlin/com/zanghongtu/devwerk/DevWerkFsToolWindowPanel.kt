@@ -49,11 +49,14 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
     private val chatArea       = JTextArea()
     private val inputArea       = PromptTextArea("Message DevWerk...  Ctrl+Enter to send", 4, 20)
     private val sendButton      = JButton("Send")
+    private val confirmPlanButton = JButton("Confirm plan")
     private val attachBtn       = JButton("+")
     private val clearAttachBtn  = JButton("Clear")
     private val settingsBtn     = JButton("\u2699")
     private val pendingAttachments = mutableListOf<File>()
     private val attachmentPanel = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
+    @Volatile private var activeTaskId: String? = null
+    @Volatile private var waitingFor: String? = null
 
     init {
         initUi()
@@ -110,6 +113,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         val rightActions = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0))
         rightActions.isOpaque = false
         rightActions.add(sendButton)
+        rightActions.add(confirmPlanButton)
         actionPanel.add(leftActions, BorderLayout.WEST)
         actionPanel.add(rightActions, BorderLayout.EAST)
 
@@ -125,7 +129,8 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         bottomPanel.add(composer, BorderLayout.CENTER)
 
         attachBtn.toolTipText = "Attach file"
-        listOf(attachBtn, clearAttachBtn, sendButton, settingsBtn).forEach {
+        confirmPlanButton.isVisible = false
+        listOf(attachBtn, clearAttachBtn, sendButton, confirmPlanButton, settingsBtn).forEach {
             it.isFocusable = false
         }
 
@@ -137,6 +142,14 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         sendButton.addActionListener { onSendClicked() }
         attachBtn.addActionListener { chooseAttachments() }
         clearAttachBtn.addActionListener { clearPendingAttachments() }
+        confirmPlanButton.addActionListener {
+            if (state == State.IDLE && waitingFor == "plan_confirmation" && activeTaskId != null) {
+                setState(State.WORKFLOW_PENDING)
+                ApplicationManager.getApplication().executeOnPooledThread {
+                    runUploadThenWorkflow("Confirm the proposed plan and continue.", emptyList(), "confirm_plan")
+                }
+            }
+        }
 
         settingsBtn.addActionListener {
             try {
@@ -157,12 +170,14 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                     inputArea.isEnabled = true
                     attachBtn.isEnabled = true
                     clearAttachBtn.isEnabled = true
+                    confirmPlanButton.isEnabled = true
                 }
                 State.WORKFLOW_PENDING -> {
                     sendButton.isEnabled = false
                     inputArea.isEnabled = false
                     attachBtn.isEnabled = false
                     clearAttachBtn.isEnabled = false
+                    confirmPlanButton.isEnabled = false
                 }
             }
         }
@@ -182,11 +197,11 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         setState(State.WORKFLOW_PENDING)
 
         ApplicationManager.getApplication().executeOnPooledThread {
-            runUploadThenWorkflow(text, attachments)
+            runUploadThenWorkflow(text, attachments, if (activeTaskId != null) "revise_plan" else null)
         }
     }
 
-    private fun runUploadThenWorkflow(userText: String, files: List<File>) {
+    private fun runUploadThenWorkflow(userText: String, files: List<File>, workflowAction: String?) {
         try {
             val aiClient = AiClientFactory.create(project) as? HttpAiClient
             if (files.isNotEmpty() && aiClient == null) {
@@ -204,7 +219,8 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 projectRoot = project.basePath,
                 history = history.toList(),
                 projectId = projectId,
-                taskId = null,
+                taskId = activeTaskId,
+                workflowAction = workflowAction,
                 project = project
             )
             runWorkflow(chatCtx, message)
@@ -242,7 +258,10 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 }
             }
 
-            if (devCtx != null) {
+            if (response.ok && response.waitingFor != null) {
+                activeTaskId = response.taskId
+                waitingFor = response.waitingFor
+            } else if (devCtx != null) {
                 if (response.ok) {
                     response = applyAndVerifyWithResume(aiClient, runner, project, updatedCtx, devCtx, response)
                 } else {
@@ -264,6 +283,11 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                     appendChatLine("[System] ${resp.patchOps.size} patch op(s) applied.")
                 } else if (resp.ok && resp.ops.isNotEmpty()) {
                     appendChatLine("[System] ${resp.ops.size} file op(s) applied.")
+                }
+                confirmPlanButton.isVisible = resp.ok && resp.waitingFor == "plan_confirmation"
+                if (resp.waitingFor == null && (resp.done || resp.statusKey in setOf("ready_to_apply", "done", "failed"))) {
+                    activeTaskId = null
+                    waitingFor = null
                 }
                 setState(State.IDLE)
             }

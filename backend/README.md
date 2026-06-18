@@ -2,10 +2,11 @@
 
 FastAPI backend for DevWerk's kanban-centered engineering loop.
 
-The backend does not write source files directly. It receives IDE context,
+The backend does not write source files directly. It receives capability-client context,
 creates or advances kanban tasks, builds planning artifacts, generates guarded
-file operations, and waits for the IntelliJ plugin to apply those changes through
-its local snapshot protection.
+file operations, and waits for a client to apply those changes through its local
+snapshot protection. The current capability client is the IntelliJ plugin; the
+protocol is intentionally not tied to Java or a particular IDE.
 
 ## Setup
 
@@ -108,25 +109,21 @@ Every phase writes a `workflow_phase_output` artifact:
 }
 ```
 
-This is the compatibility contract for future multi-agent scheduling. Planner,
-coder, and tester agents may use separate sessions, but the backend state machine
-still owns column transitions. Empty file-level plans for coding requests are
-treated as planning failures, not successful pure Q&A.
+Planner, coder, and reviewer use independent agent routes and durable column
+runs. The backend state machine alone owns transitions. A plan file is a change
+candidate unless `required=true`; reviewer does not reject a valid revision just
+because an optional candidate path stayed unchanged.
 
-## Session And Memory Storage
+## Conversation And Memory Storage
 
-Session state is durable. It is not held only in Python process memory.
+Conversation and workflow state are durable. They are not held only in Python
+process memory.
 
 Default paths:
 
 ```text
 backend/data/devwerk.db
-backend/data/sessions/{projectId}/{taskId}/events.jsonl
-backend/data/sessions/{projectId}/{taskId}/memory.jsonl
-backend/data/sessions/{projectId}/{taskId}/latest_memory.json
-backend/data/sessions/{projectId}/{taskId}/sessions/{sessionId}/events.jsonl
-backend/data/sessions/{projectId}/{taskId}/sessions/{sessionId}/memory.json
-backend/data/sessions/{projectId}/{taskId}/sessions/{sessionId}/phase_outputs.jsonl
+backend/data/sessions/{projectId}/audit_events.jsonl
 backend/data/sessions/{projectId}/project_memory.json
 backend/data/sessions/{projectId}/project_memory.jsonl
 ```
@@ -137,16 +134,18 @@ Override the file root:
 DEVWERK_SESSION_DIR=./data/sessions
 ```
 
-Rules:
+SQLite tables:
 
-- Every kanban event appends to task `events.jsonl`.
-- Events with `payload.session_id` also append to that session's `events.jsonl`.
-- Every `workflow_phase_output` updates task/session memory snapshots.
-- Project memory is updated from every phase output. It keeps compact reusable
+- `kb_conversations`, `kb_messages`: multi-turn transcript, rolling compression
+  summary, pause reason, and active column.
+- `kb_column_runs`: independent planner/coder/reviewer invocation checkpoints.
+- `kb_revisions`: generated candidate revisions and parent relationships.
+- `kb_events`, `kb_artifacts`: workflow audit and phase contracts.
+
+Project memory is updated from every phase output. It keeps compact reusable
   facts: phase summaries, touched paths, framework signals, run commands,
   extracted rules, and tasks seen.
-- Project memory intentionally does not store raw prompt transcripts. Full
-  phase inputs and outputs remain in task/session memory.
+Project memory intentionally does not store raw prompt transcripts.
 
 ## Main Endpoints
 
@@ -178,7 +177,7 @@ Behavior:
 2. Return `poll_url`, `result_url`, and `events_url`.
 3. Record request/context artifacts in the background.
 4. Move through `Context Indexed`, `Planned`, `Coding`, and `Reviewed` using
-   per-column agent sessions.
+   durable per-column agent runs.
 5. Reviewer approval moves the task to `Ready To Apply`; reviewer rework moves
    back to `Coding` or `Planned`.
 6. Store a `workflow_result` artifact with `phase_output`, `next_action`,
@@ -191,6 +190,18 @@ GET /v1/workflows/{task_id}
 GET /v1/workflows/{task_id}/events
 GET /v1/workflows/{task_id}/result
 ```
+
+Interactive clients set `interaction_mode: "confirm_plan"`. The planner then
+returns a nonterminal result with `waiting_for: "plan_confirmation"`. Continue
+the same task with:
+
+```text
+POST /v1/workflows/{task_id}/messages
+```
+
+Actions are `confirm_plan`, `revise_plan`, `message`, `tool_result`, and
+`cancel`. Resume responses include result cursors so SSE/poll clients cannot
+mistake an earlier waiting result for the new run.
 
 IDE and API clients should treat `GET /v1/workflows/{task_id}/events` as the
 primary progress channel. It streams `workflow_state`, `kanban_event`,
@@ -211,8 +222,8 @@ of long blocking chat requests.
 - Client-side post-apply tools: currently `run_command`; future IntelliJ SDK
   actions can use the same response field
 
-Backend research tools are resolved inside `/v1/execute` before file operations
-are returned. Client-side tools may be returned with `ops` or `patch_ops`; the
+Backend research tools are resolved inside the workflow coder run before file
+operations are returned. Client-side tools may be returned with `ops` or `patch_ops`; the
 IDE plugin applies the generated changes first, runs the tool, then reports the
 result through `apply_result.verification`.
 

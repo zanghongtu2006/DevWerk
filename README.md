@@ -12,9 +12,9 @@ harness system:
 
 - The IDE plugin collects project context, source maps, attachments, and applies
   returned changes through its local snapshot safety layer.
-- The backend owns kanban workflow, model routing, per-column agent sessions,
-  planning/review artifacts, coder harness rules, token accounting, and guarded
-  patch/file operations.
+- The backend owns durable conversations, kanban workflow, model routing,
+  per-column agent runs, candidate revisions, context compression, token
+  accounting, and guarded patch/file operations.
 - Backend tool requests are an extensible action protocol. Research tools are
   resolved by the backend loop; client tools are returned to the IDE plugin and
   reported back through kanban verification.
@@ -25,15 +25,17 @@ harness system:
 ## Architecture
 
 ```text
-IntelliJ Plugin
+Capability Client (current implementation: IntelliJ plugin)
   - projectId from .devwerk/meta
   - source map and selected context
   - attachment upload
-  - snapshot-protected apply
+  - snapshot-protected apply and verification tools
         |
         v
 DevWerk Backend (FastAPI)
-  - /v1/workflows kanban workflow entry
+  - /v1/workflows and /v1/workflows/{taskId}/messages
+  - durable conversation transcript and compression
+  - resumable column runs and candidate revisions
   - coder harness from source_map
   - planning bundle artifacts
   - patch/file operation generation
@@ -89,10 +91,10 @@ State meaning:
 
 ## Phase Outputs
 
-Every workflow column must produce a stable phase output artifact. This keeps the
-kanban board as the execution contract instead of a passive review view. Today a
-single configured model can run every phase; future planner, coder, and tester
-agents can own separate sessions while writing the same artifact shape.
+Every workflow column produces a stable phase output artifact and a durable
+`kb_column_runs` record. The planner, coder, and reviewer have independent agent
+prompts and model routes. They exchange artifacts through the workflow runtime,
+not hidden in-process conversation state.
 
 ```json
 {
@@ -112,34 +114,28 @@ agents can own separate sessions while writing the same artifact shape.
 If a coding request cannot produce a file-level plan, the task moves to `Failed`
 instead of returning `ok=true` with an empty file list.
 
-## Session And Memory Storage
+## Conversation And Memory Storage
 
-DevWerk persists workflow session state in two layers:
+DevWerk persists runtime state in two layers:
 
 - SQLite: `backend/data/devwerk.db`
   - `kb_events`: every kanban event and column transition
   - `kb_artifacts`: phase outputs, request/response artifacts, apply results
+  - `kb_conversations` and `kb_messages`: resumable multi-turn transcript,
+    rolling summary, waiting state, and active column
+  - `kb_column_runs`: every agent invocation and checkpoint
+  - `kb_revisions`: candidate code revisions and their ancestry
 - Files: `backend/data/sessions/` by default
   - Override with `DEVWERK_SESSION_DIR`
-  - Task event log:
-    `backend/data/sessions/{projectId}/{taskId}/events.jsonl`
-  - Task memory snapshots:
-    `backend/data/sessions/{projectId}/{taskId}/memory.jsonl`
-    and `latest_memory.json`
-  - Phase/session log:
-    `backend/data/sessions/{projectId}/{taskId}/sessions/{sessionId}/events.jsonl`
-  - Phase/session memory:
-    `backend/data/sessions/{projectId}/{taskId}/sessions/{sessionId}/memory.json`
-    and `phase_outputs.jsonl`
+  - Project audit mirror: `backend/data/sessions/{projectId}/audit_events.jsonl`
   - Project memory:
     `backend/data/sessions/{projectId}/project_memory.json`
     and `project_memory.jsonl`
 
-Task/session memory keeps detailed phase inputs, outputs, summaries, warnings,
-status, and next actions for a single delivery loop. Project memory is a compact
-cross-task summary: tasks seen, framework signals, touched paths, run commands,
-extracted rules, and recent phase summaries. It is not a vector store yet, but it
-is durable and intentionally separated from process memory.
+SQLite is the only source of truth for active workflow state. Project memory is
+a compact cross-task summary: framework signals, touched paths, commands, rules,
+and recent phase summaries. Raw prompt transcripts stay in `kb_messages`, not in
+project memory or per-task filesystem trees.
 
 ## Planning Artifacts
 

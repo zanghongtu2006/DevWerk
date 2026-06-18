@@ -418,6 +418,11 @@ async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_
     monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": FakePlannerClient())
     monkeypatch.setattr(ide_routes, "get_llm_client", lambda agent="executor": FakeExecutorClient())
 
+    async def approve_review(body: dict) -> dict:
+        return {"decision": "approve", "summary": "Candidate satisfies the plan.", "findings": [], "warnings": []}
+
+    monkeypatch.setattr(ide_routes, "_run_review_phase", approve_review)
+
     app = main_module.create_app()
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
@@ -613,7 +618,7 @@ async def test_workflow_start_poll_result_smoke(monkeypatch, tmp_path):
             assert started["events_url"] == f"/v1/workflows/{started['task_id']}/events"
 
             state = {}
-            for _ in range(100):
+            for _ in range(300):
                 poll_response = await client.get(started["poll_url"])
                 assert poll_response.status_code == 200
                 state = poll_response.json()
@@ -672,6 +677,73 @@ async def test_workflow_start_poll_result_smoke(monkeypatch, tmp_path):
             assert chat_response.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_workflow_message_api_confirms_plan_without_starting_new_task(monkeypatch, tmp_path):
+    db_path = tmp_path / "devwerk-workflow-conversation-api.db"
+    project_root = tmp_path / "conversation-project"
+    project_root.mkdir()
+    fake_settings = FakeSettings(db_path)
+
+    import app.main as main_module
+    import app.routes.ide as ide_routes
+    import app.services.kanban as kanban_service
+    import app.services.planner as planner_service
+    import app.services.usage as usage_service
+
+    patch_service_settings(monkeypatch, fake_settings, main_module, ide_routes, kanban_service, usage_service)
+    reset_service_dbs(kanban_service, usage_service)
+    monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": FakePlannerClient())
+    monkeypatch.setattr(ide_routes, "get_llm_client", lambda agent="executor": FakeExecutorClient())
+
+    async def approve_review(body: dict) -> dict:
+        return {"decision": "approve", "summary": "Approved.", "findings": [], "warnings": []}
+
+    monkeypatch.setattr(ide_routes, "_run_review_phase", approve_review)
+    app = main_module.create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            start = (await client.post(
+                "/v1/workflows",
+                json={
+                    "project_id": "conversation-api",
+                    "mode": "agent",
+                    "interaction_mode": "confirm_plan",
+                    "project_root": str(project_root),
+                    "messages": [{"role": "user", "content": "Create a minimal runnable smoke scaffold."}],
+                    "workspace": {"root_id": "conversation-api", "tree_preview": "", "source_map": None},
+                },
+            )).json()
+            task_id = start["task_id"]
+
+            waiting = {}
+            for _ in range(120):
+                waiting = (await client.get(start["poll_url"])).json()
+                if waiting.get("result"):
+                    break
+                await asyncio.sleep(0.05)
+            assert waiting["result"]["waiting_for"] == "plan_confirmation"
+            assert waiting["status_key"] == "planned"
+
+            resumed = (await client.post(
+                f"/v1/workflows/{task_id}/messages",
+                json={"action": "confirm_plan", "message": "Confirmed."},
+            )).json()
+            assert resumed["task_id"] == task_id
+            assert "result_after=" in resumed["poll_url"]
+
+            completed = {}
+            for _ in range(120):
+                completed = (await client.get(resumed["poll_url"])).json()
+                if completed.get("result"):
+                    break
+                await asyncio.sleep(0.05)
+            assert completed["result"]["status_key"] == "ready_to_apply"
+            assert completed["result"]["waiting_for"] is None
+            conversation = kanban_service.get_conversation(task_id)
+            assert [message["message_type"] for message in conversation["messages"]].count("plan_confirmation") == 1
+
+
 def test_workflow_reviewer_keeps_distinct_relative_paths():
     from app.services.workflow_engine import _review_result
 
@@ -704,7 +776,7 @@ def test_workflow_reviewer_keeps_distinct_relative_paths():
     assert review["unplanned_changed_files"] == ["src/main/java/org/example/controller/TenantController.java"]
 
 
-def test_workflow_reviewer_rejects_missing_planned_files():
+def test_workflow_reviewer_accepts_unchanged_candidate_paths():
     from app.services.workflow_engine import _review_result
 
     plan = PlanResponse(
@@ -720,9 +792,30 @@ def test_workflow_reviewer_rejects_missing_planned_files():
 
     review = _review_result(plan, executed)
 
-    assert review["decision"] == "request_recoding"
+    assert review["decision"] == "approve"
     assert review["missing_changed_files"] == ["src/domain/b.py"]
+    assert review["required_missing_files"] == []
     assert review["unplanned_changed_files"] == []
+
+
+def test_workflow_reviewer_rejects_missing_required_file():
+    from app.services.workflow_engine import _review_result
+
+    plan = PlanResponse(
+        files=[
+            PlanFile(path="src/domain/a.py", nature="modified", description="Update A."),
+            PlanFile(path="src/domain/b.py", nature="modified", description="Update B.", required=True),
+        ]
+    )
+    executed = IdeChatResponse(
+        ops=[FileOp(op="update_file", path="src/domain/a.py", content="print('a')\n")],
+        done=True,
+    )
+
+    review = _review_result(plan, executed)
+
+    assert review["decision"] == "request_recoding"
+    assert review["required_missing_files"] == ["src/domain/b.py"]
 
 
 def test_planner_rejects_directory_level_paths_from_workspace_tree():
@@ -855,7 +948,7 @@ async def test_workflow_recoding_receives_review_feedback(monkeypatch, tmp_path)
             task_id=body["task_id"],
             files=[
                 PlanFile(path="src/domain/a.py", nature="modified", description="Update A."),
-                PlanFile(path="src/domain/b.py", nature="modified", description="Update B."),
+                PlanFile(path="src/domain/b.py", nature="modified", description="Update B.", required=True),
             ],
             summary="Update A and B.",
             session_id="plan-1",
@@ -907,6 +1000,102 @@ async def test_workflow_recoding_receives_review_feedback(monkeypatch, tmp_path)
     event_types = [event["event_type"] for event in task_detail["events"]]
     assert event_types.count("coding_context_prepared") == 2
     assert "workflow_rework_loop" in event_types
+
+
+@pytest.mark.asyncio
+async def test_interactive_workflow_pauses_for_plan_confirmation_and_resumes(monkeypatch, tmp_path):
+    db_path = tmp_path / "devwerk-interactive-workflow.db"
+    fake_settings = FakeSettings(db_path)
+
+    import app.services.kanban as kanban_service
+    import app.services.workflow_engine as workflow_engine_service
+
+    patch_service_settings(monkeypatch, fake_settings, kanban_service)
+    kanban_service._initialized = False
+    task = kanban_service.create_task(
+        project_id="interactive-project",
+        title="Interactive plan",
+        description="Create a module",
+        status_key="draft",
+    )["task"]
+    kanban_service.ensure_conversation(task["id"])
+    kanban_service.append_conversation_message(task["id"], role="user", content="Create a module.")
+    coding_calls = 0
+
+    async def plan_runner(body: dict) -> PlanResponse:
+        return PlanResponse(
+            task_id=body["task_id"],
+            files=[PlanFile(path="src/module.py", nature="new", intent="create", description="Create module.")],
+            summary="Create src/module.py.",
+        )
+
+    async def coding_runner(body: dict) -> IdeChatResponse:
+        nonlocal coding_calls
+        coding_calls += 1
+        return IdeChatResponse(
+            task_id=body["task_id"],
+            done=True,
+            reply="Created module.",
+            ops=[FileOp(op="create_file", path="src/module.py", content="VALUE = 1\n")],
+        )
+
+    engine = workflow_engine_service.WorkflowEngine(plan_runner=plan_runner, coding_runner=coding_runner)
+    body = {
+        "project_id": "interactive-project",
+        "mode": "agent",
+        "interaction_mode": "confirm_plan",
+        "messages": [{"role": "user", "content": "Create a module."}],
+        "workspace": {"tree_preview": "project/", "source_map": None},
+    }
+    await engine.run(task["id"], body)
+
+    waiting_task = kanban_service.get_task(task["id"])["task"]
+    waiting_result = [item for item in waiting_task["artifacts"] if item["artifact_type"] == "workflow_result"][-1]["payload"]
+    assert waiting_result["waiting_for"] == "plan_confirmation"
+    assert waiting_task["status_key"] == "planned"
+    assert coding_calls == 0
+    assert kanban_service.get_conversation(task["id"])["state"] == "waiting_user"
+
+    kanban_service.append_conversation_message(
+        task["id"], role="user", content="Confirmed.", message_type="plan_confirmation"
+    )
+    await engine.run(task["id"], {**body, "resume_action": "confirm_plan"})
+
+    completed_task = kanban_service.get_task(task["id"])["task"]
+    assert completed_task["status_key"] == "ready_to_apply"
+    assert coding_calls == 1
+    revision_events = [event for event in completed_task["events"] if event["event_type"] == "revision_created"]
+    assert len(revision_events) == 1
+
+
+def test_conversation_context_compresses_old_messages_and_keeps_recent_turns(monkeypatch, tmp_path):
+    db_path = tmp_path / "devwerk-context-compression.db"
+    fake_settings = FakeSettings(db_path)
+
+    import app.services.kanban as kanban_service
+    from app.services.conversation_context import prepare_conversation_context
+
+    patch_service_settings(monkeypatch, fake_settings, kanban_service)
+    kanban_service._initialized = False
+    project_id = "compression-project"
+    task = kanban_service.create_task(project_id=project_id, title="Compress", description="Compress", status_key="draft")["task"]
+    kanban_service.update_project_settings(
+        project_id,
+        parameters={"context_budget_tokens": 120, "context_recent_messages": 3},
+    )
+    kanban_service.ensure_conversation(task["id"])
+    for index in range(9):
+        kanban_service.append_conversation_message(
+            task["id"], role="user" if index % 2 == 0 else "assistant", content=f"turn-{index} " + ("context " * 80)
+        )
+
+    context = prepare_conversation_context(task["id"])
+    conversation = kanban_service.get_conversation(task["id"])
+
+    assert context["compressed"] is True
+    assert conversation["summary_version"] == 1
+    assert len([item for item in conversation["messages"] if not item["compressed"]]) == 3
+    assert "turn-8" in context["messages"][-1]["content"]
 
 
 @pytest.mark.asyncio
