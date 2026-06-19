@@ -114,6 +114,7 @@ data class IdeChatResponse(
     val errorMessage: String? = null,
     val retryable: Boolean = false,
     val waitingFor: String? = null,
+    val nextAction: String? = null,
     val interaction: Map<String, Any?> = emptyMap(),
     val rawResponses: List<String> = emptyList()
 )

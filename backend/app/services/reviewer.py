@@ -6,6 +6,7 @@ from typing import Any
 
 from app.models.ide import ToolRequest
 from app.services.llm_factory import get_llm_client
+from app.services.tool_protocol import ToolProtocolError, normalize_tool_request
 
 
 _log = logging.getLogger("devwerk.reviewer")
@@ -26,6 +27,7 @@ class Reviewer:
             "workspace_summary": payload.get("workspace_summary"),
             "previous_revision_verification_feedback": payload.get("verification_feedback"),
             "client_capabilities": payload.get("client_capabilities"),
+            "verification_required": bool(payload.get("verification_required")),
         }
         messages = [
             {
@@ -42,8 +44,10 @@ class Reviewer:
                     "project evidence; commands must be project-relative and non-destructive. Prefer one authoritative project-native "
                     "build, test, typecheck, lint, or IDE diagnostic operation inferred from manifests and workspace evidence. Never use "
                     "source-printing or text-matching commands such as cat, type, grep, or findstr as verification; source content is review "
-                    "evidence, not an executable check. If no authoritative operation can be inferred, return no verification request "
-                    "instead of inventing an ad-hoc assertion. Return JSON only with decision "
+                    "evidence, not an executable check. When verification_required=true, an approve decision MUST include at least one "
+                    "authoritative verification_tool_request; infer it from project evidence rather than hardcoding a framework command. "
+                    "If verification is not required and no authoritative operation can be inferred, return no verification request. "
+                    "Return JSON only with decision "
                     "(approve|request_recoding|request_replan|fail), summary, findings[], required_changes[], warnings[], and "
                     "verification_tool_requests:[{id,tool,args}]. Use request_replan only when the plan or approved path boundary is "
                     "wrong; use request_recoding for any concrete, repairable code defect. Use fail only when no code revision can possibly "
@@ -53,17 +57,49 @@ class Reviewer:
             {"role": "user", "content": json.dumps(prompt, ensure_ascii=False, separators=(",", ":"))},
         ]
         try:
-            raw = get_llm_client(self.agent_name).chat_json(messages)
+            client = get_llm_client(self.agent_name)
+            raw = client.chat_json(messages)
             result = _normalize_review(raw, _client_tools(payload.get("client_capabilities")))
+            if _missing_required_verification(result, payload):
+                repair_messages = messages + [
+                    {"role": "assistant", "content": json.dumps(raw, ensure_ascii=False)},
+                    {
+                        "role": "user",
+                        "content": (
+                            "The task requires executable verification, but the review approved without a usable client tool request. "
+                            "Re-emit the complete review JSON and include at least one authoritative, project-relative verification_tool_request "
+                            "selected from client_capabilities and inferred from workspace manifests."
+                        ),
+                    },
+                ]
+                result = _normalize_review(
+                    client.chat_json(repair_messages),
+                    _client_tools(payload.get("client_capabilities")),
+                )
+                if _missing_required_verification(result, payload):
+                    result["decision"] = "request_recoding"
+                    result["summary"] = "Executable verification is required before this revision can be approved."
+                    result["required_changes"] = list(result.get("required_changes") or []) + [
+                        "Return an authoritative client verification request inferred from the project evidence."
+                    ]
             _log.debug("reviewer result decision=%s summary=%s", result["decision"], result["summary"])
             return result
         except Exception as exc:  # noqa: BLE001
             _log.warning("reviewer unavailable; protocol review remains authoritative error=%s: %s", type(exc).__name__, exc)
+            verification_required = bool(payload.get("verification_required"))
             return {
-                "decision": "approve",
-                "summary": "Semantic reviewer was unavailable; protocol checks passed and client verification remains required.",
+                "decision": "request_recoding" if verification_required else "approve",
+                "summary": (
+                    "Semantic reviewer was unavailable and mandatory executable verification could not be selected."
+                    if verification_required
+                    else "Semantic reviewer was unavailable; protocol checks passed."
+                ),
                 "findings": [],
-                "required_changes": [],
+                "required_changes": (
+                    ["Select an authoritative client verification request before approval."]
+                    if verification_required
+                    else []
+                ),
                 "warnings": [f"{type(exc).__name__}: {exc}"],
                 "verification_tool_requests": [],
                 "degraded": True,
@@ -96,6 +132,15 @@ def _client_tools(capabilities: Any) -> set[str]:
     return {str(tool).strip() for tool in capabilities["tools"] if str(tool).strip()}
 
 
+def _missing_required_verification(result: dict[str, Any], payload: dict[str, Any]) -> bool:
+    if not payload.get("verification_required") or result.get("decision") != "approve":
+        return False
+    client_tools = _client_tools(payload.get("client_capabilities"))
+    if not client_tools.intersection({"run_command", "ide_syntax_check"}):
+        return False
+    return not result.get("verification_tool_requests")
+
+
 def _verification_tool_requests(value: Any, allowed_tools: set[str]) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not allowed_tools:
         return []
@@ -104,13 +149,17 @@ def _verification_tool_requests(value: Any, allowed_tools: set[str]) -> list[dic
     for index, item in enumerate(value):
         if not isinstance(item, dict):
             continue
-        tool = str(item.get("tool") or "").strip()
+        try:
+            normalized = normalize_tool_request(item, index)
+        except ToolProtocolError:
+            continue
+        tool = str(normalized.get("tool") or "").strip()
         if tool not in allowed_tools:
             continue
-        request_id = str(item.get("id") or f"review-{index + 1}").strip()
+        request_id = str(normalized.get("id") or f"review-{index + 1}").strip()
         if not request_id or request_id in seen_ids:
             continue
-        args = item.get("args") if isinstance(item.get("args"), dict) else {}
+        args = normalized.get("args") if isinstance(normalized.get("args"), dict) else {}
         request = ToolRequest(id=request_id, tool=tool, args=args)
         requests.append(request.model_dump())
         seen_ids.add(request_id)

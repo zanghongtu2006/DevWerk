@@ -175,6 +175,25 @@ def _transition_by_definition(task_id: str, action: str, payload: dict[str, Any]
 def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     ok = bool(payload.get("ok", True))
     definition = _definition_for_task(task_id)
+    task_detail = get_task(task_id)
+    task = task_detail.get("task") or {}
+    current_status = str(task.get("status_key") or "")
+    current_column = definition.column(current_status)
+    if current_column is None or not _can_apply_result_from(definition, current_column):
+        add_artifact(task_id, artifact_type="stale_apply_result", payload=payload)
+        add_event(
+            task_id,
+            "stale_apply_result_ignored",
+            {
+                "status_key": current_status,
+                "ok": ok,
+                "snapshot_id": payload.get("snapshot_id"),
+                "reason": "Task is no longer waiting for a client apply result.",
+            },
+        )
+        task_detail["action_ignored"] = True
+        task_detail["ignored_action"] = ACTION_APPLY_RESULT
+        return task_detail
     add_artifact(task_id, artifact_type="apply_result", payload=payload)
     add_event(task_id, "apply_result_received", payload)
 

@@ -308,6 +308,50 @@ def test_kanban_apply_failure_requests_recoding_and_queues_resume(monkeypatch, t
     assert "Patch context" in started[0][1]["client_feedback"]["summary"]
 
 
+def test_stale_apply_result_is_idempotently_ignored(monkeypatch, tmp_path):
+    import app.main as main_module
+    import app.services.kanban as kanban_service
+    import app.services.session_store as session_store
+    import app.services.usage as usage_service
+
+    class FakeSettings:
+        devwerk_db_path = str(tmp_path / "stale-apply.db")
+
+    monkeypatch.setattr(kanban_service, "settings", lambda: FakeSettings())
+    monkeypatch.setattr(session_store, "settings", lambda: FakeSettings())
+    monkeypatch.setattr(usage_service, "settings", lambda: FakeSettings())
+    kanban_service._initialized = False
+    usage_service._initialized = False
+
+    task = kanban_service.create_task(
+        project_id="stale-apply-smoke",
+        title="Continue coding",
+        description="The reviewer already returned this task to coding.",
+        status_key="coding",
+    )["task"]
+
+    app = main_module.create_app()
+    with TestClient(app) as client:
+        response = client.post(
+            f"/v1/kanban/tasks/{task['id']}/actions",
+            json={
+                "action": "apply_result",
+                "payload": {
+                    "ok": True,
+                    "snapshot_id": "late-client-result",
+                    "changed_paths": [],
+                },
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["action_ignored"] is True
+    assert body["task"]["status_key"] == "coding"
+    task_detail = kanban_service.get_task(task["id"])["task"]
+    assert "stale_apply_result_ignored" in [event["event_type"] for event in task_detail["events"]]
+
+
 def test_verification_policy_uses_project_configured_tools_only():
     from app.services.verification_policy import configured_post_apply_tool_requests
 

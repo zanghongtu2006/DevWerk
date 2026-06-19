@@ -1819,6 +1819,49 @@ def test_planner_recovers_when_model_narrates_instead_of_using_protocol(monkeypa
     assert [item.path for item in plan.files] == ["src/main.py"]
 
 
+def test_planner_normalizes_top_level_tool_request_array(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    source_dir = project_root / "src"
+    source_dir.mkdir(parents=True)
+    (source_dir / "main.py").write_text("broken = True\n", encoding="utf-8")
+
+    class ArrayPlannerClient:
+        def __init__(self):
+            self.calls = 0
+
+        def chat_json(self, messages):
+            self.calls += 1
+            if self.calls == 1:
+                return [{"id": "read-main", "tool": "read_file", "args": {"path": "src/main.py"}}]
+            return {
+                "plan": {
+                    "files": [
+                        {
+                            "path": "src/main.py",
+                            "nature": "modified",
+                            "description": "Fix the compile error.",
+                            "confidence": 0.9,
+                        }
+                    ],
+                    "summary": "Fix the inspected file.",
+                    "warnings": [],
+                }
+            }
+
+    client = ArrayPlannerClient()
+    import app.services.planner as planner_service
+
+    monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": client)
+    plan = Planner().plan(
+        messages=[{"role": "user", "content": "Fix the compile errors."}],
+        project_root=str(project_root),
+    )
+
+    assert client.calls == 2
+    assert plan.ok is True
+    assert [item.path for item in plan.files] == ["src/main.py"]
+
+
 def test_planner_repairs_markdown_final_analysis_into_plan_contract(monkeypatch, tmp_path):
     project_root = tmp_path / "project"
     source_dir = project_root / "src"
@@ -1951,6 +1994,39 @@ def test_tool_protocol_accepts_search_pattern_without_path():
     assert requests[0].tool == "search"
     assert requests[0].args["query"] == "class TenantServiceImpl"
     assert requests[0].args["paths"] == []
+
+
+def test_execute_filters_canonicalize_project_root_prefixed_output_paths():
+    from app.routes.ide import _filter_ops, _filter_patch_ops
+
+    project_root = "C:/workspace/sample"
+    approved = {"src/main.py"}
+    ops = _filter_ops(
+        [{"op": "update_file", "path": "sample/src/main.py", "content": "fixed\n"}],
+        approved,
+        project_root,
+    )
+    patches = _filter_patch_ops(
+        [
+            {
+                "op": "apply_patch",
+                "content": (
+                    "--- a/sample/src/main.py\n"
+                    "+++ b/sample/src/main.py\n"
+                    "@@ -1 +1 @@\n"
+                    "-broken\n"
+                    "+fixed\n"
+                ),
+            }
+        ],
+        approved,
+        project_root,
+    )
+
+    assert ops[0]["path"] == "src/main.py"
+    assert "--- a/src/main.py" in patches[0]["content"]
+    assert "+++ b/src/main.py" in patches[0]["content"]
+    assert "sample/src/main.py" not in patches[0]["content"]
 
 
 @pytest.mark.asyncio
@@ -2118,7 +2194,11 @@ def test_reviewer_verification_requests_are_capability_bounded():
 
     assert review["decision"] == "approve"
     assert review["verification_tool_requests"] == [
-        {"id": "compile", "tool": "run_command", "args": {"command": ["./project-check"]}}
+        {
+            "id": "compile",
+            "tool": "run_command",
+            "args": {"command": ["./project-check"], "timeout_seconds": 120},
+        }
     ]
 
 
@@ -2142,6 +2222,93 @@ def test_reviewer_prompt_requires_authoritative_project_verification(monkeypatch
     system_prompt = captured[0]["content"]
     assert "authoritative project-native" in system_prompt
     assert "Never use source-printing or text-matching commands" in system_prompt
+
+
+def test_reviewer_repairs_missing_mandatory_verification_request(monkeypatch):
+    import app.services.reviewer as reviewer_service
+
+    class FakeReviewerClient:
+        def __init__(self):
+            self.calls = 0
+
+        def chat_json(self, messages):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "decision": "approve",
+                    "summary": "The source change looks correct.",
+                    "verification_tool_requests": [],
+                }
+            assert "requires executable verification" in messages[-1]["content"]
+            return {
+                "decision": "approve",
+                "summary": "Apply and run the project-native verifier.",
+                "verification_tool_requests": [
+                    {
+                        "id": "project-verification",
+                        "tool": "run_command",
+                        "args": {"command": ["project-check"], "cwd": ""},
+                    }
+                ],
+            }
+
+    client = FakeReviewerClient()
+    monkeypatch.setattr(reviewer_service, "get_llm_client", lambda agent: client)
+
+    result = reviewer_service.Reviewer().review(
+        {
+            "verification_required": True,
+            "client_capabilities": {"tools": ["run_command", "ide_syntax_check"]},
+        }
+    )
+
+    assert client.calls == 2
+    assert result["decision"] == "approve"
+    assert result["verification_tool_requests"][0]["id"] == "project-verification"
+
+
+def test_reviewer_repairs_malformed_mandatory_verification_request(monkeypatch):
+    import app.services.reviewer as reviewer_service
+
+    class FakeReviewerClient:
+        def __init__(self):
+            self.calls = 0
+
+        def chat_json(self, messages):
+            self.calls += 1
+            request = (
+                {"id": "broken", "tool": "run_command", "args": {"cmd": "project-check"}}
+                if self.calls == 1
+                else {"id": "fixed", "tool": "run_command", "args": {"command": ["project-check"]}}
+            )
+            return {
+                "decision": "approve",
+                "summary": "Verify the revision.",
+                "verification_tool_requests": [request],
+            }
+
+    client = FakeReviewerClient()
+    monkeypatch.setattr(reviewer_service, "get_llm_client", lambda agent: client)
+    result = reviewer_service.Reviewer().review(
+        {"verification_required": True, "client_capabilities": {"tools": ["run_command"]}}
+    )
+
+    assert client.calls == 2
+    assert [item["id"] for item in result["verification_tool_requests"]] == ["fixed"]
+
+
+def test_compile_repair_task_requires_executable_verification():
+    from app.services.workflow_engine import _task_requires_executable_verification
+
+    assert _task_requires_executable_verification(
+        {"title": "代码里有很多编译错误", "description": "尤其是 Tenant 相关"}
+    ) is True
+    assert _task_requires_executable_verification(
+        {"title": "Fix all compilation errors", "description": "Inspect the whole project"}
+    ) is True
+    assert _task_requires_executable_verification(
+        {"title": "Rename the tenant label", "description": "Text-only change"}
+    ) is False
 
 
 def test_workflow_filters_reviewer_tools_against_client_capabilities():

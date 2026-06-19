@@ -591,6 +591,7 @@ class WorkflowEngine:
                     "workspace_summary": context.get("workspace"),
                     "verification_feedback": _compact_verification_feedback(state.review_feedback),
                     "client_capabilities": body.get("client_capabilities") or {},
+                    "verification_required": _task_requires_executable_verification(context.get("task")),
                 }
             )
             semantic_decision = str(semantic_review.get("decision") or "approve").strip().lower()
@@ -885,6 +886,26 @@ def _verification_resume_feedback(body: dict[str, Any]) -> dict[str, Any] | None
         "verification": verification,
         "applied_changed_paths": verification.get("applied_changed_paths") or [],
     }
+
+
+def _task_requires_executable_verification(task: object) -> bool:
+    if not isinstance(task, dict):
+        return False
+    text = " ".join(str(task.get(key) or "") for key in ("title", "description")).lower()
+    terms = (
+        "compile",
+        "compilation",
+        "build error",
+        "test failure",
+        "tests failing",
+        "typecheck",
+        "lint error",
+        "编译",
+        "构建失败",
+        "测试失败",
+        "类型检查",
+    )
+    return any(term in text for term in terms)
 
 
 def _latest_plan_response(task_id: str) -> PlanResponse | None:

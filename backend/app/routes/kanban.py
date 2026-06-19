@@ -214,7 +214,9 @@ def kanban_task_action(task_id: str, req: WorkflowActionRequest):
         result_cursor = _latest_artifact_created_at(task_id, "workflow_result")
         result = apply_workflow_action(task_id, req.action, req.payload)
         resume_status = str((result.get("task") or {}).get("status_key") or "")
-        resume = _maybe_resume_after_apply_result(task_id, req.action, req.payload, result_cursor, resume_status)
+        resume = None if result.get("action_ignored") else _maybe_resume_after_apply_result(
+            task_id, req.action, req.payload, result_cursor, resume_status
+        )
         if resume:
             result["workflow_resume"] = resume
         return result

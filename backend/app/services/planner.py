@@ -340,7 +340,7 @@ class Planner:
     def _call_llm(self, messages: list[dict]) -> dict:
         _log.debug("Planner.call_llm: agent=%s messages=%s", self.agent_name, len(messages))
         client = get_llm_client(self.agent_name)
-        result = client.chat_json(messages)
+        result = _normalize_planner_response(client.chat_json(messages))
         _log.debug("Planner.call_llm: result_keys=%s", sorted(result.keys()))
         return result
 
@@ -439,6 +439,32 @@ def _raw_result_summary(raw: dict) -> dict[str, Any]:
         "raw_text_preview": text[:240],
         "file_count": len(files) if isinstance(files, list) else 0,
         "tool_request_count": len(raw.get("tool_requests") or []) if isinstance(raw.get("tool_requests") or [], list) else 0,
+    }
+
+
+def _normalize_planner_response(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, list):
+        objects = [item for item in value if isinstance(item, dict)]
+        if len(objects) == len(value) and objects:
+            if all(item.get("tool") or item.get("name") for item in objects):
+                return {"tool_requests": objects}
+            if all(item.get("path") for item in objects):
+                return {
+                    "plan": {
+                        "files": objects,
+                        "summary": "Planner returned a file-level plan array.",
+                        "warnings": [],
+                    }
+                }
+        return {
+            "raw_text": json.dumps(value, ensure_ascii=False),
+            "raw_value_type": "list",
+        }
+    return {
+        "raw_text": str(value or ""),
+        "raw_value_type": type(value).__name__,
     }
 
 

@@ -1061,6 +1061,7 @@ class HttpAiClient(
         val errorMessage = if (obj.has("error_message") && !obj.isNull("error_message")) obj.getString("error_message") else null
         val retryable = obj.optBoolean("retryable", false)
         val waitingFor = if (obj.has("waiting_for") && !obj.isNull("waiting_for")) obj.getString("waiting_for") else null
+        val nextAction = if (obj.has("next_action") && !obj.isNull("next_action")) obj.getString("next_action") else null
         val interactionObj = obj.optJSONObject("interaction")
         val interaction = mutableMapOf<String, Any?>()
         if (interactionObj != null) for (key in interactionObj.keys()) interaction[key] = interactionObj.get(key).let { if (it == JSONObject.NULL) null else it }
@@ -1113,7 +1114,7 @@ class HttpAiClient(
             codeTree = codeTree, ops = ops,
             toolRequests = toolReqs, patchOps = patchOps, done = done,
             ok = ok, errorCode = errorCode, errorMessage = errorMessage, retryable = retryable,
-            waitingFor = waitingFor, interaction = interaction
+            waitingFor = waitingFor, nextAction = nextAction, interaction = interaction
         )
     }
 }

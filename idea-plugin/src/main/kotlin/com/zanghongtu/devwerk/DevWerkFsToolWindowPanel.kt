@@ -40,7 +40,7 @@ import org.json.JSONObject
 class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     // State
-    private enum class State { IDLE, WORKFLOW_PENDING }
+    private enum class State { IDLE, WORKFLOW_PENDING, PLAN_CONFIRMATION }
     @Volatile private var state = State.IDLE
 
     private val history = mutableListOf<ChatMessage>()
@@ -144,7 +144,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         attachBtn.addActionListener { chooseAttachments() }
         clearAttachBtn.addActionListener { clearPendingAttachments() }
         confirmPlanButton.addActionListener {
-            if (state == State.IDLE && waitingFor == "plan_confirmation" && activeTaskId != null) {
+            if (state == State.PLAN_CONFIRMATION && waitingFor == "plan_confirmation" && activeTaskId != null) {
                 setState(State.WORKFLOW_PENDING)
                 ApplicationManager.getApplication().executeOnPooledThread {
                     runUploadThenWorkflow("Confirm the proposed plan and continue.", emptyList(), "confirm_plan")
@@ -179,6 +179,13 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                     attachBtn.isEnabled = false
                     clearAttachBtn.isEnabled = false
                     confirmPlanButton.isEnabled = false
+                }
+                State.PLAN_CONFIRMATION -> {
+                    sendButton.isEnabled = false
+                    inputArea.isEnabled = false
+                    attachBtn.isEnabled = false
+                    clearAttachBtn.isEnabled = false
+                    confirmPlanButton.isEnabled = true
                 }
             }
         }
@@ -268,12 +275,12 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 activeTaskId = response.taskId
                 waitingFor = response.waitingFor
             } else if (devCtx != null) {
-                if (response.ok) {
+                if (isReadyToApply(response)) {
                     response = applyAndVerifyWithResume(aiClient, runner, project, updatedCtx, devCtx, response)
-                } else {
+                } else if (!response.ok) {
                     runner.recordFinalSummaryAndBackup(project, devCtx, response)
                 }
-            } else if (response.ok) {
+            } else if (isReadyToApply(response)) {
                 (aiClient as? HttpAiClient)?.let {
                     reportApplyResult(it, response, null, ok = false, changedPaths = collectChangedPaths(response), errorMessage = "DevWerk local operation context is unavailable.")
                 }
@@ -299,12 +306,19 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                     appendChatLine("[System] ${resp.ops.size} file op(s) applied.")
                 }
                 confirmPlanButton.isVisible = resp.ok && resp.waitingFor == "plan_confirmation"
-                if (resp.waitingFor == null && (resp.done || resp.statusKey in setOf("ready_to_apply", "done", "failed"))) {
+                val terminal = !resp.ok || resp.done || resp.statusKey in setOf("done", "failed")
+                if (terminal) {
                     activeTaskId = null
                     waitingFor = null
                     activeDevCtx = null
                 }
-                setState(State.IDLE)
+                setState(
+                    when {
+                        terminal -> State.IDLE
+                        resp.waitingFor == "plan_confirmation" -> State.PLAN_CONFIRMATION
+                        else -> State.WORKFLOW_PENDING
+                    }
+                )
             }
 
         } catch (t: Throwable) {
@@ -328,13 +342,16 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
     ): IdeChatResponse {
         var current = initialResponse
         var resumeRounds = 0
-        val maxResumeRounds = 2
+        val maxResumeRounds = 8
 
         while (true) {
+            if (!isReadyToApply(current)) return current
             val snapshotCtx = runner.beginSnapshot(devCtx)
             runner.recordFinalSummaryAndBackup(project, snapshotCtx, current)
             val actionResponse = runCatching {
-                runner.applyResponse(project, snapshotCtx, current)
+                ApplicationManager.getApplication().invokeAndWait {
+                    runner.applyResponse(project, snapshotCtx, current)
+                }
                 val verification = runPostApplyTools(aiClient as? HttpAiClient, context, current, snapshotCtx)
                 reportApplyResult(
                     aiClient,
@@ -359,9 +376,16 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
             val resume = actionResponse.optJSONObject("workflow_resume")
             if (resume == null || resumeRounds >= maxResumeRounds) {
                 if (resume != null) {
-                    appendOpLog(devCtx, "[WARN] Verification rework limit reached; leaving task for manual retry.\n")
+                    appendOpLog(devCtx, "[WARN] Client verification rework limit reached; task remains active for backend retry or abandonment.\n")
                 }
-                return current
+                val backendStatus = actionResponse.optJSONObject("task")
+                    ?.optString("status_key", "")
+                    ?.takeIf { it.isNotBlank() }
+                return if (backendStatus != null) {
+                    current.copy(statusKey = backendStatus, done = backendStatus in setOf("done", "failed"))
+                } else {
+                    current
+                }
             }
 
             val http = aiClient as? HttpAiClient ?: return current
@@ -374,6 +398,13 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
             resumeRounds += 1
         }
     }
+
+    private fun isReadyToApply(response: IdeChatResponse): Boolean =
+        response.ok &&
+            response.waitingFor == null &&
+            response.statusKey == "ready_to_apply" &&
+            response.nextAction == "apply_result" &&
+            collectChangedPaths(response).isNotEmpty()
 
     private fun appendOpLog(devCtx: DevwerkContext?, text: String) {
         val logPath = devCtx?.opLog ?: return

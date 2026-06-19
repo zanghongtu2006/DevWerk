@@ -931,7 +931,9 @@ def _filter_patch_ops(patch_ops: list[dict], approved: set[str], project_root: s
         if diff_paths and not diff_paths.issubset(approved):
             _log.debug("filter_patch_ops: dropped diff_paths=%s approved=%s", sorted(diff_paths), sorted(approved))
             continue
-        result.append(po)
+        normalized = dict(po)
+        normalized["content"] = _canonicalize_patch_headers(str(content), project_root)
+        result.append(normalized)
     return result
 
 
@@ -946,12 +948,36 @@ def _approved_path_set(paths: list, project_root: str | None) -> set[str]:
 
 def _canonical_rel_path(path: str, project_root: str | None = None) -> str:
     text = str(path or "").strip().replace("\\", "/")
+    root = str(project_root or "").strip().replace("\\", "/").rstrip("/")
+    if root and text.lower().startswith(root.lower() + "/"):
+        text = text[len(root) + 1 :]
+    elif root:
+        root_name = root.rsplit("/", 1)[-1]
+        if root_name and text.lower().startswith(root_name.lower() + "/"):
+            text = text[len(root_name) + 1 :]
     while text.startswith("/"):
         text = text[1:]
+    if len(text) >= 2 and text[1] == ":":
+        return ""
     parts = [part for part in text.split("/") if part]
     if not parts or any(part == ".." for part in parts):
         return ""
     return "/".join(parts)
+
+
+def _canonicalize_patch_headers(content: str, project_root: str | None) -> str:
+    import re as _re
+
+    def replace(match: Any) -> str:
+        prefix = match.group(1)
+        marker = match.group(2)
+        path = match.group(3).strip()
+        if path == "/dev/null":
+            return f"{prefix}{path}"
+        canonical = _canonical_rel_path(path, project_root)
+        return f"{prefix}{marker}{canonical}" if canonical else match.group(0)
+
+    return _re.sub(r"^(--- |\+\+\+ )([ab]/)(.+)$", replace, content, flags=_re.MULTILINE)
 
 
 def _append_workspace_context(messages: list[dict], workspace: object) -> list[dict]:
