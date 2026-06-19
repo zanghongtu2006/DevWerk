@@ -179,7 +179,7 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     add_event(task_id, "apply_result_received", payload)
 
     if not ok:
-        status_key = _action_target(definition, ACTION_FAIL) or "failed"
+        status_key = _action_target(definition, ACTION_REQUEST_RECODING) or "coding"
         record_phase_output(
             task_id,
             phase="apply",
@@ -193,9 +193,14 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
                 "verification": payload.get("verification") or {},
             },
             warnings=[str(payload.get("error_message") or "apply failed")],
-            next_action=ACTION_RETRY,
+            next_action=ACTION_REQUEST_RECODING,
         )
-        return _apply_configured_action(task_id, definition, ACTION_FAIL, {"phase": "apply", **payload})
+        add_event(
+            task_id,
+            "apply_failed",
+            {"phase": "apply", "reason": payload.get("error_message") or "Client failed to apply generated changes."},
+        )
+        return _apply_configured_action(task_id, definition, ACTION_REQUEST_RECODING, {"phase": "apply", **payload})
 
     verification = payload.get("verification")
     has_verification_policy = verification_has_policy(verification)

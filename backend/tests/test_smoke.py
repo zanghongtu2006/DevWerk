@@ -163,7 +163,7 @@ def test_failed_verification_returns_to_coding(monkeypatch, tmp_path):
         },
     )
 
-    assert result["task"]["status_key"] == "coding"
+    assert result["task"]["status_key"] == "planned"
     task_detail = kanban_service.get_task(task["id"])["task"]
     event_types = [event["event_type"] for event in task_detail["events"]]
     assert "verification_failed" in event_types
@@ -234,10 +234,78 @@ def test_kanban_apply_result_queues_resume_after_failed_verification(monkeypatch
 
     assert response.status_code == 200
     body = response.json()
-    assert body["task"]["status_key"] == "coding"
+    assert body["task"]["status_key"] == "planned"
     assert body["workflow_resume"]["poll_url"].startswith(f"/v1/workflows/{task['id']}?result_after=")
     assert started and started[0][0] == task["id"]
+    assert started[0][1]["resume_status"] == "planned"
     assert started[0][1]["verification_feedback"]["results"]["compile"] == "failed"
+    assert started[0][1]["verification_feedback"]["applied_changed_paths"] == [
+        "src/main/java/App.java"
+    ]
+
+
+def test_kanban_apply_failure_requests_recoding_and_queues_resume(monkeypatch, tmp_path):
+    import app.main as main_module
+    import app.routes.ide as ide_routes
+    import app.services.kanban as kanban_service
+    import app.services.session_store as session_store
+    import app.services.usage as usage_service
+
+    class FakeSettings:
+        devwerk_db_path = str(tmp_path / "apply-resume.db")
+
+    monkeypatch.setattr(kanban_service, "settings", lambda: FakeSettings())
+    monkeypatch.setattr(session_store, "settings", lambda: FakeSettings())
+    monkeypatch.setattr(usage_service, "settings", lambda: FakeSettings())
+    kanban_service._initialized = False
+    usage_service._initialized = False
+    started = []
+    monkeypatch.setattr(ide_routes, "_start_workflow_thread", lambda task_id, body: started.append((task_id, body)))
+
+    task = kanban_service.create_task(
+        project_id="apply-resume-smoke",
+        title="Apply checked change",
+        description="Smoke",
+        status_key="ready_to_apply",
+    )["task"]
+    kanban_service.add_artifact(
+        task["id"],
+        artifact_type="workflow_request_body",
+        payload={
+            "project_id": "apply-resume-smoke",
+            "task_id": task["id"],
+            "mode": "agent",
+            "messages": [{"role": "user", "content": "Fix compile error"}],
+            "workspace": {"tree_preview": "src/main.py"},
+        },
+    )
+    kanban_service.add_artifact(
+        task["id"],
+        artifact_type="workflow_result",
+        payload={"ok": True, "task_id": task["id"], "status_key": "ready_to_apply"},
+    )
+
+    app = main_module.create_app()
+    with TestClient(app) as client:
+        response = client.post(
+            f"/v1/kanban/tasks/{task['id']}/actions",
+            json={
+                "action": "apply_result",
+                "payload": {
+                    "ok": False,
+                    "snapshot_id": "apply-failed",
+                    "changed_paths": [],
+                    "error_message": "Patch context does not match the current file",
+                },
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["task"]["status_key"] == "coding"
+    assert body["workflow_resume"]["reason"] == "apply_failed"
+    assert started[0][1]["client_feedback"]["kind"] == "apply_failed"
+    assert "Patch context" in started[0][1]["client_feedback"]["summary"]
 
 
 def test_verification_policy_uses_project_configured_tools_only():

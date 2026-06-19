@@ -345,6 +345,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                     verification = verification
                 )
             }.getOrElse { applyError ->
+                appendOpLog(devCtx, "[WARN] Apply failed; reporting structured feedback to backend: ${applyError::class.java.simpleName}: ${applyError.message}\n")
                 reportApplyResult(
                     aiClient,
                     current,
@@ -353,7 +354,6 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                     changedPaths = collectChangedPaths(current),
                     errorMessage = "${applyError::class.java.simpleName}: ${applyError.message}"
                 )
-                throw applyError
             }
 
             val resume = actionResponse.optJSONObject("workflow_resume")

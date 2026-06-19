@@ -560,6 +560,8 @@ class HttpAiClient(
     private fun clientCapabilities(): JSONObject = JSONObject()
         .put("protocol_version", 1)
         .put("transport", "http_sse")
+        .put("platform", System.getProperty("os.name") ?: "unknown")
+        .put("shell", if (System.getProperty("os.name")?.lowercase()?.contains("windows") == true) "cmd" else "posix")
         .put(
             "tools",
             JSONArray(

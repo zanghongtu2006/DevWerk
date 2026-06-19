@@ -8,7 +8,7 @@ import httpx
 import pytest
 import requests
 
-from app.models.ide import FileOp, IdeChatResponse
+from app.models.ide import FileOp, IdeChatResponse, ToolRequest
 from app.models.plan import PlanFile, PlanResponse
 from app.services.anthropic_client import AnthropicClient
 from app.services.coder_harness import build_code_context_summary
@@ -239,6 +239,123 @@ class FakePlannerNaturalLanguageSearchClient:
         }
 
 
+class FakePlannerDirectToolClient:
+    def __init__(self):
+        self.calls = 0
+
+    def chat_json(self, messages: list[dict]) -> dict:
+        self.calls += 1
+        if self.calls == 1:
+            return {"id": "l1", "tool": "list_dir", "args": {"path": "project/src", "max_depth": 3}}
+        if self.calls == 2:
+            assert any("tool_results:" in message.get("content", "") for message in messages)
+            return {"id": "r1", "tool": "read_file", "args": {"path": "project/src/main.py"}}
+        assert sum("tool_results:" in message.get("content", "") for message in messages) >= 2
+        return {
+            "plan": {
+                "files": [
+                    {
+                        "path": "src/main.py",
+                        "nature": "modified",
+                        "description": "Fix the compile error found through project inspection.",
+                        "confidence": 0.95,
+                    }
+                ],
+                "summary": "Fix the inspected source file.",
+                "warnings": [],
+            }
+        }
+
+
+class FakePlannerResearchBudgetClient:
+    def __init__(self):
+        self.calls = 0
+
+    def chat_json(self, messages: list[dict]) -> dict:
+        self.calls += 1
+        if self.calls <= 4:
+            return {
+                "tool_requests": [
+                    {
+                        "id": f"r{self.calls}",
+                        "tool": "read_file",
+                        "args": {"path": f"src/file{self.calls}.py"},
+                    }
+                ]
+            }
+        assert "research budget is complete" in messages[-1]["content"]
+        return {
+            "plan": {
+                "files": [
+                    {
+                        "path": "src/file1.py",
+                        "nature": "modified",
+                        "description": "Fix the compile error identified during research.",
+                        "confidence": 0.9,
+                    }
+                ],
+                "summary": "Fix the researched compile error.",
+                "warnings": [],
+            }
+        }
+
+
+class FakePlannerProtocolRecoveryClient:
+    def __init__(self):
+        self.calls = 0
+
+    def chat_json(self, messages: list[dict]) -> dict:
+        self.calls += 1
+        if self.calls == 1:
+            return {"tool_requests": [{"id": "r1", "tool": "read_file", "args": {"path": "src/main.py"}}]}
+        if self.calls == 2:
+            return {"raw_text": "I found one issue. Let me check related code before producing the plan."}
+        assert "neither a valid tool request nor a file-level plan" in messages[-1]["content"]
+        return {
+            "plan": {
+                "files": [
+                    {
+                        "path": "src/main.py",
+                        "nature": "modified",
+                        "description": "Fix the issue found during research.",
+                        "confidence": 0.9,
+                    }
+                ],
+                "summary": "Fix the researched issue.",
+                "warnings": [],
+            }
+        }
+
+
+class FakePlannerFormatRepairClient:
+    def __init__(self):
+        self.calls = 0
+
+    def chat_json(self, messages: list[dict]) -> dict:
+        self.calls += 1
+        if self.calls <= 4:
+            return {"tool_requests": [{"id": f"r{self.calls}", "tool": "read_file", "args": {"path": "src/main.py"}}]}
+        if self.calls == 5:
+            return {"raw_text": "## Summary\n\n`src/main.py` contains the compile defect and must be modified."}
+        assert "Convert the supplied planner analysis" in messages[0]["content"]
+        payload = json.loads(messages[1]["content"])
+        assert payload["allowed_paths"] == ["src/main.py"]
+        return {
+            "plan": {
+                "files": [
+                    {
+                        "path": "src/main.py",
+                        "nature": "modified",
+                        "description": "Fix the compile defect from the planner analysis.",
+                        "confidence": 0.9,
+                    }
+                ],
+                "summary": "Fix the compile defect.",
+                "warnings": [],
+            }
+        }
+
+
 class FakeExecutorClient:
     def chat_structured(self, messages: list[dict]) -> dict:
         return {
@@ -396,7 +513,7 @@ class FakeProtocolRepairExecutorClient:
         from app.services.validation import ModelResponseValidationError
 
         self.calls += 1
-        if self.calls == 1:
+        if self.calls <= 2:
             raise ModelResponseValidationError(
                 "patch_ops[0] must be unified diff",
                 obj={
@@ -409,7 +526,7 @@ class FakeProtocolRepairExecutorClient:
                 },
             )
 
-        assert any("protocol_error:" in message.get("content", "") for message in messages)
+        assert any("Do not use patch_ops again" in message.get("content", "") for message in messages)
         return {
             "reply": "Generated repaired file op.",
             "ops": [
@@ -863,6 +980,45 @@ def test_workflow_reviewer_treats_required_file_as_semantic_review_evidence():
     assert review["required_missing_files"] == ["src/domain/b.py"]
 
 
+def test_workflow_reviewer_includes_paths_applied_before_verification_rework():
+    from app.services.workflow_engine import _review_result
+
+    plan = PlanResponse(
+        files=[
+            PlanFile(path="src/domain/a.py", nature="modified", description="Update A.", required=True),
+            PlanFile(path="src/domain/b.py", nature="modified", description="Update B.", required=True),
+        ]
+    )
+    executed = IdeChatResponse(
+        ops=[FileOp(op="update_file", path="src/domain/b.py", content="print('b')\n")],
+        done=True,
+    )
+
+    review = _review_result(plan, executed, prior_changed_paths=["src/domain/a.py"])
+
+    assert review["decision"] == "approve"
+    assert review["missing_changed_files"] == []
+    assert review["required_missing_files"] == []
+
+
+def test_workflow_reviewer_does_not_treat_prior_revision_as_current_unplanned_change():
+    from app.services.workflow_engine import _review_result
+
+    plan = PlanResponse(
+        files=[PlanFile(path="src/domain/b.py", nature="modified", description="Fix the remaining error.")]
+    )
+    executed = IdeChatResponse(
+        ops=[FileOp(op="update_file", path="src/domain/b.py", content="print('fixed')\n")],
+        done=True,
+    )
+
+    review = _review_result(plan, executed, prior_changed_paths=["src/domain/a.py"])
+
+    assert review["decision"] == "approve"
+    assert review["normalized_changed_files"] == ["src/domain/b.py"]
+    assert review["unplanned_changed_files"] == []
+
+
 def test_planner_rejects_directory_level_paths_from_workspace_tree():
     plan = Planner._extract_plan(
         {
@@ -891,6 +1047,29 @@ def test_planner_rejects_directory_level_paths_from_workspace_tree():
 
     assert plan.ok is False
     assert plan.error_code == "PLAN_DIRECTORY_PATHS"
+    assert plan.files == []
+
+
+def test_planner_fallback_does_not_treat_workflow_feedback_as_user_paths():
+    from app.services.planner import _fallback_plan
+
+    plan = _fallback_plan(
+        {"raw_text": "I need more evidence."},
+        [
+            {"role": "user", "content": "Fix all compilation errors."},
+            {
+                "role": "user",
+                "content": (
+                    "workflow_replan_feedback:\n"
+                    '{"verification":{"tool_results":[{"content":"C:/workspace/project/src/App.java '
+                    "http://example.invalid/build/help" + '"}]}}'
+                ),
+            },
+        ],
+    )
+
+    assert plan.ok is False
+    assert plan.error_code == "PLAN_EMPTY"
     assert plan.files == []
 
 
@@ -930,7 +1109,14 @@ async def test_workflow_reviewer_rework_continues_until_approved(monkeypatch, tm
     async def coding_runner(body: dict) -> IdeChatResponse:
         nonlocal coding_calls
         coding_calls += 1
-        assert any("workflow_phase_context:" in message.get("content", "") for message in body["messages"])
+        phase_contexts = [
+            message.get("content", "")
+            for message in body["messages"]
+            if "workflow_phase_context:" in message.get("content", "")
+        ]
+        assert phase_contexts
+        if coding_calls == 2:
+            assert '"unplanned_changed_files":["src/main/java/org/example/Second.java"]' in phase_contexts[-1]
         return IdeChatResponse(
             ok=True,
             done=True,
@@ -1003,6 +1189,7 @@ async def test_workflow_recoding_receives_review_feedback(monkeypatch, tmp_path)
     async def coding_runner(body: dict) -> IdeChatResponse:
         nonlocal coding_calls
         coding_calls += 1
+        assert body["client_capabilities"] == {"tools": ["run_command"]}
         context_messages = [message["content"] for message in body["messages"] if "workflow_phase_context:" in message.get("content", "")]
         assert context_messages
         if coding_calls == 1:
@@ -1025,13 +1212,17 @@ async def test_workflow_recoding_receives_review_feedback(monkeypatch, tmp_path)
                 FileOp(op="update_file", path="src/domain/a.py", content="print('a')\n"),
                 FileOp(op="update_file", path="src/domain/b.py", content="print('b')\n"),
             ],
+            tool_requests=[
+                ToolRequest(id="unsupported", tool="ide_syntax_check", args={"paths": ["src/domain/a.py"]}),
+                ToolRequest(id="verify", tool="run_command", args={"command": ["project-check"]}),
+            ],
         )
 
     async def review_runner(body: dict) -> dict:
         nonlocal review_calls
         review_calls += 1
         if review_calls == 1:
-            return {"decision": "request_recoding", "summary": "The requested second module is still incomplete."}
+            return {"decision": "fail", "summary": "The requested second module is still incomplete."}
         return {"decision": "approve", "summary": "Both requested modules are complete."}
 
     engine = workflow_engine_service.WorkflowEngine(
@@ -1046,6 +1237,7 @@ async def test_workflow_recoding_receives_review_feedback(monkeypatch, tmp_path)
             "mode": "agent",
             "messages": [{"role": "user", "content": "Update both files."}],
             "workspace": {"tree_preview": "project/\n  src/\n    domain/\n      a.py\n      b.py", "source_map": None},
+            "client_capabilities": {"tools": ["run_command"]},
         },
     )
 
@@ -1054,6 +1246,7 @@ async def test_workflow_recoding_receives_review_feedback(monkeypatch, tmp_path)
     assert task_detail["status_key"] == "ready_to_apply"
     result = [artifact for artifact in task_detail["artifacts"] if artifact["artifact_type"] == "workflow_result"][-1]
     assert result["payload"]["ok"] is True
+    assert [request["id"] for request in result["payload"]["tool_requests"]] == ["verify"]
     event_types = [event["event_type"] for event in task_detail["events"]]
     assert event_types.count("coding_context_prepared") == 2
     assert "workflow_rework_loop" in event_types
@@ -1551,6 +1744,109 @@ def test_planner_executes_minimax_text_tool_requests_before_planning(monkeypatch
     assert "plan_tool_results" in [event_type for event_type, _ in events]
 
 
+def test_planner_executes_direct_top_level_tool_calls_across_research_rounds(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    source_dir = project_root / "src"
+    source_dir.mkdir(parents=True)
+    (source_dir / "main.py").write_text("broken = True\n", encoding="utf-8")
+    fake_client = FakePlannerDirectToolClient()
+
+    import app.services.planner as planner_service
+
+    monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": fake_client)
+    events: list[tuple[str, dict]] = []
+    plan = Planner(event_sink=lambda event_type, payload: events.append((event_type, payload))).plan(
+        messages=[
+            {"role": "user", "content": "Find and fix the compile errors."},
+            {
+                "role": "user",
+                "content": "workspace_summary:\n"
+                + '{"source_map":{"root":"project","files":[{"path":"src/main.py","kind":"source","language":"python"}]}}',
+            },
+        ],
+        project_root=str(project_root),
+    )
+
+    assert fake_client.calls == 3
+    assert plan.ok is True
+    assert [item.path for item in plan.files] == ["src/main.py"]
+    requests = [payload for event_type, payload in events if event_type == "plan_tool_requests"]
+    assert requests[0]["requests"][0]["args"]["path"] == "src"
+    assert requests[1]["requests"][0]["args"]["path"] == "src/main.py"
+
+
+def test_planner_reserves_a_final_synthesis_round_after_tool_budget(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    source_dir = project_root / "src"
+    source_dir.mkdir(parents=True)
+    for index in range(1, 5):
+        (source_dir / f"file{index}.py").write_text(f"value = {index}\n", encoding="utf-8")
+    fake_client = FakePlannerResearchBudgetClient()
+
+    import app.services.planner as planner_service
+
+    monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": fake_client)
+    events: list[tuple[str, dict]] = []
+    plan = Planner(event_sink=lambda event_type, payload: events.append((event_type, payload))).plan(
+        messages=[{"role": "user", "content": "Find and fix all compile errors."}],
+        project_root=str(project_root),
+    )
+
+    assert fake_client.calls == 5
+    assert plan.ok is True
+    assert [item.path for item in plan.files] == ["src/file1.py"]
+    final_events = [payload for event_type, payload in events if event_type == "plan_llm_round_started"]
+    assert final_events[-1]["final_synthesis"] is True
+
+
+def test_planner_recovers_when_model_narrates_instead_of_using_protocol(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    source_dir = project_root / "src"
+    source_dir.mkdir(parents=True)
+    (source_dir / "main.py").write_text("broken = True\n", encoding="utf-8")
+    fake_client = FakePlannerProtocolRecoveryClient()
+
+    import app.services.planner as planner_service
+
+    monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": fake_client)
+    plan = Planner().plan(
+        messages=[{"role": "user", "content": "Find and fix the errors."}],
+        project_root=str(project_root),
+    )
+
+    assert fake_client.calls == 3
+    assert plan.ok is True
+    assert [item.path for item in plan.files] == ["src/main.py"]
+
+
+def test_planner_repairs_markdown_final_analysis_into_plan_contract(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    source_dir = project_root / "src"
+    source_dir.mkdir(parents=True)
+    (source_dir / "main.py").write_text("broken = True\n", encoding="utf-8")
+    fake_client = FakePlannerFormatRepairClient()
+
+    import app.services.planner as planner_service
+
+    monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": fake_client)
+    events: list[tuple[str, dict]] = []
+    plan = Planner(event_sink=lambda event_type, payload: events.append((event_type, payload))).plan(
+        messages=[
+            {"role": "user", "content": "Find and fix the errors."},
+            {
+                "role": "user",
+                "content": 'workspace_summary:\n{"source_map":{"files":[{"path":"src/main.py"}]}}',
+            },
+        ],
+        project_root=str(project_root),
+    )
+
+    assert fake_client.calls == 6
+    assert plan.ok is True
+    assert [item.path for item in plan.files] == ["src/main.py"]
+    assert "plan_format_repair_completed" in [event_type for event_type, _ in events]
+
+
 def test_planner_recovers_natural_language_search_intent(monkeypatch, tmp_path):
     project_root = tmp_path / "project"
     dto_dir = project_root / "src/main/java/org/example/dto"
@@ -1786,6 +2082,25 @@ def test_coding_rework_context_includes_previous_revision():
     assert '"content":"A = 1\\n"' in messages[-1]["content"]
 
 
+def test_coding_apply_failure_context_requires_whole_file_operations():
+    from app.services.workflow_engine import _coding_phase_messages
+
+    plan = PlanResponse(files=[PlanFile(path="src/a.py", nature="modified", description="Fix A")])
+    messages = _coding_phase_messages(
+        [],
+        plan,
+        {
+            "decision": "request_recoding",
+            "client_feedback": {"kind": "apply_failed", "summary": "Patch context mismatch"},
+        },
+    )
+
+    context = messages[-1]["content"]
+    assert '"kind":"apply_failed"' in context
+    assert "do not return patch_ops again" in context
+    assert "complete update_file/create_file ops" in context
+
+
 def test_reviewer_verification_requests_are_capability_bounded():
     from app.services.reviewer import _normalize_review
 
@@ -1807,6 +2122,28 @@ def test_reviewer_verification_requests_are_capability_bounded():
     ]
 
 
+def test_reviewer_prompt_requires_authoritative_project_verification(monkeypatch):
+    import app.services.reviewer as reviewer_service
+
+    captured: list[dict] = []
+
+    class FakeReviewerClient:
+        def chat_json(self, messages):
+            captured.extend(messages)
+            return {
+                "decision": "approve",
+                "summary": "Ready to apply.",
+                "verification_tool_requests": [],
+            }
+
+    monkeypatch.setattr(reviewer_service, "get_llm_client", lambda agent: FakeReviewerClient())
+    reviewer_service.Reviewer().review({"client_capabilities": {"tools": ["run_command"]}})
+
+    system_prompt = captured[0]["content"]
+    assert "authoritative project-native" in system_prompt
+    assert "Never use source-printing or text-matching commands" in system_prompt
+
+
 def test_workflow_filters_reviewer_tools_against_client_capabilities():
     from app.services.workflow_engine import _allowed_client_tool_requests
 
@@ -1819,6 +2156,39 @@ def test_workflow_filters_reviewer_tools_against_client_capabilities():
     )
 
     assert [request.id for request in requests] == ["syntax"]
+
+
+def test_workflow_normalizes_client_command_cwd_to_project_relative_path():
+    from app.services.workflow_engine import _allowed_client_tool_requests
+
+    requests = _allowed_client_tool_requests(
+        [
+            {"id": "root-name", "tool": "run_command", "args": {"command": ["build"], "cwd": "sample"}},
+            {
+                "id": "absolute-root",
+                "tool": "run_command",
+                "args": {"command": ["build"], "cwd": "C:/workspace/sample"},
+            },
+            {
+                "id": "nested",
+                "tool": "run_command",
+                "args": {"command": ["build"], "cwd": "sample/backend"},
+            },
+            {
+                "id": "escape",
+                "tool": "run_command",
+                "args": {"command": ["build"], "cwd": "../outside"},
+            },
+        ],
+        {"tools": ["run_command"]},
+        project_root="C:/workspace/sample",
+    )
+
+    assert [(request.id, request.args["cwd"]) for request in requests] == [
+        ("root-name", ""),
+        ("absolute-root", ""),
+        ("nested", "backend"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1864,7 +2234,7 @@ async def test_execute_repairs_model_protocol_errors(monkeypatch, tmp_path):
 
     assert execute_response.status_code == 200
     executed = execute_response.json()
-    assert fake_executor.calls == 2
+    assert fake_executor.calls == 3
     assert executed["ok"] is True
     assert executed["ops"][0]["path"] == "src/domain/a.py"
     assert executed["status_key"] == "ready_to_apply"

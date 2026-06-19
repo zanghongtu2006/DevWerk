@@ -213,7 +213,8 @@ def kanban_task_action(task_id: str, req: WorkflowActionRequest):
     try:
         result_cursor = _latest_artifact_created_at(task_id, "workflow_result")
         result = apply_workflow_action(task_id, req.action, req.payload)
-        resume = _maybe_resume_after_apply_result(task_id, req.action, req.payload, result_cursor)
+        resume_status = str((result.get("task") or {}).get("status_key") or "")
+        resume = _maybe_resume_after_apply_result(task_id, req.action, req.payload, result_cursor, resume_status)
         if resume:
             result["workflow_resume"] = resume
         return result
@@ -253,11 +254,14 @@ def _maybe_resume_after_apply_result(
     action: str,
     payload: dict[str, Any],
     result_cursor: str | None,
+    resume_status: str,
 ) -> dict[str, Any] | None:
     if str(action or "").strip().lower().replace("-", "_") != "apply_result":
         return None
     verification = payload.get("verification") if isinstance(payload, dict) else None
-    if not verification_has_policy(verification) or not verification_failed(verification):
+    apply_failed = not bool(payload.get("ok", True))
+    verification_did_fail = verification_has_policy(verification) and verification_failed(verification)
+    if not apply_failed and not verification_did_fail:
         return None
 
     body = _latest_artifact_payload(task_id, "workflow_request_body")
@@ -267,15 +271,29 @@ def _maybe_resume_after_apply_result(
 
     body = dict(body)
     body["task_id"] = task_id
-    body["verification_feedback"] = verification
+    body["resume_status"] = resume_status
+    reason = "apply_failed" if apply_failed else "verification_failed"
+    if apply_failed:
+        body["client_feedback"] = {
+            "kind": "apply_failed",
+            "summary": str(payload.get("error_message") or "Client failed to apply generated changes."),
+            "changed_paths": payload.get("changed_paths") or [],
+        }
+    else:
+        body["verification_feedback"] = dict(verification or {})
+        body["verification_feedback"]["applied_changed_paths"] = payload.get("changed_paths") or []
     body.setdefault("messages", [])
 
-    add_artifact(task_id, artifact_type="verification_feedback", payload={"verification": verification})
+    add_artifact(
+        task_id,
+        artifact_type="client_feedback" if apply_failed else "verification_feedback",
+        payload=body.get("client_feedback") or {"verification": verification},
+    )
     add_event(
         task_id,
         "workflow_resume_queued",
         {
-            "reason": "verification_failed",
+            "reason": reason,
             "result_after": result_cursor,
         },
     )
@@ -285,7 +303,7 @@ def _maybe_resume_after_apply_result(
     query = f"?result_after={quote(result_cursor or '')}" if result_cursor else ""
     return {
         "ok": True,
-        "reason": "verification_failed",
+        "reason": reason,
         "poll_url": f"/v1/workflows/{task_id}{query}",
         "events_url": f"/v1/workflows/{task_id}/events{query}",
         "result_after": result_cursor,

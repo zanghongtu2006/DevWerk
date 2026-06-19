@@ -524,6 +524,13 @@ async def ide_execute(request: Request) -> IdeChatResponse:
         _workspace_debug_summary(body.get("workspace")),
     )
     messages = _append_workspace_context(messages, body.get("workspace"))
+    if isinstance(body.get("client_capabilities"), dict):
+        messages.append(
+            {
+                "role": "user",
+                "content": "client_capabilities:\n" + json.dumps(body["client_capabilities"], ensure_ascii=False),
+            }
+        )
     _log.debug("ide_execute: messages_after_workspace_context=%s", len(messages))
 
     approved_set = _approved_path_set(approved_paths, body.get("project_root"))
@@ -556,6 +563,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
     tool_results_by_id: dict[str, ToolResult] = {}
     candidate_ops: dict[str, dict] = {}
     candidate_patch_ops: list[dict] = []
+    protocol_error_count = 0
     project_settings_payload = get_project_settings(str(body.get("project_id") or "default"))
     project_settings = project_settings_payload.get("settings") if isinstance(project_settings_payload, dict) else {}
     parameters = project_settings.get("parameters") if isinstance(project_settings, dict) else {}
@@ -592,6 +600,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                         )
                     )
                 except ModelResponseValidationError as exc:
+                    protocol_error_count += 1
                     invalid_obj = exc.obj if isinstance(exc.obj, dict) else {}
                     summary = _model_response_summary(invalid_obj)
                     _kanban_event(
@@ -625,7 +634,10 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                                     {
                                         "error": str(exc),
                                         "required_action": (
-                                            "Return one valid DevWerk JSON object. If using patch_ops, content must be unified diff "
+                                            "Do not use patch_ops again in this coding session. Return ops with update_file and the "
+                                            "complete file content for existing-file edits. Stay within approved paths."
+                                            if protocol_error_count >= 2 and "patch_ops" in str(exc)
+                                            else "Return one valid DevWerk JSON object. If using patch_ops, content must be unified diff "
                                             "with --- / +++ / @@ markers. If requesting search, use args.query or args.pattern. "
                                             "If requesting read_file, include args.path."
                                         ),

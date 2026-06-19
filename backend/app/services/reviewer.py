@@ -24,7 +24,7 @@ class Reviewer:
             "plan": payload.get("plan"),
             "candidate_revision": payload.get("candidate_revision"),
             "workspace_summary": payload.get("workspace_summary"),
-            "verification_feedback": payload.get("verification_feedback"),
+            "previous_revision_verification_feedback": payload.get("verification_feedback"),
             "client_capabilities": payload.get("client_capabilities"),
         }
         messages = [
@@ -34,12 +34,20 @@ class Reviewer:
                     "You are DevWerk's REVIEWER agent. Review the candidate code change against the user request and plan. "
                     "Do not require every candidate plan path to change. Focus on correctness, completeness, compatibility, "
                     "security, and whether client-side verification is needed. Do not reject a semantically plausible candidate "
-                    "only because it has not been compiled or tested yet. Instead approve it for snapshot-protected apply and return "
+                    "because previous_revision_verification_feedback still contains errors: those results describe the previously "
+                    "applied revision and are evidence the current candidate is expected to repair, not validation of the current candidate. "
+                    "Do not reject a candidate only because it has not been compiled or tested yet. Instead approve it for "
+                    "snapshot-protected apply and return "
                     "verification_tool_requests[] using only tools declared in client_capabilities. The model must select commands from "
-                    "project evidence; commands must be project-relative and non-destructive. Return JSON only with decision "
+                    "project evidence; commands must be project-relative and non-destructive. Prefer one authoritative project-native "
+                    "build, test, typecheck, lint, or IDE diagnostic operation inferred from manifests and workspace evidence. Never use "
+                    "source-printing or text-matching commands such as cat, type, grep, or findstr as verification; source content is review "
+                    "evidence, not an executable check. If no authoritative operation can be inferred, return no verification request "
+                    "instead of inventing an ad-hoc assertion. Return JSON only with decision "
                     "(approve|request_recoding|request_replan|fail), summary, findings[], required_changes[], warnings[], and "
                     "verification_tool_requests:[{id,tool,args}]. Use request_replan only when the plan or approved path boundary is "
-                    "wrong; use request_recoding only for a concrete code defect, not for missing runtime evidence."
+                    "wrong; use request_recoding for any concrete, repairable code defect. Use fail only when no code revision can possibly "
+                    "satisfy the task, never merely because the current candidate is wrong or incomplete."
                 ),
             },
             {"role": "user", "content": json.dumps(prompt, ensure_ascii=False, separators=(",", ":"))},

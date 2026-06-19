@@ -56,6 +56,11 @@ class Planner:
         "  7. Do NOT output any ops, patch_ops, or tool_requests in your final response.\n"
         "  8. summary is one line; warnings[] lists any risky or missing context.\n"
     )
+    FINAL_SYNTHESIS_INSTRUCTION = (
+        "The planner research budget is complete. Produce the final file-level plan now using the source_map and "
+        "all tool_results already in this conversation. Do not request more tools. Include only writable files that "
+        "the coder should change; record remaining uncertainty in warnings."
+    )
 
     def __init__(self, agent_name: str = "planner", event_sink: Callable[[str, dict[str, Any]], None] | None = None):
         self.agent_name = agent_name
@@ -73,6 +78,7 @@ class Planner:
         max_rounds = 4
         backoff = 0.5
         last_plan: PlanResponse | None = None
+        used_tools = False
 
         for attempt in range(max_rounds):
             try:
@@ -126,6 +132,7 @@ class Planner:
 
                 tool_requests = _extract_tool_requests(result, conversation, project_root=project_root)
                 if tool_requests:
+                    used_tools = True
                     self._emit_event(
                         "plan_tool_requests",
                         {
@@ -170,7 +177,21 @@ class Planner:
                     ]
                     continue
 
-                return plan
+                raw_text = str(result.get("raw_text") or result.get("reply") or result.get("content") or "").strip()
+                conversation = conversation + [
+                    {"role": "assistant", "content": raw_text or "No structured planner output was produced."},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your previous response was neither a valid tool request nor a file-level plan. "
+                            "Continue this same planning session. Respond only with tool_requests JSON if more "
+                            "evidence is required, or with the final plan JSON if the evidence is sufficient."
+                        ),
+                    },
+                ]
+                if attempt < max_rounds - 1:
+                    continue
+                break
             except Exception as exc:  # noqa: BLE001
                 retryable = is_retryable_llm_error(exc)
                 if attempt < max_rounds - 1 and retryable:
@@ -197,6 +218,109 @@ class Planner:
                 )
 
         if last_plan is not None:
+            final_round = max_rounds + 1
+            final_conversation = conversation + [{"role": "user", "content": self.FINAL_SYNTHESIS_INSTRUCTION}]
+            try:
+                _log.debug("Planner.plan: final_synthesis_round=%s calling_llm", final_round)
+                self._emit_event(
+                    "plan_llm_round_started",
+                    {
+                        "round": final_round,
+                        "max_rounds": final_round,
+                        "mode": mode,
+                        "agent": self.agent_name,
+                        "final_synthesis": True,
+                        "input": {"message_count": len(final_conversation)},
+                    },
+                )
+                result = self._call_llm(final_conversation)
+                self._emit_event(
+                    "plan_llm_round_result",
+                    {
+                        "round": final_round,
+                        "agent": self.agent_name,
+                        "final_synthesis": True,
+                        "output": _raw_result_summary(result),
+                    },
+                )
+                final_plan = self._extract_plan(result, final_conversation)
+                self._emit_event(
+                    "plan_llm_round_extracted",
+                    {
+                        "round": final_round,
+                        "agent": self.agent_name,
+                        "final_synthesis": True,
+                        "result": {
+                            "ok": final_plan.ok,
+                            "file_count": len(final_plan.files),
+                            "files": [item.path for item in final_plan.files],
+                            "warnings": final_plan.warnings,
+                            "summary": final_plan.summary,
+                            "error_code": final_plan.error_code,
+                        },
+                    },
+                )
+                if final_plan.ok or final_plan.error_code == "PLAN_DIRECTORY_PATHS":
+                    return final_plan
+                raw_text = str(result.get("raw_text") or result.get("reply") or result.get("content") or "").strip()
+                if raw_text:
+                    source_paths = sorted(_source_map_paths(final_conversation))
+                    repair_messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Convert the supplied planner analysis into one JSON object with this exact shape: "
+                                '{"plan":{"files":[{"path":"...","nature":"modified|new|deleted",'
+                                '"intent":"modify|create|delete","required":true|false,"description":"...",'
+                                '"confidence":0.0}],"summary":"...","warnings":[]}}. '
+                                "Do not request tools. Do not add a path unless it appears in allowed_paths. "
+                                "Reference-only files must not be included in files."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": json.dumps(
+                                {"allowed_paths": source_paths, "planner_analysis": raw_text},
+                                ensure_ascii=False,
+                            ),
+                        },
+                    ]
+                    _log.debug(
+                        "Planner.plan: final_format_repair calling_llm analysis_chars=%s allowed_paths=%s",
+                        len(raw_text),
+                        len(source_paths),
+                    )
+                    self._emit_event(
+                        "plan_format_repair_started",
+                        {"round": final_round + 1, "agent": self.agent_name, "analysis_chars": len(raw_text)},
+                    )
+                    repaired_result = self._call_llm(repair_messages)
+                    repaired_plan = self._extract_plan(repaired_result, final_conversation)
+                    self._emit_event(
+                        "plan_format_repair_completed",
+                        {
+                            "round": final_round + 1,
+                            "agent": self.agent_name,
+                            "ok": repaired_plan.ok,
+                            "files": [item.path for item in repaired_plan.files],
+                            "error_code": repaired_plan.error_code,
+                        },
+                    )
+                    if repaired_plan.ok or repaired_plan.error_code == "PLAN_DIRECTORY_PATHS":
+                        return repaired_plan
+                    final_plan = repaired_plan
+                last_plan = final_plan
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("Planner final synthesis failed: %s", exc)
+                return PlanResponse(
+                    ok=False,
+                    files=[],
+                    error_code=llm_error_code(exc, "PLAN_ERROR"),
+                    error_message=llm_error_message(exc),
+                )
+
+            if not used_tools:
+                return last_plan
             return PlanResponse(
                 ok=False,
                 files=[],
@@ -321,6 +445,8 @@ def _raw_result_summary(raw: dict) -> dict[str, Any]:
 def _extract_tool_requests(raw: dict, messages: list[dict], project_root: str | None = None) -> list[ToolRequest]:
     source_paths = _source_map_paths(messages)
     raw_requests: list[dict[str, Any]] = []
+    if isinstance(raw, dict) and (raw.get("tool") or raw.get("name")):
+        raw_requests.append(raw)
     if isinstance(raw, dict) and isinstance(raw.get("tool_requests"), list):
         raw_requests.extend(item for item in raw["tool_requests"] if isinstance(item, dict))
 
@@ -551,6 +677,10 @@ def _normalize_tool_path(value: object, *, source_paths: set[str], project_root:
     root = str(project_root or "").strip().replace("\\", "/").rstrip("/")
     if root and text.lower().startswith(root.lower() + "/"):
         text = text[len(root) + 1 :]
+    elif root:
+        root_name = root.rsplit("/", 1)[-1]
+        if root_name and text.lower().startswith(root_name.lower() + "/"):
+            text = text[len(root_name) + 1 :]
 
     source_match = _source_path_suffix_match(text, source_paths)
     if source_match:
@@ -784,12 +914,19 @@ def _fallback_plan(raw: dict, messages: list[dict]) -> PlanResponse:
 
 
 def _last_user_text(messages: list[dict]) -> str:
+    internal_prefixes = (
+        "workspace_summary:",
+        "code_context_summary:",
+        "code_context_skill:",
+        "tool_results:",
+        "request_meta:",
+        "workflow_replan_feedback:",
+        "workflow_phase_context:",
+    )
     for item in reversed(messages):
         if isinstance(item, dict) and str(item.get("role") or "").lower() == "user":
             content = str(item.get("content") or "")
-            if not content.startswith(
-                ("workspace_summary:", "code_context_summary:", "code_context_skill:", "tool_results:", "request_meta:")
-            ):
+            if not content.startswith(internal_prefixes):
                 return content
     return ""
 

@@ -138,7 +138,14 @@ object PatchApplier {
 
         var srcIndex = 0
         for (h in hunks) {
-            val hunkStartIndex = (h.oldStart.coerceAtLeast(1) - 1).coerceAtMost(src.size)
+            val expectedStart = (h.oldStart.coerceAtLeast(1) - 1).coerceAtMost(src.size)
+            val oldSequence = h.lines.mapNotNull { line ->
+                when (line.firstOrNull()) {
+                    ' ', '-' -> line.substring(1)
+                    else -> null
+                }
+            }
+            val hunkStartIndex = locateHunk(src, oldSequence, expectedStart, srcIndex)
 
             while (srcIndex < hunkStartIndex) {
                 dst += src[srcIndex]
@@ -157,23 +164,22 @@ object PatchApplier {
 
                 when (tag) {
                     ' ' -> {
-                        if (srcIndex < src.size) {
-                            dst += src[srcIndex]
-                            srcIndex++
-                        } else {
-                            dst += payload
+                        require(srcIndex < src.size && src[srcIndex] == payload) {
+                            "Patch context mismatch at source line ${srcIndex + 1}"
                         }
+                        dst += src[srcIndex]
+                        srcIndex++
                     }
                     '-' -> {
-                        if (srcIndex < src.size) srcIndex++
+                        require(srcIndex < src.size && src[srcIndex] == payload) {
+                            "Patch removal mismatch at source line ${srcIndex + 1}"
+                        }
+                        srcIndex++
                     }
                     '+' -> {
                         dst += payload
                     }
-                    else -> {
-                        // 未知行，按原样加入，避免丢信息
-                        dst += dl
-                    }
+                    else -> throw IllegalArgumentException("Invalid unified diff line: $dl")
                 }
             }
         }
@@ -185,6 +191,22 @@ object PatchApplier {
 
         // 统一以 \n 结尾（更符合补丁预期）
         return dst.joinToString("\n").let { if (it.endsWith("\n")) it else it + "\n" }
+    }
+
+    private fun locateHunk(src: List<String>, sequence: List<String>, expected: Int, minimum: Int): Int {
+        if (sequence.isEmpty()) return expected.coerceAtLeast(minimum)
+        val lastStart = src.size - sequence.size
+        require(lastStart >= minimum) { "Patch hunk is larger than the remaining source" }
+
+        fun matches(start: Int): Boolean = sequence.indices.all { offset -> src[start + offset] == sequence[offset] }
+        if (expected in minimum..lastStart && matches(expected)) return expected
+
+        val candidates = (minimum..lastStart).filter(::matches)
+        require(candidates.size == 1) {
+            if (candidates.isEmpty()) "Patch context does not match the current file"
+            else "Patch context is ambiguous in the current file"
+        }
+        return candidates.single()
     }
 
     private fun normalizePatchPath(p: String): String {

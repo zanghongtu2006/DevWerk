@@ -101,13 +101,19 @@ class WorkflowEngine:
                 task_id,
                 "workflow_resumed",
                 {
-                    "reason": "verification_failed",
+                    "reason": "apply_failed" if body.get("client_feedback") else "verification_failed",
                     "has_previous_plan": state.plan_response is not None,
                     "summary": resume_feedback.get("summary"),
                 },
             )
 
-        current = _resume_column(definition, state) if resume_feedback else executable[0]
+        resume_status = str(body.get("resume_status") or "").strip().lower()
+        resume_column = definition.column(resume_status) if resume_status else None
+        current = (
+            resume_column
+            if resume_feedback and resume_column is not None and resume_column.executable
+            else (_resume_column(definition, state) if resume_feedback else executable[0])
+        )
         if resume_action == "confirm_plan" and state.plan_response is not None:
             current = _column_for_agent(definition, "coder") or current
             update_conversation(task_id, state="running", waiting_for=None, active_column=current.status_key)
@@ -356,12 +362,25 @@ class WorkflowEngine:
             },
         )
         conversation_context = prepare_conversation_context(task_id, fallback_messages=body.get("messages") or [])
+        plan_messages = list(conversation_context.get("messages") or body.get("messages") or [])
+        if state.review_feedback:
+            replan_feedback = {
+                "review": _compact_review_feedback(state.review_feedback),
+                "verification": _compact_verification_feedback(state.review_feedback),
+            }
+            plan_messages.append(
+                {
+                    "role": "user",
+                    "content": "workflow_replan_feedback:\n"
+                    + json.dumps(replan_feedback, ensure_ascii=False),
+                }
+            )
         _event(task_id, "agent_prompt_context_prepared", {"phase": column.status_key, **context_debug_payload(conversation_context)})
         plan_response = await self.plan_runner(
             dict(
                 body,
                 task_id=task_id,
-                messages=conversation_context.get("messages") or body.get("messages") or [],
+                messages=plan_messages,
                 _workflow_engine_managed=True,
             )
         )
@@ -399,7 +418,6 @@ class WorkflowEngine:
             action,
             {"phase": column.status_key, "files": len(plan_response.files), "session_id": plan_response.session_id},
         )
-        state.review_feedback = None
         _event(task_id, "workflow_column_completed", {"status_key": column.status_key, "agent": agent, "decision": "approve"})
         if _requires_plan_confirmation(body):
             reply = _plan_confirmation_text(plan_response)
@@ -478,6 +496,7 @@ class WorkflowEngine:
             "workspace": body.get("workspace"),
             "approved_paths": approved_paths,
             "approved_ops": [],
+            "client_capabilities": body.get("client_capabilities") or {},
             "_workflow_engine_managed": True,
         }
         _event(
@@ -494,6 +513,11 @@ class WorkflowEngine:
         )
         execute_response = await self.coding_runner(execute_body)
         execute_response.task_id = task_id
+        execute_response.tool_requests = _allowed_client_tool_requests(
+            [request.model_dump() for request in execute_response.tool_requests],
+            body.get("client_capabilities"),
+            project_root=body.get("project_root"),
+        )
         state.execute_response = execute_response
         changed_paths = [op.path for op in execute_response.ops] + _patch_paths(execute_response)
         revision = create_revision(
@@ -546,7 +570,16 @@ class WorkflowEngine:
         _event(task_id, "workflow_column_started", {"status_key": column.status_key, "agent": agent})
         context = _build_agent_context(task_id, column.status_key, agent, body, workflow_summary, column.input_artifacts or [])
         _event(task_id, "agent_context_built", {"phase": column.status_key, "agent": agent, "context": _context_log_summary(context)})
-        review_result = _review_result(state.plan_response, state.execute_response)
+        prior_changed_paths = (
+            state.review_feedback.get("applied_changed_paths") or []
+            if isinstance(state.review_feedback, dict)
+            else []
+        )
+        review_result = _review_result(
+            state.plan_response,
+            state.execute_response,
+            prior_changed_paths=prior_changed_paths,
+        )
         protocol_decision = review_result["decision"]
         semantic_review: dict[str, Any] | None = None
         if protocol_decision == "approve" and self.review_runner is not None:
@@ -561,11 +594,18 @@ class WorkflowEngine:
                 }
             )
             semantic_decision = str(semantic_review.get("decision") or "approve").strip().lower()
+            if semantic_decision == "fail":
+                semantic_decision = "request_recoding"
+                semantic_review["decision"] = semantic_decision
+                semantic_review["warnings"] = list(semantic_review.get("warnings") or []) + [
+                    "Terminal reviewer failure was converted to recoding because the candidate can be revised."
+                ]
             if semantic_decision in {"approve", "request_recoding", "request_replan", "fail"}:
                 review_result["decision"] = semantic_decision
             verification_requests = _allowed_client_tool_requests(
                 semantic_review.get("verification_tool_requests"),
                 body.get("client_capabilities"),
+                project_root=body.get("project_root"),
             )
             if verification_requests:
                 by_id = {request.id: request for request in state.execute_response.tool_requests}
@@ -590,6 +630,7 @@ class WorkflowEngine:
             "protocol_decision": protocol_decision,
             "semantic_review": semantic_review,
             "verification_tool_requests": [request.model_dump() for request in state.execute_response.tool_requests],
+            "applied_changed_paths": prior_changed_paths,
         }
         state.review_feedback = review_bundle
         _log.debug(
@@ -718,6 +759,7 @@ def _coding_phase_messages(
             "For nature=deleted, emit a delete_path operation when the file should be removed.",
             "If review_feedback is present, continue from previous_revision and address semantic defects or unplanned_changed_files before returning done=true.",
             "If verification_feedback is present, fix the reported compile/test/tool errors before returning done=true.",
+            "If review_feedback.client_feedback.kind is apply_failed, do not return patch_ops again. Read each target file and return complete update_file/create_file ops so the client can apply the revision deterministically.",
             "If a required file is not actually needed anymore, explain why in reply and avoid inventing unrelated paths.",
         ],
     }
@@ -741,7 +783,12 @@ def _compact_previous_revision(response: IdeChatResponse | None) -> dict[str, An
     }
 
 
-def _allowed_client_tool_requests(value: object, capabilities: object) -> list[ToolRequest]:
+def _allowed_client_tool_requests(
+    value: object,
+    capabilities: object,
+    *,
+    project_root: object = None,
+) -> list[ToolRequest]:
     tools = capabilities.get("tools") if isinstance(capabilities, dict) else None
     allowed = {str(tool).strip() for tool in tools or [] if str(tool).strip()} if isinstance(tools, list) else set()
     if not isinstance(value, list) or not allowed:
@@ -755,6 +802,11 @@ def _allowed_client_tool_requests(value: object, capabilities: object) -> list[T
             request = ToolRequest.model_validate(item)
         except Exception:  # noqa: BLE001
             continue
+        if request.tool == "run_command" and "cwd" in request.args:
+            normalized_cwd = _normalize_client_cwd(request.args.get("cwd"), project_root)
+            if normalized_cwd is None:
+                continue
+            request.args["cwd"] = normalized_cwd
         if request.id in seen_ids:
             continue
         requests.append(request)
@@ -762,6 +814,28 @@ def _allowed_client_tool_requests(value: object, capabilities: object) -> list[T
         if len(requests) >= 8:
             break
     return requests
+
+
+def _normalize_client_cwd(value: object, project_root: object) -> str | None:
+    cwd = str(value or "").strip().replace("\\", "/").rstrip("/")
+    root = str(project_root or "").strip().replace("\\", "/").rstrip("/")
+    if cwd in {"", "."}:
+        return ""
+    if root and cwd.lower() == root.lower():
+        return ""
+    root_name = root.rsplit("/", 1)[-1] if root else ""
+    if root_name and cwd.lower() == root_name.lower():
+        return ""
+    if root and cwd.lower().startswith(root.lower() + "/"):
+        cwd = cwd[len(root) + 1 :]
+    elif root_name and cwd.lower().startswith(root_name.lower() + "/"):
+        cwd = cwd[len(root_name) + 1 :]
+    if cwd.startswith("/") or (len(cwd) >= 2 and cwd[1] == ":"):
+        return None
+    parts = [part for part in cwd.split("/") if part not in {"", "."}]
+    if ".." in parts:
+        return None
+    return "/".join(parts)
 
 
 def _compact_review_feedback(review_feedback: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -775,6 +849,7 @@ def _compact_review_feedback(review_feedback: dict[str, Any] | None) -> dict[str
         "unplanned_changed_files": review_feedback.get("unplanned_changed_files") or [],
         "normalized_plan_files": review_feedback.get("normalized_plan_files") or [],
         "normalized_changed_files": review_feedback.get("normalized_changed_files") or [],
+        "client_feedback": review_feedback.get("client_feedback"),
     }
 
 
@@ -789,10 +864,18 @@ def _compact_verification_feedback(review_feedback: dict[str, Any] | None) -> di
         "required": verification.get("required") or [],
         "results": verification.get("results") or {},
         "tool_results": verification.get("tool_results") or [],
+        "applied_changed_paths": review_feedback.get("applied_changed_paths") or [],
     }
 
 
 def _verification_resume_feedback(body: dict[str, Any]) -> dict[str, Any] | None:
+    client_feedback = body.get("client_feedback")
+    if isinstance(client_feedback, dict):
+        return {
+            "decision": "request_recoding",
+            "summary": str(client_feedback.get("summary") or "Client failed to apply the generated changes."),
+            "client_feedback": client_feedback,
+        }
     verification = body.get("verification_feedback")
     if not isinstance(verification, dict):
         return None
@@ -800,6 +883,7 @@ def _verification_resume_feedback(body: dict[str, Any]) -> dict[str, Any] | None
         "decision": "request_recoding",
         "summary": verification_feedback_summary(verification),
         "verification": verification,
+        "applied_changed_paths": verification.get("applied_changed_paths") or [],
     }
 
 
@@ -882,7 +966,12 @@ def _waiting_response(
     )
 
 
-def _review_result(plan_response: PlanResponse, execute_response: IdeChatResponse) -> dict[str, Any]:
+def _review_result(
+    plan_response: PlanResponse,
+    execute_response: IdeChatResponse,
+    *,
+    prior_changed_paths: list[str] | None = None,
+) -> dict[str, Any]:
     writable_files = [file for file in plan_response.files if file.intent != "inspect"]
     planned_paths = {_normalize_review_path(file.path) for file in writable_files if file.path}
     required_paths = {_normalize_review_path(file.path) for file in writable_files if file.path and file.required}
@@ -891,8 +980,11 @@ def _review_result(plan_response: PlanResponse, execute_response: IdeChatRespons
         for path in ([op.path for op in execute_response.ops] + _patch_paths(execute_response))
         if path
     }
-    missing_changed_files = sorted(planned_paths - changed_paths)
-    required_missing_files = sorted(required_paths - changed_paths)
+    completed_paths = changed_paths | {
+        _normalize_review_path(path) for path in list(prior_changed_paths or []) if path
+    }
+    missing_changed_files = sorted(planned_paths - completed_paths)
+    required_missing_files = sorted(required_paths - completed_paths)
     unplanned_changed_files = sorted(changed_paths - planned_paths)
 
     if execute_response.tool_requests and not changed_paths:
