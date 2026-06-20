@@ -177,13 +177,13 @@ class AnthropicClient:
                 cleaned = cleaned[4:].strip()
 
         try:
-            return json.loads(cleaned)
+            return _normalize_top_level_json(json.loads(cleaned), cleaned)
         except json.JSONDecodeError as first_exc:
             start = cleaned.find("{")
             end = cleaned.rfind("}")
             if start >= 0 and end > start:
                 try:
-                    return json.loads(cleaned[start:end + 1])
+                    return _normalize_top_level_json(json.loads(cleaned[start:end + 1]), cleaned)
                 except json.JSONDecodeError:
                     pass
             _log.debug(
@@ -192,6 +192,52 @@ class AnthropicClient:
                 cleaned[:500],
             )
             return {"raw_text": cleaned, "reply": cleaned}
+
+
+def _normalize_top_level_json(value: Any, raw_text: str) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, list):
+        return {"raw_text": raw_text, "reply": raw_text}
+
+    if len(value) == 1 and isinstance(value[0], dict) and any(
+        key in value[0] for key in ("reply", "ops", "tool_requests", "patch_ops", "done")
+    ):
+        _log.debug("Anthropic-compatible API returned a single-item envelope array; unwrapping it")
+        return value[0]
+
+    if value and all(isinstance(item, dict) and item.get("op") in {"create_dir", "create_file", "update_file", "delete_path"} and item.get("path") for item in value):
+        _log.debug("Anthropic-compatible API returned a top-level file-op array; normalizing count=%s", len(value))
+        return {
+            "reply": "Generated file operations.",
+            "code_tree": None,
+            "ops": [
+                {
+                    "op": item.get("op"),
+                    "path": item.get("path"),
+                    "language": item.get("language"),
+                    "content": item.get("content"),
+                }
+                for item in value
+            ],
+            "tool_requests": [],
+            "patch_ops": [],
+            "done": True,
+        }
+
+    if value and all(isinstance(item, dict) and item.get("tool") for item in value):
+        _log.debug("Anthropic-compatible API returned a top-level tool-request array; normalizing count=%s", len(value))
+        return {
+            "reply": "",
+            "code_tree": None,
+            "ops": [],
+            "tool_requests": value,
+            "patch_ops": [],
+            "done": False,
+        }
+
+    _log.warning("Anthropic-compatible API returned an unsupported top-level JSON array; using raw_text fallback count=%s", len(value))
+    return {"raw_text": raw_text, "reply": raw_text}
 
 
 def _has_structured_output(obj: dict[str, Any]) -> bool:

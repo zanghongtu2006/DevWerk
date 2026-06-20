@@ -7,6 +7,7 @@ is `coder`, but planner/executor can already be bound to different profiles.
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any
 
@@ -16,6 +17,8 @@ from app.services.ollama_client import OllamaClient
 from app.services.openai_client import OpenAIClient
 from app.services.provider_errors import LLMProviderError
 from app.services.usage import record_llm_usage
+
+_log = logging.getLogger("devwerk.llm_factory")
 
 
 def get_llm_client(agent: str = "coder") -> "UsageTrackedClient":
@@ -71,12 +74,15 @@ class UsageTrackedClient:
             raise
         finally:
             duration_ms = int((time.monotonic() - started) * 1000)
-            record_llm_usage(
-                agent_name=str(self._config.get("agent") or "coder"),
-                provider=str(self._config.get("protocol") or self._config.get("api_name") or "unknown"),
-                model=str(self._config.get("model") or "unknown"),
-                usage=getattr(self._client, "last_usage", None),
-                duration_ms=duration_ms,
-                success=success,
-                error_type=error_type,
-            )
+            try:
+                record_llm_usage(
+                    agent_name=str(self._config.get("agent") or "coder"),
+                    provider=str(self._config.get("protocol") or self._config.get("api_name") or "unknown"),
+                    model=str(self._config.get("model") or "unknown"),
+                    usage=getattr(self._client, "last_usage", None),
+                    duration_ms=duration_ms,
+                    success=success,
+                    error_type=error_type,
+                )
+            except Exception as usage_error:  # noqa: BLE001
+                _log.exception("usage telemetry failed and was ignored: %s", usage_error)

@@ -367,8 +367,8 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         while (true) {
             if (!isReadyToApply(current)) return current
             val snapshotCtx = runner.beginSnapshot(devCtx)
-            runner.recordFinalSummaryAndBackup(project, snapshotCtx, current)
             val actionResponse = runCatching {
+                runner.recordFinalSummaryAndBackup(project, snapshotCtx, current)
                 ApplicationManager.getApplication().invokeAndWait {
                     runner.applyResponse(project, snapshotCtx, current)
                 }

@@ -34,6 +34,12 @@ The IntelliJ client stores the complete interaction log at
 conversation turns are grouped without allowing later recoding rounds to
 overwrite an earlier safety snapshot.
 
+Before snapshots are based on the current filesystem, not the model-provided
+operation label. An existing target is backed up even when a model incorrectly
+labels the operation `create_file`. `before/manifest.json` records every target
+and whether it existed; the client verifies all required backups and blocks the
+write if the manifest or any existing-file backup is missing.
+
 Old messages are compacted into a rolling summary when the project context
 budget is exceeded. Recent turns remain verbatim. Project memory receives only
 compact reusable engineering facts, never the raw transcript.

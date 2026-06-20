@@ -2630,6 +2630,44 @@ def test_anthropic_non_json_text_does_not_generate_framework_ops(monkeypatch):
     assert response["raw_model_text"]
 
 
+def test_minimax_top_level_file_op_array_is_normalized():
+    response = AnthropicClient._parse_json_object(
+        '[{"op":"create_file","path":"src/main.py","language":"python","content":"print(1)\\n"}]'
+    )
+
+    assert response["done"] is True
+    assert response["ops"] == [
+        {"op": "create_file", "path": "src/main.py", "language": "python", "content": "print(1)\n"}
+    ]
+
+
+def test_minimax_top_level_tool_array_is_normalized():
+    response = AnthropicClient._parse_json_object(
+        '[{"id":"read-1","tool":"read_file","args":{"path":"src/main.py"}}]'
+    )
+
+    assert response["done"] is False
+    assert response["tool_requests"][0]["tool"] == "read_file"
+
+
+def test_usage_telemetry_failure_does_not_hide_llm_result(monkeypatch):
+    import app.services.llm_factory as llm_factory
+
+    class SuccessfulClient:
+        last_usage = {"input_tokens": 1, "output_tokens": 1}
+
+        def chat_json(self, messages):
+            return {"reply": "ok"}
+
+    monkeypatch.setattr(llm_factory, "record_llm_usage", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("db unavailable")))
+    client = llm_factory.UsageTrackedClient(
+        SuccessfulClient(),
+        {"agent": "planner", "protocol": "anthropic", "model": "M3"},
+    )
+
+    assert client.chat_json([]) == {"reply": "ok"}
+
+
 def test_minimax_anthropic_529_is_retryable_overloaded_error():
     response = requests.Response()
     response.status_code = 529

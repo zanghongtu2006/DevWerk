@@ -94,8 +94,17 @@ class DevwerkOperationRunner {
             }
         }
 
-        val beforeTargets = collectBeforeTargets(response.ops, patchPaths)
-        snapshotTo(ctx, beforeTargets, slot = "before", reason = "before")
+        val beforeTargets = SnapshotGuard.mutationTargets(response.ops, patchPaths)
+            .filter { !hasHiddenDirSegment(it.path) }
+        val records = SnapshotGuard.captureBefore(ctx.projectRoot, ctx.opDir.resolve("before"), beforeTargets)
+        records.forEach { record ->
+            if (record.existed) {
+                appendLog(ctx.opLog, "[OK] Snapshot(before) ${if (record.directory) "dir" else "file"}: ${record.path}\n")
+            } else {
+                appendLog(ctx.opLog, "[OK] Snapshot(before) absent: ${record.path}\n")
+            }
+        }
+        appendLog(ctx.opLog, "[OK] Snapshot(before) manifest verified: ${records.size} target(s)\n")
 
         refreshVfs(ctx.projectRoot)
     }
@@ -123,6 +132,8 @@ class DevwerkOperationRunner {
     }
 
     fun applyResponse(project: Project, ctx: DevwerkContext, response: IdeChatResponse) {
+        SnapshotGuard.assertComplete(ctx.opDir.resolve("before"))
+        appendLog(ctx.opLog, "[OK] Before snapshot guard passed; code apply is allowed.\n")
         // 1) patch_ops（兜底：如果 patch 目标涉及隐藏目录，直接拒绝）
         if (response.patchOps.isNotEmpty()) {
             val raw = PatchApplier.collectAffectedPaths(response.patchOps).map { normalizeRelPath(it) }.filter { it.isNotBlank() }
@@ -171,21 +182,6 @@ class DevwerkOperationRunner {
         snapshotTo(ctx, afterTargets, slot = "after", reason = "after")
 
         refreshVfs(ctx.projectRoot)
-    }
-
-    private fun collectBeforeTargets(ops: List<FileOp>, patchPaths: Set<String>): List<String> {
-        val fromOps = ops.filter {
-            it.op == "update_file" ||
-                    it.op == "modify_file" ||
-                    it.op == "delete_path" ||
-                    it.op == "delete_file" ||
-                    it.op == "delete_dir"
-        }.map { it.path }
-
-        return (fromOps + patchPaths)
-            .map { normalizeRelPath(it) }
-            .filter { it.isNotBlank() && !hasHiddenDirSegment(it) }
-            .distinct()
     }
 
     private fun collectAfterTargets(ops: List<FileOp>, patchPaths: Set<String>): List<String> {
