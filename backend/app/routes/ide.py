@@ -346,9 +346,13 @@ async def ide_plan(request: Request) -> PlanResponse:
             )
 
     try:
+        project_settings_payload = get_project_settings(str(body.get("project_id") or "default"))
+        project_settings = project_settings_payload.get("settings") if isinstance(project_settings_payload, dict) else {}
+        parameters = project_settings.get("parameters") if isinstance(project_settings, dict) else {}
         p = build_planner(
             agent_name=planner_agent,
             event_sink=lambda event_type, payload: _kanban_event(task_id, event_type, payload),
+            max_rounds=_positive_int(parameters.get("planner_max_rounds"), 128, maximum=512),
         )
     except (ValueError, NotImplementedError) as exc:
         _log.warning("Planner creation failed: %s", exc)
@@ -567,7 +571,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
     project_settings_payload = get_project_settings(str(body.get("project_id") or "default"))
     project_settings = project_settings_payload.get("settings") if isinstance(project_settings_payload, dict) else {}
     parameters = project_settings.get("parameters") if isinstance(project_settings, dict) else {}
-    max_tool_rounds = _positive_int(parameters.get("agent_tool_max_rounds"), 12, maximum=40)
+    max_tool_rounds = _positive_int(parameters.get("agent_tool_max_rounds"), 128, maximum=512)
 
     for attempt in range(max_retries + 1):
         try:

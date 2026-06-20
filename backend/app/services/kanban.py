@@ -1161,6 +1161,10 @@ def _default_parameters() -> dict[str, Any]:
         "effort_level": "max",
         "temperature": 0.2,
         "max_tokens": 4096,
+        "workflow_max_total_runs": 512,
+        "workflow_max_rework_runs": 128,
+        "planner_max_rounds": 128,
+        "agent_tool_max_rounds": 128,
     }
 
 

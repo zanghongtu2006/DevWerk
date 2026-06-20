@@ -111,6 +111,22 @@ An interactive stop emits `workflow_run_paused` with `terminal=false`, a
 `waiting_for` value, and its reason. It is resumable through the same task id;
 only terminal runs emit a completed `workflow_finished` boundary.
 
+Normal agent exploration is intentionally not constrained by a small retry
+budget. Project parameters expose high safety ceilings which can be edited in
+the dashboard project settings:
+
+```json
+{
+  "workflow_max_total_runs": 512,
+  "workflow_max_rework_runs": 128,
+  "planner_max_rounds": 128,
+  "agent_tool_max_rounds": 128
+}
+```
+
+These limits protect against a broken state-machine loop; they are not expected
+completion targets. Provider transport retries remain separately bounded.
+
 Every phase writes a `workflow_phase_output` artifact:
 
 ```json

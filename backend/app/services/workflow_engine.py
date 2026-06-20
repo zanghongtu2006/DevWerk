@@ -128,8 +128,8 @@ class WorkflowEngine:
         settings_payload = get_project_settings(project_id)
         project_settings = settings_payload.get("settings") if isinstance(settings_payload, dict) else {}
         parameters = project_settings.get("parameters") if isinstance(project_settings, dict) else {}
-        max_rounds = _positive_int(parameters.get("workflow_max_total_runs"), 32)
-        max_rework_rounds = _positive_int(parameters.get("workflow_max_rework_runs"), 8)
+        max_rounds = _positive_int(parameters.get("workflow_max_total_runs"), 512)
+        max_rework_rounds = _positive_int(parameters.get("workflow_max_rework_runs"), 128)
         for round_no in range(1, max_rounds + 1):
             _log.debug(
                 "workflow loop task_id=%s round=%s status_key=%s agent=%s",

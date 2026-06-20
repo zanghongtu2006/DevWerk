@@ -1860,7 +1860,7 @@ def test_planner_reserves_a_final_synthesis_round_after_tool_budget(monkeypatch,
 
     monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": fake_client)
     events: list[tuple[str, dict]] = []
-    plan = Planner(event_sink=lambda event_type, payload: events.append((event_type, payload))).plan(
+    plan = Planner(event_sink=lambda event_type, payload: events.append((event_type, payload)), max_rounds=4).plan(
         messages=[{"role": "user", "content": "Find and fix all compile errors."}],
         project_root=str(project_root),
     )
@@ -1946,7 +1946,7 @@ def test_planner_repairs_markdown_final_analysis_into_plan_contract(monkeypatch,
 
     monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": fake_client)
     events: list[tuple[str, dict]] = []
-    plan = Planner(event_sink=lambda event_type, payload: events.append((event_type, payload))).plan(
+    plan = Planner(event_sink=lambda event_type, payload: events.append((event_type, payload)), max_rounds=4).plan(
         messages=[
             {"role": "user", "content": "Find and fix the errors."},
             {
@@ -1961,6 +1961,10 @@ def test_planner_repairs_markdown_final_analysis_into_plan_contract(monkeypatch,
     assert plan.ok is True
     assert [item.path for item in plan.files] == ["src/main.py"]
     assert "plan_format_repair_completed" in [event_type for event_type, _ in events]
+
+
+def test_planner_default_round_budget_is_a_high_safety_ceiling():
+    assert Planner().max_rounds == 128
 
 
 def test_planner_recovers_natural_language_search_intent(monkeypatch, tmp_path):

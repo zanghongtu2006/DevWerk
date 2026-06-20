@@ -62,9 +62,15 @@ class Planner:
         "the coder should change; record remaining uncertainty in warnings."
     )
 
-    def __init__(self, agent_name: str = "planner", event_sink: Callable[[str, dict[str, Any]], None] | None = None):
+    def __init__(
+        self,
+        agent_name: str = "planner",
+        event_sink: Callable[[str, dict[str, Any]], None] | None = None,
+        max_rounds: int = 128,
+    ):
         self.agent_name = agent_name
         self.event_sink = event_sink
+        self.max_rounds = max(1, max_rounds)
 
     def plan(self, messages: list[dict], mode: str = "agent", project_root: str | None = None) -> PlanResponse:
         conversation = _inject_plan_instruction(list(messages), mode)
@@ -75,7 +81,7 @@ class Planner:
             len(conversation),
         )
 
-        max_rounds = 4
+        max_rounds = self.max_rounds
         backoff = 0.5
         last_plan: PlanResponse | None = None
         used_tools = False

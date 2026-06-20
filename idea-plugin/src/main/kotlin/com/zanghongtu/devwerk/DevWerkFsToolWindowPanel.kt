@@ -363,7 +363,6 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
     ): IdeChatResponse {
         var current = initialResponse
         var resumeRounds = 0
-        val maxResumeRounds = 8
 
         while (true) {
             if (!isReadyToApply(current)) return current
@@ -395,10 +394,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
             }
 
             val resume = actionResponse.optJSONObject("workflow_resume")
-            if (resume == null || resumeRounds >= maxResumeRounds) {
-                if (resume != null) {
-                    appendOpLog(devCtx, "[WARN] Client verification rework limit reached; task remains active for backend retry or abandonment.\n")
-                }
+            if (resume == null) {
                 val backendStatus = actionResponse.optJSONObject("task")
                     ?.optString("status_key", "")
                     ?.takeIf { it.isNotBlank() }
