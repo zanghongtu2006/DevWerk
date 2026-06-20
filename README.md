@@ -21,11 +21,13 @@ harness system:
 - Kanban is the operating surface. `/v1/workflows` starts a backend-owned
   workflow, then clients follow the workflow event stream; polling is only a
   fallback if the stream is interrupted.
+- MCP clients can use the same backend workflow at `/mcp`; they do not need the
+  IntelliJ plugin when the client already owns local file and command tools.
 
 ## Architecture
 
 ```text
-Capability Client (current implementation: IntelliJ plugin)
+Capability Client (IntelliJ plugin or an MCP coding client)
   - projectId from .devwerk/meta
   - source map and selected context
   - attachment upload
@@ -34,6 +36,7 @@ Capability Client (current implementation: IntelliJ plugin)
         v
 DevWerk Backend (FastAPI)
   - /v1/workflows and /v1/workflows/{taskId}/messages
+  - /mcp (Streamable HTTP MCP)
   - durable conversation transcript and compression
   - resumable column runs and candidate revisions
   - coder harness from source_map
@@ -49,6 +52,8 @@ LLM Catalog
   - per-model parameters
   - cloud or local endpoints
 ```
+
+Codex and VS Code MCP setup is documented in [docs/mcp.md](docs/mcp.md).
 
 ## Kanban Workflow
 

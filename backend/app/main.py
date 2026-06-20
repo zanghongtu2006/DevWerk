@@ -18,6 +18,7 @@ sys.path.insert(0, str(__file__.rsplit("/", 2)[0]))
 
 from app.core.config import settings
 from app.core.logging import configure_logging, configure_logging_from_env
+from app.mcp_server import create_mcp_server
 from app.routes.ide import router as ide_router
 from app.routes.kanban import router as kanban_router
 from app.routes.kanban import ui_router as kanban_ui_router
@@ -57,19 +58,22 @@ async def lifespan(app: FastAPI):
     if cfg.app_env == "production" and not cfg.is_production:
         log.warning("Running in production but APP_ENV is not 'production'!")
 
-    yield
+    async with app.state.devwerk_mcp.session_manager.run():
+        yield
 
     log.info("DevWerk shutting down.")
 
 
 def create_app() -> FastAPI:
     configure_logging_from_env()
+    devwerk_mcp, mcp_http_app = create_mcp_server()
     app = FastAPI(
         title="DevWerk API",
         description="AI-driven CodeOps backend for IDE integration.",
         version="0.1.0",
         lifespan=lifespan,
     )
+    app.state.devwerk_mcp = devwerk_mcp
 
     # Allow IDE plugins (typically localhost) to call the API.
     app.add_middleware(
@@ -133,6 +137,8 @@ def create_app() -> FastAPI:
     app.include_router(kanban_router, prefix="/v1", tags=["Kanban"])
     app.include_router(settings_router, prefix="/v1", tags=["Settings"])
     app.include_router(kanban_ui_router)
+    # Mount last so existing FastAPI routes win and /mcp is served without a redirect.
+    app.mount("/", mcp_http_app, name="mcp")
 
     return app
 

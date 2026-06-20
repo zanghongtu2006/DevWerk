@@ -94,6 +94,12 @@ async def start_workflow(request: Request):
             "error_message": f"Failed to parse JSON: {exc}",
         }
 
+    return start_workflow_payload(body)
+
+
+def start_workflow_payload(body: dict) -> dict:
+    """Start a workflow from a transport-neutral request payload."""
+    body = dict(body)
     messages = body.get("messages", [])
     if not isinstance(messages, list) or not messages:
         return {
@@ -136,6 +142,12 @@ async def continue_workflow(task_id: str, request: Request):
         incoming = await request.json()
     except Exception as exc:
         return {"ok": False, "task_id": task_id, "error_code": "BAD_REQUEST", "error_message": f"Failed to parse JSON: {exc}"}
+    return continue_workflow_payload(task_id, incoming)
+
+
+def continue_workflow_payload(task_id: str, incoming: dict) -> dict:
+    """Continue a workflow from REST, MCP, or another backend transport."""
+    incoming = dict(incoming)
     try:
         detail = get_task(task_id)
     except KeyError:
@@ -1443,6 +1455,11 @@ def _workflow_state_payload(task_id: str, *, include_result: bool, result_after:
     return payload
 
 
+def workflow_state_payload(task_id: str, *, include_result: bool = True, result_after: str | None = None) -> dict:
+    """Return the public workflow state without binding callers to HTTP."""
+    return _workflow_state_payload(task_id, include_result=include_result, result_after=result_after)
+
+
 async def _workflow_event_stream(task_id: str, *, result_after: str | None = None):
     sent_ids: set[str] = set()
     sent_state_status: str | None = None
@@ -1534,6 +1551,11 @@ def _workflow_result_payload(task_id: str, *, result_after: str | None = None) -
         "status_key": state.get("status_key"),
         "result": state["result"],
     }
+
+
+def workflow_result_payload(task_id: str, *, result_after: str | None = None) -> dict:
+    """Return a workflow result for non-REST transports."""
+    return _workflow_result_payload(task_id, result_after=result_after)
 
 
 def _latest_artifact_payload(task: dict, artifact_type: str, *, result_after: str | None = None) -> dict | None:
