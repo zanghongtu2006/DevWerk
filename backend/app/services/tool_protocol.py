@@ -4,7 +4,7 @@ from typing import Any
 
 
 BACKEND_RESEARCH_TOOLS = {"list_dir", "read_file", "search"}
-CLIENT_TOOLS = {"run_command", "ide_syntax_check"}
+CLIENT_TOOLS = {"run_command", "ide_compile", "ide_syntax_check"}
 ALL_TOOLS = BACKEND_RESEARCH_TOOLS | CLIENT_TOOLS
 
 
@@ -63,6 +63,9 @@ def normalize_tool_request(raw: dict[str, Any], index: int = 0) -> dict[str, Any
             paths = []
         args["paths"] = paths
         args.setdefault("max_errors", 100)
+    elif tool == "ide_compile":
+        args.setdefault("timeout_seconds", 300)
+        args.setdefault("max_errors", 200)
 
     return {"id": request_id, "tool": tool, "args": args}
 

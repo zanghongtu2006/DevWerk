@@ -51,8 +51,10 @@ SYSTEM_PROMPT = textwrap.dedent(
     3. Client-side post-apply tools may be returned with ops/patch_ops. The IDE
        applies changes first, then executes the tool and reports verification
        to kanban.
-    4. Use ide_syntax_check for IDE-provided syntax validation. Include paths
-       when the changed files are known.
+    4. Use ide_compile for an IntelliJ CompilerManager project build when the
+       client declares it. It returns compiler errors with file and line evidence.
+       Use ide_syntax_check only for fast PSI parser validation; it is not a
+       substitute for compilation. Include paths when changed files are known.
     5. Use run_command only when project evidence or project settings make the
        command unambiguous. Prefer project-local executable paths such as
        ./scripts/check or ./tool-wrapper. Do not use shell wrappers such as cmd,

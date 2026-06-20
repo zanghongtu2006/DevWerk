@@ -254,8 +254,7 @@ of long blocking chat requests.
 `tool_requests` is an extensible backend-to-client action protocol.
 
 - Backend research tools: `list_dir`, `read_file`, `search`
-- Client-side post-apply tools: currently `run_command`; future IntelliJ SDK
-  actions can use the same response field
+- Client-side post-apply tools: `ide_compile`, `ide_syntax_check`, `run_command`
 
 Backend research tools are resolved inside the workflow coder run before file
 operations are returned. Client-side tools may be returned with `ops` or `patch_ops`; the
@@ -266,18 +265,20 @@ Example client-side tool request:
 
 ```json
 {
-  "id": "compile",
-  "tool": "run_command",
+  "id": "ide-compile",
+  "tool": "ide_compile",
   "args": {
-    "command": ["./mvnw", "test"],
-    "timeout_seconds": 120
+    "timeout_seconds": 300,
+    "max_errors": 200
   }
 }
 ```
 
-The current plugin implementation refuses shell wrappers and only allows
-project-local Gradle/Maven executables such as `gradlew`, `mvnw`, `gradle`, and
-`mvn`.
+`ide_compile` is implemented by the IntelliJ plugin through `CompilerManager`
+for the currently open project. It is independent of language-specific source
+paths and returns compiler file/line evidence. `ide_syntax_check` is a fast PSI
+parser check and must not be treated as compilation. `run_command` remains
+available for project-specific verification selected from workspace evidence.
 
 ### `POST /v1/kanban/tasks/{task_id}/actions`
 

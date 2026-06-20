@@ -68,7 +68,7 @@ test ensures this remains configurable.
 ## Client Capability Direction
 
 The current IntelliJ plugin declares generic capabilities (`read_file`,
-`search`, `apply_ops`, `apply_patch`, `create_snapshot`, `ide_syntax_check`,
+`search`, `apply_ops`, `apply_patch`, `create_snapshot`, `ide_compile`, `ide_syntax_check`,
 `run_command`). This is the migration boundary toward an MCP-style client:
 backend agents select tools by capability, while IntelliJ, VS Code, CLI, or a
 remote workspace adapter may implement them independently.

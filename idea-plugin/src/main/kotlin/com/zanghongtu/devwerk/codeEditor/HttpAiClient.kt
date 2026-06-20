@@ -1,6 +1,10 @@
 package com.zanghongtu.devwerk.codeEditor
 
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.compiler.CompileStatusNotification
+import com.intellij.openapi.compiler.CompilerManager
+import com.intellij.openapi.compiler.CompilerMessageCategory
+import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -25,7 +29,9 @@ import java.nio.file.Files
 import java.nio.file.StandardOpenOption
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 class HttpAiClient(
     private val workflowsEndpoint: String,
@@ -355,7 +361,11 @@ class HttpAiClient(
     fun executeClientTools(context: ChatContext, reqs: List<ToolRequest>): List<ToolResult> {
         if (reqs.isEmpty()) return emptyList()
         appendDevLog(context, "\n===== CLIENT TOOL REQUESTS =====\n${toolRequestsToJson(reqs)}\n")
-        FileDocumentManager.getInstance().saveAllDocuments()
+        val saveResult = saveAllDocumentsOnEdt()
+        appendDevLog(
+            context,
+            "[client-tool] preflight save_all_documents ok=${saveResult.first} detail=${saveResult.second}\n"
+        )
         val results = executeTools(context, reqs)
         appendDevLog(context, "\n===== CLIENT TOOL RESULTS =====\n${toolResultsToJson(results)}\n")
         return results
@@ -567,7 +577,7 @@ class HttpAiClient(
             JSONArray(
                 listOf(
                     "list_dir", "read_file", "search", "apply_ops", "apply_patch",
-                    "create_snapshot", "ide_syntax_check", "run_command"
+                    "create_snapshot", "ide_compile", "ide_syntax_check", "run_command"
                 )
             )
         )
@@ -731,30 +741,32 @@ class HttpAiClient(
         val results = mutableListOf<ToolResult>()
         for (r in reqs) {
             val id = r.id
-            try {
+            val started = System.nanoTime()
+            appendDevLog(context, "[client-tool] started id=$id tool=${r.tool}\n")
+            val result = try {
                 when (r.tool) {
                     "list_dir" -> {
                         val path = (r.args["path"] as? String) ?: ""
                         val rel = normRel(path)
                         if (rel.isNotBlank() && containsHiddenSegment(rel)) {
-                            results += ToolResult(id = id, ok = false, error = "blocked hidden directory path: $rel")
-                            continue
+                            ToolResult(id = id, ok = false, error = "blocked hidden directory path: $rel")
+                        } else {
+                            val maxDepth = (r.args["max_depth"] as? Number)?.toInt() ?: 2
+                            val content = WorkspaceTools.listDir(base, rel, maxDepth)
+                            ToolResult(id = id, ok = true, content = content)
                         }
-                        val maxDepth = (r.args["max_depth"] as? Number)?.toInt() ?: 2
-                        val content = WorkspaceTools.listDir(base, rel, maxDepth)
-                        results += ToolResult(id = id, ok = true, content = content)
                     }
                     "read_file" -> {
                         val path = (r.args["path"] as? String) ?: ""
                         val rel = normRel(path)
                         if (hasHiddenDirSegment(rel)) {
-                            results += ToolResult(id = id, ok = false, error = "blocked hidden directory path: $rel")
-                            continue
+                            ToolResult(id = id, ok = false, error = "blocked hidden directory path: $rel")
+                        } else {
+                            val start = (r.args["start_line"] as? Number)?.toInt() ?: 1
+                            val end = (r.args["end_line"] as? Number)?.toInt() ?: (start + 200)
+                            val content = WorkspaceTools.readFile(base, rel, start, end)
+                            ToolResult(id = id, ok = true, content = content)
                         }
-                        val start = (r.args["start_line"] as? Number)?.toInt() ?: 1
-                        val end = (r.args["end_line"] as? Number)?.toInt() ?: (start + 200)
-                        val content = WorkspaceTools.readFile(base, rel, start, end)
-                        results += ToolResult(id = id, ok = true, content = content)
                     }
                     "search" -> {
                         val query = (r.args["query"] as? String) ?: ""
@@ -768,12 +780,22 @@ class HttpAiClient(
                         }
                         val safePaths = paths.map { normRel(it) }.filter { it.isBlank() || !containsHiddenSegment(it) }
                         val content = WorkspaceTools.search(base, query, safePaths, maxResults)
-                        results += ToolResult(id = id, ok = true, content = content)
+                        ToolResult(id = id, ok = true, content = content)
                     }
                     "run_command" -> {
                         val content = runCommandTool(base, r.args)
                         val ok = content.first
-                        results += ToolResult(
+                        ToolResult(
+                            id = id,
+                            ok = ok,
+                            content = content.second,
+                            error = if (ok) null else content.second
+                        )
+                    }
+                    "ide_compile" -> {
+                        val content = ideCompile(context.project, base, r.args)
+                        val ok = content.first
+                        ToolResult(
                             id = id,
                             ok = ok,
                             content = content.second,
@@ -783,20 +805,46 @@ class HttpAiClient(
                     "ide_syntax_check" -> {
                         val content = ideSyntaxCheck(context.project, base, r.args)
                         val ok = content.first
-                        results += ToolResult(
+                        ToolResult(
                             id = id,
                             ok = ok,
                             content = content.second,
                             error = if (ok) null else content.second
                         )
                     }
-                    else -> results += ToolResult(id = id, ok = false, error = "unknown tool: ${r.tool}")
+                    else -> ToolResult(id = id, ok = false, error = "unknown tool: ${r.tool}")
                 }
             } catch (t: Throwable) {
-                results += ToolResult(id = id, ok = false, error = "${typeName(t)}: ${t.message}")
+                ToolResult(id = id, ok = false, error = "${typeName(t)}: ${t.message}")
             }
+            results += result
+            val durationMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
+            val evidence = (result.error ?: result.content ?: "")
+                .replace("\r", " ")
+                .replace("\n", " ")
+                .take(1000)
+            appendDevLog(
+                context,
+                "[client-tool] completed id=$id tool=${r.tool} ok=${result.ok} duration_ms=$durationMs evidence=$evidence\n"
+            )
         }
         return results
+    }
+
+    private fun saveAllDocumentsOnEdt(): Pair<Boolean, String> {
+        val application = ApplicationManager.getApplication()
+        return try {
+            if (application.isDispatchThread) {
+                FileDocumentManager.getInstance().saveAllDocuments()
+            } else {
+                application.invokeAndWait {
+                    FileDocumentManager.getInstance().saveAllDocuments()
+                }
+            }
+            true to "completed_on_edt=true"
+        } catch (t: Throwable) {
+            false to "${typeName(t)}: ${t.message}"
+        }
     }
 
     private fun runCommandTool(basePath: String, args: Map<String, Any?>): Pair<Boolean, String> {
@@ -841,6 +889,71 @@ class HttpAiClient(
             append(output)
         }
         return (exitCode == 0) to content
+    }
+
+    private fun ideCompile(project: Project?, basePath: String, args: Map<String, Any?>): Pair<Boolean, String> {
+        if (project == null) return false to "[ide_compile] project is unavailable"
+        if (project.isDisposed) return false to "[ide_compile] project is disposed"
+        val application = ApplicationManager.getApplication()
+        if (application.isDispatchThread) {
+            return false to "[ide_compile] must be awaited outside the Event Dispatch Thread"
+        }
+
+        val timeoutSeconds = ((args["timeout_seconds"] as? Number)?.toLong() ?: 300L).coerceIn(1L, 900L)
+        val maxErrors = ((args["max_errors"] as? Number)?.toInt() ?: 200).coerceIn(1, 1000)
+        val base = File(basePath).canonicalFile
+        val completed = CountDownLatch(1)
+        val outcome = AtomicReference<Pair<Boolean, String>>()
+
+        application.invokeLater {
+            try {
+                FileDocumentManager.getInstance().saveAllDocuments()
+                val compilerManager = CompilerManager.getInstance(project)
+                if (compilerManager.isCompilationActive) {
+                    outcome.set(false to "[ide_compile] rejected: another IDE compilation is already active")
+                    completed.countDown()
+                    return@invokeLater
+                }
+                compilerManager.make(
+                    CompileStatusNotification { aborted, errors, warnings, compileContext ->
+                        val messages = compileContext
+                            .getMessages(CompilerMessageCategory.ERROR)
+                            .take(maxErrors)
+                            .map { message ->
+                                val file = message.virtualFile?.let { File(it.path).canonicalFile }
+                                val descriptor = message.navigatable as? OpenFileDescriptor
+                                val path = when {
+                                    file == null -> "<project>"
+                                    file == base || file.path.startsWith(base.path + File.separator) ->
+                                        file.relativeToOrSelf(base).path.replace(File.separatorChar, '/')
+                                    else -> file.path.replace(File.separatorChar, '/')
+                                }
+                                val line = descriptor?.line?.takeIf { it >= 0 }?.plus(1)?.toString() ?: "?"
+                                val column = descriptor?.column?.takeIf { it >= 0 }?.plus(1)?.toString() ?: "?"
+                                "$path:$line:$column ${message.message}"
+                            }
+                        val content = buildString {
+                            append("[ide_compile] completed\n")
+                            append("aborted=").append(aborted).append('\n')
+                            append("errors=").append(errors).append('\n')
+                            append("warnings=").append(warnings).append('\n')
+                            append("reported_error_messages=").append(messages.size).append('\n')
+                            messages.forEach { append(it).append('\n') }
+                        }.trimEnd()
+                        outcome.set((!aborted && errors == 0) to content)
+                        completed.countDown()
+                    }
+                )
+            } catch (t: Throwable) {
+                outcome.set(false to "[ide_compile] failed to start: ${typeName(t)}: ${t.message}")
+                completed.countDown()
+            }
+        }
+
+        if (!completed.await(timeoutSeconds, TimeUnit.SECONDS)) {
+            return false to "[ide_compile] timed out after ${timeoutSeconds}s waiting for IntelliJ CompilerManager"
+        }
+        return outcome.get() ?: (false to "[ide_compile] completed without a compiler result")
     }
 
     private fun ideSyntaxCheck(project: Project?, basePath: String, args: Map<String, Any?>): Pair<Boolean, String> {

@@ -27,15 +27,16 @@ OPENAI_SYSTEM_PROMPT = textwrap.dedent(
        guidance. Address missing_changed_files before returning done=true.
     5. Backend research tool_requests (list_dir/read_file/search) must not be
        returned with ops/patch_ops. Client-side post-apply tools such as
-       ide_syntax_check and run_command may be returned with ops/patch_ops.
+       ide_compile, ide_syntax_check, and run_command may be returned with ops/patch_ops.
        read_file args require path/start_line/end_line; list_dir path is
        optional; search requires query and may also use pattern as a query
        alias. search does not require path.
     6. patch_ops only allows apply_patch and must contain unified diff content
        with --- / +++ / @@ markers.
     7. read_file requests must include path, start_line, and end_line.
-    8. Use ide_syntax_check for IDE-provided syntax validation. Use run_command
-       only when project evidence or project settings make the command
+    8. Use ide_compile for IntelliJ CompilerManager verification when available.
+       ide_syntax_check only checks PSI parser errors and does not replace a
+       compile. Use run_command only when project evidence or project settings make the command
        unambiguous. Prefer project-local executable paths. Do not use shell
        wrappers such as cmd, powershell, bash, or sh.
     9. Syntax, compile, test, or tool failures are workflow feedback and must be

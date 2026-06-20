@@ -511,6 +511,18 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         if (changedPaths.isEmpty()) return response.toolRequests
 
         val requests = response.toolRequests.toMutableList()
+        val hasIdeCompile = requests.any { it.tool == "ide_compile" }
+        if (!hasIdeCompile) {
+            requests += ToolRequest(
+                id = "ide_compile",
+                tool = "ide_compile",
+                args = mapOf(
+                    "timeout_seconds" to 300,
+                    "max_errors" to 200,
+                    "reason" to "Default post-apply IntelliJ CompilerManager verification."
+                )
+            )
+        }
         val hasIdeSyntaxCheck = requests.any { it.tool == "ide_syntax_check" }
         if (!hasIdeSyntaxCheck) {
             requests += ToolRequest(

@@ -266,17 +266,19 @@ through `apply_result.verification`.
   "ops": [],
   "tool_requests": [
     {
-      "id": "compile",
-      "tool": "run_command",
-      "args": {"command": ["./mvnw", "test"], "timeout_seconds": 120}
+      "id": "ide-compile",
+      "tool": "ide_compile",
+      "args": {"timeout_seconds": 300, "max_errors": 200}
     }
   ]
 }
 ```
 
-Today the plugin implements `run_command` for project-local Gradle/Maven
-commands. Future IntelliJ SDK actions can use the same protocol without changing
-the kanban state-machine boundary.
+The IntelliJ plugin implements `ide_compile` with the active project's
+`CompilerManager`, `ide_syntax_check` with PSI parser diagnostics, and
+`run_command` for model-selected project verification. Every client tool writes
+started/completed, duration, success, and diagnostic evidence to the operation
+log; timeouts and SDK failures are returned through the same verification result.
 
 ### `POST /v1/workflows`
 

@@ -2402,6 +2402,37 @@ def test_workflow_filters_reviewer_tools_against_client_capabilities():
     assert [request.id for request in requests] == ["syntax"]
 
 
+def test_workflow_allows_intellij_compile_capability():
+    from app.services.workflow_engine import _allowed_client_tool_requests
+
+    requests = _allowed_client_tool_requests(
+        [
+            {
+                "id": "compile",
+                "tool": "ide_compile",
+                "args": {"timeout_seconds": 45, "max_errors": 25},
+            },
+            {"id": "command", "tool": "run_command", "args": {"command": ["project-check"]}},
+        ],
+        {"tools": ["ide_compile"]},
+    )
+
+    assert [request.id for request in requests] == ["compile"]
+    assert requests[0].args == {"timeout_seconds": 45, "max_errors": 25}
+
+
+def test_tool_protocol_defaults_intellij_compile_limits():
+    from app.services.tool_protocol import normalize_tool_request
+
+    request = normalize_tool_request({"id": "compile", "tool": "ide_compile", "args": {}})
+
+    assert request == {
+        "id": "compile",
+        "tool": "ide_compile",
+        "args": {"timeout_seconds": 300, "max_errors": 200},
+    }
+
+
 def test_workflow_normalizes_client_command_cwd_to_project_relative_path():
     from app.services.workflow_engine import _allowed_client_tool_requests
 

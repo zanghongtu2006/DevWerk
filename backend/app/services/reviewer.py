@@ -136,7 +136,7 @@ def _missing_required_verification(result: dict[str, Any], payload: dict[str, An
     if not payload.get("verification_required") or result.get("decision") != "approve":
         return False
     client_tools = _client_tools(payload.get("client_capabilities"))
-    if not client_tools.intersection({"run_command", "ide_syntax_check"}):
+    if not client_tools.intersection({"run_command", "ide_compile", "ide_syntax_check"}):
         return False
     return not result.get("verification_tool_requests")
 
