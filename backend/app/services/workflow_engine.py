@@ -162,17 +162,27 @@ class WorkflowEngine:
                         waiting_for=None,
                         active_column=result.response.status_key,
                     )
-                _event(
-                    task_id,
-                    "workflow_finished",
-                    {
-                        "ok": result.response.ok,
-                        "phase": current.status_key,
-                        "status_key": result.response.status_key,
-                        "action": result.action,
-                        "round": round_no,
-                    },
-                )
+                boundary_payload = {
+                    "ok": result.response.ok,
+                    "phase": current.status_key,
+                    "status_key": result.response.status_key,
+                    "action": result.action,
+                    "round": round_no,
+                }
+                if result.response.waiting_for:
+                    boundary_payload.update(
+                        {
+                            "waiting_for": result.response.waiting_for,
+                            "reason": str((result.response.interaction or {}).get("reason") or result.response.waiting_for),
+                            "terminal": False,
+                        }
+                    )
+                    _event(task_id, "workflow_run_paused", boundary_payload)
+                else:
+                    boundary_payload["terminal"] = bool(
+                        result.response.done or result.response.status_key in {"done", "failed"}
+                    )
+                    _event(task_id, "workflow_finished", boundary_payload)
                 add_artifact(task_id, artifact_type="workflow_result", payload=result.response.model_dump())
                 return
 
@@ -184,10 +194,29 @@ class WorkflowEngine:
                         status_key=current.status_key,
                         waiting_for="user_guidance",
                         reply=str((state.review_feedback or {}).get("summary") or "Workflow needs guidance after repeated rework."),
-                        interaction={"type": "rework_guidance", "review": state.review_feedback or {}},
+                        interaction={
+                            "type": "rework_guidance",
+                            "reason": "rework_budget",
+                            "review": state.review_feedback or {},
+                            "round": round_no,
+                            "rework_rounds": state.rework_rounds,
+                            "max_rework_rounds": max_rework_rounds,
+                            "actions": ["message", "cancel"],
+                        },
                     )
                     update_conversation(task_id, state="waiting_user", waiting_for="user_guidance", active_column=current.status_key)
-                    _event(task_id, "workflow_waiting_user", {"phase": current.status_key, "reason": "rework_budget"})
+                    pause_payload = {
+                        "phase": current.status_key,
+                        "status_key": current.status_key,
+                        "waiting_for": "user_guidance",
+                        "reason": "rework_budget",
+                        "round": round_no,
+                        "rework_rounds": state.rework_rounds,
+                        "max_rework_rounds": max_rework_rounds,
+                        "terminal": False,
+                    }
+                    _event(task_id, "workflow_waiting_user", pause_payload)
+                    _event(task_id, "workflow_run_paused", pause_payload)
                     add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
                     return
                 _event(
@@ -436,6 +465,7 @@ class WorkflowEngine:
                 reply=reply,
                 interaction={
                     "type": "plan_confirmation",
+                    "reason": "plan_confirmation",
                     "summary": plan_response.summary,
                     "files": [file.model_dump() for file in plan_response.files],
                     "actions": ["confirm_plan", "revise_plan", "cancel"],

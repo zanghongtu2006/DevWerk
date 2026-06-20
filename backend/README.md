@@ -79,6 +79,22 @@ LLM HTTP clients ignore `HTTP_PROXY`/`HTTPS_PROXY` by default. Set
 `trust_env_proxy: true` on a provider only when that provider must be reached
 through the host proxy.
 
+### Backend Logs
+
+Backend logs are written to both stdout and a UTF-8 rotating file. The default
+active file is `backend/data/logs/devwerk.log`; at local midnight it is rotated
+with a date suffix such as `devwerk.log.2026-06-20`.
+
+```env
+LOG_FILE_ENABLED=true
+LOG_DIR=./data/logs
+LOG_FILE_NAME=devwerk.log
+LOG_RETENTION_DAYS=30
+```
+
+Rotation uses Python's standard `logging.handlers.TimedRotatingFileHandler`.
+The log directory is local runtime data and is ignored by git.
+
 ## Workflow
 
 Default kanban states:
@@ -91,6 +107,9 @@ Draft -> Context Indexed -> Planned -> Coding -> Reviewed -> Ready To Apply
 `Failed` is available from every stage. Reviewer rework is expressed as semantic
 actions such as `request_recoding` or `request_replan`; the workflow state
 machine chooses the target column and records a reason in events/artifacts.
+An interactive stop emits `workflow_run_paused` with `terminal=false`, a
+`waiting_for` value, and its reason. It is resumable through the same task id;
+only terminal runs emit a completed `workflow_finished` boundary.
 
 Every phase writes a `workflow_phase_output` artifact:
 

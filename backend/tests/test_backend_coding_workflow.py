@@ -1253,6 +1253,75 @@ async def test_workflow_recoding_receives_review_feedback(monkeypatch, tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_workflow_rework_budget_emits_explicit_resumable_pause(monkeypatch, tmp_path):
+    db_path = tmp_path / "devwerk-workflow-rework-pause.db"
+    fake_settings = FakeSettings(db_path)
+
+    import app.services.kanban as kanban_service
+    import app.services.workflow_engine as workflow_engine_service
+
+    patch_service_settings(monkeypatch, fake_settings, kanban_service)
+    kanban_service._initialized = False
+    project_id = "backend-workflow-rework-pause"
+    kanban_service.update_project_settings(project_id, parameters={"workflow_max_rework_runs": 1})
+    task = kanban_service.create_task(
+        project_id=project_id,
+        title="Pause after repeated review",
+        description="Smoke",
+        status_key="draft",
+    )["task"]
+
+    async def plan_runner(body: dict) -> PlanResponse:
+        return PlanResponse(
+            ok=True,
+            task_id=body["task_id"],
+            files=[PlanFile(path="src/module.py", nature="modified", description="Repair the module.")],
+            summary="Repair the module.",
+            session_id="pause-plan",
+        )
+
+    async def coding_runner(body: dict) -> IdeChatResponse:
+        return IdeChatResponse(
+            ok=True,
+            done=True,
+            task_id=body["task_id"],
+            ops=[FileOp(op="update_file", path="src/module.py", content="VALUE = 1\n")],
+        )
+
+    async def review_runner(body: dict) -> dict:
+        return {"decision": "fail", "summary": "The repair still needs user-provided diagnostics."}
+
+    engine = workflow_engine_service.WorkflowEngine(
+        plan_runner=plan_runner,
+        coding_runner=coding_runner,
+        review_runner=review_runner,
+    )
+    await engine.run(
+        task["id"],
+        {
+            "project_id": project_id,
+            "mode": "agent",
+            "messages": [{"role": "user", "content": "Fix the compilation errors."}],
+            "workspace": {"tree_preview": "project/\n  src/\n    module.py", "source_map": None},
+        },
+    )
+
+    task_detail = kanban_service.get_task(task["id"])["task"]
+    conversation = kanban_service.get_conversation(task["id"])
+    result = [artifact for artifact in task_detail["artifacts"] if artifact["artifact_type"] == "workflow_result"][-1]["payload"]
+    pause_events = [event for event in task_detail["events"] if event["event_type"] == "workflow_run_paused"]
+
+    assert result["waiting_for"] == "user_guidance"
+    assert result["interaction"]["reason"] == "rework_budget"
+    assert result["interaction"]["actions"] == ["message", "cancel"]
+    assert conversation["state"] == "waiting_user"
+    assert conversation["waiting_for"] == "user_guidance"
+    assert pause_events[-1]["payload"]["terminal"] is False
+    assert pause_events[-1]["payload"]["max_rework_rounds"] == 1
+    assert not [event for event in task_detail["events"] if event["event_type"] == "workflow_finished"]
+
+
+@pytest.mark.asyncio
 async def test_interactive_workflow_pauses_for_plan_confirmation_and_resumes(monkeypatch, tmp_path):
     db_path = tmp_path / "devwerk-interactive-workflow.db"
     fake_settings = FakeSettings(db_path)
@@ -1320,6 +1389,10 @@ async def test_interactive_workflow_pauses_for_plan_confirmation_and_resumes(mon
     assert waiting_task["status_key"] == "planned"
     assert coding_calls == 0
     assert kanban_service.get_conversation(task["id"])["state"] == "waiting_user"
+    waiting_events = kanban_service.get_task(task["id"])["task"]["events"]
+    pause_events = [event for event in waiting_events if event["event_type"] == "workflow_run_paused"]
+    assert pause_events[-1]["payload"]["waiting_for"] == "plan_confirmation"
+    assert pause_events[-1]["payload"]["terminal"] is False
 
     kanban_service.append_conversation_message(
         task["id"], role="user", content="Confirmed.", message_type="plan_confirmation"

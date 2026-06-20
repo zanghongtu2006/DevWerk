@@ -93,6 +93,10 @@ class Settings(BaseSettings):
     reload: bool = Field(default=False)
     log_level: str = Field(default="debug")
     log_format: str = Field(default="%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    log_file_enabled: bool = Field(default=True)
+    log_dir: str = Field(default="./data/logs")
+    log_file_name: str = Field(default="devwerk.log")
+    log_retention_days: int = Field(default=30)
     uvicorn_access_log: bool = Field(default=True)
 
     # Local usage accounting.

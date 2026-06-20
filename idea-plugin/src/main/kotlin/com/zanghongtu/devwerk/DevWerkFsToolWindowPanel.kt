@@ -40,7 +40,7 @@ import org.json.JSONObject
 class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     // State
-    private enum class State { IDLE, WORKFLOW_PENDING, PLAN_CONFIRMATION }
+    private enum class State { IDLE, WORKFLOW_PENDING, PLAN_CONFIRMATION, USER_GUIDANCE }
     @Volatile private var state = State.IDLE
 
     private val history = mutableListOf<ChatMessage>()
@@ -187,6 +187,13 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                     clearAttachBtn.isEnabled = false
                     confirmPlanButton.isEnabled = true
                 }
+                State.USER_GUIDANCE -> {
+                    sendButton.isEnabled = true
+                    inputArea.isEnabled = true
+                    attachBtn.isEnabled = true
+                    clearAttachBtn.isEnabled = true
+                    confirmPlanButton.isEnabled = false
+                }
             }
         }
     }
@@ -196,7 +203,9 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
     private fun onSendClicked() {
         val text = inputArea.text.trim()
         if (text.isEmpty() && pendingAttachments.isEmpty()) return
-        if (state != State.IDLE) return
+        if (state !in setOf(State.IDLE, State.USER_GUIDANCE)) return
+
+        val continuingWithGuidance = state == State.USER_GUIDANCE
 
         val attachments = pendingAttachments.toList()
         appendChatLine("You: ${text.ifBlank { "(attachments)" }}${if (attachments.isNotEmpty()) "\n[Attachments] ${attachments.joinToString { it.name }}" else ""}")
@@ -205,7 +214,15 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         setState(State.WORKFLOW_PENDING)
 
         ApplicationManager.getApplication().executeOnPooledThread {
-            runUploadThenWorkflow(text, attachments, if (activeTaskId != null) "revise_plan" else null)
+            runUploadThenWorkflow(
+                text,
+                attachments,
+                when {
+                    continuingWithGuidance -> "message"
+                    activeTaskId != null -> "revise_plan"
+                    else -> null
+                }
+            )
         }
     }
 
@@ -274,12 +291,15 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
             if (response.ok && response.waitingFor != null) {
                 activeTaskId = response.taskId
                 waitingFor = response.waitingFor
+                devCtx?.let { runner.recordInteractionPaused(it, response) }
             } else if (devCtx != null) {
                 if (isReadyToApply(response)) {
                     response = applyAndVerifyWithResume(aiClient, runner, project, updatedCtx, devCtx, response)
                 } else if (!response.ok) {
                     runner.recordFinalSummaryAndBackup(project, devCtx, response)
                 }
+                val terminal = !response.ok || response.done || response.statusKey in setOf("done", "failed")
+                if (terminal) runner.recordInteractionEnded(devCtx, response)
             } else if (isReadyToApply(response)) {
                 (aiClient as? HttpAiClient)?.let {
                     reportApplyResult(it, response, null, ok = false, changedPaths = collectChangedPaths(response), errorMessage = "DevWerk local operation context is unavailable.")
@@ -316,6 +336,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                     when {
                         terminal -> State.IDLE
                         resp.waitingFor == "plan_confirmation" -> State.PLAN_CONFIRMATION
+                        resp.waitingFor == "user_guidance" -> State.USER_GUIDANCE
                         else -> State.WORKFLOW_PENDING
                     }
                 )

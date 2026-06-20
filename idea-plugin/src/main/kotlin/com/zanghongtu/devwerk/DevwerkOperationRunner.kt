@@ -100,6 +100,28 @@ class DevwerkOperationRunner {
         refreshVfs(ctx.projectRoot)
     }
 
+    fun recordInteractionPaused(ctx: DevwerkContext, response: IdeChatResponse) {
+        val reason = response.interaction["reason"]?.toString()?.takeIf { it.isNotBlank() }
+            ?: response.waitingFor
+            ?: "unspecified"
+        appendLog(ctx.opLog, "\n===== INTERACTION PAUSED =====\n")
+        appendLog(ctx.opLog, "[INFO] task_id=${response.taskId}\n")
+        appendLog(ctx.opLog, "[INFO] status_key=${response.statusKey}\n")
+        appendLog(ctx.opLog, "[INFO] waiting_for=${response.waitingFor}\n")
+        appendLog(ctx.opLog, "[INFO] reason=$reason\n")
+        appendLog(ctx.opLog, "===== INTERACTION PAUSED END =====\n")
+        appendLog(ctx.opLog, "=== DevWerk Workflow Interaction Ended: PAUSED ===\n")
+    }
+
+    fun recordInteractionEnded(ctx: DevwerkContext, response: IdeChatResponse) {
+        val outcome = when {
+            !response.ok -> "FAILED"
+            response.statusKey.equals("failed", ignoreCase = true) -> "FAILED"
+            else -> "DONE"
+        }
+        appendLog(ctx.opLog, "\n=== DevWerk Workflow Interaction Ended: $outcome ===\n")
+    }
+
     fun applyResponse(project: Project, ctx: DevwerkContext, response: IdeChatResponse) {
         // 1) patch_ops（兜底：如果 patch 目标涉及隐藏目录，直接拒绝）
         if (response.patchOps.isNotEmpty()) {
