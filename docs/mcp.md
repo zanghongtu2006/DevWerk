@@ -66,4 +66,3 @@ review, workflow state, persistence, and observability.
 
 The current endpoint is intended for localhost use. Add authenticated MCP
 transport before exposing it to a network.
-
