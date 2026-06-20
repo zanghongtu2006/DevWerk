@@ -40,6 +40,7 @@ if not "%APP_ENV%"=="development" if not "%APP_ENV%"=="production" if not "%APP_
 
 set "PYTHON_EXE=python"
 if exist ".venv\Scripts\python.exe" set "PYTHON_EXE=.venv\Scripts\python.exe"
+if defined DEVWERK_PYTHON set "PYTHON_EXE=%DEVWERK_PYTHON%"
 
 "%PYTHON_EXE%" --version >nul 2>&1
 if errorlevel 1 (
@@ -62,20 +63,31 @@ if /i "%UVICORN_ACCESS_LOG%"=="false" set "UVICORN_ACCESS_FLAG=--no-access-log"
 if /i "%UVICORN_ACCESS_LOG%"=="0" set "UVICORN_ACCESS_FLAG=--no-access-log"
 if /i "%UVICORN_ACCESS_LOG%"=="no" set "UVICORN_ACCESS_FLAG=--no-access-log"
 
+"%PYTHON_EXE%" -c "import fastapi, mcp, uvicorn" >nul 2>&1
+if errorlevel 1 (
+    echo [DevWerk] Backend dependencies are missing or out of date.
+    echo [DevWerk] Installing requirements into %PYTHON_EXE% ...
+    "%PYTHON_EXE%" -m pip install --disable-pip-version-check -r requirements.txt
+    if errorlevel 1 (
+        echo [DevWerk] Dependency installation failed.
+        exit /b 1
+    )
+)
+
+"%PYTHON_EXE%" -c "import fastapi, mcp, uvicorn" >nul 2>&1
+if errorlevel 1 (
+    echo [DevWerk] Dependency verification failed after installation.
+    exit /b 1
+)
+
 echo [DevWerk] Starting in %APP_ENV% mode...
 echo [DevWerk] Starting uvicorn on http://%HOST%:%PORT% ...
 echo [DevWerk] Log level:          %LOG_LEVEL%
 echo [DevWerk] API docs:           http://localhost:%PORT%/docs
 echo [DevWerk] Alternative docs:   http://localhost:%PORT%/redoc
+echo [DevWerk] MCP endpoint:       http://localhost:%PORT%/mcp
 echo.
 echo [DevWerk] Press Ctrl+C to stop.
 echo.
-
-"%PYTHON_EXE%" -c "import fastapi, uvicorn" >nul 2>&1
-if errorlevel 1 (
-    echo [DevWerk] Missing backend dependencies for %PYTHON_EXE%.
-    echo [DevWerk] Run: %PYTHON_EXE% -m pip install -r requirements.txt
-    exit /b 1
-)
 
 "%PYTHON_EXE%" -m uvicorn app.main:app %UVICORN_RELOAD% --host %HOST% --port %PORT% --log-level %LOG_LEVEL% %UVICORN_ACCESS_FLAG%
