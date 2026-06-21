@@ -26,14 +26,14 @@ class IdeaSdkCompilerIntegrationTest : BasePlatformTestCase() {
             listOf(
                 ToolRequest(
                     id = "sdk-compile-test",
-                    tool = "ide_compile",
+                    tool = "project.compile",
                     args = mapOf("timeout_seconds" to 1, "max_errors" to 20),
                 )
             ),
         ).single()
 
         val evidence = result.content ?: result.error.orEmpty()
-        assertTrue(evidence, evidence.startsWith("[ide_compile]"))
+        assertTrue(evidence, evidence.startsWith("[project.compile]"))
         assertTrue(
             evidence,
             evidence.contains("completed") ||

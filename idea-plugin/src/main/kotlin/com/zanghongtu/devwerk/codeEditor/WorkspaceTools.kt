@@ -7,8 +7,8 @@ object WorkspaceTools {
 
     fun listDir(basePath: String, relativePath: String, maxDepth: Int = 2): String {
         val target = File(basePath, normalizeRel(relativePath))
-        if (!target.exists()) return "[list_dir] not found: $relativePath"
-        if (!target.isDirectory) return "[list_dir] not a directory: $relativePath"
+        if (!target.exists()) return "[workspace.list] not found: $relativePath"
+        if (!target.isDirectory) return "[workspace.list] not a directory: $relativePath"
 
         val sb = StringBuilder()
         val rel = normalizeRel(relativePath)
@@ -46,12 +46,12 @@ object WorkspaceTools {
 
         //  关键：禁止 read_file 读取隐藏目录内部文件（允许 ".gitignore" 这种顶层隐藏文件）
         if (hasHiddenDirSegment(rel)) {
-            return "[read_file] blocked hidden directory path: $relativePath"
+            return "[workspace.read] blocked hidden directory path: $relativePath"
         }
 
         val file = File(basePath, rel)
-        if (!file.exists()) return "[read_file] not found: $relativePath"
-        if (file.isDirectory) return "[read_file] is a directory: $relativePath"
+        if (!file.exists()) return "[workspace.read] not found: $relativePath"
+        if (file.isDirectory) return "[workspace.read] is a directory: $relativePath"
 
         val lines = file.readLinesSafe()
         val s = (startLine.coerceAtLeast(1) - 1).coerceAtMost(lines.size)
@@ -67,7 +67,7 @@ object WorkspaceTools {
 
     fun search(basePath: String, query: String, paths: List<String>, maxResults: Int = 50): String {
         val q = query.trim()
-        if (q.isBlank()) return "[search] empty query"
+        if (q.isBlank()) return "[workspace.search] empty query"
 
         //  如果 caller 传 [""]，我们就把它当成“从项目根开始搜”
         val roots = if (paths.isEmpty()) listOf("src/", "app/") else paths
@@ -117,7 +117,7 @@ object WorkspaceTools {
             if (results.size >= maxResults) break
         }
 
-        if (results.isEmpty()) return "[search] no hits"
+        if (results.isEmpty()) return "[workspace.search] no hits"
         return results.joinToString("\n")
     }
 

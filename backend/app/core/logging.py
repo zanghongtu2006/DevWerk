@@ -53,7 +53,7 @@ def configure_logging(config: Any) -> None:
     for name in (
         "",
         "devwerk",
-        "devwerk.ide",
+        "devwerk.workflows",
         "devwerk.kanban",
         "devwerk.usage",
         "devwerk.planner",

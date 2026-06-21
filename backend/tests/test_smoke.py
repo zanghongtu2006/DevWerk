@@ -2,7 +2,7 @@ import json
 
 from fastapi.testclient import TestClient
 
-from app.models.ide import IdeChatResponse
+from app.models.protocol import IdeChatResponse
 from app.services.kanban import DEFAULT_COLUMNS
 
 
@@ -153,7 +153,7 @@ def test_failed_verification_returns_to_coding(monkeypatch, tmp_path):
                 "tool_results": [
                     {
                         "id": "compile",
-                        "tool": "run_command",
+                        "tool": "process.run",
                         "ok": False,
                         "content": "java: illegal escape character",
                         "error": "java: illegal escape character",
@@ -173,7 +173,7 @@ def test_failed_verification_returns_to_coding(monkeypatch, tmp_path):
 
 def test_kanban_apply_result_queues_resume_after_failed_verification(monkeypatch, tmp_path):
     import app.main as main_module
-    import app.routes.ide as ide_routes
+    import app.routes.workflows as ide_routes
     import app.services.kanban as kanban_service
     import app.services.session_store as session_store
     import app.services.usage as usage_service
@@ -226,7 +226,7 @@ def test_kanban_apply_result_queues_resume_after_failed_verification(monkeypatch
                     "verification": {
                         "required": ["compile"],
                         "results": {"compile": "failed"},
-                        "tool_results": [{"id": "compile", "tool": "run_command", "ok": False, "error": "compile failed"}],
+                        "tool_results": [{"id": "compile", "tool": "process.run", "ok": False, "error": "compile failed"}],
                     },
                 },
             },
@@ -246,7 +246,7 @@ def test_kanban_apply_result_queues_resume_after_failed_verification(monkeypatch
 
 def test_kanban_apply_failure_requests_recoding_and_queues_resume(monkeypatch, tmp_path):
     import app.main as main_module
-    import app.routes.ide as ide_routes
+    import app.routes.workflows as ide_routes
     import app.services.kanban as kanban_service
     import app.services.session_store as session_store
     import app.services.usage as usage_service
@@ -364,7 +364,7 @@ def test_verification_policy_uses_project_configured_tools_only():
                     "tool_requests": [
                         {
                             "id": "syntax",
-                            "tool": "ide_syntax_check",
+                            "tool": "source.diagnostics",
                             "args": {"paths": ["src/main/java/org/example/Application.java"]},
                         }
                     ]
@@ -374,7 +374,7 @@ def test_verification_policy_uses_project_configured_tools_only():
     )
 
     assert len(requests) == 1
-    assert requests[0].tool == "ide_syntax_check"
+    assert requests[0].tool == "source.diagnostics"
     assert requests[0].args["paths"] == ["src/main/java/org/example/Application.java"]
 
 

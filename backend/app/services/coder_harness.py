@@ -2,7 +2,7 @@
 Source-map driven code context helpers.
 
 The backend must not hard-code framework or business layout decisions. This
-module turns the IDE-provided source_map into a compact, factual summary that
+module turns a capability provider's source_map into a compact, factual summary that
 agents can use as evidence when planning and writing code.
 """
 
@@ -37,7 +37,7 @@ class CoderHarness:
             return None
         guidance = {
             "role": "coder",
-            "source": "IDE source_map",
+            "source": "client source_map",
             "rules": summary.get("path_policy") or [],
             "representative_paths": [
                 item.get("path")
@@ -65,18 +65,18 @@ def build_code_context_summary(workspace: dict[str, Any] | None) -> dict[str, An
                 "syntax_diagnostics": diagnostics,
                 "path_policy": [
                     "All paths are project-root relative and use forward slashes.",
-                    "IDE syntax diagnostics are direct file evidence for syntax-fix tasks.",
+                    "Client-provided syntax diagnostics are direct file evidence for syntax-fix tasks.",
                     "Use tool results for exact content before modifying existing files.",
                     "Do not invent directories or package names from diagnostics alone.",
                 ],
                 "warnings": [
-                    "No IDE source_map was provided; syntax diagnostics are available but agents may need list_dir/search/read_file.",
+                    "No client source_map was provided; diagnostics are available but agents may need workspace.list/workspace.search/workspace.read.",
                 ],
             }
         return {
             "available": False,
             "reason": "source_map_missing",
-            "warnings": ["No IDE source_map was provided; agents must request exact context before choosing paths."],
+            "warnings": ["No client source_map was provided; agents must request exact context before choosing paths."],
         }
 
     _log_source_map(source_map)
@@ -117,9 +117,9 @@ def build_code_context_summary(workspace: dict[str, Any] | None) -> dict[str, An
         "path_policy": [
             "All paths are project-root relative and use forward slashes.",
             "Use source_map and tool results as evidence; do not invent directories or package names.",
-            "If syntax_diagnostics are present, treat their paths/messages as direct file evidence stronger than broad search hits.",
-            "If source_map lacks exact content, request read_file before modifying existing files.",
-            "If source_map is missing or insufficient, request list_dir/search/read_file instead of guessing.",
+            "If syntax_diagnostics are present, treat their paths/messages as direct file evidence stronger than broad workspace.search hits.",
+            "If source_map lacks exact content, request workspace.read before modifying existing files.",
+            "If source_map is missing or insufficient, request workspace.list/workspace.search/workspace.read instead of guessing.",
         ],
         "warnings": _summary_warnings(source_map, normalized),
     }
@@ -302,7 +302,7 @@ def _summary_warnings(source_map: dict[str, Any], files: list[dict[str, Any]]) -
     total = int(source_map.get("total_files") or 0)
     indexed = int(source_map.get("indexed_files") or 0)
     if total and indexed < total:
-        warnings.append(f"source_map indexed {indexed}/{total} files; missing files may require list_dir/search.")
+        warnings.append(f"source_map indexed {indexed}/{total} files; missing files may require workspace.list/workspace.search.")
     if not files:
         warnings.append("source_map contains no file payload; agents must request workspace tools before planning paths.")
     return warnings

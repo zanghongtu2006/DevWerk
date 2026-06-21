@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.models.ide import ToolRequest
+from app.models.protocol import ToolRequest
 from app.services.tool_protocol import ToolProtocolError, normalize_tool_request
 
 

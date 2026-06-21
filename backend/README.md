@@ -8,6 +8,12 @@ file operations, and waits for a client to apply those changes through its local
 snapshot protection. The current capability client is the IntelliJ plugin; the
 protocol is intentionally not tied to Java or a particular IDE.
 
+Workflow columns reference job templates, never concrete agents. The scheduler
+loads `config/agents/default.json`, selects an enabled agent by role and required
+capabilities, and records the derived agent, model route, skills, and grants in
+the column run. Workflow topology remains separately configurable in
+`config/workflows/default.json` and through project workflow overrides.
+
 ## Setup
 
 ```powershell
@@ -253,8 +259,8 @@ of long blocking chat requests.
 
 `tool_requests` is an extensible backend-to-client action protocol.
 
-- Backend research tools: `list_dir`, `read_file`, `search`
-- Client-side post-apply tools: `ide_compile`, `ide_syntax_check`, `run_command`
+- Local research capabilities: `workspace.list`, `workspace.read`, `workspace.search`
+- Remote capabilities: `project.compile`, `source.diagnostics`, `process.run`
 
 Backend research tools are resolved inside an agent run. Client-side evidence
 tools pause the current workflow column and resume the same task through a
@@ -266,8 +272,8 @@ Example client-side tool request:
 
 ```json
 {
-  "id": "ide-compile",
-  "tool": "ide_compile",
+  "id": "project-compile",
+  "tool": "project.compile",
   "args": {
     "timeout_seconds": 300,
     "max_errors": 200
@@ -275,11 +281,13 @@ Example client-side tool request:
 }
 ```
 
-`ide_compile` is implemented by the IntelliJ plugin through `CompilerManager`
-for the currently open project. It is independent of language-specific source
-paths and returns compiler file/line evidence. `ide_syntax_check` is a fast PSI
-parser check and must not be treated as compilation. `run_command` remains
-available for project-specific verification selected from workspace evidence.
+The IntelliJ provider implements `project.compile` through `CompilerManager`.
+Another provider can implement the same capability differently, or advertise
+an implementation mapping such as
+`{"capability":"project.compile","implementation":"pipeline.compile"}`.
+`source.diagnostics` is a fast parser/static check and must not be treated as
+compilation. `process.run` remains available for project-specific verification
+selected from workspace evidence.
 
 ### `POST /v1/kanban/tasks/{task_id}/actions`
 

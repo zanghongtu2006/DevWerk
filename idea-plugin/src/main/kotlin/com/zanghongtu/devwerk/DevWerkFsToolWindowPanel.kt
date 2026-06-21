@@ -549,35 +549,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
     }
 
     private fun postApplyRequests(response: IdeChatResponse): List<ToolRequest> {
-        val changedPaths = collectChangedPaths(response)
-        if (changedPaths.isEmpty()) return response.toolRequests
-
-        val requests = response.toolRequests.toMutableList()
-        val hasIdeCompile = requests.any { it.tool == "ide_compile" }
-        if (!hasIdeCompile) {
-            requests += ToolRequest(
-                id = "ide_compile",
-                tool = "ide_compile",
-                args = mapOf(
-                    "timeout_seconds" to 300,
-                    "max_errors" to 200,
-                    "reason" to "Default post-apply IntelliJ CompilerManager verification."
-                )
-            )
-        }
-        val hasIdeSyntaxCheck = requests.any { it.tool == "ide_syntax_check" }
-        if (!hasIdeSyntaxCheck) {
-            requests += ToolRequest(
-                id = "ide_syntax_check",
-                tool = "ide_syntax_check",
-                args = mapOf(
-                    "paths" to emptyList<String>(),
-                    "max_errors" to 200,
-                    "reason" to "Default post-apply IDE diagnostics across the project."
-                )
-            )
-        }
-        return requests
+        return response.toolRequests
     }
 
     private fun collectChangedPaths(response: IdeChatResponse): List<String> {

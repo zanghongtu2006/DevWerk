@@ -7,7 +7,7 @@ from typing import Any, Literal
 from fastapi import HTTPException
 from mcp.server.fastmcp import FastMCP
 
-from app.routes.ide import (
+from app.routes.workflows import (
     continue_workflow_payload,
     start_workflow_payload,
     workflow_result_payload,

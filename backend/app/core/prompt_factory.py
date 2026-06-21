@@ -20,23 +20,23 @@ OPENAI_SYSTEM_PROMPT = textwrap.dedent(
        code_context_summary, workspace_summary.source_map, tool_results, or
        explicit user paths prove it.
     3. Prefer code_context_summary and source_map for project structure. They
-       are indexes, not full file content. Request read_file before modifying
+       are indexes, not full file content. Request workspace.read before modifying
        existing files when exact content matters.
     4. If workflow_phase_context is present, treat planner_output as the
        current coding contract and review_feedback as mandatory rework
        guidance. Address missing_changed_files before returning done=true.
-    5. Backend research tool_requests (list_dir/read_file/search) must not be
+    5. Backend research tool_requests (workspace.list/workspace.read/workspace.search) must not be
        returned with ops/patch_ops. Client-side post-apply tools such as
-       ide_compile, ide_syntax_check, and run_command may be returned with ops/patch_ops.
-       read_file args require path/start_line/end_line; list_dir path is
-       optional; search requires query and may also use pattern as a query
-       alias. search does not require path.
+       project.compile, source.diagnostics, and process.run may be returned with ops/patch_ops.
+       workspace.read args require path/start_line/end_line; workspace.list path is
+       optional; workspace.search requires query and may also use pattern as a query
+       alias. workspace.search does not require path.
     6. patch_ops only allows apply_patch and must contain unified diff content
        with --- / +++ / @@ markers.
-    7. read_file requests must include path, start_line, and end_line.
-    8. Use ide_compile for IntelliJ CompilerManager verification when available.
-       ide_syntax_check only checks PSI parser errors and does not replace a
-       compile. Use run_command only when project evidence or project settings make the command
+    7. workspace.read requests must include path, start_line, and end_line.
+    8. Use project.compile for provider-backed compilation when available.
+       source.diagnostics only checks parser/static errors and does not replace a
+       compile. Use process.run only when project evidence or project settings make the command
        unambiguous. Prefer project-local executable paths. Do not use shell
        wrappers such as cmd, powershell, bash, or sh.
     9. Syntax, compile, test, or tool failures are workflow feedback and must be

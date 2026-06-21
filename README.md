@@ -1,6 +1,6 @@
 # DevWerk
 
-DevWerk is a kanban-centered AI engineering loop for IDE-driven code generation.
+DevWerk is a kanban-centered AI engineering loop for tool-driven code generation.
 
 The core idea is simple: AI should not be a loose text box that writes into a
 repository. Every coding action should become a visible engineering task, move
@@ -10,8 +10,9 @@ IDE plugin. The plugin remains responsible for snapshot-protected writes.
 DevWerk is evolving from a basic CodeOps backend into a loop engineering and
 harness system:
 
-- The IDE plugin collects project context, source maps, attachments, and applies
-  returned changes through its local snapshot safety layer.
+- Capability providers collect project context, source maps, attachments, and
+  apply or verify returned changes. The IntelliJ plugin is the first provider,
+  not a backend architectural dependency.
 - The backend owns durable conversations, kanban workflow, model routing,
   per-column agent runs, candidate revisions, context compression, token
   accounting, and guarded patch/file operations.
@@ -27,7 +28,7 @@ harness system:
 ## Architecture
 
 ```text
-Capability Client (IntelliJ plugin or an MCP coding client)
+Capability Provider (IntelliJ, VS Code, CI, GitHub, MCP client)
   - projectId from .devwerk/meta
   - source map and selected context
   - attachment upload
@@ -44,6 +45,7 @@ DevWerk Backend (FastAPI)
   - patch/file operation generation
   - workflow action and verification state
   - local SQLite usage accounting
+  - workflow scheduler, job templates, and derived agent runtime
         |
         v
 LLM Catalog
@@ -73,6 +75,21 @@ Verified
 Done
 Failed
 ```
+
+Columns are business states, not agents. An executable column references a
+`job_template`; the scheduler resolves that job to an enabled agent whose role
+and capabilities satisfy the template. Agent identity, model route, skills,
+memory policy, and tool grants live in `backend/config/agents/default.json`.
+The workflow topology remains independently configurable in
+`backend/config/workflows/default.json` or per-project DB overrides.
+
+```text
+column -> job template -> scheduler -> derived agent -> capability broker
+```
+
+Providers advertise semantic capabilities such as `project.compile`; they may
+map that name to an implementation-specific operation. Backend code does not
+branch on IntelliJ, VS Code, CI, or GitHub.
 
 State meaning:
 

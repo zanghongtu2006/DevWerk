@@ -49,11 +49,11 @@ class SyntaxDiagnostic(BaseModel):
     column: Optional[int] = None
     severity: str = "error"
     message: str
-    source: str = "ide"
+    source: str = "client"
 
 
 class WorkspaceSummary(BaseModel):
-    # The IDE sends compact workspace facts, not full project contents.
+    # Capability providers send compact workspace facts, not full project contents.
     root_id: Optional[str] = None
     changed_files: List[WorkspaceFile] = []
     open_files: List[str] = []

@@ -606,15 +606,16 @@ class HttpAiClient(
 
     private fun clientCapabilities(): JSONObject = JSONObject()
         .put("protocol_version", 1)
+        .put("provider", "jetbrains")
         .put("transport", "http_sse")
         .put("platform", System.getProperty("os.name") ?: "unknown")
         .put("shell", if (System.getProperty("os.name")?.lowercase()?.contains("windows") == true) "cmd" else "posix")
         .put(
-            "tools",
+            "capabilities",
             JSONArray(
                 listOf(
-                    "list_dir", "read_file", "search", "apply_ops", "apply_patch",
-                    "create_snapshot", "ide_compile", "ide_syntax_check", "run_command"
+                    "workspace.list", "workspace.read", "workspace.search", "apply_ops", "apply_patch",
+                    "create_snapshot", "project.compile", "source.diagnostics", "process.run"
                 )
             )
         )
@@ -782,7 +783,7 @@ class HttpAiClient(
             appendDevLog(context, "[client-tool] started id=$id tool=${r.tool}\n")
             val result = try {
                 when (r.tool) {
-                    "list_dir" -> {
+                    "workspace.list" -> {
                         val path = (r.args["path"] as? String) ?: ""
                         val rel = normRel(path)
                         if (rel.isNotBlank() && containsHiddenSegment(rel)) {
@@ -793,7 +794,7 @@ class HttpAiClient(
                             ToolResult(id = id, ok = true, content = content)
                         }
                     }
-                    "read_file" -> {
+                    "workspace.read" -> {
                         val path = (r.args["path"] as? String) ?: ""
                         val rel = normRel(path)
                         if (hasHiddenDirSegment(rel)) {
@@ -805,7 +806,7 @@ class HttpAiClient(
                             ToolResult(id = id, ok = true, content = content)
                         }
                     }
-                    "search" -> {
+                    "workspace.search" -> {
                         val query = (r.args["query"] as? String) ?: ""
                         val maxResults = (r.args["max_results"] as? Number)?.toInt() ?: 50
                         val pathsAny = r.args["paths"]
@@ -819,7 +820,7 @@ class HttpAiClient(
                         val content = WorkspaceTools.search(base, query, safePaths, maxResults)
                         ToolResult(id = id, ok = true, content = content)
                     }
-                    "run_command" -> {
+                    "process.run" -> {
                         val content = runCommandTool(base, r.args)
                         val ok = content.first
                         ToolResult(
@@ -829,7 +830,7 @@ class HttpAiClient(
                             error = if (ok) null else content.second
                         )
                     }
-                    "ide_compile" -> {
+                    "project.compile" -> {
                         val content = ideCompile(context.project, base, r.args)
                         val ok = content.first
                         ToolResult(
@@ -839,7 +840,7 @@ class HttpAiClient(
                             error = if (ok) null else content.second
                         )
                     }
-                    "ide_syntax_check" -> {
+                    "source.diagnostics" -> {
                         val content = ideSyntaxCheck(context.project, base, r.args)
                         val ok = content.first
                         ToolResult(
@@ -886,18 +887,18 @@ class HttpAiClient(
 
     private fun runCommandTool(basePath: String, args: Map<String, Any?>): Pair<Boolean, String> {
         val command = commandParts(args)
-        if (command.isEmpty()) return false to "[run_command] command must be a non-empty array or string"
+        if (command.isEmpty()) return false to "[process.run] command must be a non-empty array or string"
         val cwdRel = normRel((args["cwd"] as? String) ?: "")
         if (cwdRel.isNotBlank() && containsHiddenSegment(cwdRel)) {
-            return false to "[run_command] blocked hidden cwd: $cwdRel"
+            return false to "[process.run] blocked hidden cwd: $cwdRel"
         }
         val base = File(basePath).canonicalFile
         val cwd = if (cwdRel.isBlank()) base else File(base, cwdRel).canonicalFile
         if (cwd != base && !cwd.path.startsWith(base.path + File.separator)) {
-            return false to "[run_command] cwd escapes project root: $cwdRel"
+            return false to "[process.run] cwd escapes project root: $cwdRel"
         }
         if (!cwd.exists() || !cwd.isDirectory) {
-            return false to "[run_command] cwd is not a directory: $cwdRel"
+            return false to "[process.run] cwd is not a directory: $cwdRel"
         }
 
         val resolved = resolveCommand(base, cwd, command)
@@ -914,26 +915,26 @@ class HttpAiClient(
         val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
         if (!finished) {
             process.destroyForcibly()
-            return false to "[run_command] timed out after ${timeoutSeconds}s\ncommand=${commandToRun.joinToString(" ")}"
+            return false to "[process.run] timed out after ${timeoutSeconds}s\ncommand=${commandToRun.joinToString(" ")}"
         }
         val output = process.inputStream.readBytes().toString(StandardCharsets.UTF_8).takeLast(20000)
         val exitCode = process.exitValue()
         val content = buildString {
-            append("[run_command] command=").append(command.joinToString(" ")).append("\n")
-            append("[run_command] resolved_command=").append(commandToRun.joinToString(" ")).append("\n")
-            append("[run_command] cwd=").append(cwd.relativeToOrSelf(base).path.ifBlank { "." }).append("\n")
-            append("[run_command] exit_code=").append(exitCode).append("\n")
+            append("[process.run] command=").append(command.joinToString(" ")).append("\n")
+            append("[process.run] resolved_command=").append(commandToRun.joinToString(" ")).append("\n")
+            append("[process.run] cwd=").append(cwd.relativeToOrSelf(base).path.ifBlank { "." }).append("\n")
+            append("[process.run] exit_code=").append(exitCode).append("\n")
             append(output)
         }
         return (exitCode == 0) to content
     }
 
     private fun ideCompile(project: Project?, basePath: String, args: Map<String, Any?>): Pair<Boolean, String> {
-        if (project == null) return false to "[ide_compile] project is unavailable"
-        if (project.isDisposed) return false to "[ide_compile] project is disposed"
+        if (project == null) return false to "[project.compile] project is unavailable"
+        if (project.isDisposed) return false to "[project.compile] project is disposed"
         val application = ApplicationManager.getApplication()
         if (application.isDispatchThread) {
-            return false to "[ide_compile] must be awaited outside the Event Dispatch Thread"
+            return false to "[project.compile] must be awaited outside the Event Dispatch Thread"
         }
 
         val timeoutSeconds = ((args["timeout_seconds"] as? Number)?.toLong() ?: 300L).coerceIn(1L, 900L)
@@ -947,7 +948,7 @@ class HttpAiClient(
                 FileDocumentManager.getInstance().saveAllDocuments()
                 val compilerManager = CompilerManager.getInstance(project)
                 if (compilerManager.isCompilationActive) {
-                    outcome.set(false to "[ide_compile] rejected: another IDE compilation is already active")
+                    outcome.set(false to "[project.compile] rejected: another IDE compilation is already active")
                     completed.countDown()
                     return@invokeLater
                 }
@@ -970,7 +971,7 @@ class HttpAiClient(
                                 "$path:$line:$column ${message.message}"
                             }
                         val content = buildString {
-                            append("[ide_compile] completed\n")
+                            append("[project.compile] completed\n")
                             append("aborted=").append(aborted).append('\n')
                             append("errors=").append(errors).append('\n')
                             append("warnings=").append(warnings).append('\n')
@@ -982,22 +983,22 @@ class HttpAiClient(
                     }
                 )
             } catch (t: Throwable) {
-                outcome.set(false to "[ide_compile] failed to start: ${typeName(t)}: ${t.message}")
+                outcome.set(false to "[project.compile] failed to start: ${typeName(t)}: ${t.message}")
                 completed.countDown()
             }
         }
 
         if (!completed.await(timeoutSeconds, TimeUnit.SECONDS)) {
-            return false to "[ide_compile] timed out after ${timeoutSeconds}s waiting for IntelliJ CompilerManager"
+            return false to "[project.compile] timed out after ${timeoutSeconds}s waiting for IntelliJ CompilerManager"
         }
-        return outcome.get() ?: (false to "[ide_compile] completed without a compiler result")
+        return outcome.get() ?: (false to "[project.compile] completed without a compiler result")
     }
 
     private fun ideSyntaxCheck(project: Project?, basePath: String, args: Map<String, Any?>): Pair<Boolean, String> {
-        if (project == null) return false to "[ide_syntax_check] project is unavailable"
+        if (project == null) return false to "[source.diagnostics] project is unavailable"
         val base = File(basePath).canonicalFile
         if (!base.exists() || !base.isDirectory) {
-            return false to "[ide_syntax_check] project root is unavailable: ${base.path}"
+            return false to "[source.diagnostics] project root is unavailable: ${base.path}"
         }
         val requestedPaths = pathList(args["paths"])
         val maxErrors = ((args["max_errors"] as? Number)?.toInt() ?: 100).coerceIn(1, 500)
@@ -1010,10 +1011,10 @@ class HttpAiClient(
         }
 
         if (errors.isEmpty()) {
-            return true to "[ide_syntax_check] passed"
+            return true to "[source.diagnostics] passed"
         }
         return false to buildString {
-            append("[ide_syntax_check] failed errors=").append(errors.size).append('\n')
+            append("[source.diagnostics] failed errors=").append(errors.size).append('\n')
             errors.forEach { append(it).append('\n') }
         }.trimEnd()
     }
@@ -1044,10 +1045,10 @@ class HttpAiClient(
 
         if (!hasPath) {
             if (isShellWrapper(rawExecutable)) {
-                return null to "[run_command] shell wrapper is not allowed: $rawExecutable"
+                return null to "[process.run] shell wrapper is not allowed: $rawExecutable"
             }
             val resolvedGlobal = resolvePathExecutable(rawExecutable, isWindows)
-                ?: return null to "[run_command] executable not found on IDE PATH: $rawExecutable"
+                ?: return null to "[process.run] executable not found on IDE PATH: $rawExecutable"
             val resolved = if (isWindows && resolvedGlobal.extension.lowercase() in setOf("bat", "cmd")) {
                 listOf("cmd.exe", "/c", resolvedGlobal.path) + args
             } else {
@@ -1068,10 +1069,10 @@ class HttpAiClient(
         val target = candidates
             .map { runCatching { it.canonicalFile }.getOrNull() }
             .firstOrNull { it != null && it.exists() && it.isFile }
-            ?: return null to "[run_command] project wrapper not found: $rawExecutable"
+            ?: return null to "[process.run] project wrapper not found: $rawExecutable"
 
         if (target != base && !target.path.startsWith(base.path + File.separator)) {
-            return null to "[run_command] wrapper escapes project root: $rawExecutable"
+            return null to "[process.run] wrapper escapes project root: $rawExecutable"
         }
 
         val resolved = if (isWindows && target.extension.lowercase() in setOf("bat", "cmd")) {

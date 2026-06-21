@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "agents": [
+    {
+      "id": "context-indexer",
+      "roles": ["context_indexing"],
+      "runtime": "local",
+      "model_route": "default",
+      "capabilities": ["workspace.list", "workspace.read", "workspace.search"],
+      "skills": ["source-map-indexing", "project-context-summary"],
+      "memory_policy": "task_and_project"
+    },
+    {
+      "id": "planning-agent",
+      "roles": ["planning"],
+      "runtime": "tool_loop",
+      "model_route": "planner",
+      "capabilities": ["workspace.list", "workspace.read", "workspace.search", "project.compile", "source.diagnostics"],
+      "skills": ["codebase-analysis", "implementation-planning"],
+      "memory_policy": "task_and_project"
+    },
+    {
+      "id": "coding-agent",
+      "roles": ["coding"],
+      "runtime": "tool_loop",
+      "model_route": "executor",
+      "capabilities": ["workspace.list", "workspace.read", "workspace.search", "workspace.write", "process.run"],
+      "skills": ["code-generation", "repository-conventions"],
+      "memory_policy": "task_and_project"
+    },
+    {
+      "id": "review-agent",
+      "roles": ["reviewing"],
+      "runtime": "tool_loop",
+      "model_route": "reviewer",
+      "capabilities": ["workspace.read", "workspace.search", "project.compile", "source.diagnostics", "process.run"],
+      "skills": ["code-review", "verification-planning"],
+      "memory_policy": "task_and_project"
+    }
+  ],
+  "job_templates": [
+    {"id": "index_project_context", "role": "context_indexing", "output_contract": "context_bundle"},
+    {"id": "produce_change_plan", "role": "planning", "output_contract": "plan_bundle"},
+    {"id": "generate_code_change", "role": "coding", "output_contract": "code_change_bundle"},
+    {"id": "review_code_change", "role": "reviewing", "output_contract": "review_bundle"}
+  ]
+}

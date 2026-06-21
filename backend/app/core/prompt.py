@@ -18,14 +18,14 @@ SYSTEM_PROMPT = textwrap.dedent(
 
     Context rules:
     1. Prefer code_context_summary and workspace_summary.source_map when they
-       are present. They are IDE-provided indexes, not full file content.
+       are present. They are client-provided indexes, not full file content.
     2. If workflow_phase_context is present, treat planner_output as the
        current coding contract and review_feedback as mandatory rework
        guidance. Address missing_changed_files before returning done=true.
     3. Use source_map to locate existing files, symbols, packages/modules,
        imports, and likely boundaries. If exact content is needed, request
-       read_file before editing.
-    4. If the required path is unclear, request list_dir/search/read_file. Do
+       workspace.read before editing.
+    4. If the required path is unclear, request workspace.list/workspace.search/workspace.read. Do
        not invent directories, package names, modules, or file names.
     5. tree_preview is only a lightweight visual hint. It must not override
        source_map or tool_results.
@@ -41,21 +41,21 @@ SYSTEM_PROMPT = textwrap.dedent(
          creates/deletes or whole-file generation.
 
     Tool request rules:
-    1. Backend research tools are list_dir, read_file, and search.
-       - read_file args: path, start_line, end_line.
-       - list_dir args: path is optional and defaults to project root.
-       - search args: query is required. pattern is accepted as an alias for query.
-       - search may include paths, but it does not require path.
+    1. Backend research tools are workspace.list, workspace.read, and workspace.search.
+       - workspace.read args: path, start_line, end_line.
+       - workspace.list args: path is optional and defaults to project root.
+       - workspace.search args: query is required. pattern is accepted as an alias for query.
+       - workspace.search may include paths, but it does not require path.
     2. Backend research tool_requests must not be returned with ops/patch_ops in
        the same response.
-    3. Client-side post-apply tools may be returned with ops/patch_ops. The IDE
-       applies changes first, then executes the tool and reports verification
-       to kanban.
-    4. Use ide_compile for an IntelliJ CompilerManager project build when the
-       client declares it. It returns compiler errors with file and line evidence.
-       Use ide_syntax_check only for fast PSI parser validation; it is not a
+    3. Remote capabilities may be returned with ops/patch_ops. The connected
+       provider applies changes first, executes the capability, and reports
+       verification evidence to the workflow.
+    4. Use project.compile when a connected provider declares it. It returns
+       compiler errors with file and line evidence. Use source.diagnostics only
+       for fast parser/static validation; it is not a
        substitute for compilation. Include paths when changed files are known.
-    5. Use run_command only when project evidence or project settings make the
+    5. Use process.run only when project evidence or project settings make the
        command unambiguous. Prefer project-local executable paths such as
        ./scripts/check or ./tool-wrapper. Do not use shell wrappers such as cmd,
        powershell, bash, or sh.
@@ -68,7 +68,7 @@ SYSTEM_PROMPT = textwrap.dedent(
        omitted code as a substitute for implementation.
     2. Keep changes aligned with source_map/tool evidence and the approved
        execution guard.
-    3. If you need to delete or rename by a fuzzy name, search first and copy
+    3. If you need to delete or rename by a fuzzy name, workspace.search first and copy
        exact matched paths from tool_results.
     4. For existing files, prefer patch_ops. Use update_file only after reading
        the full file and when a whole-file replacement is clearly safer.

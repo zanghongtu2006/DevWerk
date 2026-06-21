@@ -299,7 +299,7 @@ def _maybe_resume_after_apply_result(
             "result_after": result_cursor,
         },
     )
-    from app.routes.ide import _start_workflow_thread  # local import avoids router import cycle
+    from app.routes.workflows import _start_workflow_thread  # local import avoids router import cycle
 
     _start_workflow_thread(task_id, body)
     query = f"?result_after={quote(result_cursor or '')}" if result_cursor else ""

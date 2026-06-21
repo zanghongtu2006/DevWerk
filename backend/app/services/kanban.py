@@ -1134,11 +1134,10 @@ def _project_stats(conn: sqlite3.Connection, project_id: str) -> dict[str, Any]:
 
 def _default_agents() -> dict[str, Any]:
     return {
-        "coder": {"enabled": True, "model_ref": "minimax/m3"},
-        "planner": {"enabled": True, "model_ref": "deepseek/deepseek-chat"},
-        "executor": {"enabled": True, "model_ref": "minimax/m3"},
-        "reviewer": {"enabled": True, "model_ref": "minimax/m3"},
-        "verifier": {"enabled": False, "model_ref": "minimax/m3"},
+        "context-indexer": {"enabled": True, "model_route": "default"},
+        "planning-agent": {"enabled": True, "model_route": "planner"},
+        "coding-agent": {"enabled": True, "model_route": "executor"},
+        "review-agent": {"enabled": True, "model_route": "reviewer"},
     }
 
 
@@ -1148,9 +1147,6 @@ def _normalize_agents(value: Any) -> dict[str, Any]:
         for name, raw in value.items():
             if isinstance(raw, dict):
                 item = {**agents.get(name, {}), **raw}
-                legacy_profile = item.pop("model_profile", None)
-                if item.get("model_ref") in {None, "", "default", "DEVWERK_DEFAULT_API"}:
-                    item["model_ref"] = "minimax/m3" if legacy_profile != "deepseek" else "deepseek/deepseek-chat"
                 agents[name] = item
     return agents
 
@@ -1330,7 +1326,7 @@ def definition_to_dict(definition: Any) -> dict[str, Any]:
                 "title": col.title,
                 "position": col.position,
                 "transition_to": col.transition_to,
-                "agent": col.agent,
+                "job_template": col.job_template,
                 "input_artifacts": col.input_artifacts or [],
                 "output_artifact": col.output_artifact,
                 "success_action": col.success_action,

@@ -1,7 +1,7 @@
 """
 DevWerk backend configuration.
 
-The backend owns model/provider selection. The IDE plugin only sends context.
+The backend owns model/provider selection. Capability providers only send context and execute granted operations.
 
 Configuration is split into:
   - API profiles: protocol + base URL + auth + default model

@@ -11,7 +11,7 @@ class WorkflowColumn:
     title: str
     position: int
     transition_to: list[str]
-    agent: str | None = None
+    job_template: str | None = None
     input_artifacts: list[str] | None = None
     output_artifact: str | None = None
     success_action: str | None = None
@@ -20,7 +20,7 @@ class WorkflowColumn:
 
     @property
     def executable(self) -> bool:
-        return bool(self.agent)
+        return bool(self.job_template)
 
 
 @dataclass(frozen=True)
@@ -56,7 +56,7 @@ class WorkflowDefinition:
                 {
                     "status_key": col.status_key,
                     "title": col.title,
-                    "agent": col.agent,
+                    "job_template": col.job_template,
                     "success_action": col.success_action,
                     "output_artifact": col.output_artifact,
                 }
@@ -86,7 +86,7 @@ def workflow_from_dict(value: dict[str, Any]) -> WorkflowDefinition:
                 title=str(raw.get("title") or status_key).strip(),
                 position=int(raw.get("position") or (len(columns) + 1) * 10),
                 transition_to=[str(item).strip().lower() for item in raw.get("transition_to") or [] if str(item).strip()],
-                agent=_none_if_blank(raw.get("agent")),
+                job_template=_none_if_blank(raw.get("job_template")),
                 input_artifacts=[str(item).strip() for item in raw.get("input_artifacts") or [] if str(item).strip()],
                 output_artifact=_none_if_blank(raw.get("output_artifact")),
                 success_action=_none_if_blank(raw.get("success_action")),
@@ -125,7 +125,7 @@ def _fallback_columns() -> list[dict[str, Any]]:
             "title": "Context Indexed",
             "position": 20,
             "transition_to": ["planned", "failed"],
-            "agent": "context",
+            "job_template": "index_project_context",
             "input_artifacts": ["workflow_request"],
             "output_artifact": "context_bundle",
             "success_action": "context_indexed",
@@ -137,7 +137,7 @@ def _fallback_columns() -> list[dict[str, Any]]:
             "title": "Planned",
             "position": 30,
             "transition_to": ["coding", "draft", "failed"],
-            "agent": "planner",
+            "job_template": "produce_change_plan",
             "input_artifacts": ["context_bundle"],
             "output_artifact": "plan_bundle",
             "success_action": "plan_ready",
@@ -149,7 +149,7 @@ def _fallback_columns() -> list[dict[str, Any]]:
             "title": "Coding",
             "position": 40,
             "transition_to": ["reviewed", "planned", "failed"],
-            "agent": "coder",
+            "job_template": "generate_code_change",
             "input_artifacts": ["context_bundle", "plan_bundle"],
             "output_artifact": "code_change_bundle",
             "success_action": "coding_ready",
@@ -161,7 +161,7 @@ def _fallback_columns() -> list[dict[str, Any]]:
             "title": "Reviewed",
             "position": 45,
             "transition_to": ["ready_to_apply", "coding", "planned", "failed"],
-            "agent": "reviewer",
+            "job_template": "review_code_change",
             "input_artifacts": ["plan_bundle", "code_change_bundle"],
             "output_artifact": "review_bundle",
             "success_action": "approve",

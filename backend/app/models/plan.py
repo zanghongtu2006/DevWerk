@@ -8,7 +8,7 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
-from app.models.ide import ToolRequest
+from app.models.protocol import ToolRequest
 
 
 class PlanFile(BaseModel):

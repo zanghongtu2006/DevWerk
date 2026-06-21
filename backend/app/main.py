@@ -19,7 +19,7 @@ sys.path.insert(0, str(__file__.rsplit("/", 2)[0]))
 from app.core.config import settings
 from app.core.logging import configure_logging, configure_logging_from_env
 from app.mcp_server import create_mcp_server
-from app.routes.ide import router as ide_router
+from app.routes.workflows import router as workflow_router
 from app.routes.kanban import router as kanban_router
 from app.routes.kanban import ui_router as kanban_ui_router
 from app.routes.settings import router as settings_router
@@ -69,13 +69,13 @@ def create_app() -> FastAPI:
     devwerk_mcp, mcp_http_app = create_mcp_server()
     app = FastAPI(
         title="DevWerk API",
-        description="AI-driven CodeOps backend for IDE integration.",
+        description="AI-driven workflow and agent runtime for engineering capability providers.",
         version="0.1.0",
         lifespan=lifespan,
     )
     app.state.devwerk_mcp = devwerk_mcp
 
-    # Allow IDE plugins (typically localhost) to call the API.
+    # Allow local capability providers to call the API.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],   # tighten in production via ALLOWED_ORIGINS env var
@@ -133,7 +133,7 @@ def create_app() -> FastAPI:
         finally:
             clear_request()
 
-    app.include_router(ide_router, prefix="/v1", tags=["IDE"])
+    app.include_router(workflow_router, prefix="/v1", tags=["Workflows"])
     app.include_router(kanban_router, prefix="/v1", tags=["Kanban"])
     app.include_router(settings_router, prefix="/v1", tags=["Settings"])
     app.include_router(kanban_ui_router)

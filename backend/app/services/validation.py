@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from app.services.tool_protocol import BACKEND_RESEARCH_TOOLS, normalize_tool_requests
+from app.services.tool_protocol import LOCAL_CAPABILITIES, normalize_tool_requests
 
 ALLOWED_FILE_OPS = {"create_dir", "create_file", "update_file", "delete_path"}
 ALLOWED_PATCH_OPS = {"apply_patch"}
@@ -72,13 +72,13 @@ def validate_model_response(obj: Dict[str, Any]) -> None:
             args = tr.get("args")
             if not isinstance(args, dict):
                 raise ValueError(f"tool_requests[{i}].args must be object")
-            # 粗略约束 read_file 必须有限制范围
-            if tr["tool"] == "read_file":
+            # Keep workspace reads bounded when a model omits a range.
+            if tr["tool"] == "workspace.read":
                 if "path" not in args:
                     raise ValueError(f"tool_requests[{i}].args.path missing")
                 # _validate_rel_path(args["path"], f"tool_requests[{i}].args")
                 # if "start_line" not in args or "end_line" not in args:
-                #     raise ValueError(f"tool_requests[{i}] read_file must set start_line/end_line")
+                #     raise ValueError(f"tool_requests[{i}] workspace.read must set start_line/end_line")
                 if "start_line" not in args:
                     args["start_line"] = None
                 if "end_line" not in args:
@@ -105,6 +105,6 @@ def validate_model_response(obj: Dict[str, Any]) -> None:
     tool_requests = obj.get("tool_requests") or []
     patch_ops = obj.get("patch_ops") or []
 
-    backend_tools = [tr for tr in tool_requests if isinstance(tr, dict) and tr.get("tool") in BACKEND_RESEARCH_TOOLS]
+    backend_tools = [tr for tr in tool_requests if isinstance(tr, dict) and tr.get("tool") in LOCAL_CAPABILITIES]
     if backend_tools and (ops or patch_ops):
         raise ValueError("Backend research tools cannot be returned with ops/patch_ops in the same response.")

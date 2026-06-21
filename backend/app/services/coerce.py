@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Set
 
-from app.models.ide import FileOp, PatchOp, ToolRequest, ToolResult
+from app.models.protocol import FileOp, PatchOp, ToolRequest, ToolResult
 from app.services.tool_protocol import normalize_tool_request
 
 

@@ -7,8 +7,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.models.ide import IdeChatResponse, ToolRequest
+from app.models.protocol import IdeChatResponse, ToolRequest
 from app.models.plan import PlanResponse
+from app.services.agent_definition import default_agent_catalog
+from app.services.capability_broker import CapabilityBroker
 from app.services.coder_harness import build_code_context_summary
 from app.services.conversation_context import context_debug_payload, prepare_conversation_context
 from app.services.kanban import (
@@ -24,6 +26,7 @@ from app.services.kanban import (
     update_conversation,
 )
 from app.services.session_store import read_project_memory
+from app.services.job_scheduler import JobScheduler
 from app.services.verification_policy import configured_post_apply_tool_requests, verification_feedback_summary
 from app.services.workflow import apply_workflow_action, record_phase_output
 from app.services.workflow_definition import WorkflowColumn, WorkflowDefinition, workflow_from_dict
@@ -57,15 +60,20 @@ class WorkflowEngine:
         self.plan_runner = plan_runner
         self.coding_runner = coding_runner
         self.review_runner = review_runner
-        self._agent_handlers = {
-            "context": self._run_context_column,
-            "planner": self._run_plan_column,
-            "coder": self._run_coding_column,
-            "reviewer": self._run_review_column,
+        self._job_handlers = {
+            "context_bundle": self._run_context_column,
+            "plan_bundle": self._run_plan_column,
+            "code_change_bundle": self._run_coding_column,
+            "review_bundle": self._run_review_column,
         }
+        self._scheduler: JobScheduler | None = None
 
     async def run(self, task_id: str, body: dict[str, Any]) -> None:
         project_id = str(body.get("project_id") or "default")
+        settings_payload = get_project_settings(project_id)
+        project_settings = settings_payload.get("settings") if isinstance(settings_payload, dict) else {}
+        agent_overrides = project_settings.get("agents") if isinstance(project_settings, dict) else {}
+        self._scheduler = JobScheduler(default_agent_catalog().with_project_overrides(agent_overrides))
         definition = workflow_from_dict(get_project_workflow(project_id).get("workflow") or {})
         workflow_summary = definition.summary()
         executable = _executable_columns(definition)
@@ -76,7 +84,7 @@ class WorkflowEngine:
                 "entrypoint": "/v1/workflows",
                 "workflow": workflow_summary,
                 "executable_columns": [
-                    {"status_key": col.status_key, "agent": col.agent, "success_action": col.success_action}
+                    {"status_key": col.status_key, "job_template": col.job_template, "success_action": col.success_action}
                     for col in executable
                 ],
             },
@@ -115,39 +123,37 @@ class WorkflowEngine:
             else (_resume_column(definition, state) if resume_feedback else executable[0])
         )
         if resume_action == "confirm_plan" and state.plan_response is not None:
-            current = _column_for_agent(definition, "coder") or current
+            current = _column_for_contract(definition, self._scheduler, "code_change_bundle") or current
             update_conversation(task_id, state="running", waiting_for=None, active_column=current.status_key)
             _event(task_id, "workflow_resumed", {"reason": "plan_confirmed", "status_key": current.status_key})
         elif resume_action in {"revise_plan", "message", "tool_result"}:
-            current = _column_for_agent(definition, "planner") or current
+            current = _column_for_contract(definition, self._scheduler, "plan_bundle") or current
             update_conversation(task_id, state="running", waiting_for=None, active_column=current.status_key)
             _event(task_id, "workflow_resumed", {"reason": resume_action, "status_key": current.status_key})
         if current is None:
             current = executable[0]
 
-        settings_payload = get_project_settings(project_id)
-        project_settings = settings_payload.get("settings") if isinstance(settings_payload, dict) else {}
         parameters = project_settings.get("parameters") if isinstance(project_settings, dict) else {}
         max_rounds = _positive_int(parameters.get("workflow_max_total_runs"), 512)
         max_rework_rounds = _positive_int(parameters.get("workflow_max_rework_runs"), 128)
         for round_no in range(1, max_rounds + 1):
             _log.debug(
-                "workflow loop task_id=%s round=%s status_key=%s agent=%s",
+                "workflow loop task_id=%s round=%s status_key=%s job_template=%s",
                 task_id,
                 round_no,
                 current.status_key,
-                current.agent,
+                current.job_template,
             )
             _event(
                 task_id,
                 "workflow_round_started",
-                {"round": round_no, "status_key": current.status_key, "agent": current.agent},
+                {"round": round_no, "status_key": current.status_key, "job_template": current.job_template},
             )
 
             try:
                 result = await self._run_column(task_id, body, definition, workflow_summary, current, state)
-            except UnsupportedAgentError as exc:
-                response = _failure_response(task_id, "UNSUPPORTED_WORKFLOW_AGENT", str(exc))
+            except UnsupportedJobError as exc:
+                response = _failure_response(task_id, "UNSUPPORTED_WORKFLOW_JOB", str(exc))
                 apply_workflow_action(task_id, "fail", {"phase": current.status_key, "reason": response.error_message})
                 _event(task_id, "workflow_finished", {"ok": False, "phase": current.status_key, "status_key": "failed"})
                 add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
@@ -275,7 +281,7 @@ class WorkflowEngine:
                 add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
                 return
 
-            if _agent_kind(next_column.agent) == "planner" and result.action != "request_replan":
+            if _column_contract(next_column, self._scheduler) == "plan_bundle" and result.action != "request_replan":
                 state.review_feedback = None
             current = next_column
 
@@ -293,22 +299,67 @@ class WorkflowEngine:
         column: WorkflowColumn,
         state: WorkflowRunState,
     ) -> ColumnResult:
-        agent = _agent_kind(column.agent)
-        handler = self._agent_handlers.get(agent)
+        if self._scheduler is None or not column.job_template:
+            raise UnsupportedJobError(f"Column {column.status_key!r} has no schedulable job template.")
+        try:
+            job = self._scheduler.schedule(
+                task_id=task_id,
+                column=column.status_key,
+                job_template=column.job_template,
+            )
+        except (KeyError, LookupError) as exc:
+            raise UnsupportedJobError(str(exc)) from exc
+        handler = self._job_handlers.get(job.template.output_contract)
         if handler is None:
-            raise UnsupportedAgentError(f"Unsupported workflow agent {column.agent!r} on column {column.status_key!r}.")
+            raise UnsupportedJobError(
+                f"No runtime adapter handles output contract {job.template.output_contract!r} "
+                f"for job template {job.template.id!r}."
+            )
+        job_body = dict(
+            body,
+            _workflow_job_id=job.id,
+            _workflow_job_template=job.template.id,
+            _workflow_agent_id=job.agent.id,
+            _workflow_agent_model_route=job.agent.model_route,
+            _workflow_agent_capabilities=list(job.agent.capabilities),
+            _workflow_agent_skills=list(job.agent.skills),
+        )
         run = start_column_run(
             task_id,
             status_key=column.status_key,
-            agent=column.agent or agent,
-            checkpoint={"workflow": workflow_summary.get("name"), "input_artifacts": column.input_artifacts or []},
+            agent=job.agent.id,
+            checkpoint={
+                "workflow": workflow_summary.get("name"),
+                "job_id": job.id,
+                "job_template": job.template.id,
+                "output_contract": job.template.output_contract,
+                "runtime": job.agent.runtime,
+                "model_route": job.agent.model_route,
+                "capabilities": list(job.agent.capabilities),
+                "skills": list(job.agent.skills),
+                "input_artifacts": column.input_artifacts or [],
+            },
         )
-        _event(task_id, "column_run_started", {"column_run_id": run["id"], "run_no": run["run_no"], "status_key": column.status_key, "agent": column.agent or agent})
+        _event(
+            task_id,
+            "job_scheduled",
+            {
+                "job_id": job.id,
+                "job_template": job.template.id,
+                "output_contract": job.template.output_contract,
+                "agent": job.agent.id,
+                "runtime": job.agent.runtime,
+                "model_route": job.agent.model_route,
+                "capabilities": list(job.agent.capabilities),
+                "skills": list(job.agent.skills),
+            },
+        )
+        _event(task_id, "column_run_started", {"column_run_id": run["id"], "run_no": run["run_no"], "status_key": column.status_key, "job_id": job.id, "agent": job.agent.id})
         try:
-            if agent == "coder":
-                outcome = await handler(task_id, body, definition, workflow_summary, column, state)
+            if job.template.output_contract == "code_change_bundle":
+                outcome = await handler(task_id, job_body, definition, workflow_summary, column, state)
             else:
-                result = handler(task_id, body, workflow_summary, column, state)
+                result = handler(task_id, job_body, workflow_summary, column, state)
                 outcome = await result if isinstance(result, Awaitable) else result
             run_state = "waiting_user" if outcome.response and outcome.response.waiting_for else "completed"
             finish_column_run(run["id"], state=run_state, checkpoint={"action": outcome.action, "decision": outcome.decision, "target_status": outcome.target_status})
@@ -325,7 +376,7 @@ class WorkflowEngine:
         column: WorkflowColumn,
         state: WorkflowRunState,
     ) -> ColumnResult:
-        agent = column.agent or "context"
+        agent = _active_agent(body)
         _event(task_id, "workflow_column_started", {"status_key": column.status_key, "agent": agent})
         context = _build_agent_context(task_id, column.status_key, agent, body, workflow_summary, column.input_artifacts or [])
         code_context_summary = build_code_context_summary(body.get("workspace"))
@@ -377,7 +428,7 @@ class WorkflowEngine:
         column: WorkflowColumn,
         state: WorkflowRunState,
     ) -> ColumnResult:
-        agent = column.agent or "planner"
+        agent = _active_agent(body)
         _event(task_id, "workflow_column_started", {"status_key": column.status_key, "agent": agent})
         _event(
             task_id,
@@ -428,12 +479,12 @@ class WorkflowEngine:
             preflight_requests = _allowed_client_tool_requests(
                 [
                     {
-                        "id": "ide-compile-evidence",
-                        "tool": "ide_compile",
+                        "id": "project-compile-evidence",
+                        "tool": "project.compile",
                         "args": {
                             "timeout_seconds": 300,
                             "max_errors": 200,
-                            "reason": "Collect authoritative IDE compiler evidence before planning a compile-error repair.",
+                            "reason": "Collect authoritative compiler evidence before planning a compile-error repair.",
                         },
                     }
                 ],
@@ -451,7 +502,7 @@ class WorkflowEngine:
                 },
             )
             plan_response = PlanResponse(
-                summary="Collecting authoritative compiler diagnostics from the connected IDE before planning.",
+                summary="Collecting authoritative compiler diagnostics from a connected capability provider before planning.",
                 tool_requests=preflight_requests,
                 next_action="need_client_tool",
             )
@@ -506,7 +557,7 @@ class WorkflowEngine:
                 task_id,
                 status_key=_current_status(task_id),
                 waiting_for="client_tool",
-                reply=plan_response.summary or "Collecting project evidence from the connected IDE.",
+                reply=plan_response.summary or "Collecting project evidence from a connected capability provider.",
                 interaction={
                     "type": "client_tool",
                     "reason": "planner_evidence",
@@ -597,7 +648,7 @@ class WorkflowEngine:
             response = _failure_response(task_id, "MISSING_PLAN", message, status_key=(moved.get("task") or {}).get("status_key") or "failed")
             return ColumnResult(action=action, decision="fail", response=response, target_status=response.status_key)
 
-        agent = column.agent or "coder"
+        agent = _active_agent(body)
         enter_action = _entry_action_for_status(definition, column.status_key)
         if enter_action and _current_status(task_id) != column.status_key:
             apply_workflow_action(task_id, enter_action, {"phase": column.status_key, "approved_paths": [file.path for file in state.plan_response.files]})
@@ -634,6 +685,7 @@ class WorkflowEngine:
             "approved_ops": [],
             "client_capabilities": body.get("client_capabilities") or {},
             "_workflow_engine_managed": True,
+            "_workflow_agent_model_route": body.get("_workflow_agent_model_route"),
         }
         _event(
             task_id,
@@ -702,7 +754,7 @@ class WorkflowEngine:
             response = _failure_response(task_id, "MISSING_REVIEW_INPUT", message, status_key=(moved.get("task") or {}).get("status_key") or "failed")
             return ColumnResult(action=action, decision="fail", response=response, target_status=response.status_key)
 
-        agent = column.agent or "reviewer"
+        agent = _active_agent(body)
         _event(task_id, "workflow_column_started", {"status_key": column.status_key, "agent": agent})
         context = _build_agent_context(task_id, column.status_key, agent, body, workflow_summary, column.input_artifacts or [])
         _event(task_id, "agent_context_built", {"phase": column.status_key, "agent": agent, "context": _context_log_summary(context)})
@@ -728,6 +780,7 @@ class WorkflowEngine:
                     "verification_feedback": _compact_verification_feedback(state.review_feedback),
                     "client_capabilities": body.get("client_capabilities") or {},
                     "verification_required": _task_requires_executable_verification(context.get("task")),
+                    "_workflow_agent_model_route": body.get("_workflow_agent_model_route"),
                 }
             )
             semantic_decision = str(semantic_review.get("decision") or "approve").strip().lower()
@@ -803,7 +856,7 @@ class WorkflowEngine:
         return ColumnResult(action=action, target_status=(moved.get("task") or {}).get("status_key"), decision=decision)
 
 
-class UnsupportedAgentError(ValueError):
+class UnsupportedJobError(ValueError):
     pass
 
 
@@ -926,8 +979,8 @@ def _allowed_client_tool_requests(
     *,
     project_root: object = None,
 ) -> list[ToolRequest]:
-    tools = capabilities.get("tools") if isinstance(capabilities, dict) else None
-    allowed = {str(tool).strip() for tool in tools or [] if str(tool).strip()} if isinstance(tools, list) else set()
+    broker = CapabilityBroker()
+    allowed = broker.available(capabilities)
     if not isinstance(value, list) or not allowed:
         return []
     requests: list[ToolRequest] = []
@@ -939,7 +992,12 @@ def _allowed_client_tool_requests(
             request = ToolRequest.model_validate(item)
         except Exception:  # noqa: BLE001
             continue
-        if request.tool == "run_command" and "cwd" in request.args:
+        offer = broker.resolve(capabilities, request.tool)
+        if offer is None:
+            continue
+        requested_capability = offer.capability
+        request.tool = offer.implementation or offer.capability
+        if requested_capability == "process.run" and "cwd" in request.args:
             normalized_cwd = _normalize_client_cwd(request.args.get("cwd"), project_root)
             if normalized_cwd is None:
                 continue
@@ -1293,20 +1351,36 @@ def _next_executable_after_transition(
 
 def _resume_column(definition: WorkflowDefinition, state: WorkflowRunState) -> WorkflowColumn | None:
     if state.plan_response is not None:
-        return _first_column_by_agent(definition, {"coder", "executor", "coding"})
-    return _first_column_by_agent(definition, {"planner", "plan"})
+        return _first_column_by_contract(definition, "code_change_bundle")
+    return _first_column_by_contract(definition, "plan_bundle")
 
 
-def _first_column_by_agent(definition: WorkflowDefinition, agents: set[str]) -> WorkflowColumn | None:
+def _first_column_by_contract(definition: WorkflowDefinition, contract: str) -> WorkflowColumn | None:
+    catalog = default_agent_catalog()
     for column in _executable_columns(definition):
-        if str(column.agent or "").strip().lower() in agents:
+        if _column_contract(column, JobScheduler(catalog)) == contract:
             return column
     return None
 
 
-def _column_for_agent(definition: WorkflowDefinition, agent: str) -> WorkflowColumn | None:
-    expected = _agent_kind(agent)
-    return next((column for column in _executable_columns(definition) if _agent_kind(column.agent) == expected), None)
+def _column_for_contract(
+    definition: WorkflowDefinition,
+    scheduler: JobScheduler | None,
+    contract: str,
+) -> WorkflowColumn | None:
+    return next(
+        (column for column in _executable_columns(definition) if _column_contract(column, scheduler) == contract),
+        None,
+    )
+
+
+def _column_contract(column: WorkflowColumn, scheduler: JobScheduler | None) -> str:
+    if scheduler is None or not column.job_template:
+        return ""
+    try:
+        return scheduler.catalog.job(column.job_template).output_contract
+    except KeyError:
+        return ""
 
 
 def _requires_plan_confirmation(body: dict[str, Any]) -> bool:
@@ -1367,21 +1441,11 @@ def _failure_action(column: WorkflowColumn) -> str:
     return "fail" if "fail" in actions else (actions[0] if actions else "fail")
 
 
-def _agent_kind(agent: str | None) -> str:
-    value = str(agent or "").strip().lower()
-    aliases = {
-        "local_context": "context",
-        "context_agent": "context",
-        "plan": "planner",
-        "planning": "planner",
-        "executor": "coder",
-        "coding": "coder",
-        "code": "coder",
-        "review": "reviewer",
-        "quality": "reviewer",
-        "quality_gate": "reviewer",
-    }
-    return aliases.get(value, value)
+def _active_agent(body: dict[str, Any]) -> str:
+    agent = str(body.get("_workflow_agent_id") or "").strip()
+    if not agent:
+        raise UnsupportedJobError("Scheduled job did not provide a derived agent identity.")
+    return agent
 
 
 def _current_status(task_id: str) -> str:

@@ -4,7 +4,8 @@ import json
 import logging
 from typing import Any
 
-from app.models.ide import ToolRequest
+from app.models.protocol import ToolRequest
+from app.services.capability_broker import CapabilityBroker
 from app.services.llm_factory import get_llm_client
 from app.services.tool_protocol import ToolProtocolError, normalize_tool_request
 
@@ -42,7 +43,7 @@ class Reviewer:
                     "snapshot-protected apply and return "
                     "verification_tool_requests[] using only tools declared in client_capabilities. The model must select commands from "
                     "project evidence; commands must be project-relative and non-destructive. Prefer one authoritative project-native "
-                    "build, test, typecheck, lint, or IDE diagnostic operation inferred from manifests and workspace evidence. Never use "
+                    "build, test, typecheck, lint, or provider diagnostic operation inferred from manifests and workspace evidence. Never use "
                     "source-printing or text-matching commands such as cat, type, grep, or findstr as verification; source content is review "
                     "evidence, not an executable check. When verification_required=true, an approve decision MUST include at least one "
                     "authoritative verification_tool_request; infer it from project evidence rather than hardcoding a framework command. "
@@ -127,16 +128,14 @@ def _normalize_review(raw: Any, allowed_tools: set[str] | None = None) -> dict[s
 
 
 def _client_tools(capabilities: Any) -> set[str]:
-    if not isinstance(capabilities, dict) or not isinstance(capabilities.get("tools"), list):
-        return set()
-    return {str(tool).strip() for tool in capabilities["tools"] if str(tool).strip()}
+    return CapabilityBroker().available(capabilities)
 
 
 def _missing_required_verification(result: dict[str, Any], payload: dict[str, Any]) -> bool:
     if not payload.get("verification_required") or result.get("decision") != "approve":
         return False
     client_tools = _client_tools(payload.get("client_capabilities"))
-    if not client_tools.intersection({"run_command", "ide_compile", "ide_syntax_check"}):
+    if not client_tools.intersection({"process.run", "project.compile", "source.diagnostics"}):
         return False
     return not result.get("verification_tool_requests")
 

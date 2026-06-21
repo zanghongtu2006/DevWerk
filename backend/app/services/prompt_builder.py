@@ -7,7 +7,7 @@ from typing import Dict, List
 
 from app.core.prompt_factory import build_system_prompt
 from app.core.schema import MODEL_RESPONSE_SCHEMA
-from app.models.ide import IdeChatRequest
+from app.models.protocol import IdeChatRequest
 from app.services.coder_harness import build_code_context_summary, build_coder_skill
 
 _log = logging.getLogger("devwerk.prompt_builder")

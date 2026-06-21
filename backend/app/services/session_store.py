@@ -219,7 +219,7 @@ def _extract_commands(outputs: dict[str, Any]) -> list[str]:
         if not isinstance(item, dict):
             continue
         args = item.get("args")
-        if item.get("tool") == "run_command" and isinstance(args, dict):
+        if item.get("tool") == "process.run" and isinstance(args, dict):
             command = args.get("command")
             if isinstance(command, list):
                 commands.append(" ".join(str(part) for part in command))

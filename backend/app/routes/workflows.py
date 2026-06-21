@@ -1,5 +1,5 @@
 """
-IDE-facing API endpoints (/v1/ide/*).
+Provider-neutral workflow API endpoints.
 
 All routes are prefixed with /v1 in app/main.py.
 """
@@ -22,7 +22,7 @@ from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from app.core.config import settings
-from app.models.ide import IdeChatResponse, ToolRequest, ToolResult
+from app.models.protocol import IdeChatResponse, ToolRequest, ToolResult
 from app.models.plan import PlanResponse
 from app.services.coerce import coerce_to_fileops, coerce_to_patchops, coerce_to_toolrequests
 from app.services.coder_harness import build_code_context_summary, build_coder_skill
@@ -41,7 +41,7 @@ from app.services.kanban import (
     update_conversation,
 )
 from app.services.llm_factory import get_llm_client
-from app.services.planner import Planner as build_planner
+from app.services.planner import EvidencePlanningLoop
 from app.services.provider_errors import (
     LLMProviderError,
     is_retryable_llm_error,
@@ -57,7 +57,7 @@ from app.services.workflow import apply_workflow_action, record_phase_output
 from app.services.workflow_engine import WorkflowEngine
 
 router = APIRouter()
-_log = logging.getLogger("devwerk.ide")
+_log = logging.getLogger("devwerk.workflows")
 
 
 def _positive_int(value: object, default: int, *, maximum: int | None = None) -> int:
@@ -281,7 +281,7 @@ async def get_workflow_result(task_id: str, result_after: str | None = None):
 @router.post("/ide/attachments")
 async def upload_attachment(file: UploadFile = File(...), project_id: str | None = Form(default=None)):
     """
-    Store an IDE attachment on the local backend filesystem.
+    Store a capability-client attachment on the local backend filesystem.
 
     This is intentionally local-only for now. The returned local_path can be
     referenced by later DevWerk requests, but the file content is not pushed
@@ -330,7 +330,7 @@ async def upload_attachment(file: UploadFile = File(...), project_id: str | None
 # ---------------------------------------------------------------------------
 
 @router.post("/plan", response_model=PlanResponse)
-async def ide_plan(request: Request) -> PlanResponse:
+async def planning_phase(request: Request) -> PlanResponse:
     """
     Plan phase — research the codebase and return a file-level change plan.
 
@@ -355,7 +355,7 @@ async def ide_plan(request: Request) -> PlanResponse:
         )
     task_id = _ensure_plan_task(body)
     _log.debug(
-        "ide_plan: received project_id=%s task_id=%s mode=%s messages=%s workspace_summary=%s",
+        "planning_phase: received project_id=%s task_id=%s mode=%s messages=%s workspace_summary=%s",
         body.get("project_id"),
         task_id,
         body.get("mode", "agent"),
@@ -371,7 +371,7 @@ async def ide_plan(request: Request) -> PlanResponse:
 
     move("context_indexed", {"workspace": _workspace_debug_summary(body.get("workspace"))})
     messages = _append_workspace_context(messages, body.get("workspace"))
-    _log.debug("ide_plan: messages_after_workspace_context=%s", len(messages))
+    _log.debug("planning_phase: messages_after_workspace_context=%s", len(messages))
 
     if not any(m.get("role", "").lower() == "user" for m in messages):
         move("failed", {"phase": "plan", "error": "messages must contain at least one user message"})
@@ -384,31 +384,27 @@ async def ide_plan(request: Request) -> PlanResponse:
         )
 
     cfg = settings()
-    planner_agent = "planner"
+    planner_agent = str(body.get("_workflow_agent_model_route") or "planner").strip()
     try:
         cfg.validate_provider(planner_agent)
     except ValueError as ve:
-        _log.warning("Planner provider unavailable, falling back to coder: %s", ve)
-        planner_agent = "coder"
-        try:
-            cfg.validate_provider(planner_agent)
-        except ValueError as coder_ve:
-            _log.warning("Provider validation failed: %s", coder_ve)
-            move("failed", {"phase": "plan", "error": str(coder_ve)})
-            return PlanResponse(
-                ok=False,
-                task_id=task_id,
-                status_key="failed",
-                error_code="CONFIG_ERROR",
-                error_message=str(coder_ve),
-            )
+        _log.warning("Planning agent provider unavailable: %s", ve)
+        move("failed", {"phase": "plan", "error": str(ve)})
+        return PlanResponse(
+            ok=False,
+            task_id=task_id,
+            status_key="failed",
+            error_code="CONFIG_ERROR",
+            error_message=str(ve),
+        )
 
     try:
         project_settings_payload = get_project_settings(str(body.get("project_id") or "default"))
         project_settings = project_settings_payload.get("settings") if isinstance(project_settings_payload, dict) else {}
         parameters = project_settings.get("parameters") if isinstance(project_settings, dict) else {}
-        p = build_planner(
-            agent_name=planner_agent,
+        p = EvidencePlanningLoop(
+            model_route=planner_agent,
+            agent_id=str(body.get("_workflow_agent_id") or "planning-agent"),
             event_sink=lambda event_type, payload: _kanban_event(task_id, event_type, payload),
             max_rounds=_positive_int(parameters.get("planner_max_rounds"), 128, maximum=512),
         )
@@ -512,7 +508,7 @@ async def ide_plan(request: Request) -> PlanResponse:
                 result.phase_output = phase_output
                 result.next_action = phase_output.get("next_action")
         _log.debug(
-            "ide_plan: planner_result ok=%s files=%s warnings=%s summary=%s",
+            "planning_phase: planner_result ok=%s files=%s warnings=%s summary=%s",
             result.ok,
             len(result.files),
             len(result.warnings),
@@ -536,7 +532,7 @@ async def ide_plan(request: Request) -> PlanResponse:
 # ---------------------------------------------------------------------------
 
 @router.post("/execute", response_model=IdeChatResponse)
-async def ide_execute(request: Request) -> IdeChatResponse:
+async def coding_phase(request: Request) -> IdeChatResponse:
     """
     Execute phase — run the approved plan.
 
@@ -567,8 +563,9 @@ async def ide_execute(request: Request) -> IdeChatResponse:
         )
 
     cfg = settings()
+    model_route = str(body.get("_workflow_agent_model_route") or "executor").strip()
     try:
-        cfg.validate_provider("executor")
+        cfg.validate_provider(model_route)
     except ValueError as ve:
         _log.warning("Provider validation failed: %s", ve)
         return IdeChatResponse(
@@ -582,7 +579,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
         )
 
     try:
-        client = get_llm_client("executor")
+        client = get_llm_client(model_route)
     except (ValueError, NotImplementedError) as exc:
         _log.warning("LLM client creation failed: %s", exc)
         return IdeChatResponse(
@@ -606,7 +603,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
             error_message="messages must be a list",
         )
     _log.debug(
-        "ide_execute: received project_id=%s mode=%s messages=%s approved_paths=%s workspace_summary=%s",
+        "coding_phase: received project_id=%s mode=%s messages=%s approved_paths=%s workspace_summary=%s",
         body.get("project_id"),
         body.get("mode", "agent"),
         len(messages),
@@ -621,7 +618,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                 "content": "client_capabilities:\n" + json.dumps(body["client_capabilities"], ensure_ascii=False),
             }
         )
-    _log.debug("ide_execute: messages_after_workspace_context=%s", len(messages))
+    _log.debug("coding_phase: messages_after_workspace_context=%s", len(messages))
 
     approved_set = _approved_path_set(approved_paths, body.get("project_root"))
 
@@ -635,7 +632,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
         ),
     }
     messages = messages + [guard_message]
-    _log.debug("ide_execute: appended_execution_guard approved_count=%s final_messages=%s", len(approved_set), len(messages))
+    _log.debug("coding_phase: appended_execution_guard approved_count=%s final_messages=%s", len(approved_set), len(messages))
 
     mode = str(body.get("mode", "agent")).strip().lower() or "agent"
     workflow_managed = bool(body.get("_workflow_engine_managed"))
@@ -705,7 +702,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                         },
                     )
                     _log.debug(
-                        "ide_execute: protocol_error round=%s error=%s output=%s",
+                        "coding_phase: protocol_error round=%s error=%s output=%s",
                         tool_round + 1,
                         exc,
                         summary,
@@ -729,7 +726,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                                             if protocol_error_count >= 2 and "patch_ops" in str(exc)
                                             else "Return one valid DevWerk JSON object. If using patch_ops, content must be unified diff "
                                             "with --- / +++ / @@ markers. If requesting search, use args.query or args.pattern. "
-                                            "If requesting read_file, include args.path."
+                                            "If requesting workspace.read, include args.path."
                                         ),
                                     },
                                     ensure_ascii=False,
@@ -749,7 +746,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                     },
                 )
                 _log.debug(
-                    "ide_execute: model_response round=%s keys=%s ops=%s patch_ops=%s tool_requests=%s done=%s",
+                    "coding_phase: model_response round=%s keys=%s ops=%s patch_ops=%s tool_requests=%s done=%s",
                     tool_round + 1,
                     sorted(obj.keys()) if isinstance(obj, dict) else type(obj).__name__,
                     len(obj.get("ops") or []),
@@ -769,7 +766,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                 backend_tool_requests = [req for req in tool_requests if _is_backend_tool_request(req)]
                 client_tool_requests = [req for req in tool_requests if not _is_backend_tool_request(req)]
                 _log.debug(
-                    "ide_execute: filtered round=%s ops=%s patch_ops=%s backend_tool_requests=%s client_tool_requests=%s approved_paths=%s",
+                    "coding_phase: filtered round=%s ops=%s patch_ops=%s backend_tool_requests=%s client_tool_requests=%s approved_paths=%s",
                     tool_round + 1,
                     len(ops),
                     len(patch_ops),
@@ -799,7 +796,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                         },
                     )
                     _log.debug(
-                        "ide_execute: tool_results round=%s results=%s",
+                        "coding_phase: tool_results round=%s results=%s",
                         tool_round + 1,
                         [
                             {"id": r.id, "ok": r.ok, "content_chars": len(r.content or ""), "error": r.error}
@@ -912,7 +909,7 @@ async def ide_execute(request: Request) -> IdeChatResponse:
                 return response
 
             _log.debug(
-                "ide_execute: tool loop exhausted rounds=%s last_tool_results=%s",
+                "coding_phase: tool loop exhausted rounds=%s last_tool_results=%s",
                 max_tool_rounds,
                 len(tool_results_by_id),
             )
@@ -1143,14 +1140,14 @@ def _execute_tool_requests(project_root: str | None, reqs: list[ToolRequest]) ->
     results: list[ToolResult] = []
     for req in reqs:
         try:
-            if req.tool == "list_dir":
+            if req.tool == "workspace.list":
                 rel = _canonical_rel_path(str(req.args.get("path") or ""), str(root))
                 if rel and _contains_hidden_segment(rel):
                     results.append(ToolResult(id=req.id, ok=False, error=f"blocked hidden directory path: {rel}"))
                     continue
                 max_depth = _int_arg(req.args.get("max_depth"), 2, 1, 8)
                 results.append(ToolResult(id=req.id, ok=True, content=_tool_list_dir(root, rel, max_depth)))
-            elif req.tool == "read_file":
+            elif req.tool == "workspace.read":
                 rel = _canonical_rel_path(str(req.args.get("path") or ""), str(root))
                 if _has_hidden_dir_segment(rel):
                     results.append(ToolResult(id=req.id, ok=False, error=f"blocked hidden directory path: {rel}"))
@@ -1158,7 +1155,7 @@ def _execute_tool_requests(project_root: str | None, reqs: list[ToolRequest]) ->
                 start_line = _int_arg(req.args.get("start_line"), 1, 1, 1_000_000)
                 end_line = _int_arg(req.args.get("end_line"), start_line + 200, start_line, 1_000_000)
                 results.append(ToolResult(id=req.id, ok=True, content=_tool_read_file(root, rel, start_line, end_line)))
-            elif req.tool == "search":
+            elif req.tool == "workspace.search":
                 query = str(req.args.get("query") or "")
                 max_results = _int_arg(req.args.get("max_results"), 50, 1, 500)
                 raw_paths = req.args.get("paths")
@@ -1177,15 +1174,15 @@ def _execute_tool_requests(project_root: str | None, reqs: list[ToolRequest]) ->
 
 
 def _is_backend_tool_request(req: ToolRequest) -> bool:
-    return req.tool in {"list_dir", "read_file", "search"}
+    return req.tool in {"workspace.list", "workspace.read", "workspace.search"}
 
 
 def _tool_list_dir(root: Path, rel: str, max_depth: int) -> str:
     target = _safe_project_path(root, rel)
     if not target.exists():
-        return f"[list_dir] not found: {rel}"
+        return f"[workspace.list] not found: {rel}"
     if not target.is_dir():
-        return f"[list_dir] not a directory: {rel}"
+        return f"[workspace.list] not a directory: {rel}"
     label = "." if not rel or rel == "." else (target.name or ".")
     lines = [f"{label}/"]
 
@@ -1209,9 +1206,9 @@ def _tool_list_dir(root: Path, rel: str, max_depth: int) -> str:
 def _tool_read_file(root: Path, rel: str, start_line: int, end_line: int) -> str:
     target = _safe_project_path(root, rel)
     if not target.exists():
-        return f"[read_file] not found: {rel}"
+        return f"[workspace.read] not found: {rel}"
     if target.is_dir():
-        return f"[read_file] is a directory: {rel}"
+        return f"[workspace.read] is a directory: {rel}"
     lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
     start = max(start_line, 1) - 1
     end = max(end_line, start_line)
@@ -1489,15 +1486,15 @@ async def _run_workflow(task_id: str, body: dict) -> None:
 
 
 async def _run_plan_phase(body: dict) -> PlanResponse:
-    return await ide_plan(_BodyRequest(body))
+    return await planning_phase(_BodyRequest(body))
 
 
 async def _run_coding_phase(body: dict) -> IdeChatResponse:
-    return await ide_execute(_BodyRequest(body))
+    return await coding_phase(_BodyRequest(body))
 
 
 async def _run_review_phase(body: dict) -> dict:
-    return Reviewer().review(body)
+    return Reviewer(agent_name=str(body.get("_workflow_agent_model_route") or "reviewer")).review(body)
 
 
 def _workflow_state_payload(task_id: str, *, include_result: bool, result_after: str | None = None) -> dict:
@@ -1700,11 +1697,11 @@ def _ensure_plan_task(body: dict) -> str:
             metadata={"entrypoint": "/v1/plan", "mode": body.get("mode", "agent")},
         )
         task_id = result["task"]["id"]
-        _log.debug("ide_plan: created kanban task_id=%s project_id=%s", task_id, body.get("project_id"))
+        _log.debug("planning_phase: created kanban task_id=%s project_id=%s", task_id, body.get("project_id"))
         return task_id
     except Exception as exc:  # noqa: BLE001
         fallback = str(uuid.uuid4())
-        _log.warning("ide_plan: failed to create kanban task, using ephemeral id=%s error=%s", fallback, exc)
+        _log.warning("planning_phase: failed to create kanban task, using ephemeral id=%s error=%s", fallback, exc)
         return fallback
 
 

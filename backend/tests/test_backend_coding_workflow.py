@@ -8,13 +8,13 @@ import httpx
 import pytest
 import requests
 
-from app.models.ide import FileOp, IdeChatResponse, ToolRequest
+from app.models.protocol import FileOp, IdeChatResponse, ToolRequest
 from app.models.plan import PlanFile, PlanResponse
 from app.services.anthropic_client import AnthropicClient
 from app.services.coder_harness import build_code_context_summary
 from app.services.openai_client import OpenAIClient
 from app.services.ollama_client import OllamaClient
-from app.services.planner import Planner
+from app.services.planner import EvidencePlanningLoop
 from app.services.provider_errors import LLMProviderError, ProviderErrorDetails, classify_provider_response
 from app.services.usage import _normalize_usage
 
@@ -179,7 +179,7 @@ class FakePlannerResearchClient:
             return {
                 "raw_text": (
                     "I'll inspect the current tenant code before planning.]<]minimax[>[\n"
-                    f'{{"name":"read_file","arguments":{{"file_path":"{self.requested_path}","start_line":1,"end_line":120}}}}\n'
+                    f'{{"name":"workspace.read","arguments":{{"file_path":"{self.requested_path}","start_line":1,"end_line":120}}}}\n'
                 )
             }
 
@@ -209,7 +209,7 @@ class FakePlannerNaturalLanguageSearchClient:
         if self.calls == 1:
             return {
                 "tool_requests": [
-                    {"id": "p1", "tool": "list_dir", "args": {"path": "src/main/java/org/example/dto", "max_depth": 2}}
+                    {"id": "p1", "tool": "workspace.list", "args": {"path": "src/main/java/org/example/dto", "max_depth": 2}}
                 ]
             }
         if self.calls == 2:
@@ -246,10 +246,10 @@ class FakePlannerDirectToolClient:
     def chat_json(self, messages: list[dict]) -> dict:
         self.calls += 1
         if self.calls == 1:
-            return {"id": "l1", "tool": "list_dir", "args": {"path": "project/src", "max_depth": 3}}
+            return {"id": "l1", "tool": "workspace.list", "args": {"path": "project/src", "max_depth": 3}}
         if self.calls == 2:
             assert any("tool_results:" in message.get("content", "") for message in messages)
-            return {"id": "r1", "tool": "read_file", "args": {"path": "project/src/main.py"}}
+            return {"id": "r1", "tool": "workspace.read", "args": {"path": "project/src/main.py"}}
         assert sum("tool_results:" in message.get("content", "") for message in messages) >= 2
         return {
             "plan": {
@@ -278,7 +278,7 @@ class FakePlannerResearchBudgetClient:
                 "tool_requests": [
                     {
                         "id": f"r{self.calls}",
-                        "tool": "read_file",
+                        "tool": "workspace.read",
                         "args": {"path": f"src/file{self.calls}.py"},
                     }
                 ]
@@ -307,7 +307,7 @@ class FakePlannerProtocolRecoveryClient:
     def chat_json(self, messages: list[dict]) -> dict:
         self.calls += 1
         if self.calls == 1:
-            return {"tool_requests": [{"id": "r1", "tool": "read_file", "args": {"path": "src/main.py"}}]}
+            return {"tool_requests": [{"id": "r1", "tool": "workspace.read", "args": {"path": "src/main.py"}}]}
         if self.calls == 2:
             return {"raw_text": "I found one issue. Let me check related code before producing the plan."}
         assert "neither a valid tool request nor a file-level plan" in messages[-1]["content"]
@@ -334,7 +334,7 @@ class FakePlannerFormatRepairClient:
     def chat_json(self, messages: list[dict]) -> dict:
         self.calls += 1
         if self.calls <= 4:
-            return {"tool_requests": [{"id": f"r{self.calls}", "tool": "read_file", "args": {"path": "src/main.py"}}]}
+            return {"tool_requests": [{"id": f"r{self.calls}", "tool": "workspace.read", "args": {"path": "src/main.py"}}]}
         if self.calls == 5:
             return {"raw_text": "## Summary\n\n`src/main.py` contains the compile defect and must be modified."}
         assert "Convert the supplied planner analysis" in messages[0]["content"]
@@ -427,11 +427,11 @@ class FakeToolLoopExecutorClient:
                 "ops": [],
                 "patch_ops": [],
                 "tool_requests": [
-                    {"id": "r1", "tool": "list_dir", "args": {"path": "", "max_depth": 4}},
-                    {"id": "r2", "tool": "read_file", "args": {"path": "pom.xml", "start_line": 1, "end_line": 200}},
+                    {"id": "r1", "tool": "workspace.list", "args": {"path": "", "max_depth": 4}},
+                    {"id": "r2", "tool": "workspace.read", "args": {"path": "pom.xml", "start_line": 1, "end_line": 200}},
                     {
                         "id": "r3",
-                        "tool": "read_file",
+                        "tool": "workspace.read",
                         "args": {"path": "src/main/java/org/example/Main.java", "start_line": 1, "end_line": 200},
                     },
                 ],
@@ -466,7 +466,7 @@ class FakeIncrementalExecutorClient:
                 "reply": "Fixed the first file; inspecting the dependency next.",
                 "ops": [{"op": "update_file", "path": "src/a.py", "content": "A = 2\n"}],
                 "patch_ops": [],
-                "tool_requests": [{"id": "read-b", "tool": "read_file", "args": {"path": "src/b.py"}}],
+                "tool_requests": [{"id": "read-b", "tool": "workspace.read", "args": {"path": "src/b.py"}}],
                 "done": False,
             }
 
@@ -497,7 +497,7 @@ class FakeClientToolExecutorClient:
             "tool_requests": [
                 {
                     "id": "compile",
-                    "tool": "run_command",
+                    "tool": "process.run",
                     "args": {"command": ["./mvnw", "test"], "timeout_seconds": 120},
                 }
             ],
@@ -551,7 +551,7 @@ async def test_backend_coding_workflow_plan_then_execute_smoke(monkeypatch, tmp_
     fake_settings = FakeSettings(db_path)
 
     import app.main as main_module
-    import app.routes.ide as ide_routes
+    import app.routes.workflows as ide_routes
     import app.services.kanban as kanban_service
     import app.services.planner as planner_service
     import app.services.usage as usage_service
@@ -664,7 +664,7 @@ async def test_execute_retries_retryable_provider_error(monkeypatch, tmp_path):
     fake_executor = FakeRetryableProviderErrorExecutorClient()
 
     import app.main as main_module
-    import app.routes.ide as ide_routes
+    import app.routes.workflows as ide_routes
     import app.services.kanban as kanban_service
     import app.services.usage as usage_service
 
@@ -717,7 +717,7 @@ async def test_workflow_start_poll_result_smoke(monkeypatch, tmp_path):
     fake_settings = FakeSettings(db_path)
 
     import app.main as main_module
-    import app.routes.ide as ide_routes
+    import app.routes.workflows as ide_routes
     import app.services.kanban as kanban_service
     import app.services.planner as planner_service
     import app.services.usage as usage_service
@@ -833,7 +833,7 @@ async def test_workflow_message_api_confirms_plan_without_starting_new_task(monk
     fake_settings = FakeSettings(db_path)
 
     import app.main as main_module
-    import app.routes.ide as ide_routes
+    import app.routes.workflows as ide_routes
     import app.services.kanban as kanban_service
     import app.services.planner as planner_service
     import app.services.usage as usage_service
@@ -914,7 +914,7 @@ async def test_workflow_message_api_accepts_client_tool_result_and_resumes_plann
     fake_settings = FakeSettings(db_path)
 
     import app.main as main_module
-    import app.routes.ide as ide_routes
+    import app.routes.workflows as ide_routes
     import app.services.kanban as kanban_service
     import app.services.planner as planner_service
     import app.services.usage as usage_service
@@ -935,7 +935,7 @@ async def test_workflow_message_api_accepts_client_tool_result_and_resumes_plann
                     "project_root": str(project_root),
                     "messages": [{"role": "user", "content": "Fix all compilation errors."}],
                     "workspace": {"root_id": "client-tool-api", "tree_preview": "", "source_map": None},
-                    "client_capabilities": {"tools": ["ide_compile"]},
+                    "client_capabilities": {"tools": ["project.compile"]},
                 },
             )).json()
             task_id = start["task_id"]
@@ -947,18 +947,18 @@ async def test_workflow_message_api_accepts_client_tool_result_and_resumes_plann
                     break
                 await asyncio.sleep(0.05)
             assert waiting["result"]["waiting_for"] == "client_tool"
-            assert waiting["result"]["tool_requests"][0]["tool"] == "ide_compile"
+            assert waiting["result"]["tool_requests"][0]["tool"] == "project.compile"
 
             resumed = (await client.post(
                 f"/v1/workflows/{task_id}/messages",
                 json={
                     "action": "tool_result",
-                    "client_capabilities": {"tools": ["ide_compile"]},
+                    "client_capabilities": {"tools": ["project.compile"]},
                     "tool_results": [
                         {
                             "id": "ide-compile-evidence",
                             "ok": False,
-                            "error": "[ide_compile] completed\nerrors=1\nservice/main.py:1:1 compile error",
+                            "error": "[project.compile] completed\nerrors=1\nservice/main.py:1:1 compile error",
                         }
                     ],
                 },
@@ -1093,7 +1093,7 @@ def test_workflow_reviewer_does_not_treat_prior_revision_as_current_unplanned_ch
 
 
 def test_planner_rejects_directory_level_paths_from_workspace_tree():
-    plan = Planner._extract_plan(
+    plan = EvidencePlanningLoop._extract_plan(
         {
             "plan": {
                 "files": [
@@ -1262,7 +1262,7 @@ async def test_workflow_recoding_receives_review_feedback(monkeypatch, tmp_path)
     async def coding_runner(body: dict) -> IdeChatResponse:
         nonlocal coding_calls
         coding_calls += 1
-        assert body["client_capabilities"] == {"tools": ["run_command"]}
+        assert body["client_capabilities"] == {"tools": ["process.run"]}
         context_messages = [message["content"] for message in body["messages"] if "workflow_phase_context:" in message.get("content", "")]
         assert context_messages
         if coding_calls == 1:
@@ -1286,8 +1286,8 @@ async def test_workflow_recoding_receives_review_feedback(monkeypatch, tmp_path)
                 FileOp(op="update_file", path="src/domain/b.py", content="print('b')\n"),
             ],
             tool_requests=[
-                ToolRequest(id="unsupported", tool="ide_syntax_check", args={"paths": ["src/domain/a.py"]}),
-                ToolRequest(id="verify", tool="run_command", args={"command": ["project-check"]}),
+                ToolRequest(id="unsupported", tool="source.diagnostics", args={"paths": ["src/domain/a.py"]}),
+                ToolRequest(id="verify", tool="process.run", args={"command": ["project-check"]}),
             ],
         )
 
@@ -1310,7 +1310,7 @@ async def test_workflow_recoding_receives_review_feedback(monkeypatch, tmp_path)
             "mode": "agent",
             "messages": [{"role": "user", "content": "Update both files."}],
             "workspace": {"tree_preview": "project/\n  src/\n    domain/\n      a.py\n      b.py", "source_map": None},
-            "client_capabilities": {"tools": ["run_command"]},
+            "client_capabilities": {"tools": ["process.run"]},
         },
     )
 
@@ -1436,7 +1436,7 @@ async def test_interactive_workflow_pauses_for_plan_confirmation_and_resumes(mon
             "decision": "approve",
             "summary": "Apply, then run the project check.",
             "verification_tool_requests": [
-                {"id": "project-check", "tool": "run_command", "args": {"command": ["./project-check"]}}
+                {"id": "project-check", "tool": "process.run", "args": {"command": ["./project-check"]}}
             ],
         }
 
@@ -1451,7 +1451,7 @@ async def test_interactive_workflow_pauses_for_plan_confirmation_and_resumes(mon
         "interaction_mode": "confirm_plan",
         "messages": [{"role": "user", "content": "Create a module."}],
         "workspace": {"tree_preview": "project/", "source_map": None},
-        "client_capabilities": {"tools": ["run_command", "ide_syntax_check"]},
+        "client_capabilities": {"tools": ["process.run", "source.diagnostics"]},
     }
     await engine.run(task["id"], body)
 
@@ -1479,7 +1479,7 @@ async def test_interactive_workflow_pauses_for_plan_confirmation_and_resumes(mon
         item for item in completed_task["artifacts"] if item["artifact_type"] == "workflow_result"
     ][-1]["payload"]
     assert completed_result["tool_requests"] == [
-        {"id": "project-check", "tool": "run_command", "args": {"command": ["./project-check"]}}
+        {"id": "project-check", "tool": "process.run", "args": {"command": ["./project-check"]}}
     ]
     revision_events = [event for event in completed_task["events"] if event["event_type"] == "revision_created"]
     assert len(revision_events) == 1
@@ -1510,7 +1510,7 @@ async def test_planner_client_tool_pause_resumes_same_workflow_with_evidence(mon
         if not body.get("tool_results"):
             return PlanResponse(
                 summary="Collect IDE compiler evidence.",
-                tool_requests=[ToolRequest(id="compile", tool="ide_compile", args={"timeout_seconds": 60})],
+                tool_requests=[ToolRequest(id="compile", tool="project.compile", args={"timeout_seconds": 60})],
                 next_action="need_client_tool",
             )
         return PlanResponse(
@@ -1539,7 +1539,7 @@ async def test_planner_client_tool_pause_resumes_same_workflow_with_evidence(mon
         "mode": "agent",
         "messages": [{"role": "user", "content": "Fix compilation errors."}],
         "workspace": {"tree_preview": "project/\n  src/\n    module.py", "source_map": None},
-        "client_capabilities": {"tools": ["ide_compile"]},
+        "client_capabilities": {"tools": ["project.compile"]},
     }
 
     await engine.run(task["id"], body)
@@ -1548,7 +1548,7 @@ async def test_planner_client_tool_pause_resumes_same_workflow_with_evidence(mon
         item for item in waiting_task["artifacts"] if item["artifact_type"] == "workflow_result"
     ][-1]["payload"]
     assert waiting_result["waiting_for"] == "client_tool"
-    assert waiting_result["tool_requests"][0]["tool"] == "ide_compile"
+    assert waiting_result["tool_requests"][0]["tool"] == "project.compile"
     assert kanban_service.get_conversation(task["id"])["state"] == "waiting_client"
     assert planner_inputs == []
 
@@ -1556,7 +1556,7 @@ async def test_planner_client_tool_pause_resumes_same_workflow_with_evidence(mon
         {
             "id": "compile",
             "ok": False,
-            "error": "[ide_compile] completed\nerrors=1\nsrc/module.py:3:7 incompatible types",
+            "error": "[project.compile] completed\nerrors=1\nsrc/module.py:3:7 incompatible types",
         }
     ]
     await engine.run(task["id"], {**body, "resume_action": "tool_result", "tool_results": tool_results})
@@ -1627,7 +1627,7 @@ async def test_workflow_engine_runs_project_defined_custom_columns(monkeypatch, 
                 "title": "Indexed",
                 "position": 20,
                 "transition_to": ["design", "failed"],
-                "agent": "context",
+                "job_template": "index_project_context",
                 "input_artifacts": ["workflow_request"],
                 "output_artifact": "context_bundle",
                 "success_action": "context_done",
@@ -1638,7 +1638,7 @@ async def test_workflow_engine_runs_project_defined_custom_columns(monkeypatch, 
                 "title": "Design",
                 "position": 30,
                 "transition_to": ["build", "failed"],
-                "agent": "planner",
+                "job_template": "produce_change_plan",
                 "input_artifacts": ["context_bundle"],
                 "output_artifact": "plan_bundle",
                 "success_action": "design_done",
@@ -1649,7 +1649,7 @@ async def test_workflow_engine_runs_project_defined_custom_columns(monkeypatch, 
                 "title": "Build",
                 "position": 40,
                 "transition_to": ["quality", "design", "failed"],
-                "agent": "coder",
+                "job_template": "generate_code_change",
                 "input_artifacts": ["plan_bundle"],
                 "output_artifact": "code_change_bundle",
                 "success_action": "build_done",
@@ -1660,7 +1660,7 @@ async def test_workflow_engine_runs_project_defined_custom_columns(monkeypatch, 
                 "title": "Quality",
                 "position": 50,
                 "transition_to": ["ready_to_apply", "build", "design", "failed"],
-                "agent": "reviewer",
+                "job_template": "review_code_change",
                 "input_artifacts": ["plan_bundle", "code_change_bundle"],
                 "output_artifact": "review_bundle",
                 "success_action": "quality_passed",
@@ -1756,7 +1756,7 @@ async def test_plan_does_not_infer_user_management_files_when_planner_returns_no
     fake_settings = FakeSettings(db_path)
 
     import app.main as main_module
-    import app.routes.ide as ide_routes
+    import app.routes.workflows as ide_routes
     import app.services.kanban as kanban_service
     import app.services.planner as planner_service
     import app.services.usage as usage_service
@@ -1824,7 +1824,7 @@ async def test_plan_does_not_infer_tenant_management_files_when_planner_returns_
     fake_settings = FakeSettings(db_path)
 
     import app.main as main_module
-    import app.routes.ide as ide_routes
+    import app.routes.workflows as ide_routes
     import app.services.kanban as kanban_service
     import app.services.planner as planner_service
     import app.services.usage as usage_service
@@ -1889,7 +1889,7 @@ async def test_plan_does_not_infer_tenant_management_files_when_planner_returns_
 
 
 def test_planner_extract_plan_returns_failure_when_fallback_cannot_infer_files():
-    plan = Planner._extract_plan(
+    plan = EvidencePlanningLoop._extract_plan(
         {"raw_text": "I need more information before planning files."},
         [{"role": "user", "content": "\u8fd9\u53ea\u662f\u4e00\u4e2a\u666e\u901a\u95ee\u9898\uff0c\u4e0d\u9700\u8981\u6539\u4ee3\u7801"}],
     )
@@ -1900,7 +1900,7 @@ def test_planner_extract_plan_returns_failure_when_fallback_cannot_infer_files()
 
 
 def test_planner_fallback_uses_ide_diagnostic_paths_without_framework_guessing():
-    plan = Planner._extract_plan(
+    plan = EvidencePlanningLoop._extract_plan(
         {"raw_text": "I need to inspect before planning."},
         [
             {"role": "user", "content": "Unclosed character class\nIllegal escape character in string literal"},
@@ -1959,7 +1959,7 @@ def test_planner_executes_minimax_text_tool_requests_before_planning(monkeypatch
 
     monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": fake_client)
     events: list[tuple[str, dict]] = []
-    planner = Planner(event_sink=lambda event_type, payload: events.append((event_type, payload)))
+    planner = EvidencePlanningLoop(event_sink=lambda event_type, payload: events.append((event_type, payload)))
     plan = planner.plan(
         messages=[
             {"role": "user", "content": "Refactor tenant to match the project structure."},
@@ -1990,7 +1990,7 @@ def test_planner_executes_direct_top_level_tool_calls_across_research_rounds(mon
 
     monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": fake_client)
     events: list[tuple[str, dict]] = []
-    plan = Planner(event_sink=lambda event_type, payload: events.append((event_type, payload))).plan(
+    plan = EvidencePlanningLoop(event_sink=lambda event_type, payload: events.append((event_type, payload))).plan(
         messages=[
             {"role": "user", "content": "Find and fix the compile errors."},
             {
@@ -2022,7 +2022,7 @@ def test_planner_reserves_a_final_synthesis_round_after_tool_budget(monkeypatch,
 
     monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": fake_client)
     events: list[tuple[str, dict]] = []
-    plan = Planner(event_sink=lambda event_type, payload: events.append((event_type, payload)), max_rounds=4).plan(
+    plan = EvidencePlanningLoop(event_sink=lambda event_type, payload: events.append((event_type, payload)), max_rounds=4).plan(
         messages=[{"role": "user", "content": "Find and fix all compile errors."}],
         project_root=str(project_root),
     )
@@ -2044,7 +2044,7 @@ def test_planner_recovers_when_model_narrates_instead_of_using_protocol(monkeypa
     import app.services.planner as planner_service
 
     monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": fake_client)
-    plan = Planner().plan(
+    plan = EvidencePlanningLoop().plan(
         messages=[{"role": "user", "content": "Find and fix the errors."}],
         project_root=str(project_root),
     )
@@ -2067,7 +2067,7 @@ def test_planner_normalizes_top_level_tool_request_array(monkeypatch, tmp_path):
         def chat_json(self, messages):
             self.calls += 1
             if self.calls == 1:
-                return [{"id": "read-main", "tool": "read_file", "args": {"path": "src/main.py"}}]
+                return [{"id": "read-main", "tool": "workspace.read", "args": {"path": "src/main.py"}}]
             return {
                 "plan": {
                     "files": [
@@ -2087,7 +2087,7 @@ def test_planner_normalizes_top_level_tool_request_array(monkeypatch, tmp_path):
     import app.services.planner as planner_service
 
     monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": client)
-    plan = Planner().plan(
+    plan = EvidencePlanningLoop().plan(
         messages=[{"role": "user", "content": "Fix the compile errors."}],
         project_root=str(project_root),
     )
@@ -2108,7 +2108,7 @@ def test_planner_repairs_markdown_final_analysis_into_plan_contract(monkeypatch,
 
     monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": fake_client)
     events: list[tuple[str, dict]] = []
-    plan = Planner(event_sink=lambda event_type, payload: events.append((event_type, payload)), max_rounds=4).plan(
+    plan = EvidencePlanningLoop(event_sink=lambda event_type, payload: events.append((event_type, payload)), max_rounds=4).plan(
         messages=[
             {"role": "user", "content": "Find and fix the errors."},
             {
@@ -2126,16 +2126,16 @@ def test_planner_repairs_markdown_final_analysis_into_plan_contract(monkeypatch,
 
 
 def test_planner_default_round_budget_is_a_high_safety_ceiling():
-    assert Planner().max_rounds == 128
+    assert EvidencePlanningLoop().max_rounds == 128
 
 
 def test_planner_returns_declared_client_tool_request_without_executing_it(monkeypatch):
     class ClientToolPlanner:
         def chat_json(self, messages):
-            assert "ide_compile" in messages[0]["content"]
+            assert "project.compile" in messages[0]["content"]
             return {
                 "tool_requests": [
-                    {"id": "compile", "tool": "ide_compile", "args": {"timeout_seconds": 60}}
+                    {"id": "compile", "tool": "project.compile", "args": {"timeout_seconds": 60}}
                 ]
             }
 
@@ -2143,14 +2143,14 @@ def test_planner_returns_declared_client_tool_request_without_executing_it(monke
 
     monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": ClientToolPlanner())
     events: list[tuple[str, dict]] = []
-    plan = Planner(event_sink=lambda event_type, payload: events.append((event_type, payload))).plan(
+    plan = EvidencePlanningLoop(event_sink=lambda event_type, payload: events.append((event_type, payload))).plan(
         messages=[{"role": "user", "content": "Find and fix all compilation errors."}],
-        client_capabilities={"tools": ["ide_compile"]},
+        client_capabilities={"tools": ["project.compile"]},
     )
 
     assert plan.ok is True
     assert plan.next_action == "need_client_tool"
-    assert [request.tool for request in plan.tool_requests] == ["ide_compile"]
+    assert [request.tool for request in plan.tool_requests] == ["project.compile"]
     assert "plan_client_tool_requested" in [event_type for event_type, _ in events]
 
 
@@ -2173,7 +2173,7 @@ def test_planner_recovers_natural_language_search_intent(monkeypatch, tmp_path):
 
     monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": fake_client)
     events: list[tuple[str, dict]] = []
-    planner = Planner(event_sink=lambda event_type, payload: events.append((event_type, payload)))
+    planner = EvidencePlanningLoop(event_sink=lambda event_type, payload: events.append((event_type, payload)))
     plan = planner.plan(
         messages=[
             {"role": "user", "content": "Unclosed character class\nIllegal escape character in string literal"},
@@ -2204,7 +2204,7 @@ def test_planner_recovers_natural_language_search_intent(monkeypatch, tmp_path):
     assert [item.path for item in plan.files] == ["src/main/java/org/example/dto/TenantCreateRequest.java"]
     tool_request_events = [payload for event_type, payload in events if event_type == "plan_tool_requests"]
     assert any(
-        any(req["tool"] == "search" and req["args"]["query"] in {"@Pattern", "Pattern.compile", "Pattern"} for req in event["requests"])
+        any(req["tool"] == "workspace.search" and req["args"]["query"] in {"@Pattern", "Pattern.compile", "Pattern"} for req in event["requests"])
         for event in tool_request_events
     )
 
@@ -2219,7 +2219,7 @@ def test_planner_normalizes_foreign_absolute_tool_paths_by_source_map_suffix(mon
     import app.services.planner as planner_service
 
     monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": fake_client)
-    planner = Planner()
+    planner = EvidencePlanningLoop()
     plan = planner.plan(
         messages=[
             {"role": "user", "content": "Tenant structure does not match the generic structure."},
@@ -2246,7 +2246,7 @@ def test_tool_protocol_accepts_search_pattern_without_path():
         "code_tree": None,
         "ops": [],
         "tool_requests": [
-            {"id": "s1", "tool": "search", "args": {"pattern": "class TenantServiceImpl"}},
+            {"id": "s1", "tool": "workspace.search", "args": {"pattern": "class TenantServiceImpl"}},
         ],
         "patch_ops": [],
         "done": False,
@@ -2255,13 +2255,13 @@ def test_tool_protocol_accepts_search_pattern_without_path():
     validate_model_response(obj)
     assert obj["tool_requests"][0]["args"]["query"] == "class TenantServiceImpl"
     requests = coerce_to_toolrequests(obj["tool_requests"])
-    assert requests[0].tool == "search"
+    assert requests[0].tool == "workspace.search"
     assert requests[0].args["query"] == "class TenantServiceImpl"
     assert requests[0].args["paths"] == []
 
 
 def test_execute_filters_canonicalize_project_root_prefixed_output_paths():
-    from app.routes.ide import _filter_ops, _filter_patch_ops
+    from app.routes.workflows import _filter_ops, _filter_patch_ops
 
     project_root = "C:/workspace/sample"
     approved = {"src/main.py"}
@@ -2305,7 +2305,7 @@ async def test_execute_resolves_tool_requests_with_project_relative_paths(monkey
     fake_executor = FakeToolLoopExecutorClient()
 
     import app.main as main_module
-    import app.routes.ide as ide_routes
+    import app.routes.workflows as ide_routes
     import app.services.kanban as kanban_service
     import app.services.usage as usage_service
 
@@ -2375,7 +2375,7 @@ async def test_execute_preserves_candidate_changes_across_research_rounds(monkey
     fake_executor = FakeIncrementalExecutorClient()
 
     import app.main as main_module
-    import app.routes.ide as ide_routes
+    import app.routes.workflows as ide_routes
     import app.services.kanban as kanban_service
     import app.services.usage as usage_service
 
@@ -2449,18 +2449,18 @@ def test_reviewer_verification_requests_are_capability_bounded():
             "decision": "approve",
             "summary": "Apply under snapshot protection, then verify.",
             "verification_tool_requests": [
-                {"id": "compile", "tool": "run_command", "args": {"command": ["./project-check"]}},
+                {"id": "compile", "tool": "process.run", "args": {"command": ["./project-check"]}},
                 {"id": "write", "tool": "apply_ops", "args": {}},
             ],
         },
-        {"run_command"},
+        {"process.run"},
     )
 
     assert review["decision"] == "approve"
     assert review["verification_tool_requests"] == [
         {
             "id": "compile",
-            "tool": "run_command",
+            "tool": "process.run",
             "args": {"command": ["./project-check"], "timeout_seconds": 120},
         }
     ]
@@ -2481,7 +2481,7 @@ def test_reviewer_prompt_requires_authoritative_project_verification(monkeypatch
             }
 
     monkeypatch.setattr(reviewer_service, "get_llm_client", lambda agent: FakeReviewerClient())
-    reviewer_service.Reviewer().review({"client_capabilities": {"tools": ["run_command"]}})
+    reviewer_service.Reviewer().review({"client_capabilities": {"tools": ["process.run"]}})
 
     system_prompt = captured[0]["content"]
     assert "authoritative project-native" in system_prompt
@@ -2510,7 +2510,7 @@ def test_reviewer_repairs_missing_mandatory_verification_request(monkeypatch):
                 "verification_tool_requests": [
                     {
                         "id": "project-verification",
-                        "tool": "run_command",
+                        "tool": "process.run",
                         "args": {"command": ["project-check"], "cwd": ""},
                     }
                 ],
@@ -2522,7 +2522,7 @@ def test_reviewer_repairs_missing_mandatory_verification_request(monkeypatch):
     result = reviewer_service.Reviewer().review(
         {
             "verification_required": True,
-            "client_capabilities": {"tools": ["run_command", "ide_syntax_check"]},
+            "client_capabilities": {"tools": ["process.run", "source.diagnostics"]},
         }
     )
 
@@ -2541,9 +2541,9 @@ def test_reviewer_repairs_malformed_mandatory_verification_request(monkeypatch):
         def chat_json(self, messages):
             self.calls += 1
             request = (
-                {"id": "broken", "tool": "run_command", "args": {"cmd": "project-check"}}
+                {"id": "broken", "tool": "process.run", "args": {"cmd": "project-check"}}
                 if self.calls == 1
-                else {"id": "fixed", "tool": "run_command", "args": {"command": ["project-check"]}}
+                else {"id": "fixed", "tool": "process.run", "args": {"command": ["project-check"]}}
             )
             return {
                 "decision": "approve",
@@ -2554,7 +2554,7 @@ def test_reviewer_repairs_malformed_mandatory_verification_request(monkeypatch):
     client = FakeReviewerClient()
     monkeypatch.setattr(reviewer_service, "get_llm_client", lambda agent: client)
     result = reviewer_service.Reviewer().review(
-        {"verification_required": True, "client_capabilities": {"tools": ["run_command"]}}
+        {"verification_required": True, "client_capabilities": {"tools": ["process.run"]}}
     )
 
     assert client.calls == 2
@@ -2580,10 +2580,10 @@ def test_workflow_filters_reviewer_tools_against_client_capabilities():
 
     requests = _allowed_client_tool_requests(
         [
-            {"id": "syntax", "tool": "ide_syntax_check", "args": {"paths": ["src/a.py"]}},
+            {"id": "syntax", "tool": "source.diagnostics", "args": {"paths": ["src/a.py"]}},
             {"id": "unknown", "tool": "remote_exec", "args": {}},
         ],
-        {"tools": ["ide_syntax_check"]},
+        {"tools": ["source.diagnostics"]},
     )
 
     assert [request.id for request in requests] == ["syntax"]
@@ -2596,12 +2596,12 @@ def test_workflow_allows_intellij_compile_capability():
         [
             {
                 "id": "compile",
-                "tool": "ide_compile",
+                "tool": "project.compile",
                 "args": {"timeout_seconds": 45, "max_errors": 25},
             },
-            {"id": "command", "tool": "run_command", "args": {"command": ["project-check"]}},
+            {"id": "command", "tool": "process.run", "args": {"command": ["project-check"]}},
         ],
-        {"tools": ["ide_compile"]},
+        {"tools": ["project.compile"]},
     )
 
     assert [request.id for request in requests] == ["compile"]
@@ -2611,11 +2611,11 @@ def test_workflow_allows_intellij_compile_capability():
 def test_tool_protocol_defaults_intellij_compile_limits():
     from app.services.tool_protocol import normalize_tool_request
 
-    request = normalize_tool_request({"id": "compile", "tool": "ide_compile", "args": {}})
+    request = normalize_tool_request({"id": "compile", "tool": "project.compile", "args": {}})
 
     assert request == {
         "id": "compile",
-        "tool": "ide_compile",
+        "tool": "project.compile",
         "args": {"timeout_seconds": 300, "max_errors": 200},
     }
 
@@ -2625,24 +2625,24 @@ def test_workflow_normalizes_client_command_cwd_to_project_relative_path():
 
     requests = _allowed_client_tool_requests(
         [
-            {"id": "root-name", "tool": "run_command", "args": {"command": ["build"], "cwd": "sample"}},
+            {"id": "root-name", "tool": "process.run", "args": {"command": ["build"], "cwd": "sample"}},
             {
                 "id": "absolute-root",
-                "tool": "run_command",
+                "tool": "process.run",
                 "args": {"command": ["build"], "cwd": "C:/workspace/sample"},
             },
             {
                 "id": "nested",
-                "tool": "run_command",
+                "tool": "process.run",
                 "args": {"command": ["build"], "cwd": "sample/backend"},
             },
             {
                 "id": "escape",
-                "tool": "run_command",
+                "tool": "process.run",
                 "args": {"command": ["build"], "cwd": "../outside"},
             },
         ],
-        {"tools": ["run_command"]},
+        {"tools": ["process.run"]},
         project_root="C:/workspace/sample",
     )
 
@@ -2663,7 +2663,7 @@ async def test_execute_repairs_model_protocol_errors(monkeypatch, tmp_path):
     fake_executor = FakeProtocolRepairExecutorClient()
 
     import app.main as main_module
-    import app.routes.ide as ide_routes
+    import app.routes.workflows as ide_routes
     import app.services.kanban as kanban_service
     import app.services.usage as usage_service
 
@@ -2710,7 +2710,7 @@ async def test_execute_returns_client_tool_requests_and_apply_result_completes_t
     fake_settings = FakeSettings(db_path)
 
     import app.main as main_module
-    import app.routes.ide as ide_routes
+    import app.routes.workflows as ide_routes
     import app.services.kanban as kanban_service
     import app.services.usage as usage_service
 
@@ -2760,11 +2760,11 @@ async def test_execute_returns_client_tool_requests_and_apply_result_completes_t
             assert executed["tool_requests"] == [
                 {
                     "id": "compile",
-                    "tool": "run_command",
+                    "tool": "process.run",
                     "args": {"command": ["./mvnw", "test"], "timeout_seconds": 120},
                 }
             ]
-            assert executed["phase_output"]["outputs"]["client_tool_requests"][0]["tool"] == "run_command"
+            assert executed["phase_output"]["outputs"]["client_tool_requests"][0]["tool"] == "process.run"
 
             apply_response = await client.post(
                 f"/v1/kanban/tasks/{task['id']}/actions",
@@ -2780,7 +2780,7 @@ async def test_execute_returns_client_tool_requests_and_apply_result_completes_t
                             "tool_results": [
                                 {
                                     "id": "compile",
-                                    "tool": "run_command",
+                                    "tool": "process.run",
                                     "ok": True,
                                     "content": "BUILD SUCCESS",
                                     "error": None,
@@ -2861,11 +2861,11 @@ def test_minimax_top_level_file_op_array_is_normalized():
 
 def test_minimax_top_level_tool_array_is_normalized():
     response = AnthropicClient._parse_json_object(
-        '[{"id":"read-1","tool":"read_file","args":{"path":"src/main.py"}}]'
+        '[{"id":"read-1","tool":"workspace.read","args":{"path":"src/main.py"}}]'
     )
 
     assert response["done"] is False
-    assert response["tool_requests"][0]["tool"] == "read_file"
+    assert response["tool_requests"][0]["tool"] == "workspace.read"
 
 
 def test_usage_telemetry_failure_does_not_hide_llm_result(monkeypatch):

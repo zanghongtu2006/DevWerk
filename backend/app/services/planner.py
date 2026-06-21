@@ -1,5 +1,5 @@
 """
-Planner service.
+Evidence-driven planning loop runtime.
 
 The planner is intentionally evidence-driven. It may ask the model to research
 the codebase and return a file-level plan, but it must not infer business or
@@ -16,18 +16,19 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from app.models.ide import ToolRequest, ToolResult
+from app.models.protocol import ToolRequest, ToolResult
 from app.models.plan import PlanFile, PlanResponse
 from app.services.llm_factory import get_llm_client
 from app.services.provider_errors import is_retryable_llm_error, llm_error_code, llm_error_log_payload, llm_error_message
-from app.services.tool_protocol import BACKEND_RESEARCH_TOOLS, CLIENT_TOOLS, ToolProtocolError, normalize_tool_request
+from app.services.capability_broker import CapabilityBroker
+from app.services.tool_protocol import LOCAL_CAPABILITIES, REMOTE_CAPABILITIES, ToolProtocolError, normalize_tool_request
 
 _log = logging.getLogger("devwerk.planner")
 
 
-class Planner:
+class EvidencePlanningLoop:
     """
-    Stateless planner.
+    Stateless planning output adapter used by a config-derived agent job.
 
     Calls the LLM with a prompt that instructs it to:
       - research the codebase via tool calls when needed
@@ -39,12 +40,12 @@ class Planner:
         "You are DevWerk's PLANNER. Your job is to research the codebase "
         "and produce a FILE-LEVEL change plan - NOT to write any files.\n\n"
         "Rules:\n"
-        "  1. Use code_context_summary/source_map first when available. They are IDE-provided facts, not full file contents.\n"
-        "     If syntax_diagnostics are present, their paths/messages are direct IDE evidence for syntax-fix tasks.\n"
+        "  1. Use code_context_summary/source_map first when available. They are client-provided facts, not full file contents.\n"
+        "     If syntax_diagnostics are present, their paths/messages are direct client evidence for syntax-fix tasks.\n"
         "  2. Do not invent directories, packages, modules, or framework conventions. If the exact target path is unclear, request tools or return no plan.\n"
-        "  3. You may call backend tools (list_dir, read_file, search) to understand the codebase.\n"
-        "     Tool calls must be JSON only: {\"tool_requests\":[{\"id\":\"p1\",\"tool\":\"read_file\",\"args\":{\"path\":\"relative/path.ext\",\"start_line\":1,\"end_line\":200}}]}.\n"
-        "     search uses args.query; args.pattern is tolerated as a query alias. search does not require path.\n"
+        "  3. You may call local capabilities (workspace.list, workspace.read, workspace.search) to understand the codebase.\n"
+        "     Tool calls must be JSON only: {\"tool_requests\":[{\"id\":\"p1\",\"tool\":\"workspace.read\",\"args\":{\"path\":\"relative/path.ext\",\"start_line\":1,\"end_line\":200}}]}.\n"
+        "     workspace.search uses args.query; args.pattern is tolerated as a query alias and path is optional.\n"
         "     Use project-relative paths from source_map/tree_preview. Never use absolute paths.\n"
         "  4. When you have enough information, respond with a JSON object containing a 'plan' key:\n"
         "     { plan: { files: [{path, nature, intent, required, description, confidence}], summary, warnings } }\n"
@@ -64,11 +65,13 @@ class Planner:
 
     def __init__(
         self,
-        agent_name: str = "planner",
+        model_route: str = "planner",
+        agent_id: str = "planning-agent",
         event_sink: Callable[[str, dict[str, Any]], None] | None = None,
         max_rounds: int = 128,
     ):
-        self.agent_name = agent_name
+        self.model_route = model_route
+        self.agent_id = agent_id
         self.event_sink = event_sink
         self.max_rounds = max(1, max_rounds)
 
@@ -102,7 +105,7 @@ class Planner:
                         "round": attempt + 1,
                         "max_rounds": max_rounds,
                         "mode": mode,
-                        "agent": self.agent_name,
+                        "agent": self.agent_id,
                         "input": {
                             "message_count": len(conversation),
                             "roles": [str(m.get("role") or "") for m in conversation],
@@ -113,7 +116,7 @@ class Planner:
                 result = self._call_llm(conversation)
                 self._emit_event(
                     "plan_llm_round_result",
-                    {"round": attempt + 1, "agent": self.agent_name, "output": _raw_result_summary(result)},
+                    {"round": attempt + 1, "agent": self.agent_id, "output": _raw_result_summary(result)},
                 )
                 _log.debug("Planner.plan: attempt=%s raw_result_keys=%s", attempt + 1, sorted(result.keys()))
                 plan = self._extract_plan(result, conversation)
@@ -122,7 +125,7 @@ class Planner:
                     "plan_llm_round_extracted",
                     {
                         "round": attempt + 1,
-                        "agent": self.agent_name,
+                        "agent": self.agent_id,
                         "result": {
                             "ok": plan.ok,
                             "file_count": len(plan.files),
@@ -147,7 +150,7 @@ class Planner:
                     result,
                     conversation,
                     project_root=project_root,
-                    allowed_tools=BACKEND_RESEARCH_TOOLS | client_tools,
+                    allowed_tools=LOCAL_CAPABILITIES | client_tools,
                 )
                 if tool_requests:
                     client_requests = [request for request in tool_requests if request.tool in client_tools]
@@ -156,7 +159,7 @@ class Planner:
                             "plan_client_tool_requested",
                             {
                                 "round": attempt + 1,
-                                "agent": self.agent_name,
+                                "agent": self.agent_id,
                                 "requests": [request.model_dump() for request in client_requests],
                             },
                         )
@@ -173,7 +176,7 @@ class Planner:
                         "plan_tool_requests",
                         {
                             "round": attempt + 1,
-                            "agent": self.agent_name,
+                            "agent": self.agent_id,
                             "count": len(tool_requests),
                             "requests": [
                                 {"id": req.id, "tool": req.tool, "args": req.args}
@@ -186,7 +189,7 @@ class Planner:
                         "plan_tool_results",
                         {
                             "round": attempt + 1,
-                            "agent": self.agent_name,
+                            "agent": self.agent_id,
                             "results": [
                                 {"id": res.id, "ok": res.ok, "content_chars": len(res.content or ""), "error": res.error}
                                 for res in tool_results
@@ -239,7 +242,7 @@ class Planner:
                     "plan_llm_round_failed",
                     {
                         "round": attempt + 1,
-                        "agent": self.agent_name,
+                        "agent": self.agent_id,
                         "error": llm_error_message(exc),
                         "error_code": llm_error_code(exc, "PLAN_ERROR"),
                         "retryable": attempt < max_rounds - 1 and retryable,
@@ -264,7 +267,7 @@ class Planner:
                         "round": final_round,
                         "max_rounds": final_round,
                         "mode": mode,
-                        "agent": self.agent_name,
+                        "agent": self.agent_id,
                         "final_synthesis": True,
                         "input": {"message_count": len(final_conversation)},
                     },
@@ -274,7 +277,7 @@ class Planner:
                     "plan_llm_round_result",
                     {
                         "round": final_round,
-                        "agent": self.agent_name,
+                        "agent": self.agent_id,
                         "final_synthesis": True,
                         "output": _raw_result_summary(result),
                     },
@@ -284,7 +287,7 @@ class Planner:
                     "plan_llm_round_extracted",
                     {
                         "round": final_round,
-                        "agent": self.agent_name,
+                        "agent": self.agent_id,
                         "final_synthesis": True,
                         "result": {
                             "ok": final_plan.ok,
@@ -328,7 +331,7 @@ class Planner:
                     )
                     self._emit_event(
                         "plan_format_repair_started",
-                        {"round": final_round + 1, "agent": self.agent_name, "analysis_chars": len(raw_text)},
+                        {"round": final_round + 1, "agent": self.agent_id, "analysis_chars": len(raw_text)},
                     )
                     repaired_result = self._call_llm(repair_messages)
                     repaired_plan = self._extract_plan(repaired_result, final_conversation)
@@ -336,7 +339,7 @@ class Planner:
                         "plan_format_repair_completed",
                         {
                             "round": final_round + 1,
-                            "agent": self.agent_name,
+                            "agent": self.agent_id,
                             "ok": repaired_plan.ok,
                             "files": [item.path for item in repaired_plan.files],
                             "error_code": repaired_plan.error_code,
@@ -374,8 +377,8 @@ class Planner:
         )
 
     def _call_llm(self, messages: list[dict]) -> dict:
-        _log.debug("Planner.call_llm: agent=%s messages=%s", self.agent_name, len(messages))
-        client = get_llm_client(self.agent_name)
+        _log.debug("Planner.call_llm: agent=%s messages=%s", self.model_route, len(messages))
+        client = get_llm_client(self.model_route)
         result = _normalize_planner_response(client.chat_json(messages))
         _log.debug("Planner.call_llm: result_keys=%s", sorted(result.keys()))
         return result
@@ -456,14 +459,14 @@ class Planner:
 
 
 def _inject_plan_instruction(messages: list[dict], mode: str, *, client_tools: set[str] | None = None) -> list[dict]:
-    system_content = Planner.PLAN_INSTRUCTION
+    system_content = EvidencePlanningLoop.PLAN_INSTRUCTION
     available = sorted(client_tools or set())
     if available:
         system_content += (
             "\nClient evidence tools declared for this request: "
             + ", ".join(available)
-            + ". Request them with the same tool_requests JSON contract when direct IDE/client evidence is required. "
-            "For compilation/build-error investigation, prefer ide_compile over static guessing when it is available. "
+            + ". Request them with the same tool_requests JSON contract when direct provider evidence is required. "
+            "For compilation/build-error investigation, prefer project.compile over static guessing when it is available. "
             "Client tools pause this planner session; their tool_results will be returned before planning resumes.\n"
         )
     if messages and messages[0].get("role", "").lower() == "system":
@@ -521,7 +524,7 @@ def _extract_tool_requests(
     allowed_tools: set[str] | None = None,
 ) -> list[ToolRequest]:
     source_paths = _source_map_paths(messages)
-    accepted_tools = allowed_tools or BACKEND_RESEARCH_TOOLS
+    accepted_tools = allowed_tools or LOCAL_CAPABILITIES
     raw_requests: list[dict[str, Any]] = []
     if isinstance(raw, dict) and (raw.get("tool") or raw.get("name")):
         raw_requests.append(raw)
@@ -559,16 +562,16 @@ def _extract_tool_requests(
                 for value in args["paths"]
                 if (normalized := _normalize_tool_path(value, source_paths=source_paths, project_root=project_root))
             ]
-        if tool in {"list_dir", "read_file"}:
+        if tool in {"workspace.list", "workspace.read"}:
             args["path"] = _normalize_tool_path(args.get("path"), source_paths=source_paths, project_root=project_root)
-            if tool == "read_file" and not args["path"]:
+            if tool == "workspace.read" and not args["path"]:
                 continue
-        if tool == "read_file":
+        if tool == "workspace.read":
             args.setdefault("start_line", 1)
             args.setdefault("end_line", 220)
-        elif tool == "list_dir":
+        elif tool == "workspace.list":
             args.setdefault("max_depth", 3)
-        elif tool == "search":
+        elif tool == "workspace.search":
             args["query"] = str(args.get("query") or "").strip()
             args.setdefault("max_results", 50)
             if not args["query"]:
@@ -593,12 +596,7 @@ def _extract_tool_requests(
 
 
 def _declared_client_tools(capabilities: object) -> set[str]:
-    if not isinstance(capabilities, dict):
-        return set()
-    tools = capabilities.get("tools")
-    if not isinstance(tools, list):
-        return set()
-    return {str(tool).strip() for tool in tools if str(tool).strip() in CLIENT_TOOLS}
+    return CapabilityBroker().available(capabilities, REMOTE_CAPABILITIES)
 
 
 def _json_tool_calls_from_text(text: str) -> list[dict[str, Any]]:
@@ -644,7 +642,7 @@ def _search_tool_calls_from_text(text: str, messages: list[dict]) -> list[dict[s
         return []
     terms = _candidate_search_terms(_last_user_text(messages), text)
     return [
-        {"id": f"p{i + 1}", "tool": "search", "args": {"query": term, "max_results": 80}}
+        {"id": f"p{i + 1}", "tool": "workspace.search", "args": {"query": term, "max_results": 80}}
         for i, term in enumerate(terms[:6])
     ]
 
@@ -798,14 +796,14 @@ def _execute_tool_requests(project_root: str | None, reqs: list[ToolRequest]) ->
     results: list[ToolResult] = []
     for req in reqs:
         try:
-            if req.tool == "list_dir":
+            if req.tool == "workspace.list":
                 rel = _safe_rel_path(req.args.get("path"))
                 if rel and _contains_hidden_segment(rel):
                     results.append(ToolResult(id=req.id, ok=False, error=f"blocked hidden directory path: {rel}"))
                     continue
                 max_depth = _int_arg(req.args.get("max_depth"), 3, 1, 8)
                 results.append(ToolResult(id=req.id, ok=True, content=_tool_list_dir(root, rel, max_depth)))
-            elif req.tool == "read_file":
+            elif req.tool == "workspace.read":
                 rel = _safe_rel_path(req.args.get("path"))
                 if not rel:
                     results.append(ToolResult(id=req.id, ok=False, error="path is required"))
@@ -816,7 +814,7 @@ def _execute_tool_requests(project_root: str | None, reqs: list[ToolRequest]) ->
                 start_line = _int_arg(req.args.get("start_line"), 1, 1, 1_000_000)
                 end_line = _int_arg(req.args.get("end_line"), start_line + 220, start_line, 1_000_000)
                 results.append(ToolResult(id=req.id, ok=True, content=_tool_read_file(root, rel, start_line, end_line)))
-            elif req.tool == "search":
+            elif req.tool == "workspace.search":
                 query = str(req.args.get("query") or "")
                 raw_paths = req.args.get("paths")
                 paths = raw_paths if isinstance(raw_paths, list) else []
@@ -834,9 +832,9 @@ def _execute_tool_requests(project_root: str | None, reqs: list[ToolRequest]) ->
 def _tool_list_dir(root: Path, rel: str, max_depth: int) -> str:
     target = _safe_project_path(root, rel)
     if not target.exists():
-        return f"[list_dir] not found: {rel}"
+        return f"[workspace.list] not found: {rel}"
     if not target.is_dir():
-        return f"[list_dir] not a directory: {rel}"
+        return f"[workspace.list] not a directory: {rel}"
     label = "." if not rel or rel == "." else (target.name or ".")
     lines = [f"{label}/"]
 
@@ -860,9 +858,9 @@ def _tool_list_dir(root: Path, rel: str, max_depth: int) -> str:
 def _tool_read_file(root: Path, rel: str, start_line: int, end_line: int) -> str:
     target = _safe_project_path(root, rel)
     if not target.exists():
-        return f"[read_file] not found: {rel}"
+        return f"[workspace.read] not found: {rel}"
     if target.is_dir():
-        return f"[read_file] is a directory: {rel}"
+        return f"[workspace.read] is a directory: {rel}"
     lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
     start = max(start_line, 1) - 1
     end = max(end_line, start_line)
@@ -976,14 +974,14 @@ def _fallback_plan(raw: dict, messages: list[dict]) -> PlanResponse:
                 PlanFile(
                     path=path,
                     nature="modified",
-                    description="IDE syntax diagnostics identify this file as a required investigation/fix target.",
+                    description="Client syntax diagnostics identify this file as a required investigation/fix target.",
                     confidence=0.75,
                 )
                 for path in diagnostic_paths
             ],
-            summary="Plan based on IDE syntax diagnostic file evidence.",
+            summary="Plan based on client syntax diagnostic file evidence.",
             warnings=[
-                "Planner returned no structured file plan; DevWerk used IDE diagnostic paths only and did not infer framework paths."
+                "Planner returned no structured file plan; DevWerk used client-provided diagnostic paths only and did not infer framework paths."
             ],
         )
 
