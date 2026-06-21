@@ -257,9 +257,11 @@ Backend research tools are consumed inside the backend execution loop:
 {"id": "r1", "tool": "read_file", "args": {"path": "pom.xml", "start_line": 1, "end_line": 200}}
 ```
 
-Client-side tools are returned with generated changes. The plugin applies the
-snapshot-protected write first, then executes the tool, then reports the result
-through `apply_result.verification`.
+Client-side tools can be requested at any workflow phase. Evidence requests
+pause the active column with `waiting_for=client_tool`; the plugin executes the
+tool and resumes the same task with `action=tool_result`. Post-apply tools run
+after the snapshot-protected write and are reported through
+`apply_result.verification`.
 
 ```json
 {
@@ -279,6 +281,9 @@ The IntelliJ plugin implements `ide_compile` with the active project's
 `run_command` for model-selected project verification. Every client tool writes
 started/completed, duration, success, and diagnostic evidence to the operation
 log; timeouts and SDK failures are returned through the same verification result.
+Compile/build-error tasks request `ide_compile` before planning when that
+capability is declared, so the planner receives compiler evidence instead of
+guessing from source text.
 
 ### `POST /v1/workflows`
 

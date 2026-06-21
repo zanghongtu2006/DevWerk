@@ -8,6 +8,8 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from app.models.ide import ToolRequest
+
 
 class PlanFile(BaseModel):
     """
@@ -73,6 +75,11 @@ class PlanResponse(BaseModel):
     warnings: list[str] = Field(
         default_factory=list,
         description="Any warnings the LLM surfaced (e.g. framework file, contains config).",
+    )
+
+    tool_requests: list[ToolRequest] = Field(
+        default_factory=list,
+        description="Client-side evidence tools required before planning can continue.",
     )
 
     error_code: Optional[str] = None

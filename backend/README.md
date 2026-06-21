@@ -256,10 +256,11 @@ of long blocking chat requests.
 - Backend research tools: `list_dir`, `read_file`, `search`
 - Client-side post-apply tools: `ide_compile`, `ide_syntax_check`, `run_command`
 
-Backend research tools are resolved inside the workflow coder run before file
-operations are returned. Client-side tools may be returned with `ops` or `patch_ops`; the
-IDE plugin applies the generated changes first, runs the tool, then reports the
-result through `apply_result.verification`.
+Backend research tools are resolved inside an agent run. Client-side evidence
+tools pause the current workflow column and resume the same task through a
+`tool_result` message. Client-side post-apply tools may also be returned with
+`ops` or `patch_ops`; the IDE plugin applies the generated changes first, runs
+the tool, then reports the result through `apply_result.verification`.
 
 Example client-side tool request:
 

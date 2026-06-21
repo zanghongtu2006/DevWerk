@@ -371,6 +371,43 @@ class HttpAiClient(
         return results
     }
 
+    fun continueWorkflowWithToolResults(
+        context: ChatContext,
+        taskId: String,
+        results: List<ToolResult>
+    ): IdeChatResponse {
+        val endpoint = "${workflowsEndpoint.trimEnd('/')}/$taskId/messages"
+        val workspace = buildWorkspaceSummary(context)
+        val body = JSONObject()
+            .put("action", "tool_result")
+            .put("message", "")
+            .put("client_capabilities", clientCapabilities())
+            .put("workspace", workspace?.let { workspaceToJson(it, context) } ?: JSONObject.NULL)
+            .put("tool_results", JSONArray(toolResultsToJson(results)))
+            .toString()
+
+        appendDevLog(context, "\n===== WORKFLOW CLIENT TOOL RESULT REQUEST ($endpoint) =====\n$body\n")
+        val startBody = postJson(endpoint, body, context)
+        appendDevLog(context, "\n===== WORKFLOW CLIENT TOOL RESULT RESPONSE =====\n$startBody\n")
+        val startObj = JSONObject(startBody)
+        if (!startObj.optBoolean("ok", false)) {
+            return IdeChatResponse(
+                reply = "",
+                taskId = taskId,
+                ok = false,
+                done = true,
+                errorCode = startObj.optString("error_code", "CLIENT_TOOL_RESULT_ERROR"),
+                errorMessage = startObj.optString("error_message", startBody),
+                retryable = startObj.optBoolean("retryable", true),
+                rawResponses = listOf(startBody)
+            )
+        }
+
+        val eventsUrl = startObj.optString("events_url", "/v1/workflows/$taskId/events")
+        val pollUrl = startObj.optString("poll_url", "/v1/workflows/$taskId")
+        return awaitWorkflowContinuation(context, taskId, pollUrl, eventsUrl)
+    }
+
     fun awaitWorkflowContinuation(
         context: ChatContext,
         taskId: String,

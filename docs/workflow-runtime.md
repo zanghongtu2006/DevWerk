@@ -59,6 +59,10 @@ compact reusable engineering facts, never the raw transcript.
   reason: the reviewer approves snapshot-protected apply and emits
   capability-bounded `verification_tool_requests` selected from project facts.
 - `verified` is driven by client tool evidence after snapshot-protected apply.
+- Executable columns may pause with `waiting_for=client_tool`. The client runs
+  the declared request, posts `action=tool_result`, and the same task/column
+  resumes with that evidence. Compile-error tasks use this gate before planning
+  when the client declares `ide_compile`.
 
 Columns and agents remain independent concepts. `default.json` or a project DB
 override determines column order, actions, artifacts, and agent binding. The

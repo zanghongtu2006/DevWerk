@@ -277,6 +277,8 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 updatedCtx = updatedCtx.copy(devCtx = devCtx, taskId = responseTaskId)
             }
 
+            response = resolveClientToolPauses(aiClient, updatedCtx, response)
+
             history += ChatMessage("user", userMessage)
             if (response.ok) {
                 if (response.waitingFor != "user_guidance") {
@@ -349,6 +351,46 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 setState(State.IDLE)
             }
         }
+    }
+
+    private fun resolveClientToolPauses(
+        aiClient: AiClient,
+        context: ChatContext,
+        initial: IdeChatResponse
+    ): IdeChatResponse {
+        val http = aiClient as? HttpAiClient ?: return initial
+        var response = initial
+        repeat(128) { round ->
+            if (!response.ok || response.waitingFor != "client_tool") return response
+            val taskId = response.taskId?.takeIf { it.isNotBlank() }
+                ?: return response.copy(
+                    ok = false,
+                    done = true,
+                    errorCode = "CLIENT_TOOL_PROTOCOL_ERROR",
+                    errorMessage = "Client-tool pause did not include task_id."
+                )
+            if (response.toolRequests.isEmpty()) {
+                return response.copy(
+                    ok = false,
+                    done = true,
+                    errorCode = "CLIENT_TOOL_PROTOCOL_ERROR",
+                    errorMessage = "Client-tool pause did not include tool_requests."
+                )
+            }
+
+            appendOpLog(
+                context.devCtx,
+                "[INFO] Client-tool workflow round=${round + 1} task=$taskId requests=${response.toolRequests.size}\n"
+            )
+            val results = http.executeClientTools(context.copy(taskId = taskId), response.toolRequests)
+            response = http.continueWorkflowWithToolResults(context.copy(taskId = taskId), taskId, results)
+        }
+        return response.copy(
+            ok = false,
+            done = true,
+            errorCode = "CLIENT_TOOL_ROUND_LIMIT",
+            errorMessage = "Workflow exceeded 128 consecutive client-tool rounds."
+        )
     }
 
     // ── Utilities ───────────────────────────────────────────────────────────────

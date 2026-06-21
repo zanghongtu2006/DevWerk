@@ -906,6 +906,79 @@ async def test_workflow_message_api_confirms_plan_without_starting_new_task(monk
             assert rejected["retryable"] is False
 
 
+@pytest.mark.asyncio
+async def test_workflow_message_api_accepts_client_tool_result_and_resumes_planner(monkeypatch, tmp_path):
+    db_path = tmp_path / "devwerk-client-tool-api.db"
+    project_root = tmp_path / "client-tool-project"
+    project_root.mkdir()
+    fake_settings = FakeSettings(db_path)
+
+    import app.main as main_module
+    import app.routes.ide as ide_routes
+    import app.services.kanban as kanban_service
+    import app.services.planner as planner_service
+    import app.services.usage as usage_service
+
+    patch_service_settings(monkeypatch, fake_settings, main_module, ide_routes, kanban_service, usage_service)
+    reset_service_dbs(kanban_service, usage_service)
+    monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": FakePlannerClient())
+    app = main_module.create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            start = (await client.post(
+                "/v1/workflows",
+                json={
+                    "project_id": "client-tool-api",
+                    "mode": "agent",
+                    "interaction_mode": "confirm_plan",
+                    "project_root": str(project_root),
+                    "messages": [{"role": "user", "content": "Fix all compilation errors."}],
+                    "workspace": {"root_id": "client-tool-api", "tree_preview": "", "source_map": None},
+                    "client_capabilities": {"tools": ["ide_compile"]},
+                },
+            )).json()
+            task_id = start["task_id"]
+
+            waiting = {}
+            for _ in range(120):
+                waiting = (await client.get(start["poll_url"])).json()
+                if waiting.get("result"):
+                    break
+                await asyncio.sleep(0.05)
+            assert waiting["result"]["waiting_for"] == "client_tool"
+            assert waiting["result"]["tool_requests"][0]["tool"] == "ide_compile"
+
+            resumed = (await client.post(
+                f"/v1/workflows/{task_id}/messages",
+                json={
+                    "action": "tool_result",
+                    "client_capabilities": {"tools": ["ide_compile"]},
+                    "tool_results": [
+                        {
+                            "id": "ide-compile-evidence",
+                            "ok": False,
+                            "error": "[ide_compile] completed\nerrors=1\nservice/main.py:1:1 compile error",
+                        }
+                    ],
+                },
+            )).json()
+            assert resumed["task_id"] == task_id
+
+            planned = {}
+            for _ in range(120):
+                planned = (await client.get(resumed["poll_url"])).json()
+                if planned.get("result"):
+                    break
+                await asyncio.sleep(0.05)
+            assert planned["result"]["waiting_for"] == "plan_confirmation"
+            detail = kanban_service.get_task(task_id)["task"]
+            assert any(item["artifact_type"] == "client_tool_result" for item in detail["artifacts"])
+            assert "workflow_client_tool_result_received" in {
+                event["event_type"] for event in detail["events"]
+            }
+
+
 def test_workflow_reviewer_keeps_distinct_relative_paths():
     from app.services.workflow_engine import _review_result
 
@@ -1410,6 +1483,95 @@ async def test_interactive_workflow_pauses_for_plan_confirmation_and_resumes(mon
     ]
     revision_events = [event for event in completed_task["events"] if event["event_type"] == "revision_created"]
     assert len(revision_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_planner_client_tool_pause_resumes_same_workflow_with_evidence(monkeypatch, tmp_path):
+    db_path = tmp_path / "devwerk-client-tool-workflow.db"
+    fake_settings = FakeSettings(db_path)
+
+    import app.services.kanban as kanban_service
+    import app.services.workflow_engine as workflow_engine_service
+
+    patch_service_settings(monkeypatch, fake_settings, kanban_service)
+    kanban_service._initialized = False
+    task = kanban_service.create_task(
+        project_id="client-tool-project",
+        title="Fix compilation errors",
+        description="Use IDE diagnostics before editing",
+        status_key="draft",
+    )["task"]
+    kanban_service.ensure_conversation(task["id"])
+    kanban_service.append_conversation_message(task["id"], role="user", content="Fix compilation errors.")
+    planner_inputs: list[list[dict]] = []
+
+    async def plan_runner(body: dict) -> PlanResponse:
+        planner_inputs.append(body["messages"])
+        if not body.get("tool_results"):
+            return PlanResponse(
+                summary="Collect IDE compiler evidence.",
+                tool_requests=[ToolRequest(id="compile", tool="ide_compile", args={"timeout_seconds": 60})],
+                next_action="need_client_tool",
+            )
+        return PlanResponse(
+            files=[PlanFile(path="src/module.py", nature="modified", intent="modify", description="Fix reported error.")],
+            summary="Fix the file reported by the IDE compiler.",
+        )
+
+    async def coding_runner(body: dict) -> IdeChatResponse:
+        return IdeChatResponse(
+            task_id=body["task_id"],
+            done=True,
+            reply="Fixed compiler error.",
+            ops=[FileOp(op="update_file", path="src/module.py", content="VALUE = 1\n")],
+        )
+
+    async def review_runner(body: dict) -> dict:
+        return {"decision": "approve", "summary": "Ready to apply.", "verification_tool_requests": []}
+
+    engine = workflow_engine_service.WorkflowEngine(
+        plan_runner=plan_runner,
+        coding_runner=coding_runner,
+        review_runner=review_runner,
+    )
+    body = {
+        "project_id": "client-tool-project",
+        "mode": "agent",
+        "messages": [{"role": "user", "content": "Fix compilation errors."}],
+        "workspace": {"tree_preview": "project/\n  src/\n    module.py", "source_map": None},
+        "client_capabilities": {"tools": ["ide_compile"]},
+    }
+
+    await engine.run(task["id"], body)
+    waiting_task = kanban_service.get_task(task["id"])["task"]
+    waiting_result = [
+        item for item in waiting_task["artifacts"] if item["artifact_type"] == "workflow_result"
+    ][-1]["payload"]
+    assert waiting_result["waiting_for"] == "client_tool"
+    assert waiting_result["tool_requests"][0]["tool"] == "ide_compile"
+    assert kanban_service.get_conversation(task["id"])["state"] == "waiting_client"
+    assert planner_inputs == []
+
+    tool_results = [
+        {
+            "id": "compile",
+            "ok": False,
+            "error": "[ide_compile] completed\nerrors=1\nsrc/module.py:3:7 incompatible types",
+        }
+    ]
+    await engine.run(task["id"], {**body, "resume_action": "tool_result", "tool_results": tool_results})
+
+    completed_task = kanban_service.get_task(task["id"])["task"]
+    completed_result = [
+        item for item in completed_task["artifacts"] if item["artifact_type"] == "workflow_result"
+    ][-1]["payload"]
+    assert completed_task["status_key"] == "ready_to_apply"
+    assert completed_result["ops"][0]["path"] == "src/module.py"
+    assert any("client_tool_results:" in message["content"] for message in planner_inputs[-1])
+    event_types = [event["event_type"] for event in completed_task["events"]]
+    assert "plan_client_tool_policy_triggered" in event_types
+    assert "workflow_client_tool_requested" in event_types
+    assert "plan_client_tool_results_injected" in event_types
 
 
 def test_conversation_context_compresses_old_messages_and_keeps_recent_turns(monkeypatch, tmp_path):
@@ -1965,6 +2127,31 @@ def test_planner_repairs_markdown_final_analysis_into_plan_contract(monkeypatch,
 
 def test_planner_default_round_budget_is_a_high_safety_ceiling():
     assert Planner().max_rounds == 128
+
+
+def test_planner_returns_declared_client_tool_request_without_executing_it(monkeypatch):
+    class ClientToolPlanner:
+        def chat_json(self, messages):
+            assert "ide_compile" in messages[0]["content"]
+            return {
+                "tool_requests": [
+                    {"id": "compile", "tool": "ide_compile", "args": {"timeout_seconds": 60}}
+                ]
+            }
+
+    import app.services.planner as planner_service
+
+    monkeypatch.setattr(planner_service, "get_llm_client", lambda agent="planner": ClientToolPlanner())
+    events: list[tuple[str, dict]] = []
+    plan = Planner(event_sink=lambda event_type, payload: events.append((event_type, payload))).plan(
+        messages=[{"role": "user", "content": "Find and fix all compilation errors."}],
+        client_capabilities={"tools": ["ide_compile"]},
+    )
+
+    assert plan.ok is True
+    assert plan.next_action == "need_client_tool"
+    assert [request.tool for request in plan.tool_requests] == ["ide_compile"]
+    assert "plan_client_tool_requested" in [event_type for event_type, _ in events]
 
 
 def test_planner_recovers_natural_language_search_intent(monkeypatch, tmp_path):

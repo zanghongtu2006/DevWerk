@@ -172,6 +172,29 @@ def continue_workflow_payload(task_id: str, incoming: dict) -> dict:
         update_conversation(task_id, state="cancelled", waiting_for=None)
         return _workflow_state_payload(task_id, include_result=True)
 
+    if action == "tool_result" and (
+        not isinstance(incoming.get("tool_results"), list) or not incoming.get("tool_results")
+    ):
+        return {
+            "ok": False,
+            "task_id": task_id,
+            "error_code": "BAD_TOOL_RESULT",
+            "error_message": "tool_result action requires tool_results array",
+        }
+    if action == "tool_result":
+        try:
+            incoming["tool_results"] = [
+                ToolResult.model_validate(item).model_dump(exclude_none=True)
+                for item in incoming["tool_results"]
+            ]
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "task_id": task_id,
+                "error_code": "BAD_TOOL_RESULT",
+                "error_message": f"invalid tool result payload: {exc}",
+            }
+
     content = str(incoming.get("message") or "").strip()
     if content or action == "confirm_plan":
         append_conversation_message(
@@ -201,6 +224,29 @@ def continue_workflow_payload(task_id: str, incoming: dict) -> dict:
         body["workspace"] = incoming["workspace"]
     if isinstance(incoming.get("tool_results"), list):
         body["tool_results"] = incoming["tool_results"]
+        if action == "tool_result":
+            payload = {
+                "waiting_for": conversation.get("waiting_for"),
+                "results": incoming["tool_results"],
+            }
+            _kanban_artifact(task_id, "client_tool_result", payload=payload)
+            _kanban_event(
+                task_id,
+                "workflow_client_tool_result_received",
+                {
+                    "result_count": len(incoming["tool_results"]),
+                    "result_ids": [
+                        str(item.get("id") or "")
+                        for item in incoming["tool_results"]
+                        if isinstance(item, dict)
+                    ],
+                    "all_ok": all(
+                        bool(item.get("ok"))
+                        for item in incoming["tool_results"]
+                        if isinstance(item, dict)
+                    ),
+                },
+            )
     if isinstance(incoming.get("client_capabilities"), dict):
         body["client_capabilities"] = incoming["client_capabilities"]
     cursor = _latest_artifact_created_at(task, "workflow_result")
@@ -381,7 +427,35 @@ async def ide_plan(request: Request) -> PlanResponse:
     _kanban_event(task_id, "plan_started", {"mode": mode, "agent": planner_agent})
 
     try:
-        result = p.plan(messages=messages, mode=mode, project_root=body.get("project_root"))
+        result = p.plan(
+            messages=messages,
+            mode=mode,
+            project_root=body.get("project_root"),
+            client_capabilities=body.get("client_capabilities"),
+        )
+        if result.ok and result.tool_requests:
+            _kanban_artifact(
+                task_id,
+                "plan_client_tool_request",
+                payload={
+                    "agent": planner_agent,
+                    "requests": [request.model_dump() for request in result.tool_requests],
+                    "summary": result.summary,
+                },
+            )
+            _kanban_event(
+                task_id,
+                "plan_waiting_client_tool",
+                {
+                    "agent": planner_agent,
+                    "request_count": len(result.tool_requests),
+                    "tools": [request.tool for request in result.tool_requests],
+                },
+            )
+            result.task_id = task_id
+            result.status_key = str((get_task(task_id).get("task") or {}).get("status_key") or "context_indexed")
+            result.next_action = "need_client_tool"
+            return result
         if result.ok:
             _kanban_artifact(task_id, "plan_response", payload=result.model_dump())
             phase_output = _record_phase_output(
@@ -1650,6 +1724,7 @@ def _workflow_request_body_artifact(body: dict) -> dict:
         "project_id": body.get("project_id"),
         "task_id": body.get("task_id"),
         "mode": body.get("mode", "agent"),
+        "interaction_mode": body.get("interaction_mode", "auto"),
         "project_root": body.get("project_root"),
         "messages": body.get("messages") if isinstance(body.get("messages"), list) else [],
         "workspace": body.get("workspace") if isinstance(body.get("workspace"), dict) else None,

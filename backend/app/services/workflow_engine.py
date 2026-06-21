@@ -118,7 +118,7 @@ class WorkflowEngine:
             current = _column_for_agent(definition, "coder") or current
             update_conversation(task_id, state="running", waiting_for=None, active_column=current.status_key)
             _event(task_id, "workflow_resumed", {"reason": "plan_confirmed", "status_key": current.status_key})
-        elif resume_action in {"revise_plan", "message"}:
+        elif resume_action in {"revise_plan", "message", "tool_result"}:
             current = _column_for_agent(definition, "planner") or current
             update_conversation(task_id, state="running", waiting_for=None, active_column=current.status_key)
             _event(task_id, "workflow_resumed", {"reason": resume_action, "status_key": current.status_key})
@@ -392,6 +392,23 @@ class WorkflowEngine:
         )
         conversation_context = prepare_conversation_context(task_id, fallback_messages=body.get("messages") or [])
         plan_messages = list(conversation_context.get("messages") or body.get("messages") or [])
+        client_tool_results = body.get("tool_results") if isinstance(body.get("tool_results"), list) else []
+        if client_tool_results:
+            plan_messages.append(
+                {
+                    "role": "user",
+                    "content": "client_tool_results:\n" + json.dumps(client_tool_results, ensure_ascii=False),
+                }
+            )
+            _event(
+                task_id,
+                "plan_client_tool_results_injected",
+                {
+                    "phase": column.status_key,
+                    "result_count": len(client_tool_results),
+                    "result_ids": [str(item.get("id") or "") for item in client_tool_results if isinstance(item, dict)],
+                },
+            )
         if state.review_feedback:
             replan_feedback = {
                 "review": _compact_review_feedback(state.review_feedback),
@@ -405,16 +422,105 @@ class WorkflowEngine:
                 }
             )
         _event(task_id, "agent_prompt_context_prepared", {"phase": column.status_key, **context_debug_payload(conversation_context)})
-        plan_response = await self.plan_runner(
-            dict(
-                body,
-                task_id=task_id,
-                messages=plan_messages,
-                _workflow_engine_managed=True,
+        task_record = (get_task(task_id).get("task") or {})
+        preflight_requests = []
+        if not client_tool_results and _task_requires_executable_verification(task_record):
+            preflight_requests = _allowed_client_tool_requests(
+                [
+                    {
+                        "id": "ide-compile-evidence",
+                        "tool": "ide_compile",
+                        "args": {
+                            "timeout_seconds": 300,
+                            "max_errors": 200,
+                            "reason": "Collect authoritative IDE compiler evidence before planning a compile-error repair.",
+                        },
+                    }
+                ],
+                body.get("client_capabilities"),
+                project_root=body.get("project_root"),
             )
-        )
+        if preflight_requests:
+            _event(
+                task_id,
+                "plan_client_tool_policy_triggered",
+                {
+                    "phase": column.status_key,
+                    "reason": "compile_error_evidence",
+                    "requests": [request.model_dump() for request in preflight_requests],
+                },
+            )
+            plan_response = PlanResponse(
+                summary="Collecting authoritative compiler diagnostics from the connected IDE before planning.",
+                tool_requests=preflight_requests,
+                next_action="need_client_tool",
+            )
+        else:
+            plan_response = await self.plan_runner(
+                dict(
+                    body,
+                    task_id=task_id,
+                    messages=plan_messages,
+                    _workflow_engine_managed=True,
+                )
+            )
         plan_response.task_id = task_id
         state.plan_response = plan_response
+        if plan_response.tool_requests:
+            client_requests = _allowed_client_tool_requests(
+                [request.model_dump() for request in plan_response.tool_requests],
+                body.get("client_capabilities"),
+                project_root=body.get("project_root"),
+            )
+            if not client_requests:
+                action = _failure_action(column)
+                message = "Planner requested client tools that are not declared by this client."
+                moved = apply_workflow_action(task_id, action, {"phase": column.status_key, "reason": message})
+                response = _failure_response(
+                    task_id,
+                    "CLIENT_TOOL_UNAVAILABLE",
+                    message,
+                    status_key=(moved.get("task") or {}).get("status_key") or "failed",
+                )
+                return ColumnResult(action=action, decision="fail", response=response, target_status=response.status_key)
+
+            request_payload = {
+                "phase": column.status_key,
+                "agent": agent,
+                "requests": [request.model_dump() for request in client_requests],
+            }
+            add_artifact(task_id, artifact_type="client_tool_request", payload=request_payload)
+            output = record_phase_output(
+                task_id,
+                phase=column.status_key,
+                agent=agent,
+                status_key=_current_status(task_id),
+                summary=plan_response.summary or "Planner requested client-provided project evidence.",
+                inputs={"client_capabilities": body.get("client_capabilities") or {}},
+                outputs=request_payload,
+                warnings=plan_response.warnings,
+                decision="need_client_tool",
+                next_action="tool_result",
+            )
+            response = _waiting_response(
+                task_id,
+                status_key=_current_status(task_id),
+                waiting_for="client_tool",
+                reply=plan_response.summary or "Collecting project evidence from the connected IDE.",
+                interaction={
+                    "type": "client_tool",
+                    "reason": "planner_evidence",
+                    "phase": column.status_key,
+                    "session_id": output["session_id"],
+                    "actions": ["tool_result", "cancel"],
+                },
+            )
+            response.tool_requests = client_requests
+            update_conversation(task_id, state="waiting_client", waiting_for="client_tool", active_column=column.status_key)
+            _event(task_id, "workflow_client_tool_requested", request_payload)
+            _event(task_id, "workflow_column_waiting", {**request_payload, "waiting_for": "client_tool"})
+            return ColumnResult(action="need_client_tool", target_status=response.status_key, decision="wait", response=response)
+
         add_artifact(task_id, artifact_type=column.output_artifact or "plan_bundle", payload=plan_response.model_dump())
         _event(task_id, "agent_output_recorded", {"phase": column.status_key, "agent": agent, "artifact": column.output_artifact or "plan_bundle"})
         if not plan_response.ok:

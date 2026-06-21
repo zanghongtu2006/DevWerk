@@ -20,7 +20,7 @@ from app.models.ide import ToolRequest, ToolResult
 from app.models.plan import PlanFile, PlanResponse
 from app.services.llm_factory import get_llm_client
 from app.services.provider_errors import is_retryable_llm_error, llm_error_code, llm_error_log_payload, llm_error_message
-from app.services.tool_protocol import ToolProtocolError, normalize_tool_request
+from app.services.tool_protocol import BACKEND_RESEARCH_TOOLS, CLIENT_TOOLS, ToolProtocolError, normalize_tool_request
 
 _log = logging.getLogger("devwerk.planner")
 
@@ -42,7 +42,7 @@ class Planner:
         "  1. Use code_context_summary/source_map first when available. They are IDE-provided facts, not full file contents.\n"
         "     If syntax_diagnostics are present, their paths/messages are direct IDE evidence for syntax-fix tasks.\n"
         "  2. Do not invent directories, packages, modules, or framework conventions. If the exact target path is unclear, request tools or return no plan.\n"
-        "  3. You may call tools (list_dir, read_file, search) to understand the codebase.\n"
+        "  3. You may call backend tools (list_dir, read_file, search) to understand the codebase.\n"
         "     Tool calls must be JSON only: {\"tool_requests\":[{\"id\":\"p1\",\"tool\":\"read_file\",\"args\":{\"path\":\"relative/path.ext\",\"start_line\":1,\"end_line\":200}}]}.\n"
         "     search uses args.query; args.pattern is tolerated as a query alias. search does not require path.\n"
         "     Use project-relative paths from source_map/tree_preview. Never use absolute paths.\n"
@@ -72,8 +72,15 @@ class Planner:
         self.event_sink = event_sink
         self.max_rounds = max(1, max_rounds)
 
-    def plan(self, messages: list[dict], mode: str = "agent", project_root: str | None = None) -> PlanResponse:
-        conversation = _inject_plan_instruction(list(messages), mode)
+    def plan(
+        self,
+        messages: list[dict],
+        mode: str = "agent",
+        project_root: str | None = None,
+        client_capabilities: dict[str, Any] | None = None,
+    ) -> PlanResponse:
+        client_tools = _declared_client_tools(client_capabilities)
+        conversation = _inject_plan_instruction(list(messages), mode, client_tools=client_tools)
         _log.debug(
             "Planner.plan: start mode=%s input_messages=%s injected_messages=%s",
             mode,
@@ -136,8 +143,31 @@ class Planner:
                 if plan.ok or plan.error_code == "PLAN_DIRECTORY_PATHS":
                     return plan
 
-                tool_requests = _extract_tool_requests(result, conversation, project_root=project_root)
+                tool_requests = _extract_tool_requests(
+                    result,
+                    conversation,
+                    project_root=project_root,
+                    allowed_tools=BACKEND_RESEARCH_TOOLS | client_tools,
+                )
                 if tool_requests:
+                    client_requests = [request for request in tool_requests if request.tool in client_tools]
+                    if client_requests:
+                        self._emit_event(
+                            "plan_client_tool_requested",
+                            {
+                                "round": attempt + 1,
+                                "agent": self.agent_name,
+                                "requests": [request.model_dump() for request in client_requests],
+                            },
+                        )
+                        return PlanResponse(
+                            ok=True,
+                            files=[],
+                            summary="Planner is waiting for client-provided project evidence.",
+                            warnings=[],
+                            tool_requests=client_requests,
+                            next_action="need_client_tool",
+                        )
                     used_tools = True
                     self._emit_event(
                         "plan_tool_requests",
@@ -425,8 +455,17 @@ class Planner:
         return PlanResponse(ok=True, files=files, summary=summary, warnings=warnings)
 
 
-def _inject_plan_instruction(messages: list[dict], mode: str) -> list[dict]:
+def _inject_plan_instruction(messages: list[dict], mode: str, *, client_tools: set[str] | None = None) -> list[dict]:
     system_content = Planner.PLAN_INSTRUCTION
+    available = sorted(client_tools or set())
+    if available:
+        system_content += (
+            "\nClient evidence tools declared for this request: "
+            + ", ".join(available)
+            + ". Request them with the same tool_requests JSON contract when direct IDE/client evidence is required. "
+            "For compilation/build-error investigation, prefer ide_compile over static guessing when it is available. "
+            "Client tools pause this planner session; their tool_results will be returned before planning resumes.\n"
+        )
     if messages and messages[0].get("role", "").lower() == "system":
         merged = messages[0]["content"] + "\n\n" + system_content
         return [{"role": "system", "content": merged}] + messages[1:]
@@ -474,8 +513,15 @@ def _normalize_planner_response(value: Any) -> dict[str, Any]:
     }
 
 
-def _extract_tool_requests(raw: dict, messages: list[dict], project_root: str | None = None) -> list[ToolRequest]:
+def _extract_tool_requests(
+    raw: dict,
+    messages: list[dict],
+    project_root: str | None = None,
+    *,
+    allowed_tools: set[str] | None = None,
+) -> list[ToolRequest]:
     source_paths = _source_map_paths(messages)
+    accepted_tools = allowed_tools or BACKEND_RESEARCH_TOOLS
     raw_requests: list[dict[str, Any]] = []
     if isinstance(raw, dict) and (raw.get("tool") or raw.get("name")):
         raw_requests.append(raw)
@@ -492,7 +538,7 @@ def _extract_tool_requests(raw: dict, messages: list[dict], project_root: str | 
     seen: set[tuple[str, str, str]] = set()
     for index, item in enumerate(raw_requests, start=1):
         tool = str(item.get("tool") or item.get("name") or "").strip()
-        if tool not in {"list_dir", "read_file", "search"}:
+        if tool not in accepted_tools:
             continue
         args = item.get("args") if isinstance(item.get("args"), dict) else item.get("arguments")
         args = dict(args) if isinstance(args, dict) else {}
@@ -544,6 +590,15 @@ def _extract_tool_requests(raw: dict, messages: list[dict], project_root: str | 
             len(source_paths),
         )
     return requests
+
+
+def _declared_client_tools(capabilities: object) -> set[str]:
+    if not isinstance(capabilities, dict):
+        return set()
+    tools = capabilities.get("tools")
+    if not isinstance(tools, list):
+        return set()
+    return {str(tool).strip() for tool in tools if str(tool).strip() in CLIENT_TOOLS}
 
 
 def _json_tool_calls_from_text(text: str) -> list[dict[str, Any]]:
@@ -951,6 +1006,7 @@ def _last_user_text(messages: list[dict]) -> str:
         "code_context_summary:",
         "code_context_skill:",
         "tool_results:",
+        "client_tool_results:",
         "request_meta:",
         "workflow_replan_feedback:",
         "workflow_phase_context:",
