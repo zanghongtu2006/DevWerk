@@ -604,21 +604,35 @@ class HttpAiClient(
         return root.toString()
     }
 
-    private fun clientCapabilities(): JSONObject = JSONObject()
-        .put("protocol_version", 1)
-        .put("provider", "jetbrains")
-        .put("transport", "http_sse")
-        .put("platform", System.getProperty("os.name") ?: "unknown")
-        .put("shell", if (System.getProperty("os.name")?.lowercase()?.contains("windows") == true) "cmd" else "posix")
-        .put(
-            "capabilities",
-            JSONArray(
-                listOf(
-                    "workspace.list", "workspace.read", "workspace.search", "apply_ops", "apply_patch",
-                    "create_snapshot", "project.compile", "source.diagnostics", "process.run"
+    private fun clientCapabilities(): JSONObject {
+        val compilerProviderAvailable = runCatching {
+            Class.forName("com.intellij.openapi.compiler.CompilerManager", false, javaClass.classLoader)
+        }.isSuccess
+        return JSONObject()
+            .put("protocol_version", 1)
+            .put("provider", "jetbrains")
+            .put("transport", "http_sse")
+            .put("platform", System.getProperty("os.name") ?: "unknown")
+            .put("shell", if (System.getProperty("os.name")?.lowercase()?.contains("windows") == true) "cmd" else "posix")
+            .put(
+                "capabilities",
+                JSONArray(
+                    listOf(
+                        "workspace.list", "workspace.read", "workspace.search", "apply_ops", "apply_patch",
+                        "create_snapshot", "project.compile", "source.diagnostics", "process.run"
+                    )
                 )
             )
-        )
+            .put(
+                "capability_providers",
+                JSONObject().put(
+                    "project.compile",
+                    JSONObject()
+                        .put("implementation", "com.intellij.openapi.compiler.CompilerManager")
+                        .put("available", compilerProviderAvailable)
+                )
+            )
+    }
 
     private fun workspaceToJson(workspace: WorkspaceSummary, context: ChatContext): JSONObject {
         val root = JSONObject()
@@ -932,6 +946,18 @@ class HttpAiClient(
     private fun ideCompile(project: Project?, basePath: String, args: Map<String, Any?>): Pair<Boolean, String> {
         if (project == null) return false to "[project.compile] project is unavailable"
         if (project.isDisposed) return false to "[project.compile] project is disposed"
+        val compilerProvider = runCatching {
+            Class.forName("com.intellij.openapi.compiler.CompilerManager", false, javaClass.classLoader)
+        }
+        if (compilerProvider.isFailure) {
+            val cause = compilerProvider.exceptionOrNull()
+            return false to buildString {
+                append("[project.compile] provider unavailable: ")
+                append(typeName(cause ?: IllegalStateException("unknown provider error")))
+                append(": ").append(cause?.message)
+                append("; required_plugin_dependency=com.intellij.java")
+            }
+        }
         val application = ApplicationManager.getApplication()
         if (application.isDispatchThread) {
             return false to "[project.compile] must be awaited outside the Event Dispatch Thread"

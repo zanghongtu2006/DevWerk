@@ -20,6 +20,7 @@
     <idea-version since-build="241" until-build="243.*"/>
 
     <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.java</depends>
 
     <!-- Actions -->
     <actions>
