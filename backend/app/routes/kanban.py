@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -12,6 +13,7 @@ from app.services.kanban import (
     add_event,
     create_task,
     get_board,
+    get_conversation,
     get_project,
     get_project_settings,
     get_project_workflow,
@@ -24,6 +26,7 @@ from app.services.kanban import (
     update_project_settings,
     upsert_project,
     update_task,
+    update_conversation,
 )
 from app.services.session_store import read_project_memory
 from app.services.verification_policy import verification_failed, verification_has_policy
@@ -217,6 +220,8 @@ def kanban_task_action(task_id: str, req: WorkflowActionRequest):
         resume = None if result.get("action_ignored") else _maybe_resume_after_apply_result(
             task_id, req.action, req.payload, result_cursor, resume_status
         )
+        if resume is None and not result.get("action_ignored"):
+            resume = _maybe_resume_after_retry(task_id, req.action, result_cursor)
         if resume:
             result["workflow_resume"] = resume
         return result
@@ -306,6 +311,52 @@ def _maybe_resume_after_apply_result(
     return {
         "ok": True,
         "reason": reason,
+        "poll_url": f"/v1/workflows/{task_id}{query}",
+        "events_url": f"/v1/workflows/{task_id}/events{query}",
+        "result_after": result_cursor,
+    }
+
+
+def _maybe_resume_after_retry(task_id: str, action: str, result_cursor: str | None) -> dict[str, Any] | None:
+    if str(action or "").strip().lower().replace("-", "_") != "retry":
+        return None
+    body = _latest_artifact_payload(task_id, "workflow_request_body")
+    if not body:
+        add_event(task_id, "workflow_retry_failed", {"reason": "missing_workflow_request_body"})
+        apply_workflow_action(task_id, "fail", {"phase": "retry", "reason": "missing workflow request body"})
+        return None
+
+    retry_nonce = str(uuid.uuid4())
+    body = dict(body)
+    body["task_id"] = task_id
+    body["retry_nonce"] = retry_nonce
+    body.pop("resume_action", None)
+    body.pop("resume_status", None)
+    body.pop("client_feedback", None)
+    body.pop("verification_feedback", None)
+    conversation = get_conversation(task_id, include_messages=False) or {}
+    retry_metadata = dict(conversation.get("metadata") or {})
+    retry_metadata["retry_nonce"] = retry_nonce
+    update_conversation(
+        task_id,
+        state="queued",
+        active_column="draft",
+        waiting_for=None,
+        metadata=retry_metadata,
+    )
+    add_event(
+        task_id,
+        "workflow_retry_queued",
+        {"retry_nonce": retry_nonce, "result_after": result_cursor},
+    )
+    from app.routes.workflows import _start_workflow_thread
+
+    _start_workflow_thread(task_id, body)
+    query = f"?result_after={quote(result_cursor or '')}" if result_cursor else ""
+    return {
+        "ok": True,
+        "reason": "retry",
+        "retry_nonce": retry_nonce,
         "poll_url": f"/v1/workflows/{task_id}{query}",
         "events_url": f"/v1/workflows/{task_id}/events{query}",
         "result_after": result_cursor,

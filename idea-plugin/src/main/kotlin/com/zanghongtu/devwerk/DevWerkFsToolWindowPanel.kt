@@ -40,7 +40,7 @@ import org.json.JSONObject
 class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     // State
-    private enum class State { IDLE, WORKFLOW_PENDING, PLAN_CONFIRMATION, USER_GUIDANCE }
+    private enum class State { IDLE, WORKFLOW_PENDING, USER_GUIDANCE }
     @Volatile private var state = State.IDLE
 
     private val history = mutableListOf<ChatMessage>()
@@ -49,7 +49,6 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
     private val chatArea       = JTextArea()
     private val inputArea       = PromptTextArea("Message DevWerk...  Ctrl+Enter to send", 4, 20)
     private val sendButton      = JButton("Send")
-    private val confirmPlanButton = JButton("Confirm & Code")
     private val attachBtn       = JButton("+")
     private val clearAttachBtn  = JButton("Clear")
     private val settingsBtn     = JButton("\u2699")
@@ -114,7 +113,6 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         val rightActions = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0))
         rightActions.isOpaque = false
         rightActions.add(sendButton)
-        rightActions.add(confirmPlanButton)
         actionPanel.add(leftActions, BorderLayout.WEST)
         actionPanel.add(rightActions, BorderLayout.EAST)
 
@@ -130,8 +128,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         bottomPanel.add(composer, BorderLayout.CENTER)
 
         attachBtn.toolTipText = "Attach file"
-        confirmPlanButton.isVisible = false
-        listOf(attachBtn, clearAttachBtn, sendButton, confirmPlanButton, settingsBtn).forEach {
+        listOf(attachBtn, clearAttachBtn, sendButton, settingsBtn).forEach {
             it.isFocusable = false
         }
 
@@ -143,15 +140,6 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         sendButton.addActionListener { onSendClicked() }
         attachBtn.addActionListener { chooseAttachments() }
         clearAttachBtn.addActionListener { clearPendingAttachments() }
-        confirmPlanButton.addActionListener {
-            if (state == State.PLAN_CONFIRMATION && waitingFor == "plan_confirmation" && activeTaskId != null) {
-                setState(State.WORKFLOW_PENDING)
-                ApplicationManager.getApplication().executeOnPooledThread {
-                    runUploadThenWorkflow("Confirm the proposed plan and continue.", emptyList(), "confirm_plan")
-                }
-            }
-        }
-
         settingsBtn.addActionListener {
             try {
                 AiSettingsDialog().show()
@@ -171,28 +159,18 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                     inputArea.isEnabled = true
                     attachBtn.isEnabled = true
                     clearAttachBtn.isEnabled = true
-                    confirmPlanButton.isEnabled = true
                 }
                 State.WORKFLOW_PENDING -> {
                     sendButton.isEnabled = false
                     inputArea.isEnabled = false
                     attachBtn.isEnabled = false
                     clearAttachBtn.isEnabled = false
-                    confirmPlanButton.isEnabled = false
-                }
-                State.PLAN_CONFIRMATION -> {
-                    sendButton.isEnabled = false
-                    inputArea.isEnabled = false
-                    attachBtn.isEnabled = false
-                    clearAttachBtn.isEnabled = false
-                    confirmPlanButton.isEnabled = true
                 }
                 State.USER_GUIDANCE -> {
                     sendButton.isEnabled = true
                     inputArea.isEnabled = true
                     attachBtn.isEnabled = true
                     clearAttachBtn.isEnabled = true
-                    confirmPlanButton.isEnabled = false
                 }
             }
         }
@@ -316,9 +294,6 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 } else if (resp.ok) {
                     appendChatLine("Bot: ${resp.reply}")
                 }
-                if (resp.ok && resp.waitingFor == "plan_confirmation") {
-                    appendChatLine("[System] Workflow paused at Planned and is waiting for confirmation.")
-                }
                 resp.codeTree?.takeIf { it.isNotBlank() }?.let {
                     appendChatLine("=== Code Tree ==="); appendChatLine(it)
                 }
@@ -327,7 +302,6 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 } else if (resp.ok && resp.ops.isNotEmpty()) {
                     appendChatLine("[System] ${resp.ops.size} file op(s) applied.")
                 }
-                confirmPlanButton.isVisible = resp.ok && resp.waitingFor == "plan_confirmation"
                 val terminal = !resp.ok || resp.done || resp.statusKey in setOf("done", "failed")
                 if (terminal) {
                     activeTaskId = null
@@ -337,7 +311,6 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 setState(
                     when {
                         terminal -> State.IDLE
-                        resp.waitingFor == "plan_confirmation" -> State.PLAN_CONFIRMATION
                         resp.waitingFor == "user_guidance" -> State.USER_GUIDANCE
                         else -> State.WORKFLOW_PENDING
                     }
@@ -453,6 +426,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
             val eventsUrl = resume.optString("events_url", "").takeIf { it.isNotBlank() } ?: return current
             appendOpLog(devCtx, "[INFO] Verification failed; waiting for backend recoding round ${resumeRounds + 1}.\n")
             current = http.awaitWorkflowContinuation(context, taskId, pollUrl, eventsUrl)
+            current = resolveClientToolPauses(aiClient, context.copy(taskId = taskId), current)
             if (!current.ok) return current
             resumeRounds += 1
         }

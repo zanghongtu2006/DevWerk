@@ -549,7 +549,7 @@ class HttpAiClient(
         root.put("project_id", context.projectId ?: JSONObject.NULL)
         root.put("task_id", context.taskId ?: JSONObject.NULL)
         root.put("mode", mode)
-        root.put("interaction_mode", "confirm_plan")
+        root.put("interaction_mode", "auto")
         root.put("project_root", projectRoot ?: JSONObject.NULL)
         root.put("messages", messagesJson)
 

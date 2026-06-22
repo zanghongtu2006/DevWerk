@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+
 @dataclass(frozen=True)
 class WorkflowColumn:
     status_key: str
@@ -101,6 +102,42 @@ def workflow_from_dict(value: dict[str, Any]) -> WorkflowDefinition:
         columns=columns or [WorkflowColumn(**col) for col in _fallback_columns()],
         actions={str(key).strip().lower().replace("-", "_"): val for key, val in actions.items() if isinstance(val, dict)},
     )
+
+
+def validate_managed_workflow_definition(definition: WorkflowDefinition) -> None:
+    """Validate the lifecycle contract required by the persistent workflow supervisor."""
+    keys = [column.status_key for column in definition.columns]
+    known = set(keys)
+    if len(keys) != len(known):
+        raise ValueError("workflow column status_key values must be unique")
+
+    for required in ("done", "failed"):
+        if required not in known:
+            raise ValueError(f"managed workflow requires a {required!r} terminal column")
+
+    for column in definition.columns:
+        unknown = set(column.transition_to) - known
+        if unknown:
+            raise ValueError(
+                f"workflow column {column.status_key!r} references unknown transitions: {sorted(unknown)}"
+            )
+    for action, rule in definition.actions.items():
+        target = str(rule.get("to") or "").strip().lower()
+        if not target:
+            raise ValueError(f"workflow action {action!r} has no target status")
+        if target not in known:
+            raise ValueError(f"workflow action {action!r} references unknown target {target!r}")
+
+    required_actions = {"fail": "failed", "abandon": "failed"}
+    for action, target in required_actions.items():
+        rule = definition.action(action)
+        if rule is None or str(rule.get("to") or "").strip().lower() != target:
+            raise ValueError(f"managed workflow action {action!r} must target {target!r}")
+
+    retry = definition.action("retry")
+    retry_target = str((retry or {}).get("to") or "").strip().lower()
+    if not retry_target or retry_target in {"done", "failed"}:
+        raise ValueError("managed workflow action 'retry' must target a non-terminal column")
 
 
 def default_columns() -> list[dict[str, Any]]:

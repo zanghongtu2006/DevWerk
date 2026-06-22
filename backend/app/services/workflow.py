@@ -37,6 +37,7 @@ ACTION_VERIFICATION_FAILED = "verification_failed"
 ACTION_WORKFLOW_DONE = "workflow_done"
 
 CLIENT_VISIBLE_ACTIONS = {ACTION_RETRY, ACTION_ABANDON}
+LIFECYCLE_ACTIONS = {ACTION_FAIL, ACTION_RETRY, ACTION_ABANDON}
 
 
 def record_phase_output(
@@ -120,6 +121,19 @@ def apply_workflow_action(task_id: str, action: str, payload: dict[str, Any] | N
     if action_key == ACTION_APPLY_RESULT:
         return _apply_result(task_id, data)
 
+    if action_key == ACTION_RETRY:
+        task_detail = get_task(task_id)
+        current_status = str((task_detail.get("task") or {}).get("status_key") or "")
+        if current_status != "failed":
+            add_event(
+                task_id,
+                "workflow_retry_deduplicated",
+                {"status_key": current_status, "reason": "retry is already active or task is not failed"},
+            )
+            task_detail["action_ignored"] = True
+            task_detail["ignored_action"] = ACTION_RETRY
+            return task_detail
+
     if _workflow_has_action(task_id, action_key):
         return _transition_by_definition(task_id, action_key, data)
 
@@ -143,7 +157,9 @@ def _transition_by_definition(task_id: str, action: str, payload: dict[str, Any]
     if not to_status:
         raise ValueError(f"workflow action {action!r} has no target status")
     current_column = definition.column(current_status)
-    if current_column is not None and not _target_allowed(current_column, to_status):
+    if definition.column(to_status) is None:
+        raise ValueError(f"workflow action {action!r} targets unknown status {to_status!r}")
+    if current_column is not None and not _target_allowed(current_column, to_status, action=action):
         raise ValueError(
             f"workflow action {action!r} cannot move from {current_status!r} to {to_status!r}"
         )
@@ -313,8 +329,12 @@ def available_actions_for_status(status_key: str, definition: WorkflowDefinition
     for action, rule in definition.actions.items():
         if not _is_client_visible_action(action, rule):
             continue
+        if action == ACTION_RETRY and status != "failed":
+            continue
+        if action == ACTION_ABANDON and status in {"done", "failed"}:
+            continue
         target = _rule_target(rule)
-        if target and _target_allowed(column, target):
+        if target and _target_allowed(column, target, action=action):
             actions.append(action)
     return _dedupe(actions)
 
@@ -381,7 +401,9 @@ def _is_client_visible_action(action: str, rule: dict[str, Any]) -> bool:
     return bool(rule.get("client_visible")) or action in CLIENT_VISIBLE_ACTIONS
 
 
-def _target_allowed(column: Any, target: str) -> bool:
+def _target_allowed(column: Any, target: str, *, action: str | None = None) -> bool:
+    if action in LIFECYCLE_ACTIONS:
+        return True
     allowed = set(column.transition_to or [])
     return target == column.status_key or target in allowed
 

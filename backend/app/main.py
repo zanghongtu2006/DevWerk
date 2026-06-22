@@ -19,12 +19,13 @@ sys.path.insert(0, str(__file__.rsplit("/", 2)[0]))
 from app.core.config import settings
 from app.core.logging import configure_logging, configure_logging_from_env
 from app.mcp_server import create_mcp_server
-from app.routes.workflows import router as workflow_router
+from app.routes.workflows import _start_workflow_thread, router as workflow_router, workflow_worker_age
 from app.routes.kanban import router as kanban_router
 from app.routes.kanban import ui_router as kanban_ui_router
 from app.routes.settings import router as settings_router
 from app.services.kanban import init_kanban_db
 from app.services.usage import clear_request, finish_request, init_usage_db, start_request
+from app.services.workflow_supervisor import WorkflowSupervisor
 
 
 @asynccontextmanager
@@ -54,12 +55,22 @@ async def lifespan(app: FastAPI):
     log.info("Active LLM config: %s", safe_config)
     init_usage_db()
     init_kanban_db()
+    supervisor = WorkflowSupervisor(
+        start_workflow=_start_workflow_thread,
+        active_worker_age=workflow_worker_age,
+        config=cfg,
+    )
+    if bool(getattr(cfg, "workflow_supervisor_enabled", True)):
+        supervisor.start()
 
     if cfg.app_env == "production" and not cfg.is_production:
         log.warning("Running in production but APP_ENV is not 'production'!")
 
     async with app.state.devwerk_mcp.session_manager.run():
-        yield
+        try:
+            yield
+        finally:
+            supervisor.stop()
 
     log.info("DevWerk shutting down.")
 

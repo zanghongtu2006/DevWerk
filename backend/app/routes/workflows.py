@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import mimetypes
 import asyncio
+import hashlib
 import logging
 import json
 import os
@@ -58,6 +59,9 @@ from app.services.workflow_engine import WorkflowEngine
 
 router = APIRouter()
 _log = logging.getLogger("devwerk.workflows")
+_workflow_dispatch_lock = threading.RLock()
+_active_workflows: dict[str, tuple[threading.Thread, float, str]] = {}
+_pending_workflows: dict[str, tuple[dict, str]] = {}
 
 
 def _positive_int(value: object, default: int, *, maximum: int | None = None) -> int:
@@ -1440,15 +1444,71 @@ class _BodyRequest:
         return self._body
 
 
-def _start_workflow_thread(task_id: str, body: dict) -> None:
+def _start_workflow_thread(task_id: str, body: dict) -> bool:
     payload = json.loads(json.dumps(body, ensure_ascii=False))
+    fingerprint = _workflow_payload_fingerprint(payload)
+    with _workflow_dispatch_lock:
+        active = _active_workflows.get(task_id)
+        if active is not None and active[0].is_alive():
+            pending = _pending_workflows.get(task_id)
+            if fingerprint == active[2] or (pending is not None and fingerprint == pending[1]):
+                _kanban_event(task_id, "workflow_dispatch_deduplicated", {"fingerprint": fingerprint})
+                return False
+            _kanban_artifact(task_id, "workflow_run_request", payload=payload)
+            _pending_workflows[task_id] = (payload, fingerprint)
+            _kanban_event(
+                task_id,
+                "workflow_dispatch_deferred",
+                {"fingerprint": fingerprint, "active_fingerprint": active[2]},
+            )
+            return False
+
+    _kanban_artifact(task_id, "workflow_run_request", payload=payload)
     thread = threading.Thread(
-        target=_run_workflow_thread,
-        args=(task_id, payload),
+        target=_run_managed_workflow_thread,
+        args=(task_id, payload, fingerprint),
         name=f"devwerk-workflow-{task_id[:8]}",
         daemon=True,
     )
-    thread.start()
+    with _workflow_dispatch_lock:
+        _active_workflows[task_id] = (thread, time.monotonic(), fingerprint)
+    try:
+        thread.start()
+    except Exception:
+        with _workflow_dispatch_lock:
+            _active_workflows.pop(task_id, None)
+        raise
+    _kanban_event(task_id, "workflow_worker_started", {"fingerprint": fingerprint, "thread": thread.name})
+    return True
+
+
+def _run_managed_workflow_thread(task_id: str, body: dict, fingerprint: str) -> None:
+    try:
+        _run_workflow_thread(task_id, body)
+    finally:
+        deferred: tuple[dict, str] | None = None
+        with _workflow_dispatch_lock:
+            active = _active_workflows.get(task_id)
+            if active is not None and active[2] == fingerprint:
+                _active_workflows.pop(task_id, None)
+                deferred = _pending_workflows.pop(task_id, None)
+        _kanban_event(task_id, "workflow_worker_stopped", {"fingerprint": fingerprint})
+        if deferred is not None:
+            _kanban_event(task_id, "workflow_deferred_dispatch_started", {"fingerprint": deferred[1]})
+            _start_workflow_thread(task_id, deferred[0])
+
+
+def workflow_worker_age(task_id: str) -> float | None:
+    with _workflow_dispatch_lock:
+        active = _active_workflows.get(task_id)
+        if active is None or not active[0].is_alive():
+            return None
+        return max(time.monotonic() - active[1], 0.0)
+
+
+def _workflow_payload_fingerprint(body: dict) -> str:
+    canonical = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
 
 
 def _run_workflow_thread(task_id: str, body: dict) -> None:

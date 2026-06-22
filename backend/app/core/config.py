@@ -99,6 +99,16 @@ class Settings(BaseSettings):
     log_retention_days: int = Field(default=30)
     uvicorn_access_log: bool = Field(default=True)
 
+    # Persistent workflow supervision. Non-terminal Kanban tasks are recovered
+    # after worker loss and are failed explicitly when an external boundary or
+    # execution lease expires.
+    workflow_supervisor_enabled: bool = Field(default=True)
+    workflow_supervisor_interval_seconds: float = Field(default=5.0)
+    workflow_queued_recovery_seconds: int = Field(default=15)
+    workflow_execution_timeout_seconds: int = Field(default=1800)
+    workflow_client_timeout_seconds: int = Field(default=1800)
+    workflow_user_timeout_seconds: int = Field(default=86400)
+
     # Local usage accounting.
     devwerk_usage_tracking: bool = Field(default=True)
     devwerk_db_path: str = Field(default="./data/devwerk.db")

@@ -10,7 +10,12 @@ from typing import Any
 
 from app.core.config import settings
 from app.services.session_store import append_task_event
-from app.services.workflow_definition import default_columns, default_workflow_definition, workflow_from_dict
+from app.services.workflow_definition import (
+    default_columns,
+    default_workflow_definition,
+    validate_managed_workflow_definition,
+    workflow_from_dict,
+)
 
 _log = logging.getLogger("devwerk.kanban")
 _initialized = False
@@ -309,6 +314,10 @@ def update_project_settings(
     pid = _project_id(project_id)
     ensure_project(pid)
     ensure_project_settings(pid)
+    workflow_definition = None
+    if workflow is not None:
+        workflow_definition = workflow_from_dict(workflow)
+        validate_managed_workflow_definition(workflow_definition)
     now = _now()
     updates = []
     params: list[Any] = []
@@ -327,9 +336,8 @@ def update_project_settings(
         params.append(pid)
         with _conn() as conn:
             conn.execute(f"UPDATE kb_project_settings SET {', '.join(updates)} WHERE project_id = ?", params)
-    if workflow is not None:
-        definition = workflow_from_dict(workflow)
-        replace_columns(pid, definition.columns_for_kanban())
+    if workflow_definition is not None:
+        replace_columns(pid, workflow_definition.columns_for_kanban())
     return get_project_settings(pid)
 
 
@@ -524,6 +532,40 @@ def get_workflow_runtime_state(task_id: str, *, result_after: str | None = None)
         "result": _loads(result_row["payload_json"], {}) if result_row is not None else None,
         "result_created_at": result_row["created_at"] if result_row is not None else None,
     }
+
+
+def list_managed_workflow_states() -> list[dict[str, Any]]:
+    """Return persistent non-terminal tasks for the workflow supervisor."""
+    with _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT t.id AS task_id, t.project_id, t.status_key, t.updated_at AS task_updated_at,
+                   c.state, c.active_column, c.waiting_for, c.updated_at AS conversation_updated_at
+              FROM kb_tasks t
+              JOIN kb_conversations c ON c.task_id = t.id
+             WHERE t.archived = 0 AND t.status_key NOT IN ('done', 'failed')
+             ORDER BY c.updated_at ASC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_latest_artifact_payload(task_id: str, artifact_type: str) -> dict[str, Any] | None:
+    with _conn() as conn:
+        row = conn.execute(
+            """
+            SELECT payload_json
+              FROM kb_artifacts
+             WHERE task_id = ? AND artifact_type = ?
+             ORDER BY created_at DESC
+             LIMIT 1
+            """,
+            (task_id, artifact_type),
+        ).fetchone()
+    if row is None:
+        return None
+    payload = _loads(row["payload_json"], {})
+    return payload if isinstance(payload, dict) else None
 
 
 def ensure_conversation(task_id: str, *, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
