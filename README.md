@@ -1,243 +1,205 @@
 # DevWerk
 
-DevWerk is a kanban-centered AI engineering loop for tool-driven code generation.
+DevWerk is a Kanban-centered AI engineering loop. It is moving from an IDE
+plugin plus backend into a product-shaped workflow engine: the DevWerk service
+owns durable tasks, workflow state, agents, model routing, memory, events, and
+tool contracts; clients provide capabilities such as source-map collection,
+file apply, diagnostics, compile, command execution, or MCP tools.
 
-The core idea is simple: AI should not be a loose text box that writes into a
-repository. Every coding action should become a visible engineering task, move
-through a small workflow, produce artifacts, and return guarded changes to the
-IDE plugin. The plugin remains responsible for snapshot-protected writes.
+The IntelliJ plugin remains the first capability provider and keeps the most
+important safety rule: every source write is protected by a before/after
+snapshot. The service does not directly mutate the user's repository.
 
-DevWerk is evolving from a basic CodeOps backend into a loop engineering and
-harness system:
+## Layout
 
-- Capability providers collect project context, source maps, attachments, and
-  apply or verify returned changes. The IntelliJ plugin is the first provider,
-  not a backend architectural dependency.
-- The backend owns durable conversations, kanban workflow, model routing,
-  per-column agent runs, candidate revisions, context compression, token
-  accounting, and guarded patch/file operations.
-- Backend tool requests are an extensible action protocol. Research tools are
-  resolved by the backend loop; client tools are returned to the IDE plugin and
-  reported back through kanban verification.
-- Kanban is the operating surface. `/v1/workflows` starts a backend-owned
-  workflow, then clients follow the workflow event stream; polling is only a
-  fallback if the stream is interrupted.
-- MCP clients can use the same backend workflow at `/mcp`; they do not need the
-  IntelliJ plugin when the client already owns local file and command tools.
+```text
+DevWerk/
+  app/          FastAPI service, workflow engine, agents, Kanban, MCP
+  config/       default agents, workflow, LLM config templates
+  tests/        service and workflow tests
+  startup.bat   Windows service launcher
+
+idea-plugin/
+  IntelliJ capability provider
+  source-map collection
+  attachments
+  IDE diagnostics/compile tools
+  snapshot-protected apply
+
+docs/
+  smoke tests, MCP notes, workflow runtime notes
+```
+
+The former `backend/` directory has been renamed to `DevWerk/` so the service
+can stand on its own as the product core.
 
 ## Architecture
 
 ```text
-Capability Provider (IntelliJ, VS Code, CI, GitHub, MCP client)
-  - projectId from .devwerk/meta
+Capability Provider
+  IntelliJ plugin, future VS Code provider, CI, GitHub, MCP client
+  - projectId
   - source map and selected context
-  - attachment upload
-  - snapshot-protected apply and verification tools
+  - attachments
+  - client tool execution
+  - guarded file apply
         |
         v
-DevWerk Backend (FastAPI)
-  - /v1/workflows and /v1/workflows/{taskId}/messages
-  - /mcp (Streamable HTTP MCP)
-  - durable conversation transcript and compression
-  - resumable column runs and candidate revisions
-  - coder harness from source_map
-  - planning bundle artifacts
-  - patch/file operation generation
-  - workflow action and verification state
-  - local SQLite usage accounting
-  - workflow scheduler, job templates, and derived agent runtime
+DevWerk Service
+  - /v1/workflows
+  - /v1/kanban/*
+  - /dashboard
+  - /workbench
+  - /mcp
+  - durable conversations and compression
+  - Kanban workflow state machine
+  - per-column agent runs
+  - workflow designer
+  - project memory and audit events
+  - token and request accounting
         |
         v
 LLM Catalog
-  - provider/model refs
-  - task routing
-  - per-model parameters
-  - cloud or local endpoints
+  provider/model refs, routing, parameters, cost-aware role mapping
 ```
 
-Codex and VS Code MCP setup is documented in [docs/mcp.md](docs/mcp.md).
+Service code must not depend on IntelliJ, VS Code, Java, Maven, or a fixed
+directory layout. It should request named capabilities such as
+`project.compile`, `source.diagnostics`, `workspace.read`, or `process.run`.
+Each client maps those names to its own implementation.
 
-## Kanban Workflow
+## Workflow
 
-The default workflow is intentionally short. Columns represent main task states;
-details such as requirements, design, verification checks, and rework reasons are
-stored as events or artifacts.
+The default workflow is:
 
 ```text
-Draft
-Context Indexed
-Planned
-Coding
-Reviewed
-Ready To Apply
-Applied
-Verified
-Done
-Failed
+Draft -> Context Indexed -> Planned -> Coding -> Reviewed -> Ready To Apply
+      -> Applied -> Verified -> Done
+                         \-> Failed
 ```
 
-Columns are business states, not agents. An executable column references a
-`job_template`; the scheduler resolves that job to an enabled agent whose role
-and capabilities satisfy the template. Agent identity, model route, skills,
-memory policy, and tool grants live in `backend/config/agents/default.json`.
-The workflow topology remains independently configurable in
-`backend/config/workflows/default.json` or per-project DB overrides.
+Columns are states. Agents are derived at runtime:
 
 ```text
-column -> job template -> scheduler -> derived agent -> capability broker
+column -> job_template -> scheduler -> enabled agent -> model route -> capabilities
 ```
 
-Providers advertise semantic capabilities such as `project.compile`; they may
-map that name to an implementation-specific operation. Backend code does not
-branch on IntelliJ, VS Code, CI, or GitHub.
+The default agent catalog lives in `DevWerk/config/agents/default.json`.
+The default workflow lives in `DevWerk/config/workflows/default.json`.
+Project-specific workflow overrides are stored in the Kanban DB and can be
+created from the Web Workbench.
 
-State meaning:
+Important runtime rules:
 
-- `Draft`: A user request exists. The task may have been created by `/v1/workflows`.
-- `Context Indexed`: The backend received source map, selected context, and
-  attachment metadata. This phase should use as little LLM work as possible.
-- `Planned`: The backend saved a planning bundle containing requirement
-  breakdown, system design, implementation plan, and verification policy.
-- `Coding`: The coder harness is generating guarded changes from the plan.
-- `Reviewed`: A reviewer agent checks the generated change bundle before the
-  plugin is allowed to apply it. It can approve, request recoding, request
-  replanning, or fail the task.
-- `Ready To Apply`: Changes are ready for the plugin. The backend has not
-  written to the repository.
-- `Applied`: The plugin applied changes through its snapshot-protected write
-  path and reported the result.
-- `Verified`: Required verification checks passed.
-- `Done`: The task is closed.
-- `Failed`: A phase failed. Rework should move the task back to the appropriate
-  earlier state rather than adding more columns.
+- Kanban is the source of task truth.
+- Clients do not move columns directly; they report semantic actions.
+- The state machine drives tasks to `done` or `failed`.
+- Waiting for a client tool is explicit and bounded by supervisor timeouts.
+- Retry is idempotent and resumes from the persisted workflow request.
+- Every column run records events, artifacts, and phase outputs.
 
-## Phase Outputs
+## Web UIs
 
-Every workflow column produces a stable phase output artifact and a durable
-`kb_column_runs` record. The planner, coder, and reviewer have independent agent
-prompts and model routes. They exchange artifacts through the workflow runtime,
-not hidden in-process conversation state.
+Start the service, then open:
+
+```text
+http://localhost:8000/dashboard
+http://localhost:8000/workbench
+http://localhost:8000/docs
+```
+
+`/dashboard` shows statistics, projects, Kanban, task details, events, project
+memory, and global model routing.
+
+`/workbench` is the product setup entry. It can:
+
+- create a project
+- load the project's active workflow and agent overrides
+- discuss a workflow design in a chat-style panel
+- generate a workflow JSON draft through the planner LLM when available
+- fall back to a local valid draft when no LLM is configured
+- edit and save columns, transitions, actions, and project agent overrides
+
+This is intentionally separate from the IDE coding loop. It configures how a
+project should run; `/v1/workflows` still executes actual coding tasks.
+
+## Main APIs
+
+### `POST /v1/workflows`
+
+Starts or resumes a coding workflow. The service creates or reuses a Kanban task,
+returns `task_id`, `poll_url`, `events_url`, and `result_url`, then runs the
+workflow in the background.
+
+Clients should consume:
+
+```text
+GET /v1/workflows/{task_id}/events
+GET /v1/workflows/{task_id}
+GET /v1/workflows/{task_id}/result
+POST /v1/workflows/{task_id}/messages
+```
+
+The event stream is the primary progress channel. Polling is only a fallback.
+
+### `POST /v1/kanban/tasks/{task_id}/actions`
+
+Reports semantic actions such as:
+
+- `apply_result`
+- `retry`
+- `abandon`
+
+Internal agents use the same state-machine boundary with actions such as
+`approve`, `request_recoding`, `request_replan`, and `fail`.
+
+### `POST /v1/kanban/projects/{project_id}/workflow/design`
+
+Generates or revises a project workflow draft from conversation messages:
 
 ```json
 {
-  "session_id": "plan-...",
-  "phase": "plan",
-  "agent": "planner",
-  "status_key": "planned",
-  "summary": "...",
-  "inputs": {},
-  "outputs": {},
-  "warnings": [],
-  "decision": "approve",
-  "next_action": "execute"
+  "messages": [{"role": "user", "content": "Add design, coding, review and verify gates"}],
+  "current_workflow": {},
+  "current_agents": {},
+  "save": false
 }
 ```
 
-If a coding request cannot produce a file-level plan, the task moves to `Failed`
-instead of returning `ok=true` with an empty file list.
+Response includes `workflow`, `agents`, `summary`, `reply`, and validation
+warnings. With `save: true`, the service stores the workflow and project agent
+overrides.
 
-## Conversation And Memory Storage
+### `GET/PUT /v1/settings`
 
-DevWerk persists runtime state in two layers:
+Reads and writes the LLM catalog in `DevWerk/config/llm.json`.
 
-- SQLite: `backend/data/devwerk.db`
-  - `kb_events`: every kanban event and column transition
-  - `kb_artifacts`: phase outputs, request/response artifacts, apply results
-  - `kb_conversations` and `kb_messages`: resumable multi-turn transcript,
-    rolling summary, waiting state, and active column
-  - `kb_column_runs`: every agent invocation and checkpoint
-  - `kb_revisions`: candidate code revisions and their ancestry
-- Files: `backend/data/sessions/` by default
-  - Override with `DEVWERK_SESSION_DIR`
-  - Project audit mirror: `backend/data/sessions/{projectId}/audit_events.jsonl`
-  - Project memory:
-    `backend/data/sessions/{projectId}/project_memory.json`
-    and `project_memory.jsonl`
+## Configuration
 
-SQLite is the only source of truth for active workflow state. Project memory is
-a compact cross-task summary: framework signals, touched paths, commands, rules,
-and recent phase summaries. Raw prompt transcripts stay in `kb_messages`, not in
-project memory or per-task filesystem trees.
-
-## Planning Artifacts
-
-`Planned` is a state, not a single string. DevWerk stores a planning bundle:
-
-```json
-{
-  "requirement_breakdown": {
-    "summary": "...",
-    "goals": [],
-    "non_goals": [],
-    "acceptance_criteria": [],
-    "constraints": []
-  },
-  "system_design": {
-    "summary": "...",
-    "components": [],
-    "api_changes": [],
-    "storage_changes": [],
-    "risks": []
-  },
-  "implementation_plan": {
-    "steps": [],
-    "files_to_touch": [],
-    "warnings": []
-  },
-  "verification_policy": {
-    "required": ["compile", "smoke"],
-    "optional": ["unit", "integration"],
-    "results": {}
-  }
-}
-```
-
-For small tasks, sections may be short. For larger tasks, this artifact becomes
-the place where requirement decomposition and system design are preserved without
-turning the kanban board into a long list of micro-columns.
-
-## Coder Harness
-
-The backend builds a zero-token coder skill from the IDE-provided source map.
-It detects common project shapes such as:
-
-- DevWerk monorepo
-- IntelliJ plugin
-- FastAPI backend
-- Spring Boot
-- React or Vue
-- generic Python/JVM projects
-
-The harness tells the model which framework it is looking at, which paths are
-representative, and what writing rules should be respected. This lets the backend
-save tokens by scanning project structure locally before asking an LLM to reason.
-
-## LLM Configuration
-
-LLM configuration is stored outside `.env` because it is structured and should be
-hand-editable.
-
-```text
-backend/config/llm.example.json   committed template
-backend/config/llm.json           local ignored runtime config
-```
-
-`.env` points to the runtime config:
+`.env` should stay small:
 
 ```env
 DEVWERK_LLM_CONFIG_PATH=./config/llm.json
+LOG_LEVEL=debug
+LOG_FILE_ENABLED=true
 ```
 
-The config has two top-level sections:
+Structured model config is kept in JSON:
+
+```text
+DevWerk/config/llm.example.json   committed template
+DevWerk/config/llm.json           local ignored runtime config
+```
+
+Example shape:
 
 ```json
 {
   "routing": {
     "default": "minimax/m3",
-    "planner": "deepseek/deepseek-chat",
-    "architecture": "minimax/m3",
-    "coding": "minimax/m3",
-    "compression": "ollama/deepseek-r1:32b"
+    "planner": "minimax/m3",
+    "executor": "minimax/m3",
+    "reviewer": "minimax/m3"
   },
   "llms": {
     "minimax": {
@@ -257,238 +219,65 @@ The config has two top-level sections:
 }
 ```
 
-Model refs use `provider/model`. This is inspired by OpenClaw-style model refs
-and Hermes-style main/auxiliary slot routing, but DevWerk maps them to engineering
-loop roles such as planning, architecture, coding, and compression.
+## Runtime Data
 
-## Main APIs
-
-### Tool Requests
-
-`tool_requests` is not a fixed review helper. It is the backend-to-client action
-protocol for the coding loop.
-
-Backend research tools are consumed inside the backend execution loop:
-
-```json
-{"id": "r1", "tool": "read_file", "args": {"path": "pom.xml", "start_line": 1, "end_line": 200}}
-```
-
-Client-side tools can be requested at any workflow phase. Evidence requests
-pause the active column with `waiting_for=client_tool`; the plugin executes the
-tool and resumes the same task with `action=tool_result`. Post-apply tools run
-after the snapshot-protected write and are reported through
-`apply_result.verification`.
-
-```json
-{
-  "ops": [],
-  "tool_requests": [
-    {
-      "id": "ide-compile",
-      "tool": "ide_compile",
-      "args": {"timeout_seconds": 300, "max_errors": 200}
-    }
-  ]
-}
-```
-
-The IntelliJ plugin implements `ide_compile` with the active project's
-`CompilerManager`, `ide_syntax_check` with PSI parser diagnostics, and
-`run_command` for model-selected project verification. Every client tool writes
-started/completed, duration, success, and diagnostic evidence to the operation
-log; timeouts and SDK failures are returned through the same verification result.
-Compile/build-error tasks request `ide_compile` before planning when that
-capability is declared, so the planner receives compiler evidence instead of
-guessing from source text.
-
-### `POST /v1/workflows`
-
-Kanban workflow entrypoint. If `task_id` is missing, the backend creates a task,
-returns immediately, and continues planning/coding in the background.
-
-Start response:
-
-```json
-{
-  "ok": true,
-  "task_id": "...",
-  "status_key": "draft",
-  "ready": false,
-  "poll_url": "/v1/workflows/...",
-  "result_url": "/v1/workflows/.../result",
-  "events_url": "/v1/workflows/.../events"
-}
-```
-
-Clients should open `GET /v1/workflows/{task_id}/events` and consume the
-`text/event-stream` feed. The stream emits `workflow_state`, `kanban_event`,
-`workflow_column_started`, `workflow_column_completed`,
-`workflow_transition_decided`, `agent_context_built`, `agent_output_recorded`,
-`heartbeat`, `workflow_result`, and `workflow_error` events. `GET
-/v1/workflows/{task_id}` remains a state endpoint and fallback path for clients
-that lost the event stream.
-
-The final `workflow_result` contains the guarded apply payload:
-
-```json
-{
-  "ok": true,
-  "task_id": "...",
-  "status_key": "ready_to_apply",
-  "result": {
-    "ops": [],
-    "patch_ops": [],
-    "tool_requests": [],
-    "next_action": "apply_result"
-  }
-}
-```
-
-`/v1/chat` has been removed. Coding clients should use workflows, not long
-blocking chat requests.
-
-### `POST /v1/kanban/tasks/{task_id}/actions`
-
-Single kanban workflow action endpoint. Clients do not move columns directly;
-they report semantic actions and the backend state machine advances the task.
-
-```json
-{
-  "action": "apply_result",
-  "payload": {
-    "ok": true,
-    "snapshot_id": "optional-audit-id",
-    "changed_paths": ["src/..."],
-    "verification": {
-      "required": ["compile", "smoke"],
-      "results": {
-        "compile": "passed",
-        "smoke": "passed"
-      }
-    }
-  }
-}
-```
-
-Supported client actions include `apply_result`, `retry`, and `abandon`.
-Internal agents use semantic actions such as `approve`, `request_recoding`,
-`request_replan`, and `fail`; the workflow state machine maps those actions to
-columns. API clients, the dashboard, and the IDE plugin all go through the same
-state-machine boundary.
-
-`apply_result` is terminal in the current single-agent flow: successful apply
-without a verification policy moves through `Applied` and `Verified` to `Done`;
-failed apply or failed verification moves the task to `Failed`.
-
-### `GET /v1/kanban/events`
-
-Returns the kanban event/log stream for a project, optionally filtered to one
-task. This is the main trace surface for fast AI-driven workflows.
+Default local data paths:
 
 ```text
-GET /v1/kanban/events?project_id=...&task_id=...&limit=200
+DevWerk/data/devwerk.db
+DevWerk/data/logs/devwerk.log
+DevWerk/data/sessions/{projectId}/audit_events.jsonl
+DevWerk/data/sessions/{projectId}/project_memory.json
+DevWerk/data/sessions/{projectId}/project_memory.jsonl
 ```
 
-Events include column transitions (`task_moved`), workflow actions, agent
-context/output records, phase output records, planner LLM rounds, executor LLM
-rounds, tool request results, review decisions, and final apply/verification
-reports. Dashboard Events uses this endpoint.
-
-### `GET /v1/kanban/projects/{project_id}/memory`
-
-Returns durable project-level memory derived from completed workflow phase
-outputs. Dashboard Memory uses this endpoint to show framework signals, touched
-paths, commands, and recent summaries.
-
-### `GET/PUT /v1/settings`
-
-Reads and writes `backend/config/llm.json`. The dashboard exposes this as two
-JSON editors: `LLM Catalog` and `Routing`.
-
-### `GET /dashboard`
-
-Local web UI for:
-
-- statistics
-- projects
-- kanban
-- events
-- project memory
-- global model/routing settings
-- project settings
-
-## Repository Layout
-
-```text
-backend/
-  app/
-    core/        configuration and schema
-    models/      IDE and planning response models
-    routes/      IDE, kanban, settings, dashboard routes
-    services/    LLM clients, kanban DB, usage DB, coder harness
-  config/
-    llm.example.json
-  tests/
-  startup.bat
-  requirements.txt
-
-idea-plugin/
-  IntelliJ plugin frontend
-  source map collection
-  attachments
-  snapshot-protected code apply
-```
+SQLite is the source of truth for tasks, events, artifacts, conversations,
+column runs, and candidate revisions. Project memory is a compact reusable
+summary, not a raw prompt store.
 
 ## Running Locally
 
-Backend:
-
 ```powershell
-cd backend
+cd DevWerk
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 copy .env.example .env
 copy config\llm.example.json config\llm.json
-startup.bat
+.\startup.bat
 ```
 
-Open:
-
-```text
-http://localhost:8000/dashboard
-http://localhost:8000/docs
-```
-
-Plugin build:
+Plugin compile:
 
 ```powershell
 cd idea-plugin
 .\gradlew.bat compileKotlin
 ```
 
-`gradlew build` may fail at `prepareSandbox` if IntelliJ is currently holding the
-sandbox plugin jar open. In that case, Kotlin compilation and jar creation may
-still be valid while sandbox copy is blocked by the IDE process.
-
 ## Tests
 
-Backend:
+Service checks:
 
 ```powershell
-cd backend
+cd DevWerk
 .\.venv\Scripts\python.exe -m compileall app tests
 .\.venv\Scripts\python.exe -m pytest tests
 ```
 
+Plugin checks:
+
+```powershell
+cd idea-plugin
+.\gradlew.bat test verifyPlugin --no-daemon
+```
+
 ## Design Principles
 
-- Kanban first: AI work should be visible as workflow, not hidden as a chat turn.
-- Backend plans and generates; frontend applies through snapshots.
-- Columns stay short; details live in events, artifacts, and checklists.
-- Source maps are zero-token structure that should reduce LLM context cost.
-- Multiple models exist to optimize cost and stability by task type.
-- Rework is a transition reason, not a board column.
+- Kanban first: AI work is workflow, not a hidden chat turn.
+- Workflow is configurable; columns and agents stay independent.
+- The service asks for capabilities, not IDE-specific APIs.
+- Source maps and project memory reduce token cost and improve consistency.
+- Frontend applies through snapshots; service produces guarded operations.
+- Events and artifacts must make fast AI task movement auditable.
 
 ## License
 

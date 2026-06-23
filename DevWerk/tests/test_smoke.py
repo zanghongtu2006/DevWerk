@@ -180,7 +180,21 @@ def test_kanban_apply_result_queues_resume_after_failed_verification(monkeypatch
 
     class FakeSettings:
         devwerk_db_path = str(tmp_path / "resume.db")
+        app_env = "test"
+        llm_provider_name = "test"
+        workflow_supervisor_enabled = False
 
+        @property
+        def is_production(self):
+            return False
+
+        def validate_provider(self):
+            return None
+
+        def get_llm_config(self, agent="coder"):
+            return {"agent": agent, "protocol": "ollama", "api_key": None, "model": "test"}
+
+    monkeypatch.setattr(main_module, "settings", lambda: FakeSettings())
     monkeypatch.setattr(kanban_service, "settings", lambda: FakeSettings())
     monkeypatch.setattr(session_store, "settings", lambda: FakeSettings())
     monkeypatch.setattr(usage_service, "settings", lambda: FakeSettings())
@@ -253,7 +267,21 @@ def test_kanban_apply_failure_requests_recoding_and_queues_resume(monkeypatch, t
 
     class FakeSettings:
         devwerk_db_path = str(tmp_path / "apply-resume.db")
+        app_env = "test"
+        llm_provider_name = "test"
+        workflow_supervisor_enabled = False
 
+        @property
+        def is_production(self):
+            return False
+
+        def validate_provider(self):
+            return None
+
+        def get_llm_config(self, agent="coder"):
+            return {"agent": agent, "protocol": "ollama", "api_key": None, "model": "test"}
+
+    monkeypatch.setattr(main_module, "settings", lambda: FakeSettings())
     monkeypatch.setattr(kanban_service, "settings", lambda: FakeSettings())
     monkeypatch.setattr(session_store, "settings", lambda: FakeSettings())
     monkeypatch.setattr(usage_service, "settings", lambda: FakeSettings())
@@ -316,7 +344,21 @@ def test_stale_apply_result_is_idempotently_ignored(monkeypatch, tmp_path):
 
     class FakeSettings:
         devwerk_db_path = str(tmp_path / "stale-apply.db")
+        app_env = "test"
+        llm_provider_name = "test"
+        workflow_supervisor_enabled = False
 
+        @property
+        def is_production(self):
+            return False
+
+        def validate_provider(self):
+            return None
+
+        def get_llm_config(self, agent="coder"):
+            return {"agent": agent, "protocol": "ollama", "api_key": None, "model": "test"}
+
+    monkeypatch.setattr(main_module, "settings", lambda: FakeSettings())
     monkeypatch.setattr(kanban_service, "settings", lambda: FakeSettings())
     monkeypatch.setattr(session_store, "settings", lambda: FakeSettings())
     monkeypatch.setattr(usage_service, "settings", lambda: FakeSettings())

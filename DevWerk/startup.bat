@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions
 
-rem DevWerk Backend - Windows startup script
+rem DevWerk Service - Windows startup script
 rem Usage:
 rem   startup.bat
 rem   startup.bat development
@@ -49,7 +49,7 @@ if errorlevel 1 (
 )
 
 if not exist "requirements.txt" (
-    echo [DevWerk] requirements.txt not found. Are you in the backend directory?
+    echo [DevWerk] requirements.txt not found. Are you in the DevWerk service directory?
     exit /b 1
 )
 
@@ -65,7 +65,7 @@ if /i "%UVICORN_ACCESS_LOG%"=="no" set "UVICORN_ACCESS_FLAG=--no-access-log"
 
 "%PYTHON_EXE%" -c "import fastapi, mcp, uvicorn" >nul 2>&1
 if errorlevel 1 (
-    echo [DevWerk] Backend dependencies are missing or out of date.
+    echo [DevWerk] Service dependencies are missing or out of date.
     echo [DevWerk] Installing requirements into %PYTHON_EXE% ...
     "%PYTHON_EXE%" -m pip install --disable-pip-version-check -r requirements.txt
     if errorlevel 1 (

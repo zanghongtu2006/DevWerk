@@ -3,99 +3,84 @@
 ## Setup
 
 ```bash
-# 1. Clone & enter backend
-cd DevWerk/backend
-
-# 2. Create virtual environment
+cd DevWerk
 python -m venv .venv
-# Windows:  .venv\Scripts\activate
-# Linux/macOS:  source .venv/bin/activate
+```
 
-# 3. Install dependencies
+Windows:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+copy .env.example .env
+copy config\llm.example.json config\llm.json
+.\startup.bat
+```
+
+Linux/macOS:
+
+```bash
+source .venv/bin/activate
 pip install -r requirements.txt
-
-# 4. Configure environment
 cp .env.example .env
-# Edit .env — set real API keys as REAL ENVIRONMENT VARIABLES, not in .env
-
-# 5. Run
+cp config/llm.example.json config/llm.json
 uvicorn app.main:app --reload --port 8000
-# or on Windows:  startup.bat
 ```
 
-## Environment Configuration
+Open:
 
-### APP_ENV — which mode?
-
-| APP_ENV | Description |
-|---------|-------------|
-| `development` | Default. Hot-reload enabled. Ollama as LLM. |
-| `test` | For CI. Uses test-specific overrides in `.env.test`. |
-| `production` | No reload. Validates API keys are set. |
-
-### LLM Provider
-
-```bash
-# Local Ollama (default — no API key needed)
-LLM_PROVIDER=ollama
-OLLAMA_BASE_URL=http://127.0.0.1:11434
-OLLAMA_MODEL=deepseek-r1:32b
-
-# OpenAI cloud
-LLM_PROVIDER=openai
-# Set the key as a REAL env var — NEVER in .env files:
-#   Linux/macOS:  export OPENAI_API_KEY=sk-...
-OPENAI_API_KEY=${OPENAI_API_KEY}   # reads from real env
-OPENAI_MODEL=gpt-4o-mini
+```text
+http://localhost:8000/dashboard
+http://localhost:8000/workbench
+http://localhost:8000/docs
 ```
 
-### Production Deployment
+## Configuration
 
-```bash
-# Set real keys as environment variables — never in .env files
-export OPENAI_API_KEY=sk-...
-export APP_ENV=production
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
+Keep `.env` small. Structured model routing belongs in
+`DevWerk/config/llm.json`, which is ignored by git.
+
+Do not commit real API keys. Use local ignored config files or real environment
+variables.
 
 ## Project Structure
 
-```
-backend/
-├── app/
-│   ├── core/
-│   │   ├── config.py      # Pydantic Settings — env var definitions
-│   │   ├── prompt.py       # System prompt templates
-│   │   ├── prompt_factory.py
-│   │   └── schema.py       # LLM response JSON schema
-│   ├── models/
-│   │   ├── ide.py          # Pydantic request/response models
-│   │   └── plan.py         # Plan / ExecuteRequest models
-│   ├── routes/
-│   │   └── ide.py          # /v1/ide/* endpoints
-│   ├── services/
-│   │   ├── llm_factory.py  # Client factory
-│   │   ├── openai_client.py
-│   │   ├── ollama_client.py
-│   │   ├── planner.py       # Plan phase: LLM research + plan extraction
-│   │   ├── coerce.py
-│   │   └── prompt_builder.py
-│   └── main.py             # FastAPI app entry point
-├── .env.example            # ← copy to .env and fill values
-├── requirements.txt
-└── startup.bat
+```text
+DevWerk/
+  app/
+    core/        configuration, prompt contracts, schema
+    models/      protocol and planning models
+    routes/      workflows, Kanban, settings, Web UIs
+    services/    workflow engine, agents, LLM clients, storage
+  config/
+    agents/
+    workflows/
+    llm.example.json
+  tests/
+  startup.bat
+
+idea-plugin/
+  IntelliJ capability provider and snapshot-protected apply path
+
+docs/
+  runtime notes and smoke tests
 ```
 
-## Running Tests
+## Checks
 
-```bash
-pytest -v
+```powershell
+cd DevWerk
+.\.venv\Scripts\python.exe -m compileall app tests
+.\.venv\Scripts\python.exe -m pytest tests
+
+cd ..\idea-plugin
+.\gradlew.bat test verifyPlugin --no-daemon
 ```
 
-## Key Principles
+## Principles
 
-1. **API keys never in committed files** — use real environment variables
-2. **Settings as code** — Pydantic `Field()` docs explain every variable
-3. **Fail fast** — `Settings.validate_provider()` raises on missing keys at startup
-4. **Env-specific overrides** — `.env.development` / `.env.production` for local deviations
-5. **Plan before Execute** — always show the user what will be changed before writing files
+1. Kanban is the source of task truth.
+2. Columns and agents are independent; workflow must stay configurable.
+3. DevWerk asks for capabilities, not IDE-specific APIs.
+4. Source writes are performed by capability providers through snapshots.
+5. Events, artifacts, and phase outputs must make workflow movement auditable.
+6. API keys and local runtime data never belong in committed files.

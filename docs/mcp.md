@@ -1,7 +1,7 @@
 # DevWerk MCP
 
-DevWerk exposes its backend-owned coding workflow as a Streamable HTTP MCP
-server. The endpoint is served by the normal backend process:
+DevWerk exposes its service-owned coding workflow as a Streamable HTTP MCP
+server. The endpoint is served by the normal DevWerk service process:
 
 ```text
 http://127.0.0.1:8000/mcp
@@ -13,10 +13,10 @@ connection.
 
 ## Codex and VS Code configuration
 
-Start the backend first:
+Start the DevWerk service first:
 
 ```powershell
-cd D:\workspace\codex\devwerk\DevWerk\backend
+cd D:\workspace\codex\devwerk\DevWerk\DevWerk
 .\startup.bat
 ```
 

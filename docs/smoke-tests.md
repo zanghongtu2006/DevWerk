@@ -1,15 +1,15 @@
 # DevWerk Smoke Tests
 
-This document lists the smoke tests that should pass before frontend/backend
+This document lists the smoke tests that should pass before provider/service
 integration work continues. Smoke tests are intentionally small: they verify the
 critical DevWerk loop without depending on a real external LLM unless stated.
 
-## Backend Unit Smoke
+## Service Unit Smoke
 
 Command:
 
 ```powershell
-cd backend
+cd DevWerk
 .\.venv\Scripts\python.exe -m pytest tests\test_smoke.py -q
 ```
 
@@ -26,12 +26,12 @@ Expected result:
 3 passed
 ```
 
-## Backend Coding Workflow Smoke
+## Service Coding Workflow Smoke
 
 Command:
 
 ```powershell
-cd backend
+cd DevWerk
 .\.venv\Scripts\python.exe -m pytest tests\test_backend_coding_workflow.py -q
 ```
 
@@ -57,12 +57,12 @@ Expected result:
 All coding workflow tests passed
 ```
 
-## Backend Full Test Smoke
+## Service Full Test Smoke
 
 Command:
 
 ```powershell
-cd backend
+cd DevWerk
 .\.venv\Scripts\python.exe -m pytest tests -q
 ```
 
@@ -77,10 +77,10 @@ Expected result:
 8 passed
 ```
 
-## Backend Debug Log Smoke
+## Service Debug Log Smoke
 
-The backend defaults to debug logging. These settings can be overridden in
-`backend/.env`:
+The DevWerk service defaults to debug logging. These settings can be overridden
+in `DevWerk/.env`:
 
 ```env
 LOG_LEVEL=debug
@@ -91,7 +91,7 @@ UVICORN_ACCESS_LOG=true
 Command:
 
 ```powershell
-cd backend
+cd DevWerk
 startup.bat
 ```
 
@@ -111,12 +111,12 @@ DEBUG [devwerk.request] request start method=...
 DEBUG [devwerk.request] request end method=...
 ```
 
-## Backend Syntax Smoke
+## Service Syntax Smoke
 
 Command:
 
 ```powershell
-cd backend
+cd DevWerk
 .\.venv\Scripts\python.exe -m compileall app tests
 ```
 
@@ -191,12 +191,12 @@ Coverage:
 
 - Deletes and regenerates the coroutine javaagent jar.
 - Runs plugin `compileKotlin`.
-- Starts backend with `startup.bat`.
+- Starts the DevWerk service with `startup.bat`.
 - Verifies `/docs`.
-- Verifies backend API contract for `/v1/workflows`, workflow event/result
+- Verifies service API contract for `/v1/workflows`, workflow event/result
   endpoints, multi-turn messages, and `/v1/ide/attachments`.
 - Starts real `runIde` and requires it to stay alive for the configured window.
-- Cleans backend and IDE processes after the run.
+- Cleans service and IDE processes after the run.
 
 Expected result:
 
@@ -206,10 +206,10 @@ Expected result:
 
 ## Pre-Integration Checklist
 
-Run this minimum set before frontend/backend debugging:
+Run this minimum set before provider/service debugging:
 
 ```powershell
-cd backend
+cd DevWerk
 .\.venv\Scripts\python.exe -m pytest tests -q
 .\.venv\Scripts\python.exe -m compileall app tests
 

@@ -31,6 +31,7 @@ from app.services.kanban import (
 from app.services.session_store import read_project_memory
 from app.services.verification_policy import verification_failed, verification_has_policy
 from app.services.workflow import apply_workflow_action, current_workflow_state
+from app.services.workflow_designer import design_project_workflow
 
 router = APIRouter(prefix="/kanban", tags=["Kanban"])
 ui_router = APIRouter(tags=["Kanban UI"])
@@ -98,6 +99,13 @@ class WorkflowDefinitionRequest(BaseModel):
     workflow: dict[str, Any] = Field(default_factory=dict)
 
 
+class WorkflowDesignRequest(BaseModel):
+    messages: list[dict[str, Any]] = Field(default_factory=list)
+    current_workflow: dict[str, Any] | None = None
+    current_agents: dict[str, Any] | None = None
+    save: bool = False
+
+
 @router.get("/board")
 def kanban_board(project_id: str | None = None):
     return get_board(project_id)
@@ -142,6 +150,26 @@ def kanban_get_project_workflow(project_id: str):
 def kanban_update_project_workflow(project_id: str, req: WorkflowDefinitionRequest):
     try:
         return update_project_workflow(project_id, req.workflow)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/projects/{project_id}/workflow/design")
+def kanban_design_project_workflow(project_id: str, req: WorkflowDesignRequest):
+    try:
+        result = design_project_workflow(
+            project_id=project_id,
+            messages=req.messages,
+            current_workflow=req.current_workflow,
+            current_agents=req.current_agents,
+        )
+        if req.save:
+            update_project_workflow(project_id, result["workflow"])
+            update_project_settings(project_id, agents=result["agents"])
+            result["saved"] = True
+        else:
+            result["saved"] = False
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -397,6 +425,204 @@ def kanban_ui():
 @ui_router.get("/dashboard", response_class=HTMLResponse)
 def dashboard_ui():
     return HTMLResponse(DASHBOARD_HTML)
+
+
+@ui_router.get("/workbench", response_class=HTMLResponse)
+def workbench_ui():
+    return HTMLResponse(WORKBENCH_HTML)
+
+
+WORKBENCH_HTML = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DevWerk Workbench</title>
+  <style>
+    :root { color-scheme: light dark; --bg: #f5f7fb; --panel: #fff; --text: #182033; --muted: #687386; --line: #d7deea; --accent: #2068d8; --ok: #027a48; --danger: #b42318; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #20242a; --panel: #2b3038; --text: #eef3fb; --muted: #aeb8c8; --line: #454d59; --accent: #7ba8ff; --ok: #75d6a4; --danger: #ff9b91; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    header { min-height: 58px; display: flex; align-items: center; gap: 10px; padding: 10px 18px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+    h1 { margin: 0; font-size: 18px; }
+    a { color: var(--accent); }
+    input, textarea, select, button { font: inherit; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); color: var(--text); }
+    input, select { height: 34px; padding: 0 10px; }
+    textarea { width: 100%; min-height: 120px; padding: 10px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; font-size: 12px; }
+    button { height: 34px; padding: 0 12px; cursor: pointer; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    main { padding: 18px; display: grid; grid-template-columns: minmax(320px, 420px) 1fr; gap: 14px; align-items: start; }
+    .panel { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 14px; }
+    .panel h2 { margin: 0 0 10px; font-size: 15px; }
+    .grid { display: grid; gap: 10px; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .grow { flex: 1 1 180px; }
+    .muted { color: var(--muted); }
+    .ok { color: var(--ok); }
+    .error { color: var(--danger); }
+    .messages { display: grid; gap: 8px; max-height: 360px; overflow: auto; padding-right: 4px; }
+    .message { border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; white-space: pre-wrap; }
+    .message.user { background: color-mix(in srgb, var(--accent) 10%, var(--panel)); }
+    .message.assistant { background: color-mix(in srgb, var(--bg) 72%, var(--panel)); }
+    .tabs { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+    .tabs button.active { border-color: var(--accent); color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--panel)); }
+    .editor { display: none; }
+    .editor.active { display: block; }
+    .summary { display: grid; grid-template-columns: repeat(4, minmax(110px, 1fr)); gap: 8px; margin-top: 10px; }
+    .metric { border: 1px solid var(--line); border-radius: 7px; padding: 9px; }
+    .metric b { display: block; font-size: 17px; margin-top: 2px; }
+    @media (max-width: 980px) { main { grid-template-columns: 1fr; } .summary { grid-template-columns: repeat(2, 1fr); } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>DevWerk Workbench</h1>
+    <select id="projectSelect" class="grow"></select>
+    <input id="projectId" placeholder="new projectId" />
+    <input id="projectName" placeholder="project name" />
+    <button id="createProject" class="primary">Create Project</button>
+    <button id="refresh">Refresh</button>
+    <a href="/dashboard">Dashboard</a>
+  </header>
+  <main>
+    <section class="panel grid">
+      <h2>Workflow Conversation</h2>
+      <div id="messages" class="messages"></div>
+      <textarea id="prompt" placeholder="Describe the engineering flow, agents, columns, gates, retry policy, and capability requirements."></textarea>
+      <div class="row">
+        <button id="send" class="primary">Generate Draft</button>
+        <button id="save">Save Draft</button>
+        <button id="load">Load Project Config</button>
+      </div>
+      <div id="status" class="muted"></div>
+      <div id="error" class="error"></div>
+    </section>
+    <section class="panel">
+      <div class="tabs">
+        <button data-tab="workflow" class="active">Workflow JSON</button>
+        <button data-tab="agents">Agent Overrides</button>
+        <button data-tab="summary">Summary</button>
+      </div>
+      <section id="tab-workflow" class="editor active"><textarea id="workflowJson" style="min-height:620px"></textarea></section>
+      <section id="tab-agents" class="editor"><textarea id="agentsJson" style="min-height:620px"></textarea></section>
+      <section id="tab-summary" class="editor">
+        <div id="summary" class="summary"></div>
+        <pre id="summaryRaw" class="panel" style="overflow:auto; max-height:520px"></pre>
+      </section>
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const state = { projectId: "default", messages: [], summary: {} };
+    async function api(path, options = {}) {
+      const res = await fetch(path, { ...options, headers: { "Content-Type": "application/json", "X-DevWerk-Project-Id": state.projectId, ...(options.headers || {}) } });
+      const text = await res.text();
+      const data = text ? JSON.parse(text) : {};
+      if (!res.ok) throw new Error(data.detail || text || `HTTP ${res.status}`);
+      return data;
+    }
+    async function refresh() {
+      clearError();
+      const data = await api("/v1/kanban/projects");
+      const projects = data.projects || [];
+      if (!projects.some(p => p.id === state.projectId)) state.projectId = projects[0]?.id || "default";
+      $("projectSelect").innerHTML = projects.map(p => `<option value="${escAttr(p.id)}" ${p.id === state.projectId ? "selected" : ""}>${esc(p.name || p.id)} (${esc(p.id)})</option>`).join("");
+      await loadProjectConfig();
+    }
+    async function createProject() {
+      const projectId = $("projectId").value.trim();
+      if (!projectId) return;
+      const name = $("projectName").value.trim() || projectId;
+      await api("/v1/kanban/projects", { method: "POST", body: JSON.stringify({ project_id: projectId, name }) });
+      state.projectId = projectId;
+      $("projectId").value = "";
+      $("projectName").value = "";
+      await refresh();
+    }
+    async function loadProjectConfig() {
+      const workflow = await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/workflow`);
+      const settings = await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/settings`);
+      $("workflowJson").value = JSON.stringify(workflow.workflow || {}, null, 2);
+      $("agentsJson").value = JSON.stringify((settings.settings || {}).agents || {}, null, 2);
+      state.summary = { source: "loaded", workflow: workflow.workflow?.summary || null };
+      renderSummary();
+      setStatus(`Loaded ${state.projectId}`);
+    }
+    async function sendDesign(save) {
+      clearError();
+      const content = $("prompt").value.trim();
+      if (content) {
+        state.messages.push({ role: "user", content });
+        $("prompt").value = "";
+      }
+      renderMessages();
+      setBusy(true);
+      try {
+        const payload = {
+          messages: state.messages,
+          current_workflow: JSON.parse($("workflowJson").value || "{}"),
+          current_agents: JSON.parse($("agentsJson").value || "{}"),
+          save: Boolean(save)
+        };
+        const result = await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/workflow/design`, { method: "POST", body: JSON.stringify(payload) });
+        state.messages.push({ role: "assistant", content: result.reply || "Workflow draft updated." });
+        $("workflowJson").value = JSON.stringify(result.workflow || {}, null, 2);
+        $("agentsJson").value = JSON.stringify(result.agents || {}, null, 2);
+        state.summary = result.summary || {};
+        renderMessages();
+        renderSummary(result);
+        setStatus(result.saved ? "Draft generated and saved" : "Draft generated");
+      } finally {
+        setBusy(false);
+      }
+    }
+    async function saveDraft() {
+      clearError();
+      await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/workflow`, { method: "PUT", body: JSON.stringify({ workflow: JSON.parse($("workflowJson").value || "{}") }) });
+      await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/settings`, { method: "PUT", body: JSON.stringify({ agents: JSON.parse($("agentsJson").value || "{}") }) });
+      setStatus("Saved workflow and agent overrides");
+    }
+    function renderMessages() {
+      $("messages").innerHTML = state.messages.map(m => `<div class="message ${escAttr(m.role)}"><b>${esc(m.role)}</b>\n${esc(m.content)}</div>`).join("") || `<div class="muted">Start by describing the process you want.</div>`;
+      $("messages").scrollTop = $("messages").scrollHeight;
+    }
+    function renderSummary(raw) {
+      const workflow = JSON.parse($("workflowJson").value || "{}");
+      const agents = JSON.parse($("agentsJson").value || "{}");
+      const columns = workflow.columns || [];
+      const executable = columns.filter(c => c.job_template).map(c => c.status_key);
+      const rows = [["Columns", columns.length], ["Executable", executable.length], ["Actions", Object.keys(workflow.actions || {}).length], ["Agent Overrides", Object.keys(agents).length]];
+      $("summary").innerHTML = rows.map(([k, v]) => `<div class="metric"><span class="muted">${esc(k)}</span><b>${esc(v)}</b></div>`).join("");
+      $("summaryRaw").textContent = JSON.stringify(raw || { executable_columns: executable, actions: Object.keys(workflow.actions || {}).sort(), agents }, null, 2);
+    }
+    function setBusy(value) { $("send").disabled = value; $("save").disabled = value; $("load").disabled = value; setStatus(value ? "Designing..." : $("status").textContent); }
+    function setStatus(text) { $("status").textContent = text || ""; }
+    function clearError() { $("error").textContent = ""; }
+    function showError(err) { $("error").textContent = err.message || String(err); setBusy(false); }
+    function esc(value) { return String(value ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[ch])); }
+    function escAttr(value) { return esc(value).replace(/`/g, "&#96;"); }
+    $("projectSelect").onchange = async (event) => { state.projectId = event.target.value; state.messages = []; renderMessages(); await loadProjectConfig().catch(showError); };
+    $("createProject").onclick = () => createProject().catch(showError);
+    $("refresh").onclick = () => refresh().catch(showError);
+    $("load").onclick = () => loadProjectConfig().catch(showError);
+    $("send").onclick = () => sendDesign(false).catch(showError);
+    $("save").onclick = () => saveDraft().catch(showError);
+    document.querySelector(".tabs").onclick = (event) => {
+      const btn = event.target.closest("button[data-tab]");
+      if (!btn) return;
+      document.querySelectorAll(".tabs button").forEach(item => item.classList.toggle("active", item === btn));
+      document.querySelectorAll(".editor").forEach(item => item.classList.remove("active"));
+      $(`tab-${btn.dataset.tab}`).classList.add("active");
+      if (btn.dataset.tab === "summary") renderSummary();
+    };
+    renderMessages();
+    refresh().catch(showError);
+  </script>
+</body>
+</html>
+"""
 
 
 DASHBOARD_HTML = r"""
