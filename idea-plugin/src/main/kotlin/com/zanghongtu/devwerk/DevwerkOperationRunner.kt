@@ -9,6 +9,7 @@ import com.zanghongtu.devwerk.codeEditor.FsScaffolder
 import com.zanghongtu.devwerk.codeEditor.PatchApplier
 import java.nio.charset.StandardCharsets
 import java.nio.file.*
+import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.util.UUID
@@ -48,7 +49,7 @@ class DevwerkOperationRunner {
     }
 
     fun beginSnapshot(ctx: DevwerkContext): DevwerkContext {
-        val snapshotId = LocalDateTime.now().format(SNAPSHOT_TIME_FORMAT) + "-" + UUID.randomUUID()
+        val snapshotId = LocalDate.now().format(SNAPSHOT_DATE_FORMAT) + "-" + UUID.randomUUID()
         val snapshotDir = ctx.opDir.resolve("snapshots").resolve(snapshotId)
         Files.createDirectories(snapshotDir.resolve("before"))
         Files.createDirectories(snapshotDir.resolve("after"))
@@ -359,6 +360,6 @@ class DevwerkOperationRunner {
 
     companion object {
         private val LOG_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
-        private val SNAPSHOT_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS")
+        private val SNAPSHOT_DATE_FORMAT: DateTimeFormatter = DateTimeFormatter.ISO_LOCAL_DATE
     }
 }
