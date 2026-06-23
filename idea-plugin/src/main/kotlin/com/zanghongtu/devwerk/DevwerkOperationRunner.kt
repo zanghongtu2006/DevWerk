@@ -9,7 +9,6 @@ import com.zanghongtu.devwerk.codeEditor.FsScaffolder
 import com.zanghongtu.devwerk.codeEditor.PatchApplier
 import java.nio.charset.StandardCharsets
 import java.nio.file.*
-import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.util.UUID
@@ -27,7 +26,7 @@ class DevwerkOperationRunner {
 
     fun bindTask(ctx: DevwerkContext, taskId: String): DevwerkContext {
         val safeTaskId = taskId.trim().takeIf { it.matches(Regex("[A-Za-z0-9._-]+")) } ?: return ctx
-        val taskDir = ctx.devwerkDir.resolve("tasks").resolve(safeTaskId)
+        val taskDir = resolveTaskDir(ctx.devwerkDir, safeTaskId)
         val taskLog = taskDir.resolve("operation.log")
         if (ctx.opLog.normalize() == taskLog.normalize()) return ctx
 
@@ -49,7 +48,7 @@ class DevwerkOperationRunner {
     }
 
     fun beginSnapshot(ctx: DevwerkContext): DevwerkContext {
-        val snapshotId = LocalDate.now().format(SNAPSHOT_DATE_FORMAT) + "-" + UUID.randomUUID()
+        val snapshotId = timestampId() + "-" + UUID.randomUUID()
         val snapshotDir = ctx.opDir.resolve("snapshots").resolve(snapshotId)
         Files.createDirectories(snapshotDir.resolve("before"))
         Files.createDirectories(snapshotDir.resolve("after"))
@@ -270,7 +269,7 @@ class DevwerkOperationRunner {
 
         val safeTaskId = taskId?.trim()?.takeIf { it.matches(Regex("[A-Za-z0-9._-]+")) }
         val opDir = if (safeTaskId != null) {
-            devwerkDir.resolve("tasks").resolve(safeTaskId)
+            resolveTaskDir(devwerkDir, safeTaskId)
         } else {
             devwerkDir.resolve("pending").resolve(UUID.randomUUID().toString())
         }
@@ -286,6 +285,23 @@ class DevwerkOperationRunner {
             opLog = opLog
         )
     }
+
+    private fun resolveTaskDir(devwerkDir: Path, safeTaskId: String): Path {
+        val tasksDir = devwerkDir.resolve("tasks")
+        Files.createDirectories(tasksDir)
+        Files.list(tasksDir).use { stream ->
+            val taskDirPattern = Regex("""\d{8}-\d{6}-\d{3}-${Regex.escape(safeTaskId)}""")
+            val existing = stream
+                .filter { Files.isDirectory(it) }
+                .filter { it.fileName.toString().matches(taskDirPattern) }
+                .sorted()
+                .findFirst()
+            if (existing.isPresent) return existing.get()
+        }
+        return tasksDir.resolve("${timestampId()}-$safeTaskId")
+    }
+
+    private fun timestampId(): String = LocalDateTime.now().format(ID_TIME_FORMAT)
 
     private fun ensureGitignoreContainsDevwerk(projectRoot: Path) {
         val gitignore = projectRoot.resolve(".gitignore")
@@ -360,6 +376,6 @@ class DevwerkOperationRunner {
 
     companion object {
         private val LOG_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
-        private val SNAPSHOT_DATE_FORMAT: DateTimeFormatter = DateTimeFormatter.ISO_LOCAL_DATE
+        private val ID_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS")
     }
 }
