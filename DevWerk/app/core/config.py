@@ -456,7 +456,7 @@ class Settings(BaseSettings):
 
 def _normalize_llm_config(value: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
     out = {
-        "routing": value.get("routing") if isinstance(value.get("routing"), dict) else fallback.get("routing", {}),
+        "routing": value.get("routing") if isinstance(value.get("routing"), dict) else {},
         "llms": {},
     }
     providers = value.get("llms") or value.get("providers") or value.get("models")
@@ -479,7 +479,34 @@ def _normalize_llm_config(value: dict[str, Any], fallback: dict[str, Any]) -> di
             out["llms"][str(name).lower()] = provider
     if not out["llms"]:
         out["llms"] = fallback.get("llms", {})
+    _validate_llm_default_route(out)
     return out
+
+
+def _validate_llm_default_route(config: dict[str, Any]) -> None:
+    routing = config.get("routing")
+    if not isinstance(routing, dict):
+        raise ValueError("llm.json must define routing.default")
+    default_ref = routing.get("default")
+    if isinstance(default_ref, dict):
+        default_ref = default_ref.get("primary") or default_ref.get("model")
+    if not str(default_ref or "").strip():
+        raise ValueError("llm.json must define routing.default")
+
+    provider_name, model_key = _split_model_ref(str(default_ref))
+    providers = config.get("llms")
+    if not isinstance(providers, dict):
+        raise ValueError("llm.json must define llms")
+    provider = providers.get(provider_name)
+    if not isinstance(provider, dict):
+        raise ValueError(f"llm.json routing.default references unknown provider {provider_name!r}")
+
+    models = provider.get("models")
+    if isinstance(models, dict) and models:
+        if model_key not in models:
+            raise ValueError(f"llm.json routing.default references unknown model {model_key!r}")
+    elif not str(provider.get("model") or model_key).strip():
+        raise ValueError(f"llm.json provider {provider_name!r} must define models or model")
 
 
 def _split_model_ref(model_ref: str) -> tuple[str, str]:

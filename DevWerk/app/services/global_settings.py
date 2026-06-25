@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from app.core.config import reload_settings, settings
+from app.core.config import _normalize_llm_config, reload_settings, settings
 
 _log = logging.getLogger("devwerk.settings")
 
@@ -54,6 +54,7 @@ def update_global_settings(payload: dict[str, Any]) -> dict[str, Any]:
     if not changed:
         return get_global_settings()
 
+    current = _normalize_llm_config(current, settings()._legacy_llm_config())
     path = _llm_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(current, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

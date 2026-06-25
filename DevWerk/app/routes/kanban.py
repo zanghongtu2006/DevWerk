@@ -515,7 +515,10 @@ WORKBENCH_HTML = r"""
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
-    const state = { projectId: "default", messages: [], summary: {} };
+    const params = new URLSearchParams(window.location.search);
+    const initialProjectId = params.get("project_id") || params.get("projectId") || "default";
+    const initialProjectName = params.get("project_name") || "";
+    const state = { projectId: initialProjectId, messages: [], summary: {} };
     async function api(path, options = {}) {
       const res = await fetch(path, { ...options, headers: { "Content-Type": "application/json", "X-DevWerk-Project-Id": state.projectId, ...(options.headers || {}) } });
       const text = await res.text();
@@ -537,6 +540,8 @@ WORKBENCH_HTML = r"""
       const name = $("projectName").value.trim() || projectId;
       await api("/v1/kanban/projects", { method: "POST", body: JSON.stringify({ project_id: projectId, name }) });
       state.projectId = projectId;
+      setWorkbenchUrl(projectId, name);
+      seedProjectDesignPrompt(projectId, name);
       $("projectId").value = "";
       $("projectName").value = "";
       await refresh();
@@ -603,6 +608,17 @@ WORKBENCH_HTML = r"""
     function showError(err) { $("error").textContent = err.message || String(err); setBusy(false); }
     function esc(value) { return String(value ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[ch])); }
     function escAttr(value) { return esc(value).replace(/`/g, "&#96;"); }
+    function setWorkbenchUrl(projectId, name) {
+      const next = new URL(window.location.href);
+      next.searchParams.set("project_id", projectId);
+      if (name) next.searchParams.set("project_name", name);
+      history.replaceState(null, "", next.toString());
+    }
+    function seedProjectDesignPrompt(projectId, name) {
+      if ($("prompt").value.trim()) return;
+      const displayName = name || projectId;
+      $("prompt").value = `Create the DevWerk project design for "${displayName}". Define the workflow columns, state-machine actions, agent roles, context policy, retry/failure behavior, and required external capabilities.`;
+    }
     $("projectSelect").onchange = async (event) => { state.projectId = event.target.value; state.messages = []; renderMessages(); await loadProjectConfig().catch(showError); };
     $("createProject").onclick = () => createProject().catch(showError);
     $("refresh").onclick = () => refresh().catch(showError);
@@ -617,6 +633,7 @@ WORKBENCH_HTML = r"""
       $(`tab-${btn.dataset.tab}`).classList.add("active");
       if (btn.dataset.tab === "summary") renderSummary();
     };
+    if (params.get("new") === "1") seedProjectDesignPrompt(initialProjectId, initialProjectName);
     renderMessages();
     refresh().catch(showError);
   </script>
@@ -738,7 +755,7 @@ DASHBOARD_HTML = r"""
         <p id="error" class="error"></p>
         <section id="view-stats" class="view active"><div id="statsGrid" class="grid stats"></div></section>
         <section id="view-projects" class="view">
-          <div class="toolbar"><input id="newProjectId" placeholder="projectId" /><input id="newProjectName" placeholder="Project name" /><button id="createProject" class="primary">Save Project</button></div>
+          <div class="toolbar"><input id="newProjectId" placeholder="new projectId" /><input id="newProjectName" placeholder="Project name" /><button id="createProject" class="primary">New Project</button></div>
           <div id="projectList" class="grid projects"></div>
           <div id="projectSettingsPanel" class="grid settings-grid">
             <div class="settings-box wide"><h3 id="projectSettingsTitle">Project Settings</h3></div>
@@ -838,7 +855,7 @@ DASHBOARD_HTML = r"""
       $("statsGrid").innerHTML = rows.map(([label, value]) => `<div class="metric"><span class="muted">${escapeHtml(label)}</span><b>${escapeHtml(value)}</b></div>`).join("");
     }
     function renderProjects() {
-      $("projectList").innerHTML = state.projects.map(p => { const s = p.stats || {}; return `<article class="project-row"><h3>${escapeHtml(p.name || p.id)}</h3><div class="muted">${escapeHtml(p.id)}</div><p>${escapeHtml(p.description || "")}</p><div class="muted">tasks ${s.tasks || 0} / requests ${s.request_count || 0} / tokens ${s.total_tokens || 0}</div><footer><button data-project="${escapeAttr(p.id)}" data-action="open-kanban">Open Kanban</button><button data-project="${escapeAttr(p.id)}" data-action="open-project-settings">Project Settings</button></footer></article>`; }).join("");
+      $("projectList").innerHTML = state.projects.map(p => { const s = p.stats || {}; return `<article class="project-row"><h3>${escapeHtml(p.name || p.id)}</h3><div class="muted">${escapeHtml(p.id)}</div><p>${escapeHtml(p.description || "")}</p><div class="muted">tasks ${s.tasks || 0} / requests ${s.request_count || 0} / tokens ${s.total_tokens || 0}</div><footer><button data-project="${escapeAttr(p.id)}" data-action="open-kanban">Open Kanban</button><button data-project="${escapeAttr(p.id)}" data-action="design-project">Design Workflow</button><button data-project="${escapeAttr(p.id)}" data-action="open-project-settings">Project Settings</button></footer></article>`; }).join("");
     }
     function renderBoard() {
       const data = state.board; if (!data) return;
@@ -970,7 +987,13 @@ DASHBOARD_HTML = r"""
       $(id).innerHTML = rows.map(item => `<li>${escapeHtml(labelFn(item))}</li>`).join("") || `<li>No data</li>`;
     }
     function renderActive() { document.querySelectorAll(".view").forEach(v => v.classList.remove("active")); document.querySelector(`#view-${state.view}`).classList.add("active"); document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b.dataset.view === state.view)); $("title").textContent = { stats: "Statistics", projects: "Projects", kanban: "Kanban", details: "Task Details", events: "Events", memory: "Memory", settings: "Settings" }[state.view]; }
-    async function createProject() { const projectId = $("newProjectId").value.trim(); const name = $("newProjectName").value.trim() || projectId; if (!projectId) return; await api("/v1/kanban/projects", { method: "POST", body: JSON.stringify({ project_id: projectId, name }) }); state.projectId = projectId; $("newProjectId").value = ""; $("newProjectName").value = ""; await refreshAll(); }
+    function openWorkbench(projectId, name, isNew = false) {
+      const query = new URLSearchParams({ project_id: projectId });
+      if (name) query.set("project_name", name);
+      if (isNew) query.set("new", "1");
+      window.location.href = `/workbench?${query.toString()}`;
+    }
+    async function createProject() { const projectId = $("newProjectId").value.trim(); const name = $("newProjectName").value.trim() || projectId; if (!projectId) return; await api("/v1/kanban/projects", { method: "POST", body: JSON.stringify({ project_id: projectId, name }) }); state.projectId = projectId; openWorkbench(projectId, name, true); }
     async function createTask() { const title = $("taskTitle").value.trim(); if (!title) return; await api("/v1/kanban/tasks", { method: "POST", body: JSON.stringify({ project_id: state.projectId, title, description: $("taskDescription").value.trim() }) }); $("taskTitle").value = ""; $("taskDescription").value = ""; await refreshAll(); }
     async function saveGlobalSettings() { await api("/v1/settings", { method: "PUT", body: JSON.stringify({ llms: JSON.parse($("llmsJson").value || "{}"), routing: JSON.parse($("routingJson").value || "{}") }) }); await refreshAll(); }
     async function saveProjectSettings() { await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/settings`, { method: "PUT", body: JSON.stringify({ agents: JSON.parse($("projectAgentsJson").value || "{}"), parameters: JSON.parse($("projectParametersJson").value || "{}") }) }); await refreshAll(); }
@@ -991,7 +1014,7 @@ DASHBOARD_HTML = r"""
     $("loadMemory").onclick = () => loadMemory().catch(showError);
     $("loadTaskDetail").onclick = () => loadTaskDetail().catch(showError);
     $("detailRefresh").onclick = () => loadTaskDetail().catch(showError);
-    $("projectList").onclick = async (event) => { const btn = event.target.closest("button[data-project]"); if (!btn) return; state.projectId = btn.dataset.project; state.view = btn.dataset.action === "open-project-settings" ? "projects" : "kanban"; await refreshAll().catch(showError); };
+    $("projectList").onclick = async (event) => { const btn = event.target.closest("button[data-project]"); if (!btn) return; state.projectId = btn.dataset.project; if (btn.dataset.action === "design-project") { const project = state.projects.find(p => p.id === state.projectId) || {}; openWorkbench(state.projectId, project.name || state.projectId, false); return; } state.view = btn.dataset.action === "open-project-settings" ? "projects" : "kanban"; await refreshAll().catch(showError); };
     $("board").onclick = async (event) => {
       const btn = event.target.closest("button[data-task]");
       if (!btn) return;

@@ -71,5 +71,16 @@ def test_workbench_exposes_project_workflow_designer():
 
     assert "/workflow/design" in WORKBENCH_HTML
     assert "Create Project" in WORKBENCH_HTML
+    assert "project_id" in WORKBENCH_HTML
+    assert "seedProjectDesignPrompt" in WORKBENCH_HTML
     assert "Workflow JSON" in WORKBENCH_HTML
     assert "Agent Overrides" in WORKBENCH_HTML
+
+
+def test_dashboard_project_creation_opens_workbench():
+    from app.routes.kanban import DASHBOARD_HTML
+
+    assert "New Project" in DASHBOARD_HTML
+    assert "Save Project</button>" not in DASHBOARD_HTML
+    assert "openWorkbench(projectId, name, true)" in DASHBOARD_HTML
+    assert "Design Workflow" in DASHBOARD_HTML
