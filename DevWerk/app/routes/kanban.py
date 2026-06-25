@@ -11,6 +11,7 @@ from urllib.parse import quote
 from app.services.kanban import (
     add_artifact,
     add_event,
+    add_project_event,
     create_task,
     get_board,
     get_conversation,
@@ -106,6 +107,17 @@ class WorkflowDesignRequest(BaseModel):
     save: bool = False
 
 
+class ProjectConversationRequest(BaseModel):
+    action: str = "design"
+    message: str = ""
+    messages: list[dict[str, Any]] = Field(default_factory=list)
+    current_workflow: dict[str, Any] | None = None
+    current_agents: dict[str, Any] | None = None
+    save: bool = False
+    workspace: dict[str, Any] | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 @router.get("/board")
 def kanban_board(project_id: str | None = None):
     return get_board(project_id)
@@ -172,6 +184,96 @@ def kanban_design_project_workflow(project_id: str, req: WorkflowDesignRequest):
         return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/projects/{project_id}/conversation")
+def kanban_project_conversation(project_id: str, limit: int = 80):
+    events = list_events(project_id=project_id, limit=limit).get("events", [])
+    messages = []
+    for event in reversed(events):
+        if event.get("event_type") != "project_conversation_message":
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        messages.append(
+            {
+                "role": payload.get("role") or "assistant",
+                "content": payload.get("content") or "",
+                "kind": payload.get("kind") or "message",
+                "created_at": event.get("created_at"),
+                "task_id": payload.get("task_id"),
+            }
+        )
+    return {"ok": True, "project_id": project_id, "messages": messages}
+
+
+@router.post("/projects/{project_id}/conversation")
+def kanban_project_conversation_message(project_id: str, req: ProjectConversationRequest):
+    action = str(req.action or "design").strip().lower().replace("-", "_")
+    messages = _project_conversation_messages(req.messages, req.message)
+    user_text = _latest_message_content(messages, role="user")
+    if user_text:
+        add_project_event(
+            project_id,
+            "project_conversation_message",
+            {"role": "user", "content": user_text, "kind": action, "metadata": req.metadata},
+        )
+
+    if action in {"design", "save_design", "revise_workflow", "configure_project"}:
+        design_req = WorkflowDesignRequest(
+            messages=messages,
+            current_workflow=req.current_workflow,
+            current_agents=req.current_agents,
+            save=req.save or action == "save_design",
+        )
+        result = kanban_design_project_workflow(project_id, design_req)
+        add_project_event(
+            project_id,
+            "project_conversation_message",
+            {
+                "role": "assistant",
+                "content": result.get("reply") or "Workflow draft updated.",
+                "kind": action,
+                "saved": result.get("saved", False),
+            },
+        )
+        return {"ok": True, "project_id": project_id, "kind": "workflow_design", **result}
+
+    if action in {"start_task", "run_task", "dispatch_task"}:
+        if not user_text:
+            raise HTTPException(status_code=400, detail="message is required to start a task")
+        body = {
+            "project_id": project_id,
+            "mode": "agent",
+            "interaction_mode": "auto",
+            "messages": [{"role": "user", "content": user_text}],
+            "workspace": req.workspace
+            or {"root_id": project_id, "changed_files": [], "open_files": [], "tree_preview": "", "source_map": None},
+            "metadata": {"source": "project_conversation", **req.metadata},
+        }
+        from app.routes import workflows as workflow_routes
+
+        result = workflow_routes.start_workflow_payload(body)
+        started = bool(result.get("ok", True))
+        content = (
+            f"Task started: {result.get('task_id') or 'unknown'}"
+            if started
+            else f"Task dispatch failed: {result.get('error_message') or result.get('error_code') or 'unknown error'}"
+        )
+        add_project_event(
+            project_id,
+            "project_conversation_message",
+            {
+                "role": "assistant",
+                "content": content,
+                "kind": action,
+                "task_id": result.get("task_id"),
+                "poll_url": result.get("poll_url"),
+                "events_url": result.get("events_url"),
+            },
+        )
+        return {"ok": started, "project_id": project_id, "kind": "task_started", **result}
+
+    raise HTTPException(status_code=400, detail=f"unsupported project conversation action: {action}")
 
 
 @router.put("/projects/{project_id}/settings")
@@ -417,6 +519,24 @@ def _latest_artifact_created_at(task_id: str, artifact_type: str) -> str | None:
     return None
 
 
+def _project_conversation_messages(messages: list[dict[str, Any]], message: str) -> list[dict[str, Any]]:
+    out = [item for item in messages if isinstance(item, dict) and str(item.get("content") or "").strip()]
+    text = str(message or "").strip()
+    if text and (not out or str(out[-1].get("content") or "").strip() != text):
+        out.append({"role": "user", "content": text})
+    return out
+
+
+def _latest_message_content(messages: list[dict[str, Any]], *, role: str) -> str:
+    expected = role.strip().lower()
+    for message in reversed(messages or []):
+        if str(message.get("role") or "").strip().lower() == expected:
+            text = str(message.get("content") or "").strip()
+            if text:
+                return text
+    return ""
+
+
 @ui_router.get("/kanban", response_class=HTMLResponse)
 def kanban_ui():
     return HTMLResponse(KANBAN_HTML)
@@ -488,12 +608,13 @@ WORKBENCH_HTML = r"""
   </header>
   <main>
     <section class="panel grid">
-      <h2>Workflow Conversation</h2>
+      <h2>Project Conversation</h2>
       <div id="messages" class="messages"></div>
-      <textarea id="prompt" placeholder="Describe the engineering flow, agents, columns, gates, retry policy, and capability requirements."></textarea>
+      <textarea id="prompt" placeholder="Describe the project, workflow change, or task to run."></textarea>
       <div class="row">
-        <button id="send" class="primary">Generate Draft</button>
-        <button id="save">Save Draft</button>
+        <button id="send" class="primary">Design Project</button>
+        <button id="save">Save Design</button>
+        <button id="startTask">Start Task</button>
         <button id="load">Load Project Config</button>
       </div>
       <div id="status" class="muted"></div>
@@ -518,7 +639,7 @@ WORKBENCH_HTML = r"""
     const params = new URLSearchParams(window.location.search);
     const initialProjectId = params.get("project_id") || params.get("projectId") || "default";
     const initialProjectName = params.get("project_name") || "";
-    const state = { projectId: initialProjectId, messages: [], summary: {} };
+    const state = { projectId: initialProjectId, messages: [], summary: {}, activeTask: null, taskTimer: null };
     async function api(path, options = {}) {
       const res = await fetch(path, { ...options, headers: { "Content-Type": "application/json", "X-DevWerk-Project-Id": state.projectId, ...(options.headers || {}) } });
       const text = await res.text();
@@ -532,6 +653,7 @@ WORKBENCH_HTML = r"""
       const projects = data.projects || [];
       if (!projects.some(p => p.id === state.projectId)) state.projectId = projects[0]?.id || "default";
       $("projectSelect").innerHTML = projects.map(p => `<option value="${escAttr(p.id)}" ${p.id === state.projectId ? "selected" : ""}>${esc(p.name || p.id)} (${esc(p.id)})</option>`).join("");
+      await loadProjectConversation();
       await loadProjectConfig();
     }
     async function createProject() {
@@ -555,6 +677,11 @@ WORKBENCH_HTML = r"""
       renderSummary();
       setStatus(`Loaded ${state.projectId}`);
     }
+    async function loadProjectConversation() {
+      const data = await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/conversation`);
+      state.messages = data.messages || [];
+      renderMessages();
+    }
     async function sendDesign(save) {
       clearError();
       const content = $("prompt").value.trim();
@@ -571,7 +698,7 @@ WORKBENCH_HTML = r"""
           current_agents: JSON.parse($("agentsJson").value || "{}"),
           save: Boolean(save)
         };
-        const result = await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/workflow/design`, { method: "POST", body: JSON.stringify(payload) });
+        const result = await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/conversation`, { method: "POST", body: JSON.stringify({ ...payload, action: save ? "save_design" : "design", message: content }) });
         state.messages.push({ role: "assistant", content: result.reply || "Workflow draft updated." });
         $("workflowJson").value = JSON.stringify(result.workflow || {}, null, 2);
         $("agentsJson").value = JSON.stringify(result.agents || {}, null, 2);
@@ -583,11 +710,62 @@ WORKBENCH_HTML = r"""
         setBusy(false);
       }
     }
+    async function startProjectTask() {
+      clearError();
+      const content = $("prompt").value.trim();
+      if (!content) throw new Error("Describe the task before starting it.");
+      state.messages.push({ role: "user", content });
+      $("prompt").value = "";
+      renderMessages();
+      setBusy(true);
+      try {
+        const result = await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/conversation`, {
+          method: "POST",
+          body: JSON.stringify({ action: "start_task", message: content, messages: state.messages })
+        });
+        state.messages.push({ role: "assistant", content: result.task_id ? `Task started: ${result.task_id}` : (result.error_message || "Task dispatch failed.") });
+        renderMessages();
+        if (!result.ok) throw new Error(result.error_message || "Task dispatch failed.");
+        state.activeTask = result;
+        setStatus(`Task started ${result.task_id}`);
+        pollTask(result.poll_url);
+      } finally {
+        setBusy(false);
+      }
+    }
+    async function pollTask(pollUrl) {
+      if (!pollUrl) return;
+      if (state.taskTimer) window.clearTimeout(state.taskTimer);
+      const tick = async () => {
+        try {
+          const data = await api(pollUrl);
+          const status = data.status_key || data.task?.status_key || "";
+          const waitingFor = data.waiting_for || data.conversation?.waiting_for || "";
+          setStatus(`Task ${data.task_id || state.activeTask?.task_id || ""} ${status}${waitingFor ? ` / waiting ${waitingFor}` : ""}`);
+          if (data.result || ["done", "failed", "ready_to_apply"].includes(status)) {
+            state.messages.push({ role: "assistant", content: `Task update: ${status || "result ready"}` });
+            renderMessages();
+            return;
+          }
+          state.taskTimer = window.setTimeout(tick, 1800);
+        } catch (err) {
+          showError(err);
+        }
+      };
+      await tick();
+    }
     async function saveDraft() {
       clearError();
       await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/workflow`, { method: "PUT", body: JSON.stringify({ workflow: JSON.parse($("workflowJson").value || "{}") }) });
       await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/settings`, { method: "PUT", body: JSON.stringify({ agents: JSON.parse($("agentsJson").value || "{}") }) });
       setStatus("Saved workflow and agent overrides");
+    }
+    async function saveDesign() {
+      if ($("prompt").value.trim()) {
+        await sendDesign(true);
+      } else {
+        await saveDraft();
+      }
     }
     function renderMessages() {
       $("messages").innerHTML = state.messages.map(m => `<div class="message ${escAttr(m.role)}"><b>${esc(m.role)}</b>\n${esc(m.content)}</div>`).join("") || `<div class="muted">Start by describing the process you want.</div>`;
@@ -602,7 +780,7 @@ WORKBENCH_HTML = r"""
       $("summary").innerHTML = rows.map(([k, v]) => `<div class="metric"><span class="muted">${esc(k)}</span><b>${esc(v)}</b></div>`).join("");
       $("summaryRaw").textContent = JSON.stringify(raw || { executable_columns: executable, actions: Object.keys(workflow.actions || {}).sort(), agents }, null, 2);
     }
-    function setBusy(value) { $("send").disabled = value; $("save").disabled = value; $("load").disabled = value; setStatus(value ? "Designing..." : $("status").textContent); }
+    function setBusy(value) { $("send").disabled = value; $("save").disabled = value; $("startTask").disabled = value; $("load").disabled = value; setStatus(value ? "Working..." : $("status").textContent); }
     function setStatus(text) { $("status").textContent = text || ""; }
     function clearError() { $("error").textContent = ""; }
     function showError(err) { $("error").textContent = err.message || String(err); setBusy(false); }
@@ -617,14 +795,15 @@ WORKBENCH_HTML = r"""
     function seedProjectDesignPrompt(projectId, name) {
       if ($("prompt").value.trim()) return;
       const displayName = name || projectId;
-      $("prompt").value = `Create the DevWerk project design for "${displayName}". Define the workflow columns, state-machine actions, agent roles, context policy, retry/failure behavior, and required external capabilities.`;
+      $("prompt").value = `Create the DevWerk project design for "${displayName}". Define workflow columns, state-machine actions, default project agent behavior, context policy, retry/failure behavior, task dispatch rules, and external capabilities. The project may be coding or non-coding.`;
     }
-    $("projectSelect").onchange = async (event) => { state.projectId = event.target.value; state.messages = []; renderMessages(); await loadProjectConfig().catch(showError); };
+    $("projectSelect").onchange = async (event) => { state.projectId = event.target.value; state.messages = []; renderMessages(); await loadProjectConversation().catch(showError); await loadProjectConfig().catch(showError); };
     $("createProject").onclick = () => createProject().catch(showError);
     $("refresh").onclick = () => refresh().catch(showError);
     $("load").onclick = () => loadProjectConfig().catch(showError);
     $("send").onclick = () => sendDesign(false).catch(showError);
-    $("save").onclick = () => saveDraft().catch(showError);
+    $("save").onclick = () => saveDesign().catch(showError);
+    $("startTask").onclick = () => startProjectTask().catch(showError);
     document.querySelector(".tabs").onclick = (event) => {
       const btn = event.target.closest("button[data-tab]");
       if (!btn) return;
@@ -683,10 +862,12 @@ DASHBOARD_HTML = r"""
     .metric b { display: block; font-size: 22px; margin-top: 4px; }
     .muted { color: var(--muted); }
     .error { color: var(--danger); }
-    .projects { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); margin-bottom: 14px; }
-    .project-row { padding: 12px; }
+    .projects { grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); margin-bottom: 14px; }
+    .project-row { padding: 14px; display: grid; gap: 8px; align-content: start; }
     .project-row h3 { margin: 0 0 6px; font-size: 15px; }
-    .project-row footer { display: flex; gap: 8px; margin-top: 10px; }
+    .project-row p { margin: 0; min-height: 20px; color: var(--muted); overflow-wrap: anywhere; }
+    .project-row footer { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 4px; padding-top: 10px; border-top: 1px solid var(--line); }
+    .project-row footer button { width: 100%; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .board { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(250px, 1fr); gap: 12px; overflow-x: auto; padding-bottom: 12px; }
     .column { min-height: 380px; overflow: hidden; }
     .column h2 { margin: 0; padding: 10px 12px; font-size: 13px; display: flex; justify-content: space-between; border-bottom: 1px solid var(--line); }
@@ -728,7 +909,7 @@ DASHBOARD_HTML = r"""
     .settings-box { padding: 12px; }
     .settings-box h3 { margin: 0 0 10px; font-size: 14px; }
     .wide { grid-column: 1 / -1; }
-    @media (max-width: 900px) { .shell, .shell.collapsed { grid-template-columns: 1fr; } aside { position: sticky; top: 0; z-index: 2; border-right: 0; border-bottom: 1px solid var(--line); } nav { grid-template-columns: repeat(7, 1fr); } .stats, .settings-grid, .memory-grid, .detail-layout { grid-template-columns: 1fr; } .project-select { min-width: 0; width: 100%; margin-left: 0; } }
+    @media (max-width: 900px) { .shell, .shell.collapsed { grid-template-columns: 1fr; } aside { position: sticky; top: 0; z-index: 2; border-right: 0; border-bottom: 1px solid var(--line); } nav { grid-template-columns: repeat(7, 1fr); } .stats, .settings-grid, .memory-grid, .detail-layout { grid-template-columns: 1fr; } .project-select { min-width: 0; width: 100%; margin-left: 0; } .projects { grid-template-columns: 1fr; } .project-row footer { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
@@ -855,7 +1036,7 @@ DASHBOARD_HTML = r"""
       $("statsGrid").innerHTML = rows.map(([label, value]) => `<div class="metric"><span class="muted">${escapeHtml(label)}</span><b>${escapeHtml(value)}</b></div>`).join("");
     }
     function renderProjects() {
-      $("projectList").innerHTML = state.projects.map(p => { const s = p.stats || {}; return `<article class="project-row"><h3>${escapeHtml(p.name || p.id)}</h3><div class="muted">${escapeHtml(p.id)}</div><p>${escapeHtml(p.description || "")}</p><div class="muted">tasks ${s.tasks || 0} / requests ${s.request_count || 0} / tokens ${s.total_tokens || 0}</div><footer><button data-project="${escapeAttr(p.id)}" data-action="open-kanban">Open Kanban</button><button data-project="${escapeAttr(p.id)}" data-action="design-project">Design Workflow</button><button data-project="${escapeAttr(p.id)}" data-action="open-project-settings">Project Settings</button></footer></article>`; }).join("");
+      $("projectList").innerHTML = state.projects.map(p => { const s = p.stats || {}; return `<article class="project-row"><h3>${escapeHtml(p.name || p.id)}</h3><div class="muted">${escapeHtml(p.id)}</div><p>${escapeHtml(p.description || "")}</p><div class="muted">tasks ${s.tasks || 0} / requests ${s.request_count || 0} / tokens ${s.total_tokens || 0}</div><footer><button data-project="${escapeAttr(p.id)}" data-action="open-kanban">Kanban</button><button data-project="${escapeAttr(p.id)}" data-action="design-project">Workflow</button><button data-project="${escapeAttr(p.id)}" data-action="open-project-settings">Settings</button></footer></article>`; }).join("");
     }
     function renderBoard() {
       const data = state.board; if (!data) return;

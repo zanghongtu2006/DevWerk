@@ -822,6 +822,27 @@ def add_event(task_id: str, event_type: str, payload: dict[str, Any] | None = No
     return _task_record_response(task_id)
 
 
+def add_project_event(
+    project_id: str | None,
+    event_type: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    pid = _project_id(project_id)
+    ensure_project(pid)
+    event_payload = payload or {}
+    with _conn() as conn:
+        _insert_event(
+            conn,
+            task_id="__project__",
+            project_id=pid,
+            event_type=event_type,
+            from_status=None,
+            to_status=None,
+            payload=event_payload,
+        )
+    return {"ok": True, "project_id": pid, "event_type": event_type, "payload": event_payload}
+
+
 def list_events(
     *,
     project_id: str | None = None,

@@ -104,7 +104,7 @@ def _ask_llm(
             ),
         },
     ]
-    obj = get_llm_client("planner").chat_json(prompt)
+    obj = get_llm_client("project").chat_json(prompt)
     if not isinstance(obj, dict):
         raise ValueError("workflow designer LLM returned non-object JSON")
     return obj
