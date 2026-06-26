@@ -32,26 +32,19 @@ def design_project_workflow(
     base_workflow = _workflow_payload(current_workflow)
     agents = dict(current_agents or {})
     user_text = _latest_user_text(messages)
-    llm_error: str | None = None
-    raw_reply: dict[str, Any] | None = None
+    if not user_text:
+        raise ValueError("project conversation requires a user message")
 
-    if user_text:
-        try:
-            raw_reply = _ask_llm(project_id=project_id, messages=messages, base_workflow=base_workflow, agents=agents)
-        except Exception as exc:  # noqa: BLE001
-            llm_error = f"{type(exc).__name__}: {exc}"
-            _log.warning("workflow designer llm failed project_id=%s error=%s", project_id, llm_error)
+    try:
+        raw_reply = _ask_llm(project_id=project_id, messages=messages, base_workflow=base_workflow, agents=agents)
+    except Exception as exc:  # noqa: BLE001
+        llm_error = f"{type(exc).__name__}: {exc}"
+        _log.warning("workflow designer llm failed project_id=%s error=%s", project_id, llm_error)
+        raise ValueError(f"project LLM agent failed: {llm_error}") from exc
 
-    if raw_reply:
-        workflow = _normalize_workflow(raw_reply.get("workflow") or base_workflow)
-        agent_overrides = _normalize_agents(raw_reply.get("agents") or agents)
-        reply = str(raw_reply.get("reply") or "Workflow draft updated.")
-        source = "llm"
-    else:
-        workflow = _fallback_workflow(user_text, base_workflow)
-        agent_overrides = _fallback_agents(user_text, agents)
-        reply = "Workflow draft generated locally. Configure an LLM planner route for richer design conversations."
-        source = "fallback"
+    workflow = _normalize_workflow(raw_reply.get("workflow") or base_workflow)
+    agent_overrides = _normalize_agents(raw_reply.get("agents") or agents)
+    reply = str(raw_reply.get("reply") or "Workflow draft updated.")
 
     definition = workflow_from_dict(workflow)
     validate_managed_workflow_definition(definition)
@@ -59,11 +52,11 @@ def design_project_workflow(
     return {
         "ok": True,
         "project_id": project_id,
-        "source": source,
+        "source": "llm",
         "reply": reply,
         "workflow": workflow,
         "agents": agent_overrides,
-        "warnings": [llm_error] if llm_error else [],
+        "warnings": [],
         "summary": _workflow_summary(definition, agent_overrides),
     }
 
@@ -206,31 +199,6 @@ def _definition_to_payload(definition: WorkflowDefinition) -> dict[str, Any]:
         ],
         "actions": dict(definition.actions),
     }
-
-
-def _fallback_workflow(user_text: str, base_workflow: dict[str, Any]) -> dict[str, Any]:
-    workflow = _normalize_workflow(base_workflow)
-    text = user_text.lower()
-    if any(token in text for token in ("verify", "test", "compile", "diagnostic", "check")):
-        for column in workflow["columns"]:
-            if column["status_key"] == "verified":
-                column.setdefault("job_template", "review_code_change")
-                column.setdefault("input_artifacts", ["code_change_bundle", "review_bundle"])
-                column.setdefault("output_artifact", "verification_bundle")
-                column.setdefault("success_action", "verification_passed")
-                column.setdefault("failure_actions", ["verification_failed", "fail"])
-                column.setdefault("context_policy", {"use_project_memory": True})
-    return workflow
-
-
-def _fallback_agents(user_text: str, agents: dict[str, Any]) -> dict[str, Any]:
-    out = dict(agents or {})
-    text = user_text.lower()
-    if any(token in text for token in ("cheap", "low cost", "local")):
-        out.setdefault("planning-agent", {}).setdefault("model_route", "planner")
-        out.setdefault("coding-agent", {}).setdefault("model_route", "executor")
-        out.setdefault("review-agent", {}).setdefault("model_route", "reviewer")
-    return out
 
 
 def _normalize_agents(value: object) -> dict[str, Any]:

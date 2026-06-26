@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any
 
@@ -8,6 +9,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from urllib.parse import quote
 
+from app.services.llm_factory import get_llm_client
 from app.services.kanban import (
     add_artifact,
     add_event,
@@ -108,7 +110,7 @@ class WorkflowDesignRequest(BaseModel):
 
 
 class ProjectConversationRequest(BaseModel):
-    action: str = "design"
+    action: str = "message"
     message: str = ""
     messages: list[dict[str, Any]] = Field(default_factory=list)
     current_workflow: dict[str, Any] | None = None
@@ -218,60 +220,62 @@ def kanban_project_conversation_message(project_id: str, req: ProjectConversatio
             {"role": "user", "content": user_text, "kind": action, "metadata": req.metadata},
         )
 
+    if action in {"message", "send"}:
+        if not user_text:
+            raise HTTPException(status_code=400, detail="message is required")
+        decision = _ask_project_conversation_agent(
+            project_id=project_id,
+            messages=messages,
+            current_workflow=req.current_workflow,
+            current_agents=req.current_agents,
+        )
+        decision_action = str(decision.get("action") or "reply").strip().lower().replace("-", "_")
+        if decision_action in {"design", "save_design", "revise_workflow", "configure_project"}:
+            return _handle_project_workflow_design(
+                project_id,
+                messages=messages,
+                current_workflow=req.current_workflow,
+                current_agents=req.current_agents,
+                save=bool(decision.get("save")) or decision_action == "save_design",
+                event_kind=decision_action,
+            )
+        if decision_action in {"start_task", "run_task", "dispatch_task"}:
+            task_message = str(decision.get("task_request") or decision.get("message") or user_text).strip()
+            return _handle_project_task_dispatch(
+                project_id,
+                task_message=task_message,
+                workspace=req.workspace,
+                metadata={"project_agent_decision": decision, **req.metadata},
+                event_kind=decision_action,
+            )
+        reply = str(decision.get("reply") or "Project conversation updated.")
+        add_project_event(
+            project_id,
+            "project_conversation_message",
+            {"role": "assistant", "content": reply, "kind": "reply", "decision": decision},
+        )
+        return {"ok": True, "project_id": project_id, "kind": "reply", "reply": reply, "decision": decision}
+
     if action in {"design", "save_design", "revise_workflow", "configure_project"}:
-        design_req = WorkflowDesignRequest(
+        return _handle_project_workflow_design(
+            project_id,
             messages=messages,
             current_workflow=req.current_workflow,
             current_agents=req.current_agents,
             save=req.save or action == "save_design",
+            event_kind=action,
         )
-        result = kanban_design_project_workflow(project_id, design_req)
-        add_project_event(
-            project_id,
-            "project_conversation_message",
-            {
-                "role": "assistant",
-                "content": result.get("reply") or "Workflow draft updated.",
-                "kind": action,
-                "saved": result.get("saved", False),
-            },
-        )
-        return {"ok": True, "project_id": project_id, "kind": "workflow_design", **result}
 
     if action in {"start_task", "run_task", "dispatch_task"}:
         if not user_text:
             raise HTTPException(status_code=400, detail="message is required to start a task")
-        body = {
-            "project_id": project_id,
-            "mode": "agent",
-            "interaction_mode": "auto",
-            "messages": [{"role": "user", "content": user_text}],
-            "workspace": req.workspace
-            or {"root_id": project_id, "changed_files": [], "open_files": [], "tree_preview": "", "source_map": None},
-            "metadata": {"source": "project_conversation", **req.metadata},
-        }
-        from app.routes import workflows as workflow_routes
-
-        result = workflow_routes.start_workflow_payload(body)
-        started = bool(result.get("ok", True))
-        content = (
-            f"Task started: {result.get('task_id') or 'unknown'}"
-            if started
-            else f"Task dispatch failed: {result.get('error_message') or result.get('error_code') or 'unknown error'}"
-        )
-        add_project_event(
+        return _handle_project_task_dispatch(
             project_id,
-            "project_conversation_message",
-            {
-                "role": "assistant",
-                "content": content,
-                "kind": action,
-                "task_id": result.get("task_id"),
-                "poll_url": result.get("poll_url"),
-                "events_url": result.get("events_url"),
-            },
+            task_message=user_text,
+            workspace=req.workspace,
+            metadata=req.metadata,
+            event_kind=action,
         )
-        return {"ok": started, "project_id": project_id, "kind": "task_started", **result}
 
     raise HTTPException(status_code=400, detail=f"unsupported project conversation action: {action}")
 
@@ -519,6 +523,120 @@ def _latest_artifact_created_at(task_id: str, artifact_type: str) -> str | None:
     return None
 
 
+def _ask_project_conversation_agent(
+    *,
+    project_id: str,
+    messages: list[dict[str, Any]],
+    current_workflow: dict[str, Any] | None,
+    current_agents: dict[str, Any] | None,
+) -> dict[str, Any]:
+    prompt = [
+        {
+            "role": "system",
+            "content": (
+                "You are DevWerk's project conversation agent. Return one JSON object only. "
+                "You help users create and maintain projects, Kanban workflows, state machines, "
+                "agent definitions, and task dispatch. DevWerk is Kanban-driven: executable work "
+                "must be started as a workflow task, not bypassed. Decide one action: reply, "
+                "design, save_design, or start_task. Use design/save_design when the user asks to "
+                "create or change project workflow, columns, state machine, agents, or capabilities. "
+                "Use start_task when the user asks DevWerk to execute a project task. Support coding "
+                "and non-coding projects such as writing, research, review, and revision. JSON shape: "
+                "{action, reply, save, task_request, notes}."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "project_id": project_id,
+                    "current_workflow": current_workflow or {},
+                    "current_agents": current_agents or {},
+                    "conversation": messages[-16:],
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+    try:
+        decision = get_llm_client("project").chat_json(prompt)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"project LLM agent failed: {type(exc).__name__}: {exc}") from exc
+    if not isinstance(decision, dict):
+        raise HTTPException(status_code=502, detail="project LLM agent returned a non-object response")
+    return decision
+
+
+def _handle_project_workflow_design(
+    project_id: str,
+    *,
+    messages: list[dict[str, Any]],
+    current_workflow: dict[str, Any] | None,
+    current_agents: dict[str, Any] | None,
+    save: bool,
+    event_kind: str,
+) -> dict[str, Any]:
+    design_req = WorkflowDesignRequest(
+        messages=messages,
+        current_workflow=current_workflow,
+        current_agents=current_agents,
+        save=save,
+    )
+    result = kanban_design_project_workflow(project_id, design_req)
+    add_project_event(
+        project_id,
+        "project_conversation_message",
+        {
+            "role": "assistant",
+            "content": result.get("reply") or "Workflow draft updated.",
+            "kind": event_kind,
+            "saved": result.get("saved", False),
+        },
+    )
+    return {"ok": True, "project_id": project_id, "kind": "workflow_design", **result}
+
+
+def _handle_project_task_dispatch(
+    project_id: str,
+    *,
+    task_message: str,
+    workspace: dict[str, Any] | None,
+    metadata: dict[str, Any],
+    event_kind: str,
+) -> dict[str, Any]:
+    body = {
+        "project_id": project_id,
+        "mode": "agent",
+        "interaction_mode": "auto",
+        "messages": [{"role": "user", "content": task_message}],
+        "workspace": workspace
+        or {"root_id": project_id, "changed_files": [], "open_files": [], "tree_preview": "", "source_map": None},
+        "metadata": {"source": "project_conversation", **metadata},
+    }
+    from app.routes import workflows as workflow_routes
+
+    result = workflow_routes.start_workflow_payload(body)
+    started = bool(result.get("ok", True))
+    content = (
+        f"Task started: {result.get('task_id') or 'unknown'}"
+        if started
+        else f"Task dispatch failed: {result.get('error_message') or result.get('error_code') or 'unknown error'}"
+    )
+    add_project_event(
+        project_id,
+        "project_conversation_message",
+        {
+            "role": "assistant",
+            "content": content,
+            "kind": event_kind,
+            "task_id": result.get("task_id"),
+            "poll_url": result.get("poll_url"),
+            "events_url": result.get("events_url"),
+        },
+    )
+    return {"ok": started, "project_id": project_id, "kind": "task_started", **result}
+
+
 def _project_conversation_messages(messages: list[dict[str, Any]], message: str) -> list[dict[str, Any]]:
     out = [item for item in messages if isinstance(item, dict) and str(item.get("content") or "").strip()]
     text = str(message or "").strip()
@@ -612,7 +730,7 @@ WORKBENCH_HTML = r"""
       <div id="messages" class="messages"></div>
       <textarea id="prompt" placeholder="Describe the project, workflow change, or task to run."></textarea>
       <div class="row">
-        <button id="send" class="primary">Design Project</button>
+        <button id="send" class="primary">Send</button>
         <button id="save">Save Design</button>
         <button id="startTask">Start Task</button>
         <button id="load">Load Project Config</button>
@@ -713,6 +831,39 @@ WORKBENCH_HTML = r"""
         setBusy(false);
       }
     }
+    async function sendProjectMessage() {
+      clearError();
+      const content = $("prompt").value.trim();
+      if (!content) throw new Error("Type a project message first.");
+      state.messages.push({ role: "user", content });
+      $("prompt").value = "";
+      renderMessages();
+      setBusy(true);
+      try {
+        const payload = {
+          action: "message",
+          message: content,
+          messages: state.messages,
+          current_workflow: JSON.parse($("workflowJson").value || "{}"),
+          current_agents: JSON.parse($("agentsJson").value || "{}")
+        };
+        const result = await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/conversation`, { method: "POST", body: JSON.stringify(payload) });
+        state.messages.push({ role: "assistant", content: result.reply || (result.task_id ? `Task started: ${result.task_id}` : "Project conversation updated.") });
+        if (result.workflow) $("workflowJson").value = JSON.stringify(result.workflow || {}, null, 2);
+        if (result.agents) $("agentsJson").value = JSON.stringify(result.agents || {}, null, 2);
+        state.summary = result.summary || state.summary || {};
+        renderMessages();
+        renderSummary(result);
+        if (result.poll_url) {
+          state.activeTask = result;
+          pollTask(result.poll_url);
+        } else {
+          setStatus(result.kind || "Project conversation updated");
+        }
+      } finally {
+        setBusy(false);
+      }
+    }
     async function startProjectTask() {
       clearError();
       const content = $("prompt").value.trim();
@@ -808,7 +959,7 @@ WORKBENCH_HTML = r"""
     $("createProject").onclick = () => createProject().catch(showError);
     $("refresh").onclick = () => refresh().catch(showError);
     $("load").onclick = () => loadProjectConfig().catch(showError);
-    $("send").onclick = () => sendDesign(false).catch(showError);
+    $("send").onclick = () => sendProjectMessage().catch(showError);
     $("save").onclick = () => saveDesign().catch(showError);
     $("startTask").onclick = () => startProjectTask().catch(showError);
     document.querySelector(".tabs").onclick = (event) => {
