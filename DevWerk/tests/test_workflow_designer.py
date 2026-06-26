@@ -103,6 +103,9 @@ def test_workbench_exposes_project_workflow_designer():
     assert "Project Conversation" in WORKBENCH_HTML
     assert "Start Task" in WORKBENCH_HTML
     assert "project_id" in WORKBENCH_HTML
+    assert "isNewProjectMode" in WORKBENCH_HTML
+    assert "createDraftProjectId" in WORKBENCH_HTML
+    assert "new project option" in WORKBENCH_HTML
     assert "seedProjectDesignPrompt" in WORKBENCH_HTML
     assert "Workflow JSON" in WORKBENCH_HTML
     assert "Agent Overrides" in WORKBENCH_HTML
@@ -113,7 +116,10 @@ def test_dashboard_project_creation_opens_workbench():
 
     assert "New Project" in DASHBOARD_HTML
     assert "Save Project</button>" not in DASHBOARD_HTML
+    assert "createDraftProjectId" in DASHBOARD_HTML
     assert "openWorkbench(projectId, name, true)" in DASHBOARD_HTML
+    assert "if (!projectId) return" not in DASHBOARD_HTML
+    assert "body: JSON.stringify({ project_id: projectId, name })" not in DASHBOARD_HTML
     assert "data-action=\"design-project\"" in DASHBOARD_HTML
     assert ".project-row footer { display: grid;" in DASHBOARD_HTML
 

@@ -637,7 +637,8 @@ WORKBENCH_HTML = r"""
   <script>
     const $ = (id) => document.getElementById(id);
     const params = new URLSearchParams(window.location.search);
-    const initialProjectId = params.get("project_id") || params.get("projectId") || "default";
+    const isNewProjectMode = params.get("new") === "1";
+    const initialProjectId = params.get("project_id") || params.get("projectId") || (isNewProjectMode ? createDraftProjectId() : "default");
     const initialProjectName = params.get("project_name") || "";
     const state = { projectId: initialProjectId, messages: [], summary: {}, activeTask: null, taskTimer: null };
     async function api(path, options = {}) {
@@ -651,14 +652,16 @@ WORKBENCH_HTML = r"""
       clearError();
       const data = await api("/v1/kanban/projects");
       const projects = data.projects || [];
-      if (!projects.some(p => p.id === state.projectId)) state.projectId = projects[0]?.id || "default";
-      $("projectSelect").innerHTML = projects.map(p => `<option value="${escAttr(p.id)}" ${p.id === state.projectId ? "selected" : ""}>${esc(p.name || p.id)} (${esc(p.id)})</option>`).join("");
+      const selectedExists = projects.some(p => p.id === state.projectId);
+      if (!selectedExists && !isNewProjectMode) state.projectId = projects[0]?.id || "default";
+      const options = projects.map(p => `<option value="${escAttr(p.id)}" ${p.id === state.projectId ? "selected" : ""}>${esc(p.name || p.id)} (${esc(p.id)})</option>`);
+      if (!selectedExists && isNewProjectMode) options.unshift(`<option value="${escAttr(state.projectId)}" selected>${esc(initialProjectName || state.projectId)} (new project option)</option>`);
+      $("projectSelect").innerHTML = options.join("");
       await loadProjectConversation();
       await loadProjectConfig();
     }
     async function createProject() {
-      const projectId = $("projectId").value.trim();
-      if (!projectId) return;
+      const projectId = $("projectId").value.trim() || state.projectId || createDraftProjectId();
       const name = $("projectName").value.trim() || projectId;
       await api("/v1/kanban/projects", { method: "POST", body: JSON.stringify({ project_id: projectId, name }) });
       state.projectId = projectId;
@@ -786,6 +789,10 @@ WORKBENCH_HTML = r"""
     function showError(err) { $("error").textContent = err.message || String(err); setBusy(false); }
     function esc(value) { return String(value ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[ch])); }
     function escAttr(value) { return esc(value).replace(/`/g, "&#96;"); }
+    function createDraftProjectId() {
+      const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 17);
+      return `project-${stamp}`;
+    }
     function setWorkbenchUrl(projectId, name) {
       const next = new URL(window.location.href);
       next.searchParams.set("project_id", projectId);
@@ -812,7 +819,11 @@ WORKBENCH_HTML = r"""
       $(`tab-${btn.dataset.tab}`).classList.add("active");
       if (btn.dataset.tab === "summary") renderSummary();
     };
-    if (params.get("new") === "1") seedProjectDesignPrompt(initialProjectId, initialProjectName);
+    if (isNewProjectMode) {
+      $("projectId").value = initialProjectId;
+      $("projectName").value = initialProjectName;
+      seedProjectDesignPrompt(initialProjectId, initialProjectName);
+    }
     renderMessages();
     refresh().catch(showError);
   </script>
@@ -1174,7 +1185,11 @@ DASHBOARD_HTML = r"""
       if (isNew) query.set("new", "1");
       window.location.href = `/workbench?${query.toString()}`;
     }
-    async function createProject() { const projectId = $("newProjectId").value.trim(); const name = $("newProjectName").value.trim() || projectId; if (!projectId) return; await api("/v1/kanban/projects", { method: "POST", body: JSON.stringify({ project_id: projectId, name }) }); state.projectId = projectId; openWorkbench(projectId, name, true); }
+    function createDraftProjectId() {
+      const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 17);
+      return `project-${stamp}`;
+    }
+    async function createProject() { const typedProjectId = $("newProjectId").value.trim(); const projectId = typedProjectId || createDraftProjectId(); const name = $("newProjectName").value.trim() || (typedProjectId ? projectId : "Untitled Project"); state.projectId = projectId; openWorkbench(projectId, name, true); }
     async function createTask() { const title = $("taskTitle").value.trim(); if (!title) return; await api("/v1/kanban/tasks", { method: "POST", body: JSON.stringify({ project_id: state.projectId, title, description: $("taskDescription").value.trim() }) }); $("taskTitle").value = ""; $("taskDescription").value = ""; await refreshAll(); }
     async function saveGlobalSettings() { await api("/v1/settings", { method: "PUT", body: JSON.stringify({ llms: JSON.parse($("llmsJson").value || "{}"), routing: JSON.parse($("routingJson").value || "{}") }) }); await refreshAll(); }
     async function saveProjectSettings() { await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/settings`, { method: "PUT", body: JSON.stringify({ agents: JSON.parse($("projectAgentsJson").value || "{}"), parameters: JSON.parse($("projectParametersJson").value || "{}") }) }); await refreshAll(); }
