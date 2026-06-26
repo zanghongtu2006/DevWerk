@@ -20,7 +20,10 @@ class JobScheduler:
         self.catalog = catalog
 
     def schedule(self, *, task_id: str, column: str, job_template: str) -> ScheduledJob:
-        template = self.catalog.job(job_template)
+        try:
+            template = self.catalog.job(job_template)
+        except KeyError:
+            template = JobTemplate(id=job_template, role="general", output_contract=job_template)
         agent = self.catalog.select(template)
         return ScheduledJob(
             id=f"job-{uuid.uuid4()}",

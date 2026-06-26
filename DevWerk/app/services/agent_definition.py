@@ -47,6 +47,14 @@ class AgentCatalog:
             and job.role in agent.roles
             and set(job.required_capabilities).issubset(agent.capabilities)
         ]
+        if not candidates and job.role != "general":
+            candidates = [
+                agent
+                for agent in self.agents
+                if agent.enabled
+                and "general" in agent.roles
+                and set(job.required_capabilities).issubset(agent.capabilities)
+            ]
         if job.preferred_agent:
             preferred = next((agent for agent in candidates if agent.id == job.preferred_agent), None)
             if preferred is not None:

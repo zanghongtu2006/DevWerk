@@ -166,6 +166,16 @@ def _normalize_actions(value: object, columns: list[dict[str, Any]]) -> dict[str
         target = _status_key(raw.get("to"))
         if target in known:
             normalized[_status_key(key)] = {"to": target}
+    for column in columns:
+        if not isinstance(column, dict):
+            continue
+        success_action = _status_key(column.get("success_action"))
+        if not success_action or success_action in normalized:
+            continue
+        transitions = [_status_key(item) for item in column.get("transition_to") or [] if _status_key(item)]
+        target = next((item for item in transitions if item in known and item != "failed"), None)
+        if target:
+            normalized[success_action] = {"to": target}
     non_terminal = next((col for col in known if col not in {"done", "failed"}), None)
     defaults = {
         "fail": "failed",

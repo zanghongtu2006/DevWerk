@@ -1326,6 +1326,127 @@ async def test_workflow_recoding_receives_review_feedback(monkeypatch, tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_generic_llm_columns_drive_custom_non_coding_workflow_to_done(monkeypatch, tmp_path):
+    db_path = tmp_path / "devwerk-generic-workflow.db"
+    fake_settings = FakeSettings(db_path)
+
+    import app.services.kanban as kanban_service
+    import app.services.workflow_engine as workflow_engine_service
+
+    patch_service_settings(monkeypatch, fake_settings, kanban_service)
+    kanban_service._initialized = False
+    project_id = "generic-writing-workflow"
+    workflow = {
+        "name": "writing-workflow",
+        "version": 1,
+        "columns": [
+            {"status_key": "draft", "title": "Draft", "position": 10, "transition_to": ["topic_defined", "failed"]},
+            {
+                "status_key": "topic_defined",
+                "title": "Topic Defined",
+                "position": 20,
+                "transition_to": ["researched", "failed"],
+                "job_template": "define_writing_topic",
+                "input_artifacts": ["workflow_request"],
+                "output_artifact": "topic_bundle",
+                "success_action": "topic_ready",
+                "failure_actions": ["fail"],
+            },
+            {
+                "status_key": "researched",
+                "title": "Researched",
+                "position": 30,
+                "transition_to": ["written", "failed"],
+                "job_template": "research_writing_material",
+                "input_artifacts": ["topic_bundle"],
+                "output_artifact": "research_bundle",
+                "success_action": "research_ready",
+                "failure_actions": ["fail"],
+            },
+            {
+                "status_key": "written",
+                "title": "Written",
+                "position": 40,
+                "transition_to": ["done", "failed"],
+                "job_template": "write_draft",
+                "input_artifacts": ["topic_bundle", "research_bundle"],
+                "output_artifact": "draft_bundle",
+                "success_action": "workflow_done",
+                "failure_actions": ["fail"],
+            },
+            {"status_key": "done", "title": "Done", "position": 90, "transition_to": []},
+            {"status_key": "failed", "title": "Failed", "position": 99, "transition_to": ["draft"]},
+        ],
+        "actions": {
+            "topic_ready": {"to": "topic_defined"},
+            "research_ready": {"to": "researched"},
+            "workflow_done": {"to": "done"},
+            "fail": {"to": "failed"},
+            "abandon": {"to": "failed"},
+            "retry": {"to": "draft"},
+        },
+    }
+    kanban_service.update_project_workflow(project_id, workflow)
+    task = kanban_service.create_task(
+        project_id=project_id,
+        title="Write release note",
+        description="Write a concise release note.",
+        status_key="draft",
+    )["task"]
+    calls: list[str] = []
+
+    class FakeGenericColumnClient:
+        def chat_json(self, messages: list[dict]) -> dict:
+            payload = json.loads(messages[-1]["content"])
+            phase = payload["phase"]
+            calls.append(phase)
+            action_by_phase = {
+                "topic_defined": "topic_ready",
+                "researched": "research_ready",
+                "written": "workflow_done",
+            }
+            return {
+                "phase": phase,
+                "summary": f"{phase} complete",
+                "outputs": {"artifact": f"{phase} artifact"},
+                "warnings": [],
+                "decision": "approve",
+                "next_action": action_by_phase[phase],
+            }
+
+    monkeypatch.setattr(workflow_engine_service, "get_llm_client", lambda route: FakeGenericColumnClient())
+
+    async def plan_runner(body: dict) -> PlanResponse:
+        raise AssertionError("custom non-coding workflow must not use the coding planner")
+
+    async def coding_runner(body: dict) -> IdeChatResponse:
+        raise AssertionError("custom non-coding workflow must not use the coding runner")
+
+    engine = workflow_engine_service.WorkflowEngine(plan_runner=plan_runner, coding_runner=coding_runner)
+    await engine.run(
+        task["id"],
+        {
+            "project_id": project_id,
+            "mode": "agent",
+            "messages": [{"role": "user", "content": "Write a concise release note."}],
+            "workspace": {"root_id": project_id, "tree_preview": "", "source_map": None},
+        },
+    )
+
+    detail = kanban_service.get_task(task["id"])["task"]
+    assert detail["status_key"] == "done"
+    assert calls == ["topic_defined", "researched", "written"]
+    artifact_types = [artifact["artifact_type"] for artifact in detail["artifacts"]]
+    assert "topic_bundle" in artifact_types
+    assert "research_bundle" in artifact_types
+    assert "draft_bundle" in artifact_types
+    result = [artifact for artifact in detail["artifacts"] if artifact["artifact_type"] == "workflow_result"][-1]
+    assert result["payload"]["ok"] is True
+    assert result["payload"]["done"] is True
+    assert result["payload"]["status_key"] == "done"
+
+
+@pytest.mark.asyncio
 async def test_workflow_rework_budget_emits_explicit_resumable_pause(monkeypatch, tmp_path):
     db_path = tmp_path / "devwerk-workflow-rework-pause.db"
     fake_settings = FakeSettings(db_path)

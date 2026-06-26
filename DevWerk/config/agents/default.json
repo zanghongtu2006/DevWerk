@@ -2,6 +2,15 @@
   "version": 1,
   "agents": [
     {
+      "id": "project-agent",
+      "roles": ["general", "project", "workflow_design", "writing", "research"],
+      "runtime": "tool_loop",
+      "model_route": "default",
+      "capabilities": ["workspace.list", "workspace.read", "workspace.search", "project.compile", "source.diagnostics", "process.run"],
+      "skills": ["project-conversation", "workflow-operation", "artifact-synthesis"],
+      "memory_policy": "task_and_project"
+    },
+    {
       "id": "context-indexer",
       "roles": ["context_indexing"],
       "runtime": "local",

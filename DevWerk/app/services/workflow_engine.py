@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -22,11 +23,14 @@ from app.services.kanban import (
     get_project_settings,
     get_project_workflow,
     get_task,
+    move_task,
     start_column_run,
     update_conversation,
 )
 from app.services.session_store import read_project_memory
 from app.services.job_scheduler import JobScheduler
+from app.services.llm_factory import get_llm_client
+from app.services.provider_errors import is_retryable_llm_error
 from app.services.verification_policy import configured_post_apply_tool_requests, verification_feedback_summary
 from app.services.workflow import apply_workflow_action, record_phase_output
 from app.services.workflow_definition import WorkflowColumn, WorkflowDefinition, workflow_from_dict
@@ -44,6 +48,7 @@ class WorkflowRunState:
     plan_response: PlanResponse | None = None
     execute_response: IdeChatResponse | None = None
     review_feedback: dict[str, Any] | None = None
+    phase_outputs: list[dict[str, Any]] = field(default_factory=list)
     rework_rounds: int = 0
 
 
@@ -61,10 +66,10 @@ class WorkflowEngine:
         self.coding_runner = coding_runner
         self.review_runner = review_runner
         self._job_handlers = {
-            "context_bundle": self._run_context_column,
-            "plan_bundle": self._run_plan_column,
-            "code_change_bundle": self._run_coding_column,
-            "review_bundle": self._run_review_column,
+            "index_project_context": self._run_context_column,
+            "produce_change_plan": self._run_plan_column,
+            "generate_code_change": self._run_coding_column,
+            "review_code_change": self._run_review_column,
         }
         self._scheduler: JobScheduler | None = None
 
@@ -245,6 +250,30 @@ class WorkflowEngine:
 
             next_column = _next_executable_after_transition(definition, target_status, current)
             if next_column is None:
+                if target_status == "done" and state.execute_response is None and result.decision == "approve":
+                    response = _generic_done_response(task_id, project_id, target_status, state)
+                    append_conversation_message(
+                        task_id,
+                        role="assistant",
+                        content=response.reply or "Workflow completed.",
+                        message_type="workflow_result",
+                        metadata={"status_key": target_status},
+                    )
+                    update_conversation(task_id, state="done", waiting_for=None, active_column=target_status)
+                    _event(
+                        task_id,
+                        "workflow_finished",
+                        {
+                            "ok": response.ok,
+                            "phase": current.status_key,
+                            "status_key": response.status_key,
+                            "round": round_no,
+                            "generic_phase_outputs": len(state.phase_outputs),
+                        },
+                    )
+                    add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
+                    return
+
                 if state.execute_response is not None and result.decision == "approve":
                     response = _ready_response(task_id, project_id, target_status, state.execute_response)
                     append_conversation_message(
@@ -309,12 +338,7 @@ class WorkflowEngine:
             )
         except (KeyError, LookupError) as exc:
             raise UnsupportedJobError(str(exc)) from exc
-        handler = self._job_handlers.get(job.template.output_contract)
-        if handler is None:
-            raise UnsupportedJobError(
-                f"No runtime adapter handles output contract {job.template.output_contract!r} "
-                f"for job template {job.template.id!r}."
-            )
+        handler = self._job_handlers.get(job.template.id)
         job_body = dict(
             body,
             _workflow_job_id=job.id,
@@ -356,8 +380,10 @@ class WorkflowEngine:
         )
         _event(task_id, "column_run_started", {"column_run_id": run["id"], "run_no": run["run_no"], "status_key": column.status_key, "job_id": job.id, "agent": job.agent.id})
         try:
-            if job.template.output_contract == "code_change_bundle":
+            if job.template.id == "generate_code_change":
                 outcome = await handler(task_id, job_body, definition, workflow_summary, column, state)
+            elif handler is None:
+                outcome = await self._run_generic_column(task_id, job_body, definition, workflow_summary, column, state)
             else:
                 result = handler(task_id, job_body, workflow_summary, column, state)
                 outcome = await result if isinstance(result, Awaitable) else result
@@ -367,6 +393,190 @@ class WorkflowEngine:
         except Exception as exc:
             finish_column_run(run["id"], state="failed", checkpoint={"error": f"{type(exc).__name__}: {exc}"})
             raise
+
+    async def _run_generic_column(
+        self,
+        task_id: str,
+        body: dict[str, Any],
+        definition: WorkflowDefinition,
+        workflow_summary: dict[str, Any],
+        column: WorkflowColumn,
+        state: WorkflowRunState,
+    ) -> ColumnResult:
+        agent = _active_agent(body)
+        model_route = str(body.get("_workflow_agent_model_route") or "default").strip() or "default"
+        job_template = str(body.get("_workflow_job_template") or column.job_template or column.status_key)
+        output_artifact = column.output_artifact or f"{column.status_key}_bundle"
+        if _current_status(task_id) != column.status_key:
+            enter_action = _entry_action_for_status(definition, column.status_key)
+            if enter_action:
+                apply_workflow_action(task_id, enter_action, {"phase": column.status_key, "reason": "enter generic workflow column"})
+            else:
+                move_task(
+                    task_id,
+                    column.status_key,
+                    force=True,
+                    payload={
+                        "phase": column.status_key,
+                        "reason": "enter generic workflow column",
+                        "action": "workflow_column_entered",
+                    },
+                )
+            _event(task_id, "workflow_column_entered", {"status_key": column.status_key, "agent": agent})
+        _event(
+            task_id,
+            "workflow_column_started",
+            {
+                "status_key": column.status_key,
+                "agent": agent,
+                "job_template": job_template,
+                "runtime": "generic_llm_column",
+            },
+        )
+        context = _build_agent_context(
+            task_id,
+            column.status_key,
+            agent,
+            body,
+            workflow_summary,
+            column.input_artifacts or [],
+        )
+        _event(task_id, "agent_context_built", {"phase": column.status_key, "agent": agent, "context": _context_log_summary(context)})
+        prompt = _generic_column_prompt(
+            task_id=task_id,
+            column=column,
+            agent=agent,
+            job_template=job_template,
+            output_artifact=output_artifact,
+            workflow_summary=workflow_summary,
+            actions=definition.actions,
+            context=context,
+        )
+        _event(
+            task_id,
+            "agent_prompt_context_prepared",
+            {
+                "phase": column.status_key,
+                "agent": agent,
+                "runtime": "generic_llm_column",
+                "model_route": model_route,
+                "input_artifacts": column.input_artifacts or [],
+                "output_artifact": output_artifact,
+            },
+        )
+        raw = await _chat_json_with_retry(model_route, prompt)
+        if not isinstance(raw, dict):
+            raise ValueError("generic column agent returned a non-object JSON response")
+
+        warnings = [str(item) for item in (raw.get("warnings") or []) if str(item).strip()]
+        summary = str(raw.get("summary") or raw.get("reply") or f"{column.title} completed.").strip()
+        outputs = raw.get("outputs") if isinstance(raw.get("outputs"), dict) else {}
+        if not outputs:
+            outputs = {
+                key: value
+                for key, value in raw.items()
+                if key not in {"phase", "agent", "summary", "reply", "warnings", "decision", "next_action", "tool_requests"}
+            }
+        phase_bundle = {
+            "phase": raw.get("phase") or column.status_key,
+            "agent": raw.get("agent") or agent,
+            "job_template": job_template,
+            "summary": summary,
+            "outputs": outputs,
+            "warnings": warnings,
+            "raw": raw,
+        }
+
+        tool_requests = _allowed_client_tool_requests(
+            raw.get("tool_requests") or [],
+            body.get("client_capabilities"),
+            project_root=body.get("project_root"),
+        )
+        decision = _generic_decision(raw.get("decision"), raw.get("next_action"), has_tool_requests=bool(tool_requests))
+        if decision == "need_client_tool" and tool_requests:
+            request_payload = {
+                "phase": column.status_key,
+                "agent": agent,
+                "requests": [request.model_dump() for request in tool_requests],
+            }
+            add_artifact(task_id, artifact_type="client_tool_request", payload=request_payload)
+            output = record_phase_output(
+                task_id,
+                phase=column.status_key,
+                agent=agent,
+                status_key=_current_status(task_id),
+                summary=summary or "Column agent requested client tool evidence.",
+                inputs=context,
+                outputs={**phase_bundle, "client_tool_request": request_payload},
+                warnings=warnings,
+                decision="need_client_tool",
+                next_action="tool_result",
+            )
+            state.phase_outputs.append(output)
+            response = _waiting_response(
+                task_id,
+                status_key=_current_status(task_id),
+                waiting_for="client_tool",
+                reply=summary or "Collecting project evidence from a connected capability provider.",
+                interaction={
+                    "type": "client_tool",
+                    "reason": "generic_column_evidence",
+                    "phase": column.status_key,
+                    "session_id": output["session_id"],
+                    "actions": ["tool_result", "cancel"],
+                },
+            )
+            response.tool_requests = tool_requests
+            update_conversation(task_id, state="waiting_client", waiting_for="client_tool", active_column=column.status_key)
+            _event(task_id, "workflow_client_tool_requested", request_payload)
+            _event(task_id, "workflow_column_waiting", {**request_payload, "waiting_for": "client_tool"})
+            return ColumnResult(action="need_client_tool", target_status=response.status_key, decision="wait", response=response)
+
+        add_artifact(task_id, artifact_type=output_artifact, payload=phase_bundle)
+        action = _generic_column_action(definition, column, raw, decision)
+        if action == "fail":
+            summary = summary or f"{column.title} failed."
+        output = record_phase_output(
+            task_id,
+            phase=column.status_key,
+            agent=agent,
+            status_key=_action_target(definition, action) or column.status_key,
+            summary=summary,
+            inputs=context,
+            outputs=phase_bundle,
+            warnings=warnings,
+            decision=decision,
+            next_action=action,
+        )
+        state.phase_outputs.append(output)
+        _event(
+            task_id,
+            "agent_output_recorded",
+            {"phase": column.status_key, "agent": agent, "artifact": output_artifact, "session_id": output["session_id"]},
+        )
+        append_conversation_message(
+            task_id,
+            role="assistant",
+            content=summary,
+            message_type="phase_summary",
+            metadata={"phase": column.status_key, "agent": agent, "action": action},
+        )
+        moved = apply_workflow_action(
+            task_id,
+            action,
+            {
+                "phase": column.status_key,
+                "session_id": output["session_id"],
+                "reason": summary,
+                "output_artifact": output_artifact,
+            },
+        )
+        _event(
+            task_id,
+            "workflow_column_completed",
+            {"status_key": column.status_key, "agent": agent, "decision": decision, "action": action},
+        )
+        return ColumnResult(action=action, target_status=(moved.get("task") or {}).get("status_key"), decision=decision)
 
     def _run_context_column(
         self,
@@ -858,6 +1068,165 @@ class WorkflowEngine:
 
 class UnsupportedJobError(ValueError):
     pass
+
+
+def _generic_column_prompt(
+    *,
+    task_id: str,
+    column: WorkflowColumn,
+    agent: str,
+    job_template: str,
+    output_artifact: str,
+    workflow_summary: dict[str, Any],
+    actions: dict[str, Any],
+    context: dict[str, Any],
+) -> list[dict[str, str]]:
+    allowed_actions = {
+        action: {"to": str(rule.get("to") or "")}
+        for action, rule in actions.items()
+        if isinstance(rule, dict)
+    }
+    prompt_context = {
+        "task_id": task_id,
+        "phase": column.status_key,
+        "column": {
+            "status_key": column.status_key,
+            "title": column.title,
+            "job_template": job_template,
+            "input_artifacts": column.input_artifacts or [],
+            "output_artifact": output_artifact,
+            "success_action": column.success_action,
+            "failure_actions": column.failure_actions or [],
+            "transition_to": column.transition_to,
+            "context_policy": column.context_policy or {},
+        },
+        "workflow": workflow_summary,
+        "actions": allowed_actions,
+        "agent_context": context,
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are a DevWerk workflow column agent. Return one JSON object only. "
+                "Execute the current Kanban column using the provided task context, prior artifacts, "
+                "project memory, and workflow definition. Do not move Kanban columns yourself; choose "
+                "a semantic next_action from the supplied actions. If the phase succeeds, prefer the "
+                "column success_action. If it cannot succeed, use a configured failure action. "
+                "If external evidence is required and available tools are described in context, return "
+                "decision='need_client_tool' with tool_requests. JSON shape: "
+                "{phase, agent, summary, outputs, warnings, decision, next_action, tool_requests}. "
+                "decision must be approve, fail, request_rework, request_replan, request_recoding, "
+                "or need_client_tool."
+            ),
+        },
+        {"role": "user", "content": json.dumps(prompt_context, ensure_ascii=False)},
+    ]
+
+
+async def _chat_json_with_retry(model_route: str, messages: list[dict[str, str]]) -> dict[str, Any]:
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        try:
+            return get_llm_client(model_route).chat_json(messages)
+        except Exception as exc:  # noqa: BLE001
+            if attempt >= attempts or not is_retryable_llm_error(exc):
+                raise
+            delay = min(8.0, 1.5 * attempt)
+            _log.warning(
+                "generic column llm retry model_route=%s attempt=%s/%s error=%s",
+                model_route,
+                attempt,
+                attempts,
+                f"{type(exc).__name__}: {exc}",
+            )
+            await asyncio.sleep(delay)
+    raise RuntimeError("unreachable generic LLM retry state")
+
+
+def _generic_decision(decision: object, next_action: object, *, has_tool_requests: bool) -> str:
+    value = str(decision or "").strip().lower().replace("-", "_")
+    action = str(next_action or "").strip().lower().replace("-", "_")
+    if has_tool_requests and value in {"need_client_tool", "tool", "tools", "need_tool"}:
+        return "need_client_tool"
+    if value in {"approve", "approved", "success", "succeeded", "done", "complete", "completed"}:
+        return "approve"
+    if value in {"fail", "failed", "failure", "error"}:
+        return "fail"
+    if value in {"request_replan", "replan"} or action == "request_replan":
+        return "request_replan"
+    if value in {"request_recoding", "recoding", "request_rewrite", "rewrite", "request_rework"}:
+        return "request_recoding" if "coding" in value else "request_rework"
+    if action in {"fail", "request_replan", "request_recoding"}:
+        return action
+    return "approve"
+
+
+def _generic_column_action(
+    definition: WorkflowDefinition,
+    column: WorkflowColumn,
+    raw: dict[str, Any],
+    decision: str,
+) -> str:
+    requested = str(raw.get("next_action") or raw.get("action") or "").strip().lower().replace("-", "_")
+    if requested and _is_valid_column_action(definition, column, requested):
+        return requested
+    if decision == "fail":
+        return _failure_action(column)
+    if decision in {"request_replan", "request_recoding", "request_rework"}:
+        for action in [requested, *(column.failure_actions or [])]:
+            if action and _is_valid_column_action(definition, column, action):
+                return action
+        return _failure_action(column)
+    success = _preferred_success_action(definition, column)
+    if success:
+        return success
+    return _failure_action(column)
+
+
+def _preferred_success_action(definition: WorkflowDefinition, column: WorkflowColumn) -> str | None:
+    if column.success_action and _is_valid_column_action(definition, column, column.success_action):
+        return column.success_action
+    preferred_targets = [target for target in column.transition_to if target != "failed"]
+    for action, rule in definition.actions.items():
+        target = str(rule.get("to") or "").strip().lower() if isinstance(rule, dict) else ""
+        if target in preferred_targets:
+            return action
+    if "done" in column.transition_to and _is_valid_column_action(definition, column, "workflow_done"):
+        return "workflow_done"
+    return None
+
+
+def _is_valid_column_action(definition: WorkflowDefinition, column: WorkflowColumn, action: str) -> bool:
+    target = _action_target(definition, action)
+    if not target:
+        return False
+    if action in {"fail", "retry", "abandon"}:
+        return True
+    return target == column.status_key or target in set(column.transition_to or [])
+
+
+def _generic_done_response(
+    task_id: str,
+    project_id: str,
+    status_key: str,
+    state: WorkflowRunState,
+) -> IdeChatResponse:
+    latest = state.phase_outputs[-1] if state.phase_outputs else {}
+    summary = str(latest.get("summary") or "Workflow completed.")
+    return IdeChatResponse(
+        ok=True,
+        reply=summary,
+        done=True,
+        task_id=task_id,
+        status_key=status_key or "done",
+        phase_output=latest or None,
+        planning={
+            "project_id": project_id,
+            "phase_outputs": len(state.phase_outputs),
+            "kind": "generic_workflow_result",
+        },
+    )
 
 
 def record_agent_message(
