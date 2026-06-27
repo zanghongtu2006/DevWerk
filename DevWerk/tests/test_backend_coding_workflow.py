@@ -814,12 +814,21 @@ async def test_workflow_start_poll_result_smoke(monkeypatch, tmp_path):
             assert "workflow_transition_decided" in events_text
             assert "agent_context_built" in events_text
             assert "agent_output_recorded" in events_text
+            assert "task_memory_keys" in events_text
+            assert "project_memory_keys" in events_text
             assert "event: workflow_result" in events_text
 
             memory_response = await client.get(f"/v1/kanban/projects/{project_id}/memory")
             memory = memory_response.json()["memory"]
             assert "context_indexed" in {item["phase"] for item in memory["phase_summaries"]}
             assert {"service/main.py", "README.md"}.issubset(set(memory["paths"]))
+            assert started["task_id"] in memory["tasks_seen"]
+
+            task_memory_response = await client.get(f"/v1/kanban/tasks/{started['task_id']}/memory")
+            task_memory = task_memory_response.json()["memory"]
+            assert task_memory["task"]["id"] == started["task_id"]
+            assert task_memory["conversation"]["message_count"] >= 1
+            assert "workflow_result" in task_memory["artifact_types"]
 
             chat_response = await client.post("/v1/chat", json=body)
             assert chat_response.status_code == 404

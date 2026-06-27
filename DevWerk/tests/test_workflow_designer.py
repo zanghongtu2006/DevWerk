@@ -204,18 +204,19 @@ def test_workbench_exposes_project_workflow_designer():
 
     assert callable(kanban_routes.kanban_design_project_workflow)
     assert "/conversation" in WORKBENCH_HTML
-    assert "Create Project" in WORKBENCH_HTML
-    assert "Project Conversation" in WORKBENCH_HTML
+    assert "New Project" in WORKBENCH_HTML
+    assert "projectList" in WORKBENCH_HTML
+    assert "activeProjectName" in WORKBENCH_HTML
+    assert "composer-box" in WORKBENCH_HTML
     assert ">Send</button>" in WORKBENCH_HTML
-    assert "Start Task" in WORKBENCH_HTML
     assert 'action: "message"' in WORKBENCH_HTML
     assert "project_id" in WORKBENCH_HTML
     assert "isNewProjectMode" in WORKBENCH_HTML
     assert "createDraftProjectId" in WORKBENCH_HTML
-    assert "new project option" in WORKBENCH_HTML
-    assert "seedProjectDesignPrompt" in WORKBENCH_HTML
-    assert "Workflow JSON" in WORKBENCH_HTML
-    assert "Agent Overrides" in WORKBENCH_HTML
+    assert "Save Design" not in WORKBENCH_HTML
+    assert "Start Task" not in WORKBENCH_HTML
+    assert "Workflow JSON" not in WORKBENCH_HTML
+    assert "Agent Overrides" not in WORKBENCH_HTML
 
 
 def test_dashboard_project_creation_opens_workbench():
@@ -290,6 +291,9 @@ def test_project_conversation_default_message_uses_project_agent(monkeypatch, tm
     )
 
     assert captured["agent"] == "project"
+    prompt_payload = captured["messages"][-1]["content"]
+    assert "active_task" in prompt_payload
+    assert "current_workflow" in prompt_payload
     assert response["kind"] == "reply"
     assert response["reply"] == "Tell me the writing audience and tone."
     conversation = kanban_routes.kanban_project_conversation("conversation-project")["messages"]
@@ -420,3 +424,60 @@ def test_project_conversation_agent_can_dispatch_task_to_workflow_engine(monkeyp
     assert captured["messages"] == [{"role": "user", "content": "Write the release note using the writing workflow."}]
     assert captured["metadata"]["source"] == "project_conversation"
     assert captured["metadata"]["project_agent_decision"]["action"] == "start_task"
+
+
+def test_project_conversation_agent_can_continue_active_task(monkeypatch, tmp_path):
+    kanban_service = _configure(monkeypatch, tmp_path)
+    import app.routes.kanban as kanban_routes
+    import app.routes.workflows as workflow_routes
+
+    task = kanban_service.create_task(
+        project_id="writing-project",
+        title="Release note",
+        description="Write the release note.",
+        status_key="planned",
+    )["task"]
+    kanban_service.add_project_event(
+        "writing-project",
+        "project_conversation_message",
+        {"role": "assistant", "content": "Task started.", "kind": "start_task", "task_id": task["id"]},
+    )
+    captured = {}
+
+    class FakeProjectAgent:
+        def chat_json(self, messages):
+            captured["prompt"] = messages[-1]["content"]
+            return {
+                "action": "continue_task",
+                "task_id": task["id"],
+                "task_request": "Use the new tone guidance in the active release-note task.",
+            }
+
+    def fake_continue_workflow_payload(task_id, incoming):
+        captured["task_id"] = task_id
+        captured["incoming"] = incoming
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "poll_url": f"/v1/workflows/{task_id}",
+            "events_url": f"/v1/workflows/{task_id}/events",
+        }
+
+    monkeypatch.setattr(kanban_routes, "get_llm_client", lambda agent: FakeProjectAgent())
+    monkeypatch.setattr(workflow_routes, "continue_workflow_payload", fake_continue_workflow_payload)
+    kanban_service.upsert_project(project_id="writing-project", name="Writing Project")
+
+    response = kanban_routes.kanban_project_conversation_message(
+        "writing-project",
+        kanban_routes.ProjectConversationRequest(
+            message="Keep the same release-note task, but make the tone more formal.",
+        ),
+    )
+
+    assert response["ok"] is True
+    assert response["kind"] == "task_continued"
+    assert response["task_id"] == task["id"]
+    assert captured["task_id"] == task["id"]
+    assert captured["incoming"]["action"] == "message"
+    assert captured["incoming"]["message"] == "Use the new tone guidance in the active release-note task."
+    assert task["id"] in captured["prompt"]

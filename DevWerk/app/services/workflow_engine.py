@@ -1279,6 +1279,7 @@ def _build_agent_context(
         "workflow": workflow_summary,
         "previous_artifacts": _latest_artifacts(artifacts, required_artifacts),
         "task_events": _event_summary(task.get("events") or []),
+        "task_memory": _compact_task_memory(task, conversation_context),
         "project_memory": _compact_project_memory(read_project_memory(project_id)),
         "workspace": _workspace_summary(body.get("workspace")),
     }
@@ -1673,12 +1674,46 @@ def _compact_project_memory(memory: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _compact_task_memory(task: dict[str, Any], conversation_context: dict[str, Any]) -> dict[str, Any]:
+    artifacts = task.get("artifacts") if isinstance(task.get("artifacts"), list) else []
+    phase_outputs = [
+        artifact.get("payload") or {}
+        for artifact in artifacts
+        if isinstance(artifact, dict) and artifact.get("artifact_type") == "workflow_phase_output"
+    ]
+    return {
+        "task_id": task.get("id"),
+        "status_key": task.get("status_key"),
+        "conversation_summary": conversation_context.get("summary") or "",
+        "conversation_message_count": len(conversation_context.get("messages") or []),
+        "recent_events": _event_summary(task.get("events") or [])[-20:],
+        "artifact_types": [
+            str(artifact.get("artifact_type") or "")
+            for artifact in artifacts[-40:]
+            if isinstance(artifact, dict)
+        ],
+        "recent_phase_outputs": [
+            {
+                "phase": item.get("phase"),
+                "agent": item.get("agent"),
+                "status_key": item.get("status_key"),
+                "summary": item.get("summary"),
+                "decision": item.get("decision"),
+                "next_action": item.get("next_action"),
+            }
+            for item in phase_outputs[-20:]
+            if isinstance(item, dict)
+        ],
+    }
+
+
 def _context_log_summary(context: dict[str, Any]) -> dict[str, Any]:
     return {
         "phase": context.get("phase"),
         "agent": context.get("agent"),
         "artifact_keys": sorted((context.get("previous_artifacts") or {}).keys()),
         "event_count": len(context.get("task_events") or []),
+        "task_memory_keys": sorted((context.get("task_memory") or {}).keys()),
         "project_memory_keys": sorted((context.get("project_memory") or {}).keys()),
         "workspace": context.get("workspace"),
     }

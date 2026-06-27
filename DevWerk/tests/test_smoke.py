@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -119,6 +120,24 @@ def test_project_memory_does_not_treat_source_map_symbol_kinds_as_frameworks():
     )
 
     assert memory["frameworks"] == ["Spring Boot"]
+
+
+def test_packaging_scripts_cover_devwerk_and_intellij_plugin():
+    root = Path(__file__).resolve().parents[2]
+
+    scripts = {
+        "scripts/package-all.ps1": ["package-devwerk.ps1", "package-idea-plugin.ps1"],
+        "scripts/package-all.sh": ["package-devwerk.sh", "package-idea-plugin.sh"],
+        "scripts/package-all.bat": ["package-all.ps1"],
+        "scripts/package-devwerk.ps1": ["config/llm.json", "Compress-Archive", "install.bat", "start.sh"],
+        "scripts/package-devwerk.sh": ["config/llm.json", "install.sh", "start.bat"],
+        "scripts/package-idea-plugin.ps1": ["buildPlugin", "build\\distributions"],
+        "scripts/package-idea-plugin.sh": ["buildPlugin", "build/distributions"],
+    }
+    for relative, expected in scripts.items():
+        text = (root / relative).read_text(encoding="utf-8")
+        for needle in expected:
+            assert needle in text
 
 
 def test_failed_verification_returns_to_coding(monkeypatch, tmp_path):

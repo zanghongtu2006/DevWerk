@@ -205,19 +205,25 @@ def kanban_project_conversation(project_id: str, limit: int = 80):
                 "task_id": payload.get("task_id"),
             }
         )
-    return {"ok": True, "project_id": project_id, "messages": messages}
+    return {"ok": True, "project_id": project_id, "messages": messages, "active_task": _active_project_task(project_id)}
 
 
 @router.post("/projects/{project_id}/conversation")
 def kanban_project_conversation_message(project_id: str, req: ProjectConversationRequest):
-    action = str(req.action or "design").strip().lower().replace("-", "_")
+    action = str(req.action or "message").strip().lower().replace("-", "_")
     messages = _project_conversation_messages(req.messages, req.message)
     user_text = _latest_message_content(messages, role="user")
+    current_workflow, current_agents = _effective_project_workflow_agents(
+        project_id,
+        req.current_workflow,
+        req.current_agents,
+    )
+    active_task = _active_project_task(project_id, req.metadata.get("active_task_id"))
     if user_text:
         add_project_event(
             project_id,
             "project_conversation_message",
-            {"role": "user", "content": user_text, "kind": action, "metadata": req.metadata},
+            {"role": "user", "content": user_text, "kind": action, "metadata": req.metadata, "active_task_id": active_task.get("id") if active_task else None},
         )
 
     if action in {"message", "send"}:
@@ -226,17 +232,31 @@ def kanban_project_conversation_message(project_id: str, req: ProjectConversatio
         decision = _ask_project_conversation_agent(
             project_id=project_id,
             messages=messages,
-            current_workflow=req.current_workflow,
-            current_agents=req.current_agents,
+            current_workflow=current_workflow,
+            current_agents=current_agents,
+            active_task=active_task,
         )
         decision_action = str(decision.get("action") or "reply").strip().lower().replace("-", "_")
         if decision_action in {"design", "save_design", "revise_workflow", "configure_project"}:
             return _handle_project_workflow_design(
                 project_id,
                 messages=messages,
-                current_workflow=req.current_workflow,
-                current_agents=req.current_agents,
+                current_workflow=current_workflow,
+                current_agents=current_agents,
                 save=bool(decision.get("save")) or decision_action == "save_design",
+                event_kind=decision_action,
+            )
+        if decision_action in {"continue_task", "resume_task", "message_task"}:
+            task_id = str(decision.get("task_id") or (active_task or {}).get("id") or "").strip()
+            if not task_id:
+                raise HTTPException(status_code=409, detail="project agent chose continue_task but no active task is available")
+            task_message = str(decision.get("task_request") or decision.get("message") or user_text).strip()
+            return _handle_project_task_continue(
+                project_id,
+                task_id=task_id,
+                task_message=task_message,
+                workspace=req.workspace,
+                metadata={"project_agent_decision": decision, **req.metadata},
                 event_kind=decision_action,
             )
         if decision_action in {"start_task", "run_task", "dispatch_task"}:
@@ -260,8 +280,8 @@ def kanban_project_conversation_message(project_id: str, req: ProjectConversatio
         return _handle_project_workflow_design(
             project_id,
             messages=messages,
-            current_workflow=req.current_workflow,
-            current_agents=req.current_agents,
+            current_workflow=current_workflow,
+            current_agents=current_agents,
             save=req.save or action == "save_design",
             event_kind=action,
         )
@@ -271,6 +291,21 @@ def kanban_project_conversation_message(project_id: str, req: ProjectConversatio
             raise HTTPException(status_code=400, detail="message is required to start a task")
         return _handle_project_task_dispatch(
             project_id,
+            task_message=user_text,
+            workspace=req.workspace,
+            metadata=req.metadata,
+            event_kind=action,
+        )
+
+    if action in {"continue_task", "resume_task", "message_task"}:
+        task_id = str(req.metadata.get("task_id") or req.metadata.get("active_task_id") or (active_task or {}).get("id") or "").strip()
+        if not task_id:
+            raise HTTPException(status_code=400, detail="active task is required to continue a task")
+        if not user_text:
+            raise HTTPException(status_code=400, detail="message is required to continue a task")
+        return _handle_project_task_continue(
+            project_id,
+            task_id=task_id,
             task_message=user_text,
             workspace=req.workspace,
             metadata=req.metadata,
@@ -326,6 +361,46 @@ def kanban_get_task(task_id: str):
         return get_task(task_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/tasks/{task_id}/memory")
+def kanban_get_task_memory(task_id: str):
+    try:
+        task = get_task(task_id).get("task") or {}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    conversation = get_conversation(task_id) or {}
+    artifacts = task.get("artifacts") if isinstance(task.get("artifacts"), list) else []
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "project_id": task.get("project_id"),
+        "memory": {
+            "task": {key: task.get(key) for key in ("id", "project_id", "title", "description", "status_key", "metadata")},
+            "conversation": {
+                "state": conversation.get("state"),
+                "active_column": conversation.get("active_column"),
+                "waiting_for": conversation.get("waiting_for"),
+                "summary": conversation.get("summary") or "",
+                "message_count": len(conversation.get("messages") or []),
+            },
+            "artifact_types": [
+                str(artifact.get("artifact_type") or "")
+                for artifact in artifacts[-80:]
+                if isinstance(artifact, dict)
+            ],
+            "events": [
+                {
+                    "event_type": event.get("event_type"),
+                    "from_status": event.get("from_status"),
+                    "to_status": event.get("to_status"),
+                    "created_at": event.get("created_at"),
+                }
+                for event in (task.get("events") or [])[-80:]
+                if isinstance(event, dict)
+            ],
+        },
+    }
 
 
 @router.patch("/tasks/{task_id}")
@@ -529,6 +604,7 @@ def _ask_project_conversation_agent(
     messages: list[dict[str, Any]],
     current_workflow: dict[str, Any] | None,
     current_agents: dict[str, Any] | None,
+    active_task: dict[str, Any] | None,
 ) -> dict[str, Any]:
     prompt = [
         {
@@ -537,12 +613,14 @@ def _ask_project_conversation_agent(
                 "You are DevWerk's project conversation agent. Return one JSON object only. "
                 "You help users create and maintain projects, Kanban workflows, state machines, "
                 "agent definitions, and task dispatch. DevWerk is Kanban-driven: executable work "
-                "must be started as a workflow task, not bypassed. Decide one action: reply, "
-                "design, save_design, or start_task. Use design/save_design when the user asks to "
+                "must be executed or continued as a workflow task, not bypassed. Decide one action: reply, "
+                "design, save_design, start_task, or continue_task. Use design/save_design when the user asks to "
                 "create or change project workflow, columns, state machine, agents, or capabilities. "
-                "Use start_task when the user asks DevWerk to execute a project task. Support coding "
-                "and non-coding projects such as writing, research, review, and revision. JSON shape: "
-                "{action, reply, save, task_request, notes}."
+                "Use continue_task when the user's message belongs to the active non-terminal task, "
+                "for example extra guidance, compile feedback, rework, or follow-up details. Use start_task "
+                "when the user begins a distinct work item or the active task is terminal/unrelated. "
+                "Support coding and non-coding projects such as writing, research, review, and revision. "
+                "JSON shape: {action, reply, save, task_id, task_request, notes}."
             ),
         },
         {
@@ -552,6 +630,7 @@ def _ask_project_conversation_agent(
                     "project_id": project_id,
                     "current_workflow": current_workflow or {},
                     "current_agents": current_agents or {},
+                    "active_task": active_task or None,
                     "conversation": messages[-16:],
                 },
                 ensure_ascii=False,
@@ -565,6 +644,54 @@ def _ask_project_conversation_agent(
     if not isinstance(decision, dict):
         raise HTTPException(status_code=502, detail="project LLM agent returned a non-object response")
     return decision
+
+
+def _effective_project_workflow_agents(
+    project_id: str,
+    current_workflow: dict[str, Any] | None,
+    current_agents: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    workflow = current_workflow if isinstance(current_workflow, dict) and current_workflow.get("columns") else None
+    agents = current_agents if isinstance(current_agents, dict) and current_agents else None
+    if workflow is None:
+        workflow = get_project_workflow(project_id).get("workflow") or {}
+    if agents is None:
+        settings_payload = get_project_settings(project_id)
+        settings = settings_payload.get("settings") if isinstance(settings_payload, dict) else {}
+        agents = settings.get("agents") if isinstance(settings, dict) else {}
+    return workflow or {}, agents or {}
+
+
+def _active_project_task(project_id: str, preferred_task_id: object = None) -> dict[str, Any] | None:
+    preferred = str(preferred_task_id or "").strip()
+    candidates: list[str] = []
+    if preferred:
+        candidates.append(preferred)
+    events = list_events(project_id=project_id, limit=200).get("events", [])
+    for event in events:
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        task_id = str(payload.get("task_id") or payload.get("active_task_id") or "").strip()
+        if task_id and task_id not in candidates:
+            candidates.append(task_id)
+    for task_id in candidates:
+        try:
+            task = get_task(task_id).get("task") or {}
+        except KeyError:
+            continue
+        status_key = str(task.get("status_key") or "")
+        if status_key in {"done", "failed"}:
+            continue
+        if str(task.get("project_id") or "") != str(project_id):
+            continue
+        return {
+            "id": task.get("id"),
+            "project_id": task.get("project_id"),
+            "title": task.get("title"),
+            "description": task.get("description"),
+            "status_key": status_key,
+            "updated_at": task.get("updated_at"),
+        }
+    return None
 
 
 def _handle_project_workflow_design(
@@ -637,6 +764,46 @@ def _handle_project_task_dispatch(
     return {"ok": started, "project_id": project_id, "kind": "task_started", **result}
 
 
+def _handle_project_task_continue(
+    project_id: str,
+    *,
+    task_id: str,
+    task_message: str,
+    workspace: dict[str, Any] | None,
+    metadata: dict[str, Any],
+    event_kind: str,
+) -> dict[str, Any]:
+    from app.routes import workflows as workflow_routes
+
+    incoming: dict[str, Any] = {
+        "action": "message",
+        "message": task_message,
+        "metadata": {"source": "project_conversation", **metadata},
+    }
+    if workspace is not None:
+        incoming["workspace"] = workspace
+    result = workflow_routes.continue_workflow_payload(task_id, incoming)
+    ok = bool(result.get("ok", True))
+    content = (
+        f"Task continued: {task_id}"
+        if ok
+        else f"Task continuation failed: {result.get('error_message') or result.get('error_code') or 'unknown error'}"
+    )
+    add_project_event(
+        project_id,
+        "project_conversation_message",
+        {
+            "role": "assistant",
+            "content": content,
+            "kind": event_kind,
+            "task_id": task_id,
+            "poll_url": result.get("poll_url"),
+            "events_url": result.get("events_url"),
+        },
+    )
+    return {"ok": ok, "project_id": project_id, "kind": "task_continued", **result}
+
+
 def _project_conversation_messages(messages: list[dict[str, Any]], message: str) -> list[dict[str, Any]]:
     out = [item for item in messages if isinstance(item, dict) and str(item.get("content") or "").strip()]
     text = str(message or "").strip()
@@ -678,87 +845,104 @@ WORKBENCH_HTML = r"""
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>DevWerk Workbench</title>
   <style>
-    :root { color-scheme: light dark; --bg: #f5f7fb; --panel: #fff; --text: #182033; --muted: #687386; --line: #d7deea; --accent: #2068d8; --ok: #027a48; --danger: #b42318; }
-    @media (prefers-color-scheme: dark) { :root { --bg: #20242a; --panel: #2b3038; --text: #eef3fb; --muted: #aeb8c8; --line: #454d59; --accent: #7ba8ff; --ok: #75d6a4; --danger: #ff9b91; } }
+    :root { color-scheme: light dark; --bg: #f6f7fa; --panel: #fff; --panel-soft: #f0f3f8; --text: #182033; --muted: #687386; --line: #d7deea; --accent: #2068d8; --danger: #b42318; --user: #e7f0ff; --assistant: #fff; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #1f2329; --panel: #2b3038; --panel-soft: #242932; --text: #eef3fb; --muted: #aeb8c8; --line: #454d59; --accent: #7ba8ff; --danger: #ff9b91; --user: #243a5f; --assistant: #303641; } }
     * { box-sizing: border-box; }
+    html, body { height: 100%; }
     body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    header { min-height: 58px; display: flex; align-items: center; gap: 10px; padding: 10px 18px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
-    h1 { margin: 0; font-size: 18px; }
-    a { color: var(--accent); }
-    input, textarea, select, button { font: inherit; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); color: var(--text); }
-    input, select { height: 34px; padding: 0 10px; }
-    textarea { width: 100%; min-height: 120px; padding: 10px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; font-size: 12px; }
+    a { color: var(--accent); text-decoration: none; }
+    button, input, textarea { font: inherit; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); }
     button { height: 34px; padding: 0 12px; cursor: pointer; }
     button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
     button:disabled { opacity: .55; cursor: not-allowed; }
-    main { padding: 18px; display: grid; grid-template-columns: minmax(320px, 420px) 1fr; gap: 14px; align-items: start; }
-    .panel { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 14px; }
-    .panel h2 { margin: 0 0 10px; font-size: 15px; }
-    .grid { display: grid; gap: 10px; }
-    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    .grow { flex: 1 1 180px; }
+    input { height: 34px; padding: 0 10px; width: 100%; }
+    textarea { width: 100%; min-height: 56px; max-height: 220px; padding: 12px 14px; resize: vertical; line-height: 1.45; }
+    .app { min-height: 100vh; display: grid; grid-template-columns: minmax(220px, 22vw) minmax(0, 1fr); }
+    aside { border-right: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 100vh; }
+    .brand { height: 56px; padding: 0 14px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); gap: 10px; }
+    .brand h1 { margin: 0; font-size: 16px; }
+    .sidebar-body { padding: 12px; display: grid; gap: 12px; overflow: auto; }
+    .new-project { display: grid; gap: 8px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+    .project-list { display: grid; gap: 6px; }
+    .project-card { text-align: left; height: auto; min-height: 58px; padding: 9px 10px; display: grid; gap: 3px; border-color: transparent; background: transparent; }
+    .project-card.active { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); background: color-mix(in srgb, var(--accent) 10%, var(--panel)); }
+    .project-card b, .project-card span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    main { min-width: 0; min-height: 100vh; display: grid; grid-template-rows: 56px 1fr auto; }
+    .chat-header { border-bottom: 1px solid var(--line); background: var(--panel); display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 18px; }
+    .chat-title { min-width: 0; }
+    .chat-title b, .chat-title span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .chat-title span { color: var(--muted); font-size: 12px; }
+    .messages { padding: 24px clamp(18px, 5vw, 72px); overflow-y: auto; display: flex; flex-direction: column; gap: 16px; }
+    .empty { align-self: center; max-width: 640px; margin-top: 12vh; color: var(--muted); text-align: center; }
+    .message { max-width: min(760px, 88%); display: grid; gap: 5px; }
+    .message.user { align-self: flex-end; }
+    .message.assistant { align-self: flex-start; }
+    .bubble { border: 1px solid var(--line); border-radius: 16px; padding: 12px 14px; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--assistant); }
+    .message.user .bubble { background: var(--user); border-color: color-mix(in srgb, var(--accent) 28%, var(--line)); }
+    .meta { color: var(--muted); font-size: 12px; padding: 0 4px; }
+    .composer { border-top: 1px solid var(--line); background: var(--panel); padding: 14px clamp(18px, 5vw, 72px); display: grid; gap: 8px; }
+    .composer-box { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: end; }
+    .status-row { min-height: 20px; display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
     .muted { color: var(--muted); }
-    .ok { color: var(--ok); }
     .error { color: var(--danger); }
-    .messages { display: grid; gap: 8px; max-height: 360px; overflow: auto; padding-right: 4px; }
-    .message { border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; white-space: pre-wrap; }
-    .message.user { background: color-mix(in srgb, var(--accent) 10%, var(--panel)); }
-    .message.assistant { background: color-mix(in srgb, var(--bg) 72%, var(--panel)); }
-    .tabs { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
-    .tabs button.active { border-color: var(--accent); color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--panel)); }
-    .editor { display: none; }
-    .editor.active { display: block; }
-    .summary { display: grid; grid-template-columns: repeat(4, minmax(110px, 1fr)); gap: 8px; margin-top: 10px; }
-    .metric { border: 1px solid var(--line); border-radius: 7px; padding: 9px; }
-    .metric b { display: block; font-size: 17px; margin-top: 2px; }
-    @media (max-width: 980px) { main { grid-template-columns: 1fr; } .summary { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 880px) {
+      .app { grid-template-columns: 1fr; }
+      aside { min-height: auto; max-height: 42vh; border-right: 0; border-bottom: 1px solid var(--line); }
+      main { min-height: 58vh; grid-template-rows: 52px 1fr auto; }
+      .messages { padding: 16px; }
+      .composer { padding: 12px 16px; }
+      .message { max-width: 96%; }
+    }
   </style>
 </head>
 <body>
-  <header>
-    <h1>DevWerk Workbench</h1>
-    <select id="projectSelect" class="grow"></select>
-    <input id="projectId" placeholder="new projectId" />
-    <input id="projectName" placeholder="project name" />
-    <button id="createProject" class="primary">Create Project</button>
-    <button id="refresh">Refresh</button>
-    <a href="/dashboard">Dashboard</a>
-  </header>
-  <main>
-    <section class="panel grid">
-      <h2>Project Conversation</h2>
+  <div class="app">
+    <aside>
+      <div class="brand">
+        <h1>DevWerk</h1>
+        <a href="/dashboard">Dashboard</a>
+      </div>
+      <div class="sidebar-body">
+        <section class="new-project">
+          <input id="projectName" placeholder="New project name" />
+          <input id="projectId" placeholder="project id (optional)" />
+          <button id="createProject" class="primary">New Project</button>
+        </section>
+        <section>
+          <div class="status-row"><span class="muted">Projects</span><button id="refresh">Refresh</button></div>
+          <div id="projectList" class="project-list"></div>
+        </section>
+      </div>
+    </aside>
+    <main>
+      <header class="chat-header">
+        <div class="chat-title">
+          <b id="activeProjectName">Project</b>
+          <span id="activeProjectId">default</span>
+        </div>
+        <span id="taskStatus" class="muted"></span>
+      </header>
       <div id="messages" class="messages"></div>
-      <textarea id="prompt" placeholder="Describe the project, workflow change, or task to run."></textarea>
-      <div class="row">
-        <button id="send" class="primary">Send</button>
-        <button id="save">Save Design</button>
-        <button id="startTask">Start Task</button>
-        <button id="load">Load Project Config</button>
-      </div>
-      <div id="status" class="muted"></div>
-      <div id="error" class="error"></div>
-    </section>
-    <section class="panel">
-      <div class="tabs">
-        <button data-tab="workflow" class="active">Workflow JSON</button>
-        <button data-tab="agents">Agent Overrides</button>
-        <button data-tab="summary">Summary</button>
-      </div>
-      <section id="tab-workflow" class="editor active"><textarea id="workflowJson" style="min-height:620px"></textarea></section>
-      <section id="tab-agents" class="editor"><textarea id="agentsJson" style="min-height:620px"></textarea></section>
-      <section id="tab-summary" class="editor">
-        <div id="summary" class="summary"></div>
-        <pre id="summaryRaw" class="panel" style="overflow:auto; max-height:520px"></pre>
+      <section class="composer">
+        <div class="composer-box">
+          <textarea id="prompt" placeholder="Message DevWerk about this project, workflow, or task."></textarea>
+          <button id="send" class="primary">Send</button>
+        </div>
+        <div class="status-row">
+          <span id="status" class="muted"></span>
+          <span id="error" class="error"></span>
+        </div>
       </section>
-    </section>
-  </main>
+    </main>
+  </div>
   <script>
     const $ = (id) => document.getElementById(id);
     const params = new URLSearchParams(window.location.search);
     const isNewProjectMode = params.get("new") === "1";
     const initialProjectId = params.get("project_id") || params.get("projectId") || (isNewProjectMode ? createDraftProjectId() : "default");
     const initialProjectName = params.get("project_name") || "";
-    const state = { projectId: initialProjectId, messages: [], summary: {}, activeTask: null, taskTimer: null };
+    const state = { projectId: initialProjectId, projects: [], messages: [], activeTask: null, taskTimer: null, busy: false };
+
     async function api(path, options = {}) {
       const res = await fetch(path, { ...options, headers: { "Content-Type": "application/json", "X-DevWerk-Project-Id": state.projectId, ...(options.headers || {}) } });
       const text = await res.text();
@@ -766,96 +950,63 @@ WORKBENCH_HTML = r"""
       if (!res.ok) throw new Error(data.detail || text || `HTTP ${res.status}`);
       return data;
     }
+
     async function refresh() {
       clearError();
       const data = await api("/v1/kanban/projects");
-      const projects = data.projects || [];
-      const selectedExists = projects.some(p => p.id === state.projectId);
-      if (!selectedExists && !isNewProjectMode) state.projectId = projects[0]?.id || "default";
-      const options = projects.map(p => `<option value="${escAttr(p.id)}" ${p.id === state.projectId ? "selected" : ""}>${esc(p.name || p.id)} (${esc(p.id)})</option>`);
-      if (!selectedExists && isNewProjectMode) options.unshift(`<option value="${escAttr(state.projectId)}" selected>${esc(initialProjectName || state.projectId)} (new project option)</option>`);
-      $("projectSelect").innerHTML = options.join("");
+      state.projects = data.projects || [];
+      const selectedExists = state.projects.some(p => p.id === state.projectId);
+      if (!selectedExists && !isNewProjectMode) state.projectId = state.projects[0]?.id || "default";
+      renderProjects();
       await loadProjectConversation();
-      await loadProjectConfig();
     }
+
     async function createProject() {
-      const projectId = $("projectId").value.trim() || state.projectId || createDraftProjectId();
-      const name = $("projectName").value.trim() || projectId;
+      clearError();
+      const name = $("projectName").value.trim() || initialProjectName || "Untitled Project";
+      const projectId = $("projectId").value.trim() || createDraftProjectId();
       await api("/v1/kanban/projects", { method: "POST", body: JSON.stringify({ project_id: projectId, name }) });
       state.projectId = projectId;
       setWorkbenchUrl(projectId, name);
-      seedProjectDesignPrompt(projectId, name);
-      $("projectId").value = "";
       $("projectName").value = "";
+      $("projectId").value = "";
       await refresh();
+      if (!state.messages.length) {
+        $("prompt").value = `Create the DevWerk project design for "${name}". Define the workflow, state machine, default agent behavior, context policy, retry/failure behavior, task dispatch rules, and external capabilities.`;
+      }
     }
-    async function loadProjectConfig() {
-      const workflow = await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/workflow`);
-      const settings = await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/settings`);
-      $("workflowJson").value = JSON.stringify(workflow.workflow || {}, null, 2);
-      $("agentsJson").value = JSON.stringify((settings.settings || {}).agents || {}, null, 2);
-      state.summary = { source: "loaded", workflow: workflow.workflow?.summary || null };
-      renderSummary();
-      setStatus(`Loaded ${state.projectId}`);
-    }
+
     async function loadProjectConversation() {
       const data = await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/conversation`);
       state.messages = data.messages || [];
+      state.activeTask = data.active_task || null;
       renderMessages();
+      renderHeader();
     }
-    async function sendDesign(save) {
-      clearError();
-      const content = $("prompt").value.trim();
-      if (content) {
-        state.messages.push({ role: "user", content });
-        $("prompt").value = "";
-      }
-      renderMessages();
-      setBusy(true);
-      try {
-        const payload = {
-          messages: state.messages,
-          current_workflow: JSON.parse($("workflowJson").value || "{}"),
-          current_agents: JSON.parse($("agentsJson").value || "{}"),
-          save: Boolean(save)
-        };
-        const result = await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/conversation`, { method: "POST", body: JSON.stringify({ ...payload, action: save ? "save_design" : "design", message: content }) });
-        state.messages.push({ role: "assistant", content: result.reply || "Workflow draft updated." });
-        $("workflowJson").value = JSON.stringify(result.workflow || {}, null, 2);
-        $("agentsJson").value = JSON.stringify(result.agents || {}, null, 2);
-        state.summary = result.summary || {};
-        renderMessages();
-        renderSummary(result);
-        setStatus(result.saved ? "Draft generated and saved" : "Draft generated");
-      } finally {
-        setBusy(false);
-      }
-    }
+
     async function sendProjectMessage() {
       clearError();
       const content = $("prompt").value.trim();
-      if (!content) throw new Error("Type a project message first.");
-      state.messages.push({ role: "user", content });
+      if (!content) return;
+      state.messages.push({ role: "user", content, kind: "message" });
       $("prompt").value = "";
       renderMessages();
       setBusy(true);
       try {
-        const payload = {
-          action: "message",
-          message: content,
-          messages: state.messages,
-          current_workflow: JSON.parse($("workflowJson").value || "{}"),
-          current_agents: JSON.parse($("agentsJson").value || "{}")
-        };
-        const result = await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/conversation`, { method: "POST", body: JSON.stringify(payload) });
-        state.messages.push({ role: "assistant", content: result.reply || (result.task_id ? `Task started: ${result.task_id}` : "Project conversation updated.") });
-        if (result.workflow) $("workflowJson").value = JSON.stringify(result.workflow || {}, null, 2);
-        if (result.agents) $("agentsJson").value = JSON.stringify(result.agents || {}, null, 2);
-        state.summary = result.summary || state.summary || {};
+        const result = await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/conversation`, {
+          method: "POST",
+          body: JSON.stringify({
+            action: "message",
+            message: content,
+            messages: state.messages,
+            metadata: { active_task_id: state.activeTask?.id || state.activeTask?.task_id || null }
+          })
+        });
+        state.messages.push({ role: "assistant", content: assistantText(result), kind: result.kind || "reply", task_id: result.task_id });
+        if (result.task_id) state.activeTask = { id: result.task_id, status_key: result.status_key || "queued" };
         renderMessages();
-        renderSummary(result);
+        renderHeader();
         if (result.poll_url) {
-          state.activeTask = result;
           pollTask(result.poll_url);
         } else {
           setStatus(result.kind || "Project conversation updated");
@@ -864,29 +1015,7 @@ WORKBENCH_HTML = r"""
         setBusy(false);
       }
     }
-    async function startProjectTask() {
-      clearError();
-      const content = $("prompt").value.trim();
-      if (!content) throw new Error("Describe the task before starting it.");
-      state.messages.push({ role: "user", content });
-      $("prompt").value = "";
-      renderMessages();
-      setBusy(true);
-      try {
-        const result = await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/conversation`, {
-          method: "POST",
-          body: JSON.stringify({ action: "start_task", message: content, messages: state.messages })
-        });
-        state.messages.push({ role: "assistant", content: result.task_id ? `Task started: ${result.task_id}` : (result.error_message || "Task dispatch failed.") });
-        renderMessages();
-        if (!result.ok) throw new Error(result.error_message || "Task dispatch failed.");
-        state.activeTask = result;
-        setStatus(`Task started ${result.task_id}`);
-        pollTask(result.poll_url);
-      } finally {
-        setBusy(false);
-      }
-    }
+
     async function pollTask(pollUrl) {
       if (!pollUrl) return;
       if (state.taskTimer) window.clearTimeout(state.taskTimer);
@@ -894,10 +1023,11 @@ WORKBENCH_HTML = r"""
         try {
           const data = await api(pollUrl);
           const status = data.status_key || data.task?.status_key || "";
-          const waitingFor = data.waiting_for || data.conversation?.waiting_for || "";
-          setStatus(`Task ${data.task_id || state.activeTask?.task_id || ""} ${status}${waitingFor ? ` / waiting ${waitingFor}` : ""}`);
+          state.activeTask = { id: data.task_id || state.activeTask?.id, status_key: status };
+          renderHeader();
+          setStatus(`Task ${state.activeTask.id || ""} ${status}`);
           if (data.result || ["done", "failed", "ready_to_apply"].includes(status)) {
-            state.messages.push({ role: "assistant", content: `Task update: ${status || "result ready"}` });
+            state.messages.push({ role: "assistant", content: `Task update: ${status || "result ready"}`, kind: "task_update", task_id: state.activeTask.id });
             renderMessages();
             return;
           }
@@ -908,33 +1038,54 @@ WORKBENCH_HTML = r"""
       };
       await tick();
     }
-    async function saveDraft() {
-      clearError();
-      await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/workflow`, { method: "PUT", body: JSON.stringify({ workflow: JSON.parse($("workflowJson").value || "{}") }) });
-      await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/settings`, { method: "PUT", body: JSON.stringify({ agents: JSON.parse($("agentsJson").value || "{}") }) });
-      setStatus("Saved workflow and agent overrides");
+
+    function renderProjects() {
+      const projects = state.projects;
+      $("projectList").innerHTML = projects.map(project => `
+        <button class="project-card ${project.id === state.projectId ? "active" : ""}" data-project="${escAttr(project.id)}">
+          <b>${esc(project.name || project.id)}</b>
+          <span class="muted">${esc(project.id)}</span>
+        </button>
+      `).join("") || `<div class="muted">No projects yet.</div>`;
+      renderHeader();
     }
-    async function saveDesign() {
-      if ($("prompt").value.trim()) {
-        await sendDesign(true);
-      } else {
-        await saveDraft();
-      }
+
+    function renderHeader() {
+      const project = state.projects.find(item => item.id === state.projectId) || { id: state.projectId, name: initialProjectName || state.projectId };
+      $("activeProjectName").textContent = project.name || project.id || "Project";
+      $("activeProjectId").textContent = project.id || state.projectId || "default";
+      $("taskStatus").textContent = state.activeTask?.id ? `Task ${state.activeTask.id} ${state.activeTask.status_key || ""}` : "";
     }
+
     function renderMessages() {
-      $("messages").innerHTML = state.messages.map(m => `<div class="message ${escAttr(m.role)}"><b>${esc(m.role)}</b>\n${esc(m.content)}</div>`).join("") || `<div class="muted">Start by describing the process you want.</div>`;
+      if (!state.messages.length) {
+        $("messages").innerHTML = `<div class="empty">Start with a project goal. DevWerk will design the workflow, maintain the Kanban state machine, and start or continue tasks from the conversation.</div>`;
+        return;
+      }
+      $("messages").innerHTML = state.messages.map(message => `
+        <article class="message ${escAttr(message.role || "assistant")}">
+          <div class="meta">${esc(message.role || "assistant")}${message.task_id ? ` / task ${esc(message.task_id)}` : ""}</div>
+          <div class="bubble">${esc(message.content || "")}</div>
+        </article>
+      `).join("");
       $("messages").scrollTop = $("messages").scrollHeight;
     }
-    function renderSummary(raw) {
-      const workflow = JSON.parse($("workflowJson").value || "{}");
-      const agents = JSON.parse($("agentsJson").value || "{}");
-      const columns = workflow.columns || [];
-      const executable = columns.filter(c => c.job_template).map(c => c.status_key);
-      const rows = [["Columns", columns.length], ["Executable", executable.length], ["Actions", Object.keys(workflow.actions || {}).length], ["Agent Overrides", Object.keys(agents).length]];
-      $("summary").innerHTML = rows.map(([k, v]) => `<div class="metric"><span class="muted">${esc(k)}</span><b>${esc(v)}</b></div>`).join("");
-      $("summaryRaw").textContent = JSON.stringify(raw || { executable_columns: executable, actions: Object.keys(workflow.actions || {}).sort(), agents }, null, 2);
+
+    function assistantText(result) {
+      if (result.reply) return result.reply;
+      if (result.kind === "workflow_design") return result.saved ? "Project workflow updated." : "Workflow draft created.";
+      if (result.kind === "task_continued") return `Continuing task ${result.task_id}.`;
+      if (result.task_id) return `Task started: ${result.task_id}`;
+      return "Project conversation updated.";
     }
-    function setBusy(value) { $("send").disabled = value; $("save").disabled = value; $("startTask").disabled = value; $("load").disabled = value; setStatus(value ? "Working..." : $("status").textContent); }
+
+    function setBusy(value) {
+      state.busy = value;
+      $("send").disabled = value;
+      $("prompt").disabled = value;
+      $("createProject").disabled = value;
+      setStatus(value ? "Working..." : "");
+    }
     function setStatus(text) { $("status").textContent = text || ""; }
     function clearError() { $("error").textContent = ""; }
     function showError(err) { $("error").textContent = err.message || String(err); setBusy(false); }
@@ -950,30 +1101,28 @@ WORKBENCH_HTML = r"""
       if (name) next.searchParams.set("project_name", name);
       history.replaceState(null, "", next.toString());
     }
-    function seedProjectDesignPrompt(projectId, name) {
-      if ($("prompt").value.trim()) return;
-      const displayName = name || projectId;
-      $("prompt").value = `Create the DevWerk project design for "${displayName}". Define workflow columns, state-machine actions, default project agent behavior, context policy, retry/failure behavior, task dispatch rules, and external capabilities. The project may be coding or non-coding.`;
-    }
-    $("projectSelect").onchange = async (event) => { state.projectId = event.target.value; state.messages = []; renderMessages(); await loadProjectConversation().catch(showError); await loadProjectConfig().catch(showError); };
+
+    $("projectList").onclick = async (event) => {
+      const button = event.target.closest("button[data-project]");
+      if (!button || state.busy) return;
+      state.projectId = button.dataset.project;
+      state.messages = [];
+      setWorkbenchUrl(state.projectId, "");
+      renderProjects();
+      await loadProjectConversation().catch(showError);
+    };
     $("createProject").onclick = () => createProject().catch(showError);
     $("refresh").onclick = () => refresh().catch(showError);
-    $("load").onclick = () => loadProjectConfig().catch(showError);
     $("send").onclick = () => sendProjectMessage().catch(showError);
-    $("save").onclick = () => saveDesign().catch(showError);
-    $("startTask").onclick = () => startProjectTask().catch(showError);
-    document.querySelector(".tabs").onclick = (event) => {
-      const btn = event.target.closest("button[data-tab]");
-      if (!btn) return;
-      document.querySelectorAll(".tabs button").forEach(item => item.classList.toggle("active", item === btn));
-      document.querySelectorAll(".editor").forEach(item => item.classList.remove("active"));
-      $(`tab-${btn.dataset.tab}`).classList.add("active");
-      if (btn.dataset.tab === "summary") renderSummary();
-    };
+    $("prompt").addEventListener("keydown", event => {
+      if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+        event.preventDefault();
+        sendProjectMessage().catch(showError);
+      }
+    });
     if (isNewProjectMode) {
-      $("projectId").value = initialProjectId;
       $("projectName").value = initialProjectName;
-      seedProjectDesignPrompt(initialProjectId, initialProjectName);
+      $("projectId").value = initialProjectId;
     }
     renderMessages();
     refresh().catch(showError);

@@ -114,14 +114,16 @@ memory, and global model routing.
 `/workbench` is the product setup entry. It can:
 
 - create a project
-- load the project's active workflow and agent overrides
-- discuss a workflow design in a chat-style panel
-- generate a workflow JSON draft through the planner LLM when available
-- fall back to a local valid draft when no LLM is configured
-- edit and save columns, transitions, actions, and project agent overrides
+- show projects in a left rail and a large project chat on the right
+- discuss project workflow, agent behavior, state-machine changes, and tasks
+- let the project conversation agent decide whether to reply, save workflow
+  design, start a new task, or continue the active task
+- keep workflow JSON, agent overrides, memory, and events in dashboard views
+  instead of the main conversation surface
 
-This is intentionally separate from the IDE coding loop. It configures how a
-project should run; `/v1/workflows` still executes actual coding tasks.
+The workbench is not limited to coding. It is the standalone product entry for
+LLM-driven Kanban projects, including writing, research, review, revision, and
+coding workflows.
 
 ## Main APIs
 
@@ -232,8 +234,9 @@ DevWerk/data/sessions/{projectId}/project_memory.jsonl
 ```
 
 SQLite is the source of truth for tasks, events, artifacts, conversations,
-column runs, and candidate revisions. Project memory is a compact reusable
-summary, not a raw prompt store.
+column runs, and candidate revisions. Task memory is built from the active
+task's conversation, events, artifacts, and phase outputs. Project memory is a
+compact reusable summary carried into every task, not a raw prompt store.
 
 ## Running Locally
 
@@ -269,6 +272,37 @@ Plugin checks:
 cd idea-plugin
 .\gradlew.bat test verifyPlugin --no-daemon
 ```
+
+## Packaging
+
+Windows:
+
+```powershell
+.\scripts\package-all.ps1
+```
+
+or:
+
+```bat
+scripts\package-all.bat
+```
+
+macOS/Linux:
+
+```sh
+sh scripts/package-all.sh
+```
+
+Outputs:
+
+```text
+dist/devwerk-release.zip              DevWerk service package
+dist/idea-plugin/DevWerk-*.zip        IntelliJ Platform plugin install package
+```
+
+The service package includes `install` and `start` scripts for Windows and
+Unix-like systems. Local secrets and runtime data are excluded, including
+`DevWerk/config/llm.json`, `.env*`, `data/`, tests, and bytecode caches.
 
 ## Design Principles
 
