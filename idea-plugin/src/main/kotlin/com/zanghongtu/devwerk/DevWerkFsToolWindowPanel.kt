@@ -60,6 +60,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
 
     init {
         initUi()
+        restoreActiveTaskFromMeta()
     }
 
     private fun initUi() {
@@ -183,6 +184,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         if (text.isEmpty() && pendingAttachments.isEmpty()) return
         if (state !in setOf(State.IDLE, State.USER_GUIDANCE)) return
 
+        restoreActiveTaskFromMeta(silent = true)
         val continuingWithGuidance = state == State.USER_GUIDANCE
 
         val attachments = pendingAttachments.toList()
@@ -197,7 +199,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 attachments,
                 when {
                     continuingWithGuidance -> "message"
-                    activeTaskId != null -> "revise_plan"
+                    activeTaskId != null -> "message"
                     else -> null
                 }
             )
@@ -216,13 +218,17 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
             }
 
             val projectId = DevWerkProjectMeta.getOrCreateProjectId(project)
+            val restoredTaskId = activeTaskId ?: DevWerkProjectMeta.getActiveTask(project)?.taskId
+            if (!restoredTaskId.isNullOrBlank()) {
+                activeTaskId = restoredTaskId
+            }
             val uploaded = files.map { file -> aiClient!!.uploadAttachment(file, projectId) }
             val message = buildUserMessage(userText, uploaded)
             val chatCtx = ChatContext(
                 projectRoot = project.basePath,
                 history = history.toList(),
                 projectId = projectId,
-                taskId = activeTaskId,
+                taskId = restoredTaskId,
                 workflowAction = workflowAction,
                 project = project
             )
@@ -271,6 +277,7 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
             if (response.ok && response.waitingFor != null) {
                 activeTaskId = response.taskId
                 waitingFor = response.waitingFor
+                persistActiveTask(response)
                 devCtx?.let { runner.recordInteractionPaused(it, response) }
             } else if (devCtx != null) {
                 if (isReadyToApply(response)) {
@@ -279,7 +286,12 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                     runner.recordFinalSummaryAndBackup(project, devCtx, response)
                 }
                 val terminal = !response.ok || response.done || response.statusKey in setOf("done", "failed")
-                if (terminal) runner.recordInteractionEnded(devCtx, response)
+                if (terminal) {
+                    clearActiveTask(response)
+                    runner.recordInteractionEnded(devCtx, response)
+                } else {
+                    persistActiveTask(response)
+                }
             } else if (isReadyToApply(response)) {
                 (aiClient as? HttpAiClient)?.let {
                     reportApplyResult(it, response, null, ok = false, changedPaths = collectChangedPaths(response), errorMessage = "DevWerk local operation context is unavailable.")
@@ -324,6 +336,31 @@ class DevWerkFsToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 setState(State.IDLE)
             }
         }
+    }
+
+    private fun restoreActiveTaskFromMeta(silent: Boolean = false) {
+        if (activeTaskId != null) return
+        val active = DevWerkProjectMeta.getActiveTask(project) ?: return
+        activeTaskId = active.taskId
+        waitingFor = active.waitingFor
+        if (!silent) {
+            appendChatLine("[System] Restored active workflow task: ${active.taskId}")
+        }
+        if (active.waitingFor == "user_guidance") {
+            setState(State.USER_GUIDANCE)
+        }
+    }
+
+    private fun persistActiveTask(response: IdeChatResponse) {
+        val taskId = response.taskId?.takeIf { it.isNotBlank() } ?: return
+        activeTaskId = taskId
+        waitingFor = response.waitingFor
+        DevWerkProjectMeta.saveActiveTask(project, taskId, response.statusKey, response.waitingFor)
+    }
+
+    private fun clearActiveTask(response: IdeChatResponse) {
+        val taskId = response.taskId
+        DevWerkProjectMeta.clearActiveTask(project, taskId)
     }
 
     private fun resolveClientToolPauses(
