@@ -33,14 +33,14 @@ def test_default_kanban_flow_contains_required_control_points():
 
 
 def test_dashboard_contains_task_detail_surface():
-    from app.routes.kanban import DASHBOARD_HTML
+    from app.routes.kanban import TASKS_HTML
 
-    assert 'data-view="details"' in DASHBOARD_HTML
-    assert 'id="view-details"' in DASHBOARD_HTML
-    assert "loadTaskDetail" in DASHBOARD_HTML
-    assert "workflow_phase_output" in DASHBOARD_HTML
-    assert "code_context_summary" in DASHBOARD_HTML
-    assert "review_bundle" in DASHBOARD_HTML
+    assert "Task ID" in TASKS_HTML
+    assert "Execution log (reasoning + actions)" in TASKS_HTML
+    assert "Memory / Context" in TASKS_HTML
+    assert "Linked files" in TASKS_HTML
+    assert "plan_bundle" in TASKS_HTML
+    assert "code_change_bundle" in TASKS_HTML
 
 
 def test_workflow_action_protocol_drives_kanban_state(monkeypatch, tmp_path):

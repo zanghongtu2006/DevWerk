@@ -9,6 +9,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from urllib.parse import quote
 
+from app.routes.web_ui import render_web_ui
 from app.services.llm_factory import get_llm_client
 from app.services.kanban import (
     add_artifact,
@@ -887,17 +888,22 @@ def _latest_message_content(messages: list[dict[str, Any]], *, role: str) -> str
 
 @ui_router.get("/kanban", response_class=HTMLResponse)
 def kanban_ui():
-    return HTMLResponse(KANBAN_HTML)
+    return HTMLResponse(render_web_ui("kanban"))
 
 
 @ui_router.get("/dashboard", response_class=HTMLResponse)
 def dashboard_ui():
-    return HTMLResponse(DASHBOARD_HTML)
+    return HTMLResponse(render_web_ui("projects"))
 
 
 @ui_router.get("/workbench", response_class=HTMLResponse)
 def workbench_ui():
-    return HTMLResponse(WORKBENCH_HTML)
+    return HTMLResponse(render_web_ui("overview"))
+
+
+@ui_router.get("/tasks", response_class=HTMLResponse)
+def tasks_ui():
+    return HTMLResponse(render_web_ui("tasks"))
 
 
 WORKBENCH_HTML = r"""
@@ -1985,3 +1991,11 @@ KANBAN_HTML = r"""
 </body>
 </html>
 """
+
+
+# Final compatibility exports. The old module used large standalone HTML
+# constants; routes and imports now resolve to the shared redesigned shell.
+WORKBENCH_HTML = render_web_ui("overview")
+DASHBOARD_HTML = render_web_ui("projects")
+KANBAN_HTML = render_web_ui("kanban")
+TASKS_HTML = render_web_ui("tasks")

@@ -206,18 +206,17 @@ def test_workbench_exposes_project_workflow_designer():
     assert "/conversation" in WORKBENCH_HTML
     assert "New Project" in WORKBENCH_HTML
     assert "projectList" in WORKBENCH_HTML
-    assert "activeProjectName" in WORKBENCH_HTML
-    assert "composer-box" in WORKBENCH_HTML
-    assert 'id="splitter"' in WORKBENCH_HTML
-    assert "--sidebar-width" in WORKBENCH_HTML
-    assert "initSplitter()" in WORKBENCH_HTML
+    assert "ctxProject" in WORKBENCH_HTML
+    assert "ctxModelRoute" in WORKBENCH_HTML
+    assert "project-rail" in WORKBENCH_HTML
+    assert "resize: horizontal" in WORKBENCH_HTML
     assert "overflow-y: auto" in WORKBENCH_HTML
+    assert "composer-box" in WORKBENCH_HTML
     assert "normalizeMessages" in WORKBENCH_HTML
-    assert ">Send</button>" in WORKBENCH_HTML
-    assert 'action: "message"' in WORKBENCH_HTML
+    assert "displayMessageContent" in WORKBENCH_HTML
+    assert "sendProjectMessage" in WORKBENCH_HTML
+    assert 'action:"message"' in WORKBENCH_HTML
     assert "project_id" in WORKBENCH_HTML
-    assert "isNewProjectMode" in WORKBENCH_HTML
-    assert "createDraftProjectId" in WORKBENCH_HTML
     assert "Save Design" not in WORKBENCH_HTML
     assert "Start Task" not in WORKBENCH_HTML
     assert "Workflow JSON" not in WORKBENCH_HTML
@@ -229,12 +228,26 @@ def test_dashboard_project_creation_opens_workbench():
 
     assert "New Project" in DASHBOARD_HTML
     assert "Save Project</button>" not in DASHBOARD_HTML
-    assert "createDraftProjectId" in DASHBOARD_HTML
-    assert "openWorkbench(projectId, name, true)" in DASHBOARD_HTML
-    assert "if (!projectId) return" not in DASHBOARD_HTML
-    assert "body: JSON.stringify({ project_id: projectId, name })" not in DASHBOARD_HTML
-    assert "data-action=\"design-project\"" in DASHBOARD_HTML
-    assert ".project-row footer { display: grid;" in DASHBOARD_HTML
+    assert "createProjectFromPrompt" in DASHBOARD_HTML
+    assert "/workbench?project_id=" in DASHBOARD_HTML
+    assert "Project Configuration" in DASHBOARD_HTML
+    assert "Workflow Presets" in DASHBOARD_HTML
+    assert "Routing Summary" in DASHBOARD_HTML
+    assert "Team & Access" in DASHBOARD_HTML
+
+
+def test_backend_web_ui_routes_share_redesigned_shell():
+    from app.routes.web_ui import render_web_ui
+
+    for page in ("overview", "projects", "kanban", "tasks"):
+        html = render_web_ui(page)
+        assert 'class="app-shell"' in html
+        assert 'class="global-nav"' in html
+        assert 'class="project-rail"' in html
+        assert "ctxModelRoute" in html
+        assert "renderProjectsPage" in html
+        assert "renderKanbanPage" in html
+        assert "renderTaskPage" in html
 
 
 def test_project_conversation_can_save_workflow_design(monkeypatch, tmp_path):
