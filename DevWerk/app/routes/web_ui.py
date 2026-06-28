@@ -26,10 +26,10 @@ def render_web_ui(active_page: str) -> str:
         <a class="nav-link" data-nav="projects" href="/dashboard"><span data-icon="P"></span>Projects</a>
         <a class="nav-link" data-nav="kanban" href="/kanban"><span data-icon="K"></span>Kanban</a>
         <a class="nav-link" data-nav="tasks" href="/tasks"><span data-icon="T"></span>Tasks</a>
-        <a class="nav-link" href="/dashboard#events"><span data-icon="E"></span>Events</a>
-        <a class="nav-link" href="/dashboard#memory"><span data-icon="M"></span>Memory</a>
-        <a class="nav-link" href="/dashboard#analytics"><span data-icon="A"></span>Analytics</a>
-        <a class="nav-link" href="/dashboard#settings"><span data-icon="S"></span>Settings</a>
+        <a class="nav-link" data-nav="events" href="/dashboard#events"><span data-icon="E"></span>Events</a>
+        <a class="nav-link" data-nav="memory" href="/dashboard#memory"><span data-icon="M"></span>Memory</a>
+        <a class="nav-link" data-nav="analytics" href="/dashboard#analytics"><span data-icon="A"></span>Analytics</a>
+        <a class="nav-link" data-nav="settings" href="/dashboard#settings"><span data-icon="S"></span>Settings</a>
       </nav>
       <div class="nav-footer">
         <div class="identity"><span class="avatar">EE</span><span><b>Evan Engineer</b><small>evan@devwerk.dev</small></span></div>
@@ -222,6 +222,19 @@ button, input, textarea, select { font: inherit; }
 .project-overview { padding: 16px; display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; }
 .info-item { display: flex; gap: 10px; align-items: center; font-size: 12px; }
 .info-icon { width: 28px; height: 28px; border-radius: 8px; border: 1px solid var(--border); display: grid; place-items: center; color: var(--muted); }
+.section-grid { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 14px; align-items: start; }
+.section-stack { display: grid; gap: 14px; }
+.dense-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+.data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.data-table th, .data-table td { text-align: left; padding: 11px 10px; border-bottom: 1px solid #eef2f7; vertical-align: top; }
+.data-table th { color: var(--muted); font-size: 12px; font-weight: 800; background: var(--surface-soft); }
+.pill-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.pill { border: 1px solid var(--border); border-radius: 999px; padding: 6px 10px; background: #fff; color: #334155; font-size: 12px; font-weight: 700; }
+.tab-button { border: 0; background: transparent; cursor: pointer; }
+.tab-button.active { color: var(--blue); border-color: var(--blue); }
+.timeline-list { display: grid; gap: 10px; }
+.timeline-item { display: grid; grid-template-columns: 18px minmax(0,1fr) auto; gap: 10px; align-items: start; border-bottom: 1px solid #eef2f7; padding-bottom: 10px; }
+.json-panel { max-height: 360px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: #fbfdff; padding: 12px; font: 12px Consolas, monospace; white-space: pre; color: #334155; }
 .kanban-page { display: grid; grid-template-columns: minmax(0,1fr) 260px; gap: 14px; min-height: calc(100vh - 104px); }
 .kanban-main { min-width: 0; display: grid; grid-template-rows: auto minmax(0,1fr); }
 .kanban-header { padding: 18px; display: flex; justify-content: space-between; align-items: center; gap: 14px; }
@@ -325,6 +338,7 @@ const state = {
   memory: {},
   usage: {},
   activeTask: null,
+  projectTab: "configuration",
   busy: false
 };
 const $ = (id) => document.getElementById(id);
@@ -357,13 +371,15 @@ async function loadWorkflow() { try { const data = await api(`${API}/kanban/proj
 async function loadMemory() { try { state.memory = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/memory`); } catch (_) { state.memory = {}; } }
 async function loadUsage() { try { state.usage = await api(`${API}/usage/summary`); } catch (_) { state.usage = {}; } }
 function renderShell() {
-  document.querySelectorAll(".nav-link").forEach(link => link.dataset.active = String(link.dataset.nav === state.page));
+  state.section = activeSection();
+  document.querySelectorAll(".nav-link").forEach(link => link.dataset.active = String(link.dataset.nav === activeNav()));
   $("ctxProject").textContent = currentProject().name || state.projectId;
   $("ctxStatus").textContent = projectStatus(currentProject()).label;
   $("ctxStatus").className = `badge ${projectStatus(currentProject()).badge}`;
   $("ctxModelRoute").innerHTML = modelRoutes().map(route => `<option>${esc(route)}</option>`).join("") || "<option>default</option>";
   renderProjectRail();
-  if (state.page === "projects") renderProjectsPage();
+  if (state.section) renderSectionPage(state.section);
+  else if (state.page === "projects") renderProjectsPage();
   else if (state.page === "kanban") renderKanbanPage();
   else if (state.page === "tasks") renderTaskPage();
   else renderOverviewPage();
@@ -396,12 +412,105 @@ function renderProjectsPage() {
       <div class="project-cards">${(state.projects.length ? state.projects : [{id:"default",name:"default",description:"General purpose development assistant"}]).map(projectCard).join("")}</div>
       <section class="card config-panel">
         <div class="panel-head"><div class="title-block"><span class="folder-icon" style="width:28px;height:28px"></span><div><div class="muted">Project Configuration</div><h2 class="h2">${esc(currentProject().name || state.projectId)} <span class="badge green">Active</span></h2></div></div><div class="toolbar"><button class="button">Preview</button><button class="button">Clone</button><button class="icon-button">...</button></div></div>
-        <div class="tabs">${["Configuration","Settings","Workflow","Routing","Integrations","History","Activity"].map((t,i)=>`<span class="tab ${i===0?"active":""}">${t}</span>`).join("")}</div>
-        <div class="config-grid">${editorCard("Agents","Define the agents available in this project.","YAML", yamlish(state.settings.agents || defaultAgents()))}${editorCard("Parameters","Configure runtime parameters and defaults.","JSON", JSON.stringify(state.settings.parameters || defaultParameters(), null, 2))}<div class="side-stack">${workflowPresetCard()}${routingSummaryCard()}${teamCard()}</div></div>
+        <div class="tabs">${projectTabs().map(tab=>`<button class="tab tab-button ${state.projectTab===tab.key?"active":""}" data-project-tab="${tab.key}">${tab.label}</button>`).join("")}</div>
+        ${projectTabContent()}
         <div class="card project-overview">${infoItem("Environment","default")}${infoItem("Model Route", modelRoutes()[0] || "default")}${infoItem("Created", dateShort(currentProject().created_at))}${infoItem("Last Updated", relative(currentProject().updated_at))}${infoItem("Project ID", state.projectId)}</div>
       </section>
     </div>`;
   $("newProjectMain").onclick = createProjectFromPrompt;
+  document.querySelectorAll("[data-project-tab]").forEach(button => {
+    button.onclick = () => {
+      state.projectTab = button.dataset.projectTab || "configuration";
+      renderProjectsPage();
+    };
+  });
+}
+function renderSectionPage(section) {
+  const renderers = {
+    events: renderEventsSection,
+    memory: renderMemorySection,
+    analytics: renderAnalyticsSection,
+    settings: renderSettingsSection
+  };
+  (renderers[section] || renderProjectsPage)();
+}
+function renderEventsSection() {
+  $("page").innerHTML = `<div class="section-grid">
+    <section class="card card-pad"><div class="page-head"><div><h1 class="h2">Events</h1><div class="muted">Project and task event stream. Use this to audit workflow movement and agent decisions.</div></div><button class="button" onclick="refreshAll()">Refresh</button></div><table class="data-table" style="margin-top:16px"><thead><tr><th>Time</th><th>Event</th><th>Task</th><th>Transition</th><th>Detail</th></tr></thead><tbody>${state.events.length ? state.events.map(eventRow).join("") : `<tr><td colspan="5" class="muted">No events recorded for this project.</td></tr>`}</tbody></table></section>
+    <aside class="side-stack">${recentEventsCard()}${workflowHealthSmallCard()}${routingCard()}</aside>
+  </div>`;
+}
+function renderMemorySection() {
+  const mem = state.memory || {};
+  $("page").innerHTML = `<div class="section-grid">
+    <section class="card card-pad"><div class="page-head"><div><h1 class="h2">Memory</h1><div class="muted">Project-level memory carried into future tasks. This is not a raw prompt log.</div></div><span class="badge green">Project Memory</span></div>
+      <div class="dense-grid" style="margin-top:16px">${memoryBucket("Frameworks", mem.frameworks)}${memoryBucket("Codebase Paths", mem.paths)}${memoryBucket("Commands", mem.commands)}${memoryBucket("Rules", mem.rules)}${memorySummaries(mem)}<div class="card card-pad"><div class="h3">Raw Memory</div><pre class="json-panel">${esc(JSON.stringify(mem, null, 2))}</pre></div></div>
+    </section>
+    <aside class="side-stack">${memoryCard()}${recentTasksCard()}${routingCard()}</aside>
+  </div>`;
+}
+function renderAnalyticsSection() {
+  const usage = usageTotals();
+  $("page").innerHTML = `<div class="section-stack">
+    <div class="page-head"><div><h1 class="h2">Analytics</h1><div class="muted">Usage, throughput, and workflow distribution for the current project.</div></div><button class="button" onclick="refreshAll()">Refresh</button></div>
+    <div class="quick-grid">${kpi("Requests", usage.calls || 0, "12%")}${kpi("Input Tokens", compact(usage.input), "15%")}${kpi("Output Tokens", compact(usage.output), "9%")}${kpi("Total Tokens", compact(usage.total), "12%")}${kpi("Duration", duration(usage.duration), "6%")}${kpi("Tasks", allTasks().length, "stable")}</div>
+    <div class="section-grid"><section class="card card-pad"><div class="h3">Workflow Distribution</div><table class="data-table" style="margin-top:12px"><thead><tr><th>Stage</th><th>Tasks</th><th>Share</th></tr></thead><tbody>${columns().map(c=>`<tr><td>${esc(c.title || c.status_key)}</td><td>${(c.tasks || []).length}</td><td><div class="progress"><span style="width:${Math.min(100, Math.max(3, Math.round(((c.tasks||[]).length / Math.max(1, allTasks().length)) * 100)))}%"></span></div></td></tr>`).join("")}</tbody></table></section><aside class="side-stack">${healthCard()}${usageCard(usage)}</aside></div>
+  </div>`;
+}
+function renderSettingsSection() {
+  $("page").innerHTML = `<div class="section-grid">
+    <section class="card card-pad"><div class="page-head"><div><h1 class="h2">Settings</h1><div class="muted">System-facing settings view. Project-specific workflow and agent settings remain in Projects.</div></div><span class="badge blue">Read Only</span></div>
+      <div class="dense-grid" style="margin-top:16px">${settingsTile("Default Route", modelRoutes()[0] || "default", "The route used when a project or agent does not override model selection.")}${settingsTile("Fallback Route", modelRoutes()[1] || modelRoutes()[0] || "default", "Secondary model route exposed by current configuration.")}${settingsTile("Thinking Mode", (state.settings.parameters || {}).thinking_mode || "balanced", "Runtime reasoning parameter inherited by agents when not overridden.")}</div>
+      <div style="margin-top:14px" class="config-grid">${editorCard("Effective Project Settings","Settings currently loaded for the selected project.","JSON", JSON.stringify(state.settings, null, 2))}${editorCard("Effective Workflow","Workflow definition used by the state machine.","JSON", JSON.stringify(state.workflow, null, 2))}<div class="side-stack">${routingSummaryCard()}${teamCard()}</div></div>
+    </section>
+    <aside class="side-stack">${memoryCard()}${recentEventsCard()}</aside>
+  </div>`;
+}
+function projectTabs() {
+  return [
+    {key:"configuration", label:"Configuration"},
+    {key:"settings", label:"Settings"},
+    {key:"workflow", label:"Workflow"},
+    {key:"routing", label:"Routing"},
+    {key:"integrations", label:"Integrations"},
+    {key:"history", label:"History"},
+    {key:"activity", label:"Activity"}
+  ];
+}
+function projectTabContent() {
+  const renderers = {
+    configuration: projectConfigurationTab,
+    settings: projectSettingsTab,
+    workflow: projectWorkflowTab,
+    routing: projectRoutingTab,
+    integrations: projectIntegrationsTab,
+    history: projectHistoryTab,
+    activity: projectActivityTab
+  };
+  return (renderers[state.projectTab] || projectConfigurationTab)();
+}
+function projectConfigurationTab() {
+  return `<div class="config-grid">${editorCard("Agents","Define the agents available in this project.","YAML", yamlish(state.settings.agents || defaultAgents()))}${editorCard("Parameters","Configure runtime parameters and defaults.","JSON", JSON.stringify(state.settings.parameters || defaultParameters(), null, 2))}<div class="side-stack">${workflowPresetCard()}${routingSummaryCard()}${teamCard()}</div></div>`;
+}
+function projectSettingsTab() {
+  return `<div class="config-grid">${editorCard("Project Settings","Identity, defaults, and runtime settings for this project.","JSON", JSON.stringify({project: currentProject(), settings: state.settings}, null, 2))}${editorCard("Task Policy","How DevWerk should manage task continuity, memory and approvals.","JSON", JSON.stringify(defaultTaskPolicy(), null, 2))}<div class="side-stack">${settingsTile("Task Continuity","Conversation-driven","Same topic continues active task; explicit new work starts a task.")}${settingsTile("Approval Mode","Automatic","Kanban state machine drives work without manual tab buttons.")}${settingsTile("Memory Scope","Project + Task","Project memory is injected into every task context.")}</div></div>`;
+}
+function projectWorkflowTab() {
+  return `<div class="config-grid">${editorCard("Workflow Definition","Columns, semantic actions, and transition rules.","JSON", JSON.stringify(state.workflow || {}, null, 2))}<div class="card card-pad"><div class="h3">Columns</div><table class="data-table" style="margin-top:12px"><thead><tr><th>Key</th><th>Title</th><th>Tasks</th></tr></thead><tbody>${columns().map(c=>`<tr><td>${esc(c.status_key)}</td><td>${esc(c.title || STAGE_TITLES[c.status_key] || c.status_key)}</td><td>${(c.tasks || []).length}</td></tr>`).join("")}</tbody></table></div><div class="side-stack">${workflowPresetCard()}${workflowHealthSmallCard()}</div></div>`;
+}
+function projectRoutingTab() {
+  const agents = state.settings.agents || defaultAgents();
+  return `<div class="section-grid"><section class="card card-pad"><div class="h3">Agent Routing</div><table class="data-table" style="margin-top:12px"><thead><tr><th>Agent</th><th>Role</th><th>Model Route</th><th>Tools</th></tr></thead><tbody>${Object.entries(agents).map(([id,agent])=>`<tr><td>${esc(id)}</td><td>${esc(agent.role || agent.name || "-")}</td><td>${esc(agent.model_route || agent.model || "default")}</td><td>${esc((agent.tools || []).join(", ") || "-")}</td></tr>`).join("")}</tbody></table></section><aside class="side-stack">${routingSummaryCard()}${routingCard()}</aside></div>`;
+}
+function projectIntegrationsTab() {
+  const integrations = [{name:"IDE Capability Provider", status:"Available via plugin/MCP contract", detail:"Compilation, diagnostics, source map, file read/write and command execution are capability requests."},{name:"MCP Server", status:"Backend exposed", detail:"External clients can call DevWerk backend capabilities without changing plugin APIs."},{name:"CI / Terminal", status:"Project-configured", detail:"Verification commands belong to project settings, not hardcoded backend behavior."},{name:"Git / PR", status:"Planned", detail:"Task artifacts and events are ready to support repository integrations."}];
+  return `<div class="section-grid"><section class="card card-pad"><div class="h3">Integrations</div><table class="data-table" style="margin-top:12px"><thead><tr><th>Name</th><th>Status</th><th>Contract</th></tr></thead><tbody>${integrations.map(i=>`<tr><td>${esc(i.name)}</td><td>${esc(i.status)}</td><td>${esc(i.detail)}</td></tr>`).join("")}</tbody></table></section><aside class="side-stack">${commandsCard()}${routingSummaryCard()}</aside></div>`;
+}
+function projectHistoryTab() {
+  return `<div class="section-grid"><section class="card card-pad"><div class="h3">Project History</div><div class="timeline-list" style="margin-top:12px">${state.events.length ? state.events.map(eventTimeline).join("") : `<div class="muted">No project history yet.</div>`}</div></section><aside class="side-stack">${recentEventsCard()}${memoryCard()}</aside></div>`;
+}
+function projectActivityTab() {
+  return `<div class="section-grid"><section class="card card-pad"><div class="h3">Activity</div><table class="data-table" style="margin-top:12px"><thead><tr><th>Task</th><th>Status</th><th>Updated</th><th>Priority</th></tr></thead><tbody>${allTasks().map(t=>`<tr><td>${esc(t.title)}</td><td>${esc(STAGE_TITLES[t.status_key] || t.status_key || "-")}</td><td>${relative(t.updated_at)}</td><td>${priorityLabel(t.priority)}</td></tr>`).join("") || `<tr><td colspan="4" class="muted">No tasks yet.</td></tr>`}</tbody></table></section><aside class="side-stack">${recentTasksCard()}${healthCard()}</aside></div>`;
 }
 function renderKanbanPage() {
   $("page").innerHTML = `<div class="kanban-page"><section class="kanban-main">
@@ -492,6 +601,15 @@ function linkedFilesCard(artifacts){ return `<div class="card side-card"><div cl
 function commandsCard(){ return `<div class="card side-card"><div class="h3" style="margin-bottom:10px">Related commands</div>${["project.compile","source.diagnostics","process.run","workspace.search"].map(c=>`<span class="command">${c}</span>`).join("")}<br/><a class="link">Show more</a></div>`; }
 function memorySnippetsCard(){ return `<div class="card side-card"><div class="side-title"><div class="h3">Memory / Context</div><a class="link">View in Memory</a></div><div class="muted" style="font-size:12px">Relevant snippets</div><div class="snippet"><b>Project Memory</b><br/>${esc(JSON.stringify(state.memory || {}).slice(0,120) || "No memory recorded yet.")}</div><div class="snippet"><b>Workflow Context</b><br/>Kanban remains the state-machine driver.</div></div>`; }
 function filesHtml(artifacts){ const paths=[]; (artifacts || []).forEach(a => { if (a.path) paths.push(a.path); const payload = a.payload || {}; (payload.changed_paths || payload.paths || []).forEach(x => paths.push(String(x))); }); const list=(paths.length ? paths : ["workflow_request_body","plan_bundle","code_change_bundle"]).slice(0,6); return `<div class="files" style="margin-top:10px">${list.map((p,i)=>`<div class="files-row"><span>${esc(p)}</span><span><span class="plus">+${(i + 1) * 14}</span> <span class="minus">-0</span></span></div>`).join("")}</div>`; }
+function eventRow(event){ const payload = event.payload || {}; return `<tr><td>${esc(dateTime(event.created_at))}</td><td>${esc(eventTitle(event))}</td><td>${esc(event.task_title || event.task_id || "-")}</td><td>${esc(event.from_status || "")}${event.to_status ? " -> " + esc(event.to_status) : ""}</td><td>${esc(payload.reason || payload.summary || payload.action || JSON.stringify(payload).slice(0, 120) || "-")}</td></tr>`; }
+function eventTimeline(event){ const payload = event.payload || {}; return `<div class="timeline-item"><span class="timeline-dot"></span><div><b>${esc(eventTitle(event))}</b><div class="muted">${esc(payload.reason || payload.summary || payload.action || event.task_title || event.task_id || state.projectId)}</div></div><span class="muted">${relative(event.created_at)}</span></div>`; }
+function memoryBucket(title, items){ const list = Array.isArray(items) ? items : []; return `<div class="card card-pad"><div class="h3">${title}</div><div class="pill-list">${list.length ? list.slice(-18).map(item=>`<span class="pill">${esc(typeof item === "string" ? item : JSON.stringify(item))}</span>`).join("") : `<span class="muted">No ${title.toLowerCase()} recorded yet.</span>`}</div></div>`; }
+function memorySummaries(mem){ const summaries = Array.isArray(mem.phase_summaries) ? mem.phase_summaries : []; return `<div class="card card-pad"><div class="h3">Recent Summaries</div><div class="timeline-list" style="margin-top:12px">${summaries.length ? summaries.slice(-6).reverse().map(item=>`<div class="timeline-item"><span class="timeline-dot"></span><div><b>${esc(item.phase || item.task_id || "summary")}</b><div class="muted">${esc(item.summary || JSON.stringify(item).slice(0, 160))}</div></div><span class="muted">${relative(item.created_at || item.updated_at)}</span></div>`).join("") : `<div class="muted">No compact summaries yet.</div>`}</div></div>`; }
+function settingsTile(title, value, detail){ return `<div class="card card-pad"><div class="h3">${title}</div><div class="kpi-value" style="font-size:18px">${esc(value)}</div><div class="muted" style="font-size:12px;line-height:1.55">${esc(detail)}</div></div>`; }
+function workflowHealthSmallCard(){ return `<div class="card card-pad"><div class="h3">Workflow Health</div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><span><i class="dot green"></i> On Track</span><b>${allTasks().filter(t=>t.status_key !== "failed").length}</b></div><div class="metric-line"><span><i class="dot red"></i> Failed</span><b>${allTasks().filter(t=>t.status_key === "failed").length}</b></div><div class="metric-line"><span><i class="dot blue"></i> Active Stage</span><b>${esc(STAGE_TITLES[activeStage()] || activeStage())}</b></div></div></div>`; }
+function defaultTaskPolicy(){ return {task_identity:"conversation_groups_related_messages", new_task_trigger:"explicit_new_work_or_agent_decision", approval_mode:"auto", memory_policy:"task_and_project", workflow_driver:"kanban_state_machine", manual_actions:["retry","abandon"]}; }
+function activeSection(){ const hash = location.hash.replace("#", "").trim().toLowerCase(); return ["events","memory","analytics","settings"].includes(hash) ? hash : ""; }
+function activeNav(){ return state.section || state.page; }
 function normalizeMessages(messages) {
   const seen = new Set();
   const out = [];
@@ -582,6 +700,7 @@ $("projectList").addEventListener("click", async event => { const button = event
 $("projectSearch").addEventListener("input", renderShell);
 $("newProjectRail").onclick = createProjectFromPrompt;
 $("refresh").onclick = () => refreshAll().catch(err => alert(err.message || String(err)));
+window.addEventListener("hashchange", () => { state.section = activeSection(); renderShell(); });
 document.addEventListener("click", async event => {
   const project = event.target.closest("[data-project-card]");
   if(project) { state.projectId = project.dataset.projectCard; history.replaceState(null, "", `/dashboard?project_id=${encodeURIComponent(state.projectId)}`); await refreshAll(); }

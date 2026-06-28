@@ -248,6 +248,29 @@ def test_backend_web_ui_routes_share_redesigned_shell():
         assert "renderProjectsPage" in html
         assert "renderKanbanPage" in html
         assert "renderTaskPage" in html
+        assert "renderSectionPage" in html
+        assert "activeSection" in html
+
+
+def test_backend_web_ui_navigation_and_project_tabs_are_interactive():
+    from app.routes.web_ui import render_web_ui
+
+    html = render_web_ui("projects")
+
+    for nav in ("events", "memory", "analytics", "settings"):
+        assert f'data-nav="{nav}"' in html
+        assert f"render{nav.title()}Section" in html
+
+    for tab in ("configuration", "settings", "workflow", "routing", "integrations", "history", "activity"):
+        assert f'data-project-tab="${{tab.key}}"' in html
+        assert f"{tab}:" in html
+
+    assert "projectWorkflowTab" in html
+    assert "projectRoutingTab" in html
+    assert "projectIntegrationsTab" in html
+    assert "projectHistoryTab" in html
+    assert "projectActivityTab" in html
+    assert "window.addEventListener(\"hashchange\"" in html
 
 
 def test_project_conversation_can_save_workflow_design(monkeypatch, tmp_path):
