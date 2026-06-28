@@ -208,6 +208,11 @@ def test_workbench_exposes_project_workflow_designer():
     assert "projectList" in WORKBENCH_HTML
     assert "activeProjectName" in WORKBENCH_HTML
     assert "composer-box" in WORKBENCH_HTML
+    assert 'id="splitter"' in WORKBENCH_HTML
+    assert "--sidebar-width" in WORKBENCH_HTML
+    assert "initSplitter()" in WORKBENCH_HTML
+    assert "overflow-y: auto" in WORKBENCH_HTML
+    assert "normalizeMessages" in WORKBENCH_HTML
     assert ">Send</button>" in WORKBENCH_HTML
     assert 'action: "message"' in WORKBENCH_HTML
     assert "project_id" in WORKBENCH_HTML
@@ -424,6 +429,51 @@ def test_project_conversation_agent_can_dispatch_task_to_workflow_engine(monkeyp
     assert captured["messages"] == [{"role": "user", "content": "Write the release note using the writing workflow."}]
     assert captured["metadata"]["source"] == "project_conversation"
     assert captured["metadata"]["project_agent_decision"]["action"] == "start_task"
+
+
+def test_project_conversation_agent_normalizes_raw_json_reply(monkeypatch, tmp_path):
+    kanban_service = _configure(monkeypatch, tmp_path)
+    import app.routes.kanban as kanban_routes
+    import app.routes.workflows as workflow_routes
+
+    raw_decision = (
+        '{"action":"start_task","reply":"Start the writing intake.",'
+        '"task_request":"Run the writing intake workflow."}'
+    )
+    captured = {}
+
+    class FakeProjectAgent:
+        def chat_json(self, messages):
+            return {"raw_text": raw_decision, "reply": raw_decision}
+
+    def fake_start_workflow_payload(body):
+        captured["messages"] = body["messages"]
+        captured["metadata"] = body["metadata"]
+        return {
+            "ok": True,
+            "task_id": "task-json-123",
+            "status_key": "queued",
+            "poll_url": "/v1/workflows/task-json-123",
+            "events_url": "/v1/workflows/task-json-123/events",
+        }
+
+    monkeypatch.setattr(kanban_routes, "get_llm_client", lambda agent: FakeProjectAgent())
+    monkeypatch.setattr(workflow_routes, "start_workflow_payload", fake_start_workflow_payload)
+    kanban_service.upsert_project(project_id="json-project", name="JSON Project")
+
+    response = kanban_routes.kanban_project_conversation_message(
+        "json-project",
+        kanban_routes.ProjectConversationRequest(message="开始第一个任务"),
+    )
+
+    assert response["ok"] is True
+    assert response["kind"] == "task_started"
+    assert captured["messages"] == [{"role": "user", "content": "Run the writing intake workflow."}]
+    assert captured["metadata"]["project_agent_decision"]["action"] == "start_task"
+    conversation = kanban_routes.kanban_project_conversation("json-project")["messages"]
+    assistant_messages = [message for message in conversation if message["role"] == "assistant"]
+    assert assistant_messages[-1]["content"] == "Task started: task-json-123"
+    assert '"action"' not in assistant_messages[-1]["content"]
 
 
 def test_project_conversation_agent_can_continue_active_task(monkeypatch, tmp_path):

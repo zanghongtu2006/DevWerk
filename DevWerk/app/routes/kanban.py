@@ -643,7 +643,70 @@ def _ask_project_conversation_agent(
         raise HTTPException(status_code=503, detail=f"project LLM agent failed: {type(exc).__name__}: {exc}") from exc
     if not isinstance(decision, dict):
         raise HTTPException(status_code=502, detail="project LLM agent returned a non-object response")
+    return _normalize_project_agent_decision(decision)
+
+
+def _normalize_project_agent_decision(decision: dict[str, Any]) -> dict[str, Any]:
+    """Normalize provider fallbacks so raw JSON text does not leak into chat bubbles."""
+    candidate_texts = [
+        str(decision.get("raw_text") or "").strip(),
+        str(decision.get("reply") or "").strip(),
+        str(decision.get("content") or "").strip(),
+    ]
+    for text in candidate_texts:
+        parsed = _extract_project_agent_json(text)
+        if parsed is not None:
+            decision = {**decision, **parsed}
+            break
+
+    reply = str(decision.get("reply") or "").strip()
+    parsed_reply = _extract_project_agent_json(reply)
+    if parsed_reply is not None:
+        decision = {**decision, **parsed_reply}
+        reply = str(decision.get("reply") or "").strip()
+
+    if _looks_like_json_payload(reply):
+        action = str(decision.get("action") or "reply").strip().lower().replace("-", "_")
+        decision["reply"] = _default_project_agent_reply(action)
     return decision
+
+
+def _extract_project_agent_json(text: str) -> dict[str, Any] | None:
+    if not text or "{" not in text:
+        return None
+    decoder = json.JSONDecoder()
+    start = 0
+    while True:
+        idx = text.find("{", start)
+        if idx < 0:
+            return None
+        try:
+            parsed, _ = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            start = idx + 1
+            continue
+        if isinstance(parsed, dict) and any(key in parsed for key in ("action", "reply", "save", "task_request", "workflow", "agents")):
+            return parsed
+        start = idx + 1
+
+
+def _looks_like_json_payload(text: str) -> bool:
+    stripped = text.strip()
+    return bool(stripped) and (
+        stripped.startswith("{")
+        or stripped.startswith("[")
+        or ("\"action\"" in stripped and "\"reply\"" in stripped)
+    )
+
+
+def _default_project_agent_reply(action: str) -> str:
+    if action in {"start_task", "run_task", "dispatch_task"}:
+        return "Starting the workflow task."
+    if action in {"continue_task", "resume_task", "message_task"}:
+        return "Continuing the active workflow task."
+    if action in {"design", "save_design", "revise_workflow", "configure_project"}:
+        return "Updating the project workflow design."
+    return "Project conversation updated."
 
 
 def _effective_project_workflow_agents(
@@ -848,7 +911,7 @@ WORKBENCH_HTML = r"""
     :root { color-scheme: light dark; --bg: #f6f7fa; --panel: #fff; --panel-soft: #f0f3f8; --text: #182033; --muted: #687386; --line: #d7deea; --accent: #2068d8; --danger: #b42318; --user: #e7f0ff; --assistant: #fff; }
     @media (prefers-color-scheme: dark) { :root { --bg: #1f2329; --panel: #2b3038; --panel-soft: #242932; --text: #eef3fb; --muted: #aeb8c8; --line: #454d59; --accent: #7ba8ff; --danger: #ff9b91; --user: #243a5f; --assistant: #303641; } }
     * { box-sizing: border-box; }
-    html, body { height: 100%; }
+    html, body { height: 100%; overflow: hidden; }
     body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     a { color: var(--accent); text-decoration: none; }
     button, input, textarea { font: inherit; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); }
@@ -857,22 +920,24 @@ WORKBENCH_HTML = r"""
     button:disabled { opacity: .55; cursor: not-allowed; }
     input { height: 34px; padding: 0 10px; width: 100%; }
     textarea { width: 100%; min-height: 56px; max-height: 220px; padding: 12px 14px; resize: vertical; line-height: 1.45; }
-    .app { min-height: 100vh; display: grid; grid-template-columns: minmax(220px, 22vw) minmax(0, 1fr); }
-    aside { border-right: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 100vh; }
+    .app { height: 100vh; min-height: 0; display: grid; grid-template-columns: minmax(220px, var(--sidebar-width, 360px)) 6px minmax(0, 1fr); overflow: hidden; }
+    aside { border-right: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 0; height: 100vh; overflow: hidden; }
     .brand { height: 56px; padding: 0 14px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); gap: 10px; }
     .brand h1 { margin: 0; font-size: 16px; }
-    .sidebar-body { padding: 12px; display: grid; gap: 12px; overflow: auto; }
+    .sidebar-body { padding: 12px; display: grid; gap: 12px; overflow: auto; min-height: 0; align-content: start; }
     .new-project { display: grid; gap: 8px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
     .project-list { display: grid; gap: 6px; }
     .project-card { text-align: left; height: auto; min-height: 58px; padding: 9px 10px; display: grid; gap: 3px; border-color: transparent; background: transparent; }
     .project-card.active { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); background: color-mix(in srgb, var(--accent) 10%, var(--panel)); }
     .project-card b, .project-card span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    main { min-width: 0; min-height: 100vh; display: grid; grid-template-rows: 56px 1fr auto; }
+    .splitter { cursor: col-resize; background: color-mix(in srgb, var(--line) 65%, transparent); min-width: 6px; }
+    .splitter:hover, .splitter.dragging { background: color-mix(in srgb, var(--accent) 42%, var(--line)); }
+    main { min-width: 0; min-height: 0; height: 100vh; display: grid; grid-template-rows: 56px minmax(0, 1fr) auto; overflow: hidden; }
     .chat-header { border-bottom: 1px solid var(--line); background: var(--panel); display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 18px; }
     .chat-title { min-width: 0; }
     .chat-title b, .chat-title span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .chat-title span { color: var(--muted); font-size: 12px; }
-    .messages { padding: 24px clamp(18px, 5vw, 72px); overflow-y: auto; display: flex; flex-direction: column; gap: 16px; }
+    .messages { min-height: 0; padding: 24px clamp(18px, 5vw, 72px); overflow-y: auto; display: flex; flex-direction: column; gap: 16px; }
     .empty { align-self: center; max-width: 640px; margin-top: 12vh; color: var(--muted); text-align: center; }
     .message { max-width: min(760px, 88%); display: grid; gap: 5px; }
     .message.user { align-self: flex-end; }
@@ -886,9 +951,11 @@ WORKBENCH_HTML = r"""
     .muted { color: var(--muted); }
     .error { color: var(--danger); }
     @media (max-width: 880px) {
-      .app { grid-template-columns: 1fr; }
-      aside { min-height: auto; max-height: 42vh; border-right: 0; border-bottom: 1px solid var(--line); }
-      main { min-height: 58vh; grid-template-rows: 52px 1fr auto; }
+      html, body { overflow: auto; }
+      .app { height: auto; min-height: 100vh; grid-template-columns: 1fr; grid-template-rows: minmax(220px, 42vh) auto; overflow: visible; }
+      .splitter { display: none; }
+      aside { min-height: 0; height: auto; max-height: 42vh; border-right: 0; border-bottom: 1px solid var(--line); }
+      main { min-height: 58vh; height: 58vh; grid-template-rows: 52px minmax(0, 1fr) auto; }
       .messages { padding: 16px; }
       .composer { padding: 12px 16px; }
       .message { max-width: 96%; }
@@ -914,6 +981,7 @@ WORKBENCH_HTML = r"""
         </section>
       </div>
     </aside>
+    <div id="splitter" class="splitter" role="separator" aria-orientation="vertical" aria-label="Resize project list"></div>
     <main>
       <header class="chat-header">
         <div class="chat-title">
@@ -978,7 +1046,7 @@ WORKBENCH_HTML = r"""
 
     async function loadProjectConversation() {
       const data = await api(`/v1/kanban/projects/${encodeURIComponent(state.projectId)}/conversation`);
-      state.messages = data.messages || [];
+      state.messages = normalizeMessages(data.messages || []);
       state.activeTask = data.active_task || null;
       renderMessages();
       renderHeader();
@@ -1002,9 +1070,16 @@ WORKBENCH_HTML = r"""
             metadata: { active_task_id: state.activeTask?.id || state.activeTask?.task_id || null }
           })
         });
-        state.messages.push({ role: "assistant", content: assistantText(result), kind: result.kind || "reply", task_id: result.task_id });
         if (result.task_id) state.activeTask = { id: result.task_id, status_key: result.status_key || "queued" };
-        renderMessages();
+        await loadProjectConversation();
+        const hasServerAssistant = result.task_id
+          ? state.messages.some(message => message.role === "assistant" && message.task_id === result.task_id)
+          : state.messages.some(message => message.role === "assistant" && displayMessageContent(message) === assistantText(result));
+        if (!hasServerAssistant) {
+          state.messages.push({ role: "assistant", content: assistantText(result), kind: result.kind || "reply", task_id: result.task_id, transient: true });
+          state.messages = normalizeMessages(state.messages);
+          renderMessages();
+        }
         renderHeader();
         if (result.poll_url) {
           pollTask(result.poll_url);
@@ -1028,6 +1103,7 @@ WORKBENCH_HTML = r"""
           setStatus(`Task ${state.activeTask.id || ""} ${status}`);
           if (data.result || ["done", "failed", "ready_to_apply"].includes(status)) {
             state.messages.push({ role: "assistant", content: `Task update: ${status || "result ready"}`, kind: "task_update", task_id: state.activeTask.id });
+            state.messages = normalizeMessages(state.messages);
             renderMessages();
             return;
           }
@@ -1065,10 +1141,90 @@ WORKBENCH_HTML = r"""
       $("messages").innerHTML = state.messages.map(message => `
         <article class="message ${escAttr(message.role || "assistant")}">
           <div class="meta">${esc(message.role || "assistant")}${message.task_id ? ` / task ${esc(message.task_id)}` : ""}</div>
-          <div class="bubble">${esc(message.content || "")}</div>
+          <div class="bubble">${esc(displayMessageContent(message))}</div>
         </article>
       `).join("");
       $("messages").scrollTop = $("messages").scrollHeight;
+    }
+
+    function normalizeMessages(messages) {
+      const seen = new Set();
+      const out = [];
+      for (const message of messages) {
+        const content = displayMessageContent(message).trim();
+        if (!content) continue;
+        const key = [
+          message.role || "assistant",
+          message.kind || "message",
+          message.task_id || "",
+          content
+        ].join("\u0001");
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({ ...message, content });
+      }
+      return out;
+    }
+
+    function displayMessageContent(message) {
+      const content = String(message?.content ?? "");
+      const parsed = parseJsonDecision(content);
+      if (parsed) {
+        if (parsed.reply && !looksLikeJson(parsed.reply)) return String(parsed.reply);
+        if (parsed.action === "start_task") return "Starting the workflow task.";
+        if (parsed.action === "continue_task") return "Continuing the active workflow task.";
+        if (parsed.action === "save_design" || parsed.action === "design") return "Updating the project workflow design.";
+        return "Project conversation updated.";
+      }
+      return content;
+    }
+
+    function parseJsonDecision(text) {
+      const value = String(text || "").trim();
+      if (!looksLikeJson(value)) return null;
+      const start = value.indexOf("{");
+      const end = firstJsonObjectEnd(value, start);
+      if (start < 0 || end <= start) return null;
+      try {
+        const parsed = JSON.parse(value.slice(start, end + 1));
+        return parsed && typeof parsed === "object" && ("action" in parsed || "reply" in parsed) ? parsed : null;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function firstJsonObjectEnd(text, start) {
+      if (start < 0) return -1;
+      let depth = 0;
+      let inString = false;
+      let escaped = false;
+      for (let i = start; i < text.length; i += 1) {
+        const ch = text[i];
+        if (inString) {
+          if (escaped) {
+            escaped = false;
+          } else if (ch === "\\") {
+            escaped = true;
+          } else if (ch === "\"") {
+            inString = false;
+          }
+          continue;
+        }
+        if (ch === "\"") {
+          inString = true;
+        } else if (ch === "{") {
+          depth += 1;
+        } else if (ch === "}") {
+          depth -= 1;
+          if (depth === 0) return i;
+        }
+      }
+      return -1;
+    }
+
+    function looksLikeJson(value) {
+      const text = String(value || "").trim();
+      return text.startsWith("{") || text.startsWith("[") || (text.includes('"action"') && text.includes('"reply"'));
     }
 
     function assistantText(result) {
@@ -1102,6 +1258,38 @@ WORKBENCH_HTML = r"""
       history.replaceState(null, "", next.toString());
     }
 
+    function initSplitter() {
+      const splitter = $("splitter");
+      let dragging = false;
+      const stored = Number(localStorage.getItem("devwerk.workbench.sidebarWidth") || 0);
+      if (stored) setSidebarWidth(stored);
+      splitter.addEventListener("pointerdown", event => {
+        dragging = true;
+        splitter.classList.add("dragging");
+        splitter.setPointerCapture(event.pointerId);
+      });
+      splitter.addEventListener("pointermove", event => {
+        if (!dragging) return;
+        setSidebarWidth(event.clientX);
+      });
+      splitter.addEventListener("pointerup", event => {
+        if (!dragging) return;
+        dragging = false;
+        splitter.classList.remove("dragging");
+        splitter.releasePointerCapture(event.pointerId);
+        localStorage.setItem("devwerk.workbench.sidebarWidth", getComputedStyle(document.documentElement).getPropertyValue("--sidebar-width").trim().replace("px", ""));
+      });
+      splitter.addEventListener("pointercancel", () => {
+        dragging = false;
+        splitter.classList.remove("dragging");
+      });
+    }
+
+    function setSidebarWidth(value) {
+      const width = Math.max(220, Math.min(Number(value) || 360, Math.floor(window.innerWidth * 0.55)));
+      document.documentElement.style.setProperty("--sidebar-width", `${width}px`);
+    }
+
     $("projectList").onclick = async (event) => {
       const button = event.target.closest("button[data-project]");
       if (!button || state.busy) return;
@@ -1124,6 +1312,7 @@ WORKBENCH_HTML = r"""
       $("projectName").value = initialProjectName;
       $("projectId").value = initialProjectId;
     }
+    initSplitter();
     renderMessages();
     refresh().catch(showError);
   </script>
