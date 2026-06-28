@@ -1145,7 +1145,10 @@ def _project_stats(conn: sqlite3.Connection, project_id: str) -> dict[str, Any]:
         """
         SELECT
             COUNT(*) AS tasks,
-            SUM(CASE WHEN archived = 1 THEN 1 ELSE 0 END) AS archived_tasks
+            SUM(CASE WHEN archived = 1 THEN 1 ELSE 0 END) AS archived_tasks,
+            SUM(CASE WHEN archived = 0 AND status_key NOT IN ('done', 'failed') THEN 1 ELSE 0 END) AS active_tasks,
+            SUM(CASE WHEN archived = 0 AND status_key = 'done' THEN 1 ELSE 0 END) AS done_tasks,
+            SUM(CASE WHEN archived = 0 AND status_key = 'failed' THEN 1 ELSE 0 END) AS failed_tasks
           FROM kb_tasks
          WHERE project_id = ?
         """,
@@ -1185,6 +1188,9 @@ def _project_stats(conn: sqlite3.Connection, project_id: str) -> dict[str, Any]:
     return {
         "tasks": task_row["tasks"] or 0,
         "archived_tasks": task_row["archived_tasks"] or 0,
+        "active_tasks": task_row["active_tasks"] or 0,
+        "done_tasks": task_row["done_tasks"] or 0,
+        "failed_tasks": task_row["failed_tasks"] or 0,
         "request_count": request_count or 0,
         "llm_calls": token_row.get("calls") or 0,
         "input_tokens": token_row.get("input_tokens") or 0,

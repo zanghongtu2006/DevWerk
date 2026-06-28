@@ -231,7 +231,7 @@ def test_dashboard_project_creation_opens_workbench():
     assert "createProjectFromPrompt" in DASHBOARD_HTML
     assert "/workbench?project_id=" in DASHBOARD_HTML
     assert "Project Configuration" in DASHBOARD_HTML
-    assert "Workflow Presets" in DASHBOARD_HTML
+    assert "Workflow Definition" in DASHBOARD_HTML
     assert "Routing Summary" in DASHBOARD_HTML
     assert "Team & Access" in DASHBOARD_HTML
 
@@ -271,6 +271,72 @@ def test_backend_web_ui_navigation_and_project_tabs_are_interactive():
     assert "projectHistoryTab" in html
     assert "projectActivityTab" in html
     assert "window.addEventListener(\"hashchange\"" in html
+
+
+def test_backend_web_ui_all_design_tabs_have_click_handlers():
+    from app.routes.web_ui import render_web_ui
+
+    html = render_web_ui("overview")
+
+    for tab in ("configuration", "settings", "workflow", "routing", "integrations", "history", "activity"):
+        assert f'data-project-tab="${{tab.key}}"' in html
+    assert 'button.dataset.projectTab' in html
+    assert 'renderProjectsPage();' in html
+
+    for tab in ("conversation", "workflow_log", "artifacts"):
+        assert f'data-chat-tab="${{tab.key}}"' in html
+    assert 'button.dataset.chatTab' in html
+    assert 'renderOverviewPage();' in html
+
+    for tab in ("summary", "plan", "diff", "events", "memory"):
+        assert f'data-task-tab="${{tab.key}}"' in html
+    assert 'button.dataset.taskTab' in html
+    assert 'renderTaskPage();' in html
+
+
+def test_backend_web_ui_uses_backend_data_not_demo_metrics():
+    from app.routes.web_ui import render_web_ui
+
+    html = render_web_ui("overview")
+
+    forbidden = (
+        "DEMO_TASKS",
+        "128,540",
+        "1,000,000",
+        "4h 32m",
+        "up 18%",
+        "up 12%",
+        "Math.random",
+        "T-1042",
+        "Implement NextAuth setup",
+        "Standard Dev Flow",
+        "Bug Triage Flow",
+        "anthropic/claude-3-5-sonnet",
+    )
+    for text in forbidden:
+        assert text not in html
+
+    assert "Backend usage DB" in html
+    assert "Loaded from backend API" in html
+    assert "No artifacts returned by backend" in html
+    assert "pageUrlForCurrentView" in html
+    assert 'state.section ? "#" + encodeURIComponent(state.section)' in html
+
+
+def test_project_stats_include_status_breakdown(monkeypatch, tmp_path):
+    kanban_service = _configure(monkeypatch, tmp_path)
+
+    kanban_service.create_task(project_id="stats-project", title="Active", status_key="coding")
+    kanban_service.create_task(project_id="stats-project", title="Done", status_key="done")
+    kanban_service.create_task(project_id="stats-project", title="Failed", status_key="failed")
+
+    project = next(item for item in kanban_service.list_projects() if item["id"] == "stats-project")
+    stats = project["stats"]
+
+    assert stats["tasks"] == 3
+    assert stats["active_tasks"] == 1
+    assert stats["done_tasks"] == 1
+    assert stats["failed_tasks"] == 1
 
 
 def test_project_conversation_can_save_workflow_design(monkeypatch, tmp_path):

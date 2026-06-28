@@ -39,8 +39,8 @@ def test_dashboard_contains_task_detail_surface():
     assert "Execution log (reasoning + actions)" in TASKS_HTML
     assert "Memory / Context" in TASKS_HTML
     assert "Linked files" in TASKS_HTML
-    assert "plan_bundle" in TASKS_HTML
-    assert "code_change_bundle" in TASKS_HTML
+    assert "No plan artifacts returned by backend" in TASKS_HTML
+    assert "No artifacts returned by backend" in TASKS_HTML
 
 
 def test_workflow_action_protocol_drives_kanban_state(monkeypatch, tmp_path):
