@@ -140,7 +140,7 @@ def start_workflow_payload(body: dict) -> dict:
         {
             "entrypoint": "/v1/workflows",
             "project_id": project_id,
-            "workspace": _workspace_debug_summary(body.get("workspace")),
+            "workspace": _workspace_request_summary(body.get("workspace")),
         },
     )
     _start_workflow_thread(task_id, body)
@@ -734,7 +734,31 @@ def _plan_request_artifact(body: dict) -> dict:
         "mode": body.get("mode", "agent"),
         "message_count": len(messages) if isinstance(messages, list) else 0,
         "user_request": _first_user_text_from_messages(messages),
-        "workspace_summary": _workspace_debug_summary(body.get("workspace")),
+        "workspace_summary": _workspace_request_summary(body.get("workspace")),
+    }
+
+
+def _workspace_request_summary(workspace: object) -> dict:
+    if not isinstance(workspace, dict):
+        return {"present": False}
+    source_map = workspace.get("source_map")
+    files = source_map.get("files") if isinstance(source_map, dict) and isinstance(source_map.get("files"), list) else []
+    sample_paths = [
+        str(item.get("path") or item.get("relative_path") or "")
+        for item in files[:8]
+        if isinstance(item, dict) and (item.get("path") or item.get("relative_path"))
+    ]
+    tree_preview = workspace.get("tree_preview")
+    return {
+        "present": True,
+        "keys": sorted(str(key) for key in workspace.keys()),
+        "tree_preview_chars": len(tree_preview) if isinstance(tree_preview, str) else 0,
+        "source_map_present": isinstance(source_map, dict),
+        "source_map_root": source_map.get("root") if isinstance(source_map, dict) else None,
+        "source_map_total_files": source_map.get("total_files") if isinstance(source_map, dict) else None,
+        "source_map_indexed_files": source_map.get("indexed_files") if isinstance(source_map, dict) else None,
+        "source_map_files_payload": len(files),
+        "sample_paths": sample_paths,
     }
 
 

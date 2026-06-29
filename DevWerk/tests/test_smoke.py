@@ -119,6 +119,38 @@ def test_project_requires_explicit_workflow_before_task(monkeypatch, tmp_path):
         raise AssertionError("task creation must fail without project workflow")
 
 
+def test_workflow_start_records_workspace_summary_without_legacy_plan_api(monkeypatch, tmp_path):
+    _, kanban_service = configure(monkeypatch, tmp_path)
+    from app.routes import workflows as workflow_routes
+
+    project_id = "workspace-summary-start"
+    kanban_service.update_project_workflow(project_id, code_flow())
+    monkeypatch.setattr(workflow_routes, "_start_workflow_thread", lambda task_id, body: None)
+
+    result = workflow_routes.start_workflow_payload(
+        {
+            "project_id": project_id,
+            "messages": [{"role": "user", "content": "Repair the compile error."}],
+            "workspace": {
+                "tree_preview": "demo/\n  src/Main.java",
+                "source_map": {
+                    "root": "demo",
+                    "total_files": 1,
+                    "indexed_files": 1,
+                    "files": [{"path": "src/Main.java", "language": "java"}],
+                },
+            },
+        }
+    )
+
+    assert result["ok"] is True
+    task = kanban_service.get_task(result["task_id"])["task"]
+    request_artifact = [item for item in task["artifacts"] if item["artifact_type"] == "workflow_request"][-1]["payload"]
+    assert request_artifact["workspace_summary"]["source_map_present"] is True
+    assert request_artifact["workspace_summary"]["sample_paths"] == ["src/Main.java"]
+    assert "workflow_queued" in [event["event_type"] for event in task["events"]]
+
+
 def test_workflow_action_protocol_uses_project_defined_transitions(monkeypatch, tmp_path):
     _, kanban_service = configure(monkeypatch, tmp_path)
     import app.services.workflow as workflow_service
