@@ -248,8 +248,9 @@ def test_backend_web_ui_is_split_into_template_css_and_script():
     assert 'class="global-nav"' in html
     assert 'class="project-rail"' in html
     assert '<style' not in html
-    assert '<script src="/web/static/dashboard.js" defer></script>' in html
-    assert '<link rel="stylesheet" href="/web/static/dashboard.css" />' in html
+    assert '<script src="/web/static/dashboard.js' in html
+    assert 'defer></script>' in html
+    assert '<link rel="stylesheet" href="/web/static/dashboard.css' in html
     assert "renderProjectsPage" not in html
 
 

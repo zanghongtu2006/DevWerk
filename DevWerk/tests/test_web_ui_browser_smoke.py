@@ -164,6 +164,10 @@ const chrome = process.env.DEVWERK_BROWSER_CHROME || 'C:/Program Files/Google/Ch
   }}
   await page.goto('{base_url}/dashboard?project_id=web-smoke-alpha', {{ waitUntil: 'domcontentloaded' }});
   await page.waitForSelector('button[data-project-tab="configuration"]');
+  await (await one('#newProjectMain', 'new project button')).click();
+  await page.waitForSelector('.modal');
+  if (!await page.locator('.modal h2:has-text("New Project")').count()) throw new Error('new project modal did not open');
+  await page.locator('[data-dialog-close="true"]').click();
   for (const key of ['configuration','settings','workflow','routing','integrations','history','activity']) {{
     await (await one(`button[data-project-tab="${{key}}"]`, `project tab ${{key}}`)).click();
     await page.waitForTimeout(80);
@@ -171,6 +175,11 @@ const chrome = process.env.DEVWERK_BROWSER_CHROME || 'C:/Program Files/Google/Ch
     const expected = key === 'configuration' ? 'configuration' : key;
     if (!current.activeTab.toLowerCase().includes(expected)) throw new Error(`project tab ${{key}} did not activate: ${{JSON.stringify(current)}}`);
   }}
+  await (await one('button[data-project-tab="configuration"]', 'configuration tab')).click();
+  await page.locator('.editor-card[data-editor-title="Agents"] [data-action="editor-format"]').first().click();
+  await page.waitForSelector('.toast');
+  await page.locator('.editor-card[data-editor-title="Parameters"] [data-action="editor-save"]').first().click();
+  await page.waitForSelector('text=Parameters saved.');
   for (const key of ['events','memory','analytics','settings']) {{
     await (await one(`a[data-nav="${{key}}"]`, `nav ${{key}}`)).click();
     await page.waitForTimeout(160);
@@ -187,8 +196,28 @@ const chrome = process.env.DEVWERK_BROWSER_CHROME || 'C:/Program Files/Google/Ch
       await page.waitForSelector('text=Global Route Map');
     }}
   }}
+  for (const key of ['overview','projects','kanban','tasks']) {{
+    await (await one(`a[data-nav="${{key}}"]`, `nav ${{key}}`)).click();
+    await page.waitForTimeout(180);
+    const current = await info();
+    const expectedPath = key === 'overview' ? '/workbench' : key === 'projects' ? '/dashboard' : `/${{key}}`;
+    if (!current.url.includes(expectedPath)) throw new Error(`nav ${{key}} did not navigate: ${{JSON.stringify(current)}}`);
+    if (!current.url.includes('project_id=web-smoke-alpha')) throw new Error(`nav ${{key}} lost project id: ${{JSON.stringify(current)}}`);
+  }}
+  await page.goto('{base_url}/kanban?project_id=web-smoke-alpha', {{ waitUntil: 'domcontentloaded' }});
+  await page.waitForSelector('#createTask');
+  await (await one('#createTask', 'create task button')).click();
+  await page.waitForSelector('.modal');
+  if (!await page.locator('.modal h2:has-text("New Task")').count()) throw new Error('new task modal did not open');
+  await page.locator('[data-dialog-close="true"]').click();
   await page.goto('{base_url}/workbench?project_id=web-smoke-alpha', {{ waitUntil: 'domcontentloaded' }});
   await page.waitForSelector('button[data-chat-tab="conversation"]');
+  await (await one('#heroNewTask', 'hero new task')).click();
+  if (!await page.locator('#prompt').inputValue().then(value => value.includes('Start a new workflow task'))) throw new Error('hero new task did not seed the composer');
+  await (await one('#heroPlan', 'hero plan')).click();
+  if (!await page.locator('#prompt').inputValue().then(value => value.includes('Design or revise'))) throw new Error('hero plan did not seed the composer');
+  await page.locator('button:has-text("Add Context")').click();
+  if (!await page.locator('#prompt').inputValue().then(value => value.includes('Add project context'))) throw new Error('add context did not seed the composer');
   for (const key of ['conversation','workflow_log','artifacts']) {{
     await (await one(`button[data-chat-tab="${{key}}"]`, `chat tab ${{key}}`)).click();
     await page.waitForTimeout(80);

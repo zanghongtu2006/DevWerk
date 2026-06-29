@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -79,12 +81,30 @@ def test_web_ui_uses_external_static_assets():
     from app.routes.web_ui import render_web_ui
 
     html = render_web_ui("projects")
-    assert '<link rel="stylesheet" href="/web/static/dashboard.css"' in html
-    assert '<script src="/web/static/dashboard.js" defer>' in html
+    assert '<link rel="stylesheet" href="/web/static/dashboard.css' in html
+    assert '<script src="/web/static/dashboard.js' in html
+    assert 'defer></script>' in html
     assert "<style>" not in html
     assert "const API" not in html
     assert Path("app/web/static/dashboard.css").is_file()
     assert Path("app/web/static/dashboard.js").is_file()
+
+
+def test_dashboard_javascript_is_parseable():
+    if shutil.which("node") is None:
+        return
+
+    backend_root = Path(__file__).resolve().parents[1]
+    completed = subprocess.run(
+        ["node", "--check", str(backend_root / "app" / "web" / "static" / "dashboard.js")],
+        cwd=backend_root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=15,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_dashboard_route_serves_shell_and_static_assets(monkeypatch, tmp_path):

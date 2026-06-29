@@ -185,7 +185,7 @@ function projectTabContent() {
   return (renderers[state.projectTab] || projectConfigurationTab)();
 }
 function projectConfigurationTab() {
-  return `<div class="config-grid">${editorCard("Agents","Define the agents available in this project.","YAML", yamlish(state.settings.agents || defaultAgents()))}${editorCard("Parameters","Configure runtime parameters and defaults.","JSON", JSON.stringify(state.settings.parameters || defaultParameters(), null, 2))}<div class="side-stack">${workflowPresetCard()}${routingSummaryCard()}${teamCard()}</div></div>`;
+  return `<div class="config-grid">${editorCard("Agents","Define the agents available in this project.","JSON", JSON.stringify(state.settings.agents || defaultAgents(), null, 2))}${editorCard("Parameters","Configure runtime parameters and defaults.","JSON", JSON.stringify(state.settings.parameters || defaultParameters(), null, 2))}<div class="side-stack">${workflowPresetCard()}${routingSummaryCard()}${teamCard()}</div></div>`;
 }
 function projectSettingsTab() {
   return `<div class="config-grid">${editorCard("Project Settings","Identity, defaults, and runtime settings for this project.","JSON", JSON.stringify({project: currentProject(), settings: state.settings}, null, 2))}${editorCard("Task Policy","How DevWerk should manage task continuity, memory and approvals.","JSON", JSON.stringify(defaultTaskPolicy(), null, 2))}<div class="side-stack">${settingsTile("Task Continuity","Conversation-driven","Same topic continues active task; explicit new work starts a task.")}${settingsTile("Approval Mode","Automatic","Kanban state machine drives work without manual tab buttons.")}${settingsTile("Memory Scope","Project + Task","Project memory is injected into every task context.")}</div></div>`;
@@ -241,10 +241,10 @@ function pipelineHtml() {
   return `<div class="card pipeline"><div class="pipeline-title">Workflow Pipeline</div><div class="pipeline-row">${stages.map(stage => {
     const done = !activeSeen && stage !== active;
     if (stage === active) activeSeen = true;
-    return `<div class="stage ${stage === active ? "active" : done ? "done" : ""}"><span class="stage-icon">${done ? "✓" : ""}</span><span class="stage-label">${stageTitle(stage)} <b>${statusCount(stage)}</b></span></div>`;
+    return `<div class="stage ${stage === active ? "active" : done ? "done" : ""}"><span class="stage-icon">${done ? "OK" : ""}</span><span class="stage-label">${stageTitle(stage)} <b>${statusCount(stage)}</b></span></div>`;
   }).join("")}</div></div>`;
 }
-function healthCard(){ const failed=(currentProject().stats || {}).failed_tasks || 0; const active=activeStage(); const stages=columns().map(c=>c.status_key); return `<div class="card card-pad"><div style="display:flex;gap:10px;align-items:center"><span class="ok">${failed ? "!" : "✓"}</span><div><div class="h3">${failed ? "Attention" : "No failed tasks"}</div><div class="muted" style="font-size:12px">Derived from backend Kanban state.</div></div></div><div style="margin-top:18px" class="muted">Active Stage</div><div style="margin-top:8px"><span class="badge blue">${esc(active ? stageTitle(active) : "-")}</span></div><div class="muted" style="font-size:12px;margin-top:6px">${active ? statusCount(active) : 0} tasks in active stage</div><div class="progress"><span style="width:${active && stages.length ? Math.max(3, Math.round(((stages.indexOf(active) + 1) / stages.length) * 100)) : 0}%"></span></div></div>`; }
+function healthCard(){ const failed=(currentProject().stats || {}).failed_tasks || 0; const active=activeStage(); const stages=columns().map(c=>c.status_key); return `<div class="card card-pad"><div style="display:flex;gap:10px;align-items:center"><span class="ok">${failed ? "!" : "OK"}</span><div><div class="h3">${failed ? "Attention" : "No failed tasks"}</div><div class="muted" style="font-size:12px">Derived from backend Kanban state.</div></div></div><div style="margin-top:18px" class="muted">Active Stage</div><div style="margin-top:8px"><span class="badge blue">${esc(active ? stageTitle(active) : "-")}</span></div><div class="muted" style="font-size:12px;margin-top:6px">${active ? statusCount(active) : 0} tasks in active stage</div><div class="progress"><span style="width:${active && stages.length ? Math.max(3, Math.round(((stages.indexOf(active) + 1) / stages.length) * 100)) : 0}%"></span></div></div>`; }
 function usageCard(u, title="Token Usage", rows=null){ return `<div class="card card-pad"><div style="display:flex;justify-content:space-between;gap:10px"><div class="h3">${esc(title)}</div><span class="muted" style="font-size:12px">Backend usage DB</span></div><div style="font-size:20px;font-weight:850;margin-top:12px">${compact(u.total)} total tokens</div><div class="progress"><span style="width:${u.total ? 100 : 0}%"></span></div><div class="metric-lines"><div class="metric-line"><span>Input Tokens</span><b>${compact(u.input)}</b></div><div class="metric-line"><span>Output Tokens</span><b>${compact(u.output)}</b></div><div class="metric-line"><span>LLM Calls</span><b>${compact(u.calls)}</b></div><div class="metric-line"><span>Requests</span><b>${compact(u.request_count)}</b></div></div>${usageBars(rows || state.usage.by_task || state.usage.projects || [])}</div>`; }
 function routingCard(){ return `<div class="card card-pad"><div class="h3">Agent Route</div><div class="muted" style="font-size:12px;margin-top:4px">Routes map agent responsibilities to model configs; they are not model names.</div><div class="metric-lines" style="margin-top:12px"><div><div class="muted">Project Default</div><b>${esc(modelRoutes()[0] || "default")}</b></div><div><div class="muted">Project Routes</div><b>${esc(modelRoutes().join(", ") || "default")}</b></div><div><div class="muted">Thinking Mode</div><b>${esc((state.settings.parameters || {}).thinking_mode || "Balanced")}</b></div></div></div>`; }
 function conversationCard(){ return `<section class="card chat-card"><div class="tabs">${conversationTabs().map(tab=>`<button class="tab tab-button ${state.conversationTab===tab.key?"active":""}" data-chat-tab="${tab.key}">${tab.label}</button>`).join("")}<span style="margin-left:auto;display:flex;gap:8px;align-items:center;margin-bottom:8px"><button class="small-button">Auto</button><button class="icon-button">Run</button><button id="clearChat" class="small-button">Clear</button></span></div><div id="chatBody" class="chat-body">${conversationTabContent()}</div><div class="composer"><div class="composer-box"><textarea id="prompt" class="composer-input" placeholder="Message DevWerk about this project, workflow, or task..."></textarea><div class="composer-actions"><div class="tool-row"><span class="tool">A</span><span class="tool">F</span><span class="tool">&lt;/&gt;</span><span class="tool">B</span></div><div style="display:flex;gap:10px"><select class="select-pill">${modelRoutes().map(m=>`<option>${esc(m)}</option>`).join("") || "<option>default</option>"}</select><button id="send" class="send-button">></button></div></div></div></div></section>`; }
@@ -299,7 +299,7 @@ function memoryCard(){ const mem=state.memory || {}; return `<div class="card ca
 function recentEventsCard(){ return `<div class="card card-pad"><div style="display:flex;justify-content:space-between;margin-bottom:16px"><div class="h3">Recent Events</div><a class="link">View all</a></div><div class="list">${state.events.slice(0,5).map(e=>`<div class="list-row"><span class="timeline-dot"></span><div><div class="list-row-title">${esc(dateTime(e.created_at))} ${esc(eventTitle(e))}</div><div class="list-row-sub">${esc(e.task_title || e.to_status || state.projectId)}</div></div></div>`).join("") || `<div class="muted">No events yet.</div>`}</div></div>`; }
 function kpi(label,value){ return `<div class="card kpi"><div class="kpi-label">${label}</div><div class="kpi-value">${value}</div></div>`; }
 function projectCard(project){ const stats=project.stats || {}; const health=projectHealth(stats); return `<button class="project-card ${project.id === state.projectId ? "selected" : ""}" data-project-card="${escAttr(project.id)}"><div class="card-top"><div class="project-title">${esc(project.name || project.id)}</div><span class="badge ${projectStatus(project).badge}">${projectStatus(project).label}</span></div><div class="muted" style="font-size:12px;line-height:1.45;margin-top:12px">${esc(project.description || project.id)}<br/>${esc(modelRoutes()[0] || "default")}</div><div class="card-meta"><div><div class="meta-label">Tasks</div><div class="meta-value">${stats.tasks || 0}</div></div><div><div class="meta-label">Active</div><div class="meta-value">${stats.active_tasks || 0}</div></div><div><div class="meta-label">Last activity</div><div class="meta-value">${relative(project.updated_at)}</div></div><div><div class="meta-label">Health</div><div class="meta-value">${health.label}</div></div></div>${projectUsageMini(stats)}</button>`; }
-function editorCard(title, desc, mode, content){ const lines=String(content || "").split("\n"); return `<div class="editor-card card"><div class="editor-head"><div><div class="h3">${title}</div><div class="muted" style="font-size:12px;margin-top:4px">${desc}</div></div><div><button class="small-button">${mode}</button><button class="icon-button">X</button></div></div><div class="editor"><div class="line-nos">${lines.map((_,i)=>i+1).join("<br/>")}</div><pre class="code">${esc(lines.join("\n"))}</pre></div><div class="editor-foot"><span class="muted">Loaded from backend API</span><span><button class="small-button">Format</button> <button class="small-button">Save</button></span></div></div>`; }
+function editorCard(title, desc, mode, content){ const lines=String(content || "").split("\n"); return `<div class="editor-card card" data-editor-title="${escAttr(title)}" data-editor-mode="${escAttr(mode)}"><div class="editor-head"><div><div class="h3">${title}</div><div class="muted" style="font-size:12px;margin-top:4px">${desc}</div></div><div><button class="small-button" data-action="editor-format">${mode}</button><button class="icon-button" data-action="editor-collapse" title="Collapse editor">X</button></div></div><div class="editor"><div class="line-nos">${lines.map((_,i)=>i+1).join("<br/>")}</div><textarea class="code-editor" spellcheck="false">${esc(lines.join("\n"))}</textarea></div><div class="editor-foot"><span class="muted">Loaded from backend API</span><span><button class="small-button" data-action="editor-format">Format</button> <button class="small-button" data-action="editor-save">Save</button></span></div></div>`; }
 function workflowPresetCard(){ const workflow=state.workflow || {}; const columnsCount=(workflow.columns || workflow.stages || columns() || []).length; return `<div class="card side-card"><div class="h3">Workflow Definition</div><div class="muted" style="font-size:12px;margin-top:4px">Loaded from backend project workflow.</div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Name</b><span>${esc(workflow.name || "default")}</span></div><div class="metric-line"><b>Columns</b><span>${columnsCount}</span></div><div class="metric-line"><b>Source</b><span>${workflow.source ? esc(workflow.source) : "project settings"}</span></div></div></div>`; }
 function routingSummaryCard(){ const params=state.settings.parameters || {}; return `<div class="card side-card"><div class="h3">Project Route Summary</div><div class="muted" style="font-size:12px;margin-top:4px">Project agent routes. Route keys are responsibilities, not model names.</div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Default Route</b><span>${esc(modelRoutes()[0] || "default")}</span></div><div class="metric-line"><b>Route Count</b><span>${modelRoutes().length}</span></div><div class="metric-line"><b>Strategy</b><span>${esc(params.routing_strategy || "project override")}</span></div></div></div>`; }
 function globalRoutingSummaryCard(){ const routing=state.globalSettings.routing || {}; const rows=Object.entries(routing); return `<div class="card side-card"><div class="h3">Global Route Map</div><div class="muted" style="font-size:12px;margin-top:4px">Agent responsibility -> model route.</div><div class="metric-lines" style="margin-top:12px">${rows.length ? rows.slice(0,8).map(([key,value])=>`<div class="metric-line"><b>${esc(routeKeyLabel(key))}</b><span>${esc(value)}</span></div>`).join("") : `<div class="muted">No global routing returned by backend.</div>`}</div></div>`; }
@@ -319,7 +319,7 @@ function taskTabContent(task, events, artifacts){ const renderers={summary:()=>t
 function taskSummaryTab(task, events, artifacts){ return `<div class="summary-grid">
       <div class="summary-card"><div class="h3">What was done</div><p class="muted">${esc(task.description || "No task description returned by backend.")}</p><div class="h3">Acceptance criteria</div><ul class="clean"><li>Task has workflow status: ${esc(task.status_key || "-")}</li><li>${events.length} task events returned</li><li>${artifacts.length} artifacts returned</li></ul></div>
       <div class="summary-card"><div class="h3">Scope</div><ul class="clean"><li>Project: ${esc(task.project_id || state.projectId)}</li><li>Status: ${esc(task.status_key || "-")}</li><li>Priority: ${esc(String(task.priority || 0))}</li></ul></div>
-      <div class="summary-card wide"><div class="h3">Checklist</div><div class="check-list">${["Plan recorded","Context gathered","Implementation tracked","Review evidence available","Verification tracked","Memory updated"].map(x=>`<div class="check-item"><span class="ok">${taskHasEvidence(task, x) ? "鉁? : "-"}</span><span>${x}</span></div>`).join("")}</div></div>
+      <div class="summary-card wide"><div class="h3">Checklist</div><div class="check-list">${["Plan recorded","Context gathered","Implementation tracked","Review evidence available","Verification tracked","Memory updated"].map(x=>`<div class="check-item"><span class="ok">${taskHasEvidence(task, x) ? "OK" : "-"}</span><span>${x}</span></div>`).join("")}</div></div>
       <div class="summary-card"><div class="h3">Touched paths</div>${filesHtml(artifacts)}<a class="link">Show more files</a></div>
       <div class="summary-card"><div class="h3">Assistant notes</div><p class="muted">${esc(latestArtifactSummary(task) || "No assistant notes recorded yet.")}</p><div class="soft" style="font-size:12px">Updated <span style="float:right">${relative(task.updated_at)}</span></div></div>
       <div class="summary-card wide exec-log"><div class="log-head"><div class="h3">Execution log (reasoning + actions)</div><button class="small-button">Copy log</button></div><div class="log-body"><div class="steps">${columns().slice(0,6).map(c=>`<div class="step ${c.status_key===task.status_key?"active":""}"><span class="timeline-dot" style="width:12px;height:12px"></span><b>${esc(c.title)}</b><span>${statusCount(c.status_key)}</span></div>`).join("")}</div><div class="log-lines">${events.length ? events.map(e=>`${dateTime(e.created_at)}  ${esc(e.event_type)} ${esc(e.from_status||"")} ${e.to_status ? "-> "+esc(e.to_status) : ""}`).join("<br/>") : "No task events recorded yet."}</div></div></div>
@@ -413,8 +413,126 @@ function looksLikeJson(value) {
 }
 function defaultAgents(){ return {"dev-assistant":{name:"DevWerk Assistant",role:"primary",description:"General purpose development assistant",model_route:"default",tools:["code","search","file_editor","terminal"]}}; }
 function defaultParameters(){ return {model:modelRoutes()[0] || "default",temperature:0.2,max_tokens:8192,top_p:1,stream:true,thinking_mode:"balanced",retry:{attempts:3,backoff_ms:500}}; }
-async function createProjectFromPrompt(){ const name=prompt("Project name","Untitled Project"); if(!name)return; const id=`project-${new Date().toISOString().replace(/[-:TZ.]/g,"").slice(0,17)}`; await api(`${API}/kanban/projects`,{method:"POST",body:JSON.stringify({project_id:id,name})}); state.projectId=id; await refreshAll(); location.href=`/workbench?project_id=${encodeURIComponent(id)}&new=1&project_name=${encodeURIComponent(name)}`; }
-async function createTaskFromPrompt(){ const title=prompt("Task title","New workflow task"); if(!title)return; await api(`${API}/kanban/tasks`,{method:"POST",body:JSON.stringify({project_id:state.projectId,title,description:"Created from DevWerk Web UI."})}); await Promise.allSettled([loadBoard(),loadEvents()]); renderKanbanPage(); }
+async function createProjectFromPrompt(){ openTextDialog({title:"New Project", label:"Project name", defaultValue:"Untitled Project", submitText:"Create Project", onSubmit: async name => { const id=`project-${new Date().toISOString().replace(/[-:TZ.]/g,"").slice(0,17)}`; await api(`${API}/kanban/projects`,{method:"POST",body:JSON.stringify({project_id:id,name})}); state.projectId=id; await refreshAll(); location.href=`/workbench?project_id=${encodeURIComponent(id)}&new=1&project_name=${encodeURIComponent(name)}`; }}); }
+async function createTaskFromPrompt(){ openTextDialog({title:"New Task", label:"Task title", defaultValue:"New workflow task", submitText:"Create Task", onSubmit: async title => { await api(`${API}/kanban/tasks`,{method:"POST",body:JSON.stringify({project_id:state.projectId,title,description:"Created from DevWerk Web UI."})}); await Promise.allSettled([loadBoard(),loadEvents()]); renderShell(); notify("Task created."); }}); }
+function notify(message, type="info") {
+  document.querySelectorAll(".toast").forEach(node => node.remove());
+  const toast = document.createElement("div");
+  toast.className = `toast ${type === "error" ? "error" : ""}`;
+  toast.textContent = message;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 3200);
+}
+function openTextDialog({title, label, defaultValue, submitText, onSubmit}) {
+  document.querySelectorAll(".modal-backdrop").forEach(node => node.remove());
+  const wrap = document.createElement("div");
+  wrap.className = "modal-backdrop";
+  wrap.innerHTML = `<form class="modal"><h2>${esc(title)}</h2><label>${esc(label)}<input name="value" value="${escAttr(defaultValue || "")}" /></label><div class="modal-actions"><button type="button" class="button" data-dialog-close="true">Cancel</button><button type="submit" class="button primary">${esc(submitText || "Create")}</button></div></form>`;
+  document.body.appendChild(wrap);
+  const input = wrap.querySelector("input");
+  input.focus();
+  input.select();
+  wrap.querySelector("[data-dialog-close]").onclick = () => wrap.remove();
+  wrap.querySelector("form").onsubmit = async event => {
+    event.preventDefault();
+    const value = (input.value || "").trim();
+    if (!value) return;
+    try {
+      await onSubmit(value);
+      wrap.remove();
+    } catch (error) {
+      notify(error.message || String(error), "error");
+    }
+  };
+}
+function setPrompt(text) {
+  const prompt = $("prompt");
+  if (!prompt) {
+    location.href = `/workbench?project_id=${encodeURIComponent(state.projectId)}`;
+    return;
+  }
+  prompt.value = text;
+  prompt.focus();
+}
+function goSection(section) {
+  state.page = "projects";
+  state.section = section;
+  history.pushState(null, "", `/dashboard?project_id=${encodeURIComponent(state.projectId)}#${encodeURIComponent(section)}`);
+  renderShell();
+}
+function navigatePrimary(section) {
+  const paths = {overview:"/workbench", projects:"/dashboard", kanban:"/kanban", tasks:"/tasks"};
+  if (["events","memory","analytics","settings"].includes(section)) {
+    goSection(section);
+    return;
+  }
+  const path = paths[section] || "/dashboard";
+  location.href = `${path}?project_id=${encodeURIComponent(state.projectId)}`;
+}
+async function cloneCurrentProject() {
+  const source = currentProject();
+  const id = `project-${new Date().toISOString().replace(/[-:TZ.]/g,"").slice(0,17)}`;
+  await api(`${API}/kanban/projects`, {method:"POST", body:JSON.stringify({project_id:id, name:`${source.name || source.id} copy`, description:source.description || ""})});
+  if (state.workflow && (state.workflow.columns || []).length) {
+    await api(`${API}/kanban/projects/${encodeURIComponent(id)}/workflow`, {method:"PUT", body:JSON.stringify({workflow:state.workflow})}).catch(() => null);
+  }
+  state.projectId = id;
+  await refreshAll();
+  notify("Project cloned.");
+}
+function exportBoard() {
+  const blob = new Blob([JSON.stringify({project_id: state.projectId, board: state.board, events: state.events}, null, 2)], {type:"application/json"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `devwerk-${state.projectId}-board.json`;
+  document.body.appendChild(a);
+  a.click();
+  URL.revokeObjectURL(a.href);
+  a.remove();
+  notify("Board export downloaded.");
+}
+function editorPayload(card) {
+  const text = card.querySelector(".code-editor")?.value || "";
+  try { return JSON.parse(text); }
+  catch (error) { throw new Error(`Invalid JSON in ${card.dataset.editorTitle}: ${error.message}`); }
+}
+function formatEditor(card) {
+  const textarea = card.querySelector(".code-editor");
+  if (!textarea) return;
+  if ((card.dataset.editorMode || "").toUpperCase() === "JSON") textarea.value = JSON.stringify(JSON.parse(textarea.value || "{}"), null, 2);
+  notify(`${card.dataset.editorTitle || "Editor"} formatted.`);
+}
+async function saveEditor(card) {
+  const title = card.dataset.editorTitle || "";
+  const payload = editorPayload(card);
+  if (title === "Agents") await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/settings`, {method:"PUT", body:JSON.stringify({agents: payload})});
+  else if (title === "Parameters") await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/settings`, {method:"PUT", body:JSON.stringify({parameters: payload})});
+  else if (title === "Workflow Definition") await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/workflow`, {method:"PUT", body:JSON.stringify({workflow: payload})});
+  else if (title === "Global LLM Catalog") await api(`${API}/settings`, {method:"PUT", body:JSON.stringify({llms: payload})});
+  else if (title === "Global Routing Map") await api(`${API}/settings`, {method:"PUT", body:JSON.stringify({routing: payload})});
+  else { notify(`${title} is read-only in this view.`); return; }
+  await Promise.allSettled([loadSettings(), loadGlobalSettings(), loadWorkflow(), loadBoard()]);
+  renderShell();
+  notify(`${title} saved.`);
+}
+async function actOnCurrentTask(action) {
+  const task = activeBoardTask();
+  if (!task) { notify("No task selected.", "error"); return; }
+  if (action === "review") { state.taskTab = "diff"; renderTaskPage(); notify("Review artifacts opened."); return; }
+  if (action === "apply") { notify("Apply is performed by a connected capability provider; this dashboard records apply results."); return; }
+  if (action === "open-pr") { notify("No pull request integration is configured for this project."); return; }
+  if (action === "open-editor") { notify("No editor capability provider is connected to this web session."); return; }
+  if (action === "rerun") {
+    try {
+      await api(`${API}/kanban/tasks/${encodeURIComponent(task.id)}/actions`, {method:"POST", body:JSON.stringify({action:"retry", payload:{source:"web_ui"}})});
+      await Promise.allSettled([loadBoard(), loadEvents()]);
+      renderTaskPage();
+      notify("Retry requested.");
+    } catch (error) {
+      notify(error.message || String(error), "error");
+    }
+  }
+}
 function currentProject(){ return state.projects.find(p => p.id === state.projectId) || {id: state.projectId, name: state.projectId, description: ""}; }
 function projectStatus(project){ const raw = String(project.status || project.state || "").toLowerCase(); if(raw === "draft") return {label:"Draft", badge:"orange", dot:"orange"}; if(raw === "planned") return {label:"Planned", badge:"blue", dot:"blue"}; if(raw === "idle") return {label:"Idle", badge:"blue", dot:"blue"}; return projectHealth(project.stats || {}); }
 function columns(){ return (state.board && state.board.columns) || []; }
@@ -448,18 +566,54 @@ $("newProjectRail").onclick = createProjectFromPrompt;
 $("refresh").onclick = () => refreshAll().catch(err => alert(err.message || String(err)));
 window.addEventListener("hashchange", () => { state.section = activeSection(); renderShell(); });
 document.addEventListener("click", async event => {
+  const collapse = event.target.closest(".nav-collapse");
+  if (collapse) {
+    document.querySelector(".app-shell")?.classList.toggle("nav-collapsed");
+    return;
+  }
   const sectionLink = event.target.closest("a[data-nav]");
-  if (sectionLink && ["events","memory","analytics","settings"].includes(sectionLink.dataset.nav || "")) {
+  if (sectionLink) {
     event.preventDefault();
-    state.page = "projects";
-    state.section = sectionLink.dataset.nav;
-    history.pushState(null, "", `/dashboard?project_id=${encodeURIComponent(state.projectId)}#${encodeURIComponent(state.section)}`);
-    renderShell();
+    navigatePrimary(sectionLink.dataset.nav || "projects");
     return;
   }
   const project = event.target.closest("[data-project-card]");
   if(project) { state.projectId = project.dataset.projectCard; history.replaceState(null, "", pageUrlForCurrentView()); await refreshAll(); }
   const task = event.target.closest("[data-task]");
   if(task) location.href = `/tasks?project_id=${encodeURIComponent(state.projectId)}&task_id=${encodeURIComponent(task.dataset.task)}`;
+  const editorButton = event.target.closest("[data-action]");
+  if (editorButton) {
+    const card = editorButton.closest(".editor-card");
+    try {
+      if (editorButton.dataset.action === "editor-format" && card) formatEditor(card);
+      if (editorButton.dataset.action === "editor-save" && card) await saveEditor(card);
+      if (editorButton.dataset.action === "editor-collapse" && card) { card.classList.toggle("collapsed"); card.querySelector(".editor")?.classList.toggle("hidden"); notify("Editor collapsed."); }
+    } catch (error) {
+      notify(error.message || String(error), "error");
+    }
+    return;
+  }
+  const target = event.target.closest("button,a.link");
+  if (!target || target.classList.contains("tab-button") || target.closest("[data-project-card]") || target.closest("[data-task]")) return;
+  const label = (target.innerText || target.title || "").trim().replace(/\s+/g, " ");
+  if (!label) return;
+  if (label === "N" || target.title === "Notifications" || label === "View all" && target.closest(".card")?.textContent?.includes("Recent Events")) { goSection("events"); return; }
+  if (label === "S" || target.title === "Settings") { goSection("settings"); return; }
+  if (label === "Add Context") { setPrompt("Add project context: "); return; }
+  if (label === "Preview") { state.projectTab = "workflow"; renderProjectsPage(); notify("Workflow preview opened."); return; }
+  if (label === "Clone") { await cloneCurrentProject(); return; }
+  if (label === "..." && target.closest(".config-panel")) { state.projectTab = "activity"; renderProjectsPage(); return; }
+  if (label === "Auto") { notify("Auto mode is active; workflow state machine drives tasks."); return; }
+  if (label === "Run") { const prompt = $("prompt"); if (prompt && prompt.value.trim()) await sendProjectMessage(); else { setPrompt("Start or continue a workflow task: "); notify("Write a task request, then press Send."); } return; }
+  if (label === "Clear") { state.conversation = []; renderShell(); notify("Conversation view cleared locally."); return; }
+  if (label === "New Task" || label === "+ Add task") { setPrompt("Start a new workflow task: "); return; }
+  if (label === "View" || label === "View in Memory") { goSection("memory"); return; }
+  if (label === "Show more files" || label === "View diff") { state.taskTab = "diff"; if (state.page === "tasks") renderTaskPage(); else location.href = `/tasks?project_id=${encodeURIComponent(state.projectId)}`; return; }
+  if (label === "Export Board") { exportBoard(); return; }
+  if (label === "Review") { await actOnCurrentTask("review"); return; }
+  if (label === "Apply") { await actOnCurrentTask("apply"); return; }
+  if (label === "Re-run") { await actOnCurrentTask("rerun"); return; }
+  if (label === "Open PR") { await actOnCurrentTask("open-pr"); return; }
+  if (label === "Open in editor") { await actOnCurrentTask("open-editor"); return; }
 });
 refreshAll().catch(error => { $("page").innerHTML = `<div class="card card-pad"><h1 class="h2">DevWerk UI failed to load</h1><p class="muted">${esc(error.message || String(error))}</p></div>`; });

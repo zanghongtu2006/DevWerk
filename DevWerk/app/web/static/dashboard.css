@@ -23,6 +23,12 @@ html, body { height: 100%; margin: 0; color: var(--text); background: var(--bg);
 body { overflow: hidden; }
 button, input, textarea, select { font: inherit; }
 .app-shell { height: 100vh; display: grid; grid-template-columns: 192px minmax(240px, 320px) minmax(0, 1fr); background: var(--bg); }
+.app-shell.nav-collapsed { grid-template-columns: 62px minmax(240px, 320px) minmax(0, 1fr); }
+.app-shell.nav-collapsed .brand-name,
+.app-shell.nav-collapsed .nav-link:not(:hover) { font-size: 0; gap: 0; justify-content: center; }
+.app-shell.nav-collapsed .identity span:not(.avatar),
+.app-shell.nav-collapsed .footer-links { display: none; }
+.app-shell.nav-collapsed .global-nav { padding-left: 10px; padding-right: 10px; }
 .global-nav, .project-rail { background: rgba(255,255,255,.94); border-right: 1px solid var(--border); height: 100vh; overflow-y: auto; overflow-x: hidden; }
 .global-nav { display: flex; flex-direction: column; padding: 24px 14px; }
 .brand { display: flex; align-items: center; gap: 12px; height: 34px; margin-bottom: 28px; }
@@ -102,6 +108,15 @@ button, input, textarea, select { font: inherit; }
 .tabs { display: flex; gap: 24px; border-bottom: 1px solid var(--border); padding: 0 16px; min-height: 48px; align-items: end; }
 .tab { padding: 14px 0 11px; color: #334155; font-weight: 750; font-size: 13px; border-bottom: 2px solid transparent; }
 .tab.active { color: var(--blue); border-color: var(--blue); }
+.toast { position: fixed; right: 22px; bottom: 22px; z-index: 50; max-width: 380px; border: 1px solid var(--border-strong); background: #fff; color: var(--text); box-shadow: var(--shadow); border-radius: 10px; padding: 12px 14px; font-size: 13px; font-weight: 700; }
+.toast.error { border-color: #fecdd3; background: #fff1f2; color: #9f1239; }
+.hidden { display: none !important; }
+.modal-backdrop { position: fixed; inset: 0; z-index: 60; background: rgba(15, 23, 42, .25); display: grid; place-items: center; padding: 22px; }
+.modal { width: min(460px, 100%); background: #fff; border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); padding: 18px; }
+.modal h2 { margin: 0 0 10px; font-size: 18px; }
+.modal label { display: grid; gap: 8px; color: var(--muted); font-size: 13px; font-weight: 700; }
+.modal input { height: 38px; border: 1px solid var(--border); border-radius: 8px; padding: 0 12px; color: var(--text); }
+.modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
 .chat-body { padding: 22px 24px; overflow-y: auto; display: flex; flex-direction: column; gap: 20px; }
 .message { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 12px; max-width: 760px; }
 .bot-badge { width: 26px; height: 26px; border-radius: 8px; background: var(--blue-soft); border: 1px solid #bed3ff; display: grid; place-items: center; color: var(--blue); font-weight: 850; }
@@ -245,6 +260,7 @@ button, input, textarea, select { font: inherit; }
 .grow { flex: 1; min-width: 0; }
 .snippet { border: 1px solid var(--border); background: var(--surface-soft); border-radius: 8px; padding: 12px; margin-top: 10px; font-size: 12px; color: #334155; line-height: 1.5; }
 .small-button { min-height: 28px; border: 1px solid var(--border); border-radius: 7px; background: #fff; padding: 0 10px; cursor: pointer; font-size: 12px; font-weight: 750; }
+.code-editor { min-height: 286px; width: 100%; border: 0; outline: 0; resize: vertical; background: transparent; color: #172554; font: 12px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre; overflow: auto; padding: 14px 14px 14px 0; }
 @media (max-width: 1280px) {
   .app-shell { grid-template-columns: 78px minmax(220px, 300px) minmax(0,1fr); }
   .brand-name, .nav-link:not(span), .nav-link { font-size: 0; }
