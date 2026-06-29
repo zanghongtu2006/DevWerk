@@ -67,8 +67,10 @@ class AgentCatalog:
         if not isinstance(overrides, dict):
             return self
         updated: list[AgentSpec] = []
+        seen: set[str] = set()
         for agent in self.agents:
             raw = overrides.get(agent.id)
+            seen.add(agent.id)
             if not isinstance(raw, dict):
                 updated.append(agent)
                 continue
@@ -78,6 +80,23 @@ class AgentCatalog:
                     agent,
                     enabled=bool(raw.get("enabled", agent.enabled)),
                     model_route=model_route or agent.model_route,
+                )
+            )
+        for agent_id, raw in overrides.items():
+            if agent_id in seen or not isinstance(raw, dict):
+                continue
+            roles = _strings(raw.get("roles")) or ("general",)
+            updated.append(
+                AgentSpec(
+                    id=str(agent_id).strip(),
+                    roles=roles,
+                    runtime=str(raw.get("runtime") or "tool_loop").strip(),
+                    model_route=str(raw.get("model_route") or raw.get("model_ref") or "default").strip(),
+                    capabilities=_strings(raw.get("capabilities")),
+                    skills=_strings(raw.get("skills")),
+                    memory_policy=str(raw.get("memory_policy") or "task_and_project").strip(),
+                    context_policy=dict(raw.get("context_policy") or {}),
+                    enabled=bool(raw.get("enabled", True)),
                 )
             )
         return AgentCatalog(tuple(updated), self.jobs)

@@ -126,9 +126,10 @@ class WorkflowSupervisor:
         }
         add_event(task_id, "workflow_supervisor_timeout", payload)
         try:
-            apply_workflow_action(task_id, "fail", payload)
-            update_conversation(task_id, state="failed", waiting_for=None)
-            add_event(task_id, "workflow_finished", {**payload, "ok": False, "status_key": "failed", "terminal": True})
+            result = apply_workflow_action(task_id, "fail", payload)
+            status_key = str((result.get("task") or {}).get("status_key") or "")
+            update_conversation(task_id, state="failed", waiting_for=None, active_column=status_key or None)
+            add_event(task_id, "workflow_finished", {**payload, "ok": False, "status_key": status_key, "terminal": True})
             add_artifact(
                 task_id,
                 artifact_type="workflow_result",
@@ -136,7 +137,7 @@ class WorkflowSupervisor:
                     "ok": False,
                     "done": True,
                     "task_id": task_id,
-                    "status_key": "failed",
+                    "status_key": status_key,
                     "error_code": "WORKFLOW_SUPERVISOR_TIMEOUT",
                     "error_message": reason,
                     "retryable": True,

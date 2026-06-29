@@ -424,6 +424,8 @@ def create_task(
     ensure_default_columns(pid)
     with _conn() as conn:
         columns = _columns(conn, pid)
+        if not columns:
+            raise ValueError("project workflow is not configured; define columns through the project conversation first")
         status = status_key or columns[0]["status_key"]
         _require_status(columns, status)
         now = _now()
@@ -543,11 +545,17 @@ def list_managed_workflow_states() -> list[dict[str, Any]]:
                    c.state, c.active_column, c.waiting_for, c.updated_at AS conversation_updated_at
               FROM kb_tasks t
               JOIN kb_conversations c ON c.task_id = t.id
-             WHERE t.archived = 0 AND t.status_key NOT IN ('done', 'failed')
+             WHERE t.archived = 0
              ORDER BY c.updated_at ASC
             """
         ).fetchall()
-    return [dict(row) for row in rows]
+        result = []
+        for row in rows:
+            success, failure = _workflow_terminal_statuses_from_db(conn, row["project_id"])
+            if row["status_key"] in (success | failure):
+                continue
+            result.append(dict(row))
+    return result
 
 
 def get_latest_artifact_payload(task_id: str, artifact_type: str) -> dict[str, Any] | None:
@@ -928,7 +936,7 @@ def ensure_default_columns(project_id: str | None = None) -> None:
             "SELECT COUNT(*) AS count FROM kb_columns WHERE project_id = ?",
             (pid,),
         ).fetchone()["count"]
-        if count:
+        if count or not DEFAULT_COLUMNS:
             _ensure_workflow_columns(conn, pid)
             return
         now = _now()
@@ -1141,19 +1149,17 @@ def _settings_dict(row: sqlite3.Row | None) -> dict[str, Any]:
 
 
 def _project_stats(conn: sqlite3.Connection, project_id: str) -> dict[str, Any]:
-    task_row = conn.execute(
-        """
-        SELECT
-            COUNT(*) AS tasks,
-            SUM(CASE WHEN archived = 1 THEN 1 ELSE 0 END) AS archived_tasks,
-            SUM(CASE WHEN archived = 0 AND status_key NOT IN ('done', 'failed') THEN 1 ELSE 0 END) AS active_tasks,
-            SUM(CASE WHEN archived = 0 AND status_key = 'done' THEN 1 ELSE 0 END) AS done_tasks,
-            SUM(CASE WHEN archived = 0 AND status_key = 'failed' THEN 1 ELSE 0 END) AS failed_tasks
-          FROM kb_tasks
-         WHERE project_id = ?
-        """,
+    task_rows = conn.execute(
+        "SELECT status_key, archived FROM kb_tasks WHERE project_id = ?",
         (project_id,),
-    ).fetchone()
+    ).fetchall()
+    success_statuses, failure_statuses = _workflow_terminal_statuses_from_db(conn, project_id)
+    terminal_statuses = success_statuses | failure_statuses
+    tasks_count = len(task_rows)
+    archived_tasks = sum(1 for row in task_rows if row["archived"])
+    active_tasks = sum(1 for row in task_rows if not row["archived"] and row["status_key"] not in terminal_statuses)
+    done_tasks = sum(1 for row in task_rows if not row["archived"] and row["status_key"] in success_statuses)
+    failed_tasks = sum(1 for row in task_rows if not row["archived"] and row["status_key"] in failure_statuses)
 
     request_count = 0
     token_row = {
@@ -1186,11 +1192,11 @@ def _project_stats(conn: sqlite3.Connection, project_id: str) -> dict[str, Any]:
         ).fetchone()
         token_row = dict(row)
     return {
-        "tasks": task_row["tasks"] or 0,
-        "archived_tasks": task_row["archived_tasks"] or 0,
-        "active_tasks": task_row["active_tasks"] or 0,
-        "done_tasks": task_row["done_tasks"] or 0,
-        "failed_tasks": task_row["failed_tasks"] or 0,
+        "tasks": tasks_count,
+        "archived_tasks": archived_tasks,
+        "active_tasks": active_tasks,
+        "done_tasks": done_tasks,
+        "failed_tasks": failed_tasks,
         "request_count": request_count or 0,
         "llm_calls": token_row.get("calls") or 0,
         "input_tokens": token_row.get("input_tokens") or 0,
@@ -1201,12 +1207,25 @@ def _project_stats(conn: sqlite3.Connection, project_id: str) -> dict[str, Any]:
     }
 
 
+def _workflow_terminal_statuses_from_db(conn: sqlite3.Connection, project_id: str) -> tuple[set[str], set[str]]:
+    row = conn.execute("SELECT workflow_json FROM kb_project_settings WHERE project_id = ?", (project_id,)).fetchone()
+    workflow = _loads(row["workflow_json"], {}) if row is not None else {}
+    actions = workflow.get("actions") if isinstance(workflow, dict) and isinstance(workflow.get("actions"), dict) else {}
+    def target(action: str) -> str:
+        rule = actions.get(action)
+        return str((rule or {}).get("to") or "").strip().lower() if isinstance(rule, dict) else ""
+
+    success = {target(action) for action in ("workflow_done", "complete", "completed")}
+    failure = {target(action) for action in ("fail", "abandon")}
+    success.discard("")
+    failure.discard("")
+    return success, failure
+
+
 def _default_agents() -> dict[str, Any]:
     return {
         "context-indexer": {"enabled": True, "model_route": "default"},
-        "planning-agent": {"enabled": True, "model_route": "planner"},
-        "coding-agent": {"enabled": True, "model_route": "executor"},
-        "review-agent": {"enabled": True, "model_route": "reviewer"},
+        "project-agent": {"enabled": True, "model_route": "default"},
     }
 
 
@@ -1215,8 +1234,7 @@ def _normalize_agents(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         for name, raw in value.items():
             if isinstance(raw, dict):
-                item = {**agents.get(name, {}), **raw}
-                agents[name] = item
+                agents[name] = {**agents.get(name, {}), **raw}
     return agents
 
 

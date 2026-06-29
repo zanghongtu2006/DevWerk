@@ -35,6 +35,7 @@ from app.services.kanban import (
     ensure_conversation,
     get_conversation,
     get_project_settings,
+    get_project_workflow,
     get_task,
     get_workflow_runtime_state,
     list_events,
@@ -117,9 +118,18 @@ def start_workflow_payload(body: dict) -> dict:
             "error_message": "messages must be a non-empty list",
         }
 
+    project_id = str(body.get("project_id") or "default")
+    workflow = get_project_workflow(project_id).get("workflow") or {}
+    if not workflow.get("columns"):
+        return {
+            "ok": False,
+            "project_id": project_id,
+            "error_code": "PROJECT_WORKFLOW_REQUIRED",
+            "error_message": "Project workflow is not configured. Use the project conversation agent to design columns, actions, and node agents before starting tasks.",
+        }
+
     task_id = _ensure_workflow_task(body)
     body["task_id"] = task_id
-    project_id = str(body.get("project_id") or "default")
     ensure_conversation(task_id, metadata={"interaction_mode": body.get("interaction_mode", "auto")})
     conversation = get_conversation(task_id) or {}
     if not conversation.get("messages"):
@@ -393,7 +403,7 @@ async def planning_phase(request: Request) -> PlanResponse:
         )
 
     cfg = settings()
-    planner_agent = str(body.get("_workflow_agent_model_route") or "planner").strip()
+    planner_agent = str(body.get("_workflow_agent_model_route") or "default").strip()
     try:
         cfg.validate_provider(planner_agent)
     except ValueError as ve:
@@ -413,7 +423,7 @@ async def planning_phase(request: Request) -> PlanResponse:
         parameters = project_settings.get("parameters") if isinstance(project_settings, dict) else {}
         p = EvidencePlanningLoop(
             model_route=planner_agent,
-            agent_id=str(body.get("_workflow_agent_id") or "planning-agent"),
+            agent_id=str(body.get("_workflow_agent_id") or "project-agent"),
             event_sink=lambda event_type, payload: _kanban_event(task_id, event_type, payload),
             max_rounds=_positive_int(parameters.get("planner_max_rounds"), 128, maximum=512),
         )
@@ -1535,7 +1545,10 @@ def _run_workflow_thread(task_id: str, body: dict) -> None:
             retryable=True,
         )
         _kanban_artifact(task_id, "workflow_result", payload=response.model_dump())
-        _kanban_move(task_id, "failed", {"phase": "workflow", "error": response.error_message})
+        try:
+            apply_workflow_action(task_id, "fail", {"phase": "workflow", "error": response.error_message})
+        except Exception:
+            _kanban_move(task_id, response.status_key, {"phase": "workflow", "error": response.error_message})
         finish_request(ctx, status_code=500, success=False, error_type=type(exc).__name__)
     finally:
         clear_request()
@@ -1570,7 +1583,8 @@ def _workflow_state_payload(task_id: str, *, include_result: bool, result_after:
     task = runtime.get("task") or {}
     result = runtime.get("result")
     status_key = task.get("status_key")
-    ready = result is not None or status_key in {"ready_to_apply", "done", "failed"}
+    terminal_statuses = _workflow_terminal_statuses(str(task.get("project_id") or "default"))
+    ready = result is not None or status_key in terminal_statuses
     conversation = runtime.get("conversation") or {}
     query = f"?result_after={quote(result_after)}" if result_after else ""
     payload = {
@@ -1579,7 +1593,7 @@ def _workflow_state_payload(task_id: str, *, include_result: bool, result_after:
         "project_id": task.get("project_id"),
         "status_key": status_key,
         "ready": ready,
-        "done": status_key in {"done", "failed"},
+        "done": status_key in terminal_statuses,
         "conversation_state": conversation.get("state"),
         "waiting_for": conversation.get("waiting_for"),
         "poll_url": f"/v1/workflows/{task_id}{query}",
@@ -1589,6 +1603,18 @@ def _workflow_state_payload(task_id: str, *, include_result: bool, result_after:
     if include_result and result is not None:
         payload["result"] = result
     return payload
+
+
+def _workflow_terminal_statuses(project_id: str) -> set[str]:
+    workflow = get_project_workflow(project_id).get("workflow") or {}
+    actions = workflow.get("actions") if isinstance(workflow.get("actions"), dict) else {}
+    terminals = set()
+    for action in ("workflow_done", "complete", "completed", "fail", "abandon"):
+        rule = actions.get(action) if isinstance(actions, dict) else None
+        target = str((rule or {}).get("to") or "").strip().lower() if isinstance(rule, dict) else ""
+        if target:
+            terminals.add(target)
+    return terminals
 
 
 def workflow_state_payload(task_id: str, *, include_result: bool = True, result_after: str | None = None) -> dict:
@@ -1803,11 +1829,16 @@ def _ensure_workflow_task(body: dict) -> str:
     user_text = _first_user_text_from_messages(messages)
     title = (user_text or "DevWerk workflow task").strip().splitlines()[0][:120]
     try:
+        workflow = get_project_workflow(body.get("project_id")).get("workflow") or {}
+        columns = workflow.get("columns") if isinstance(workflow.get("columns"), list) else []
+        initial_status = str((columns[0] or {}).get("status_key") or "").strip() if columns else ""
+        if not initial_status:
+            raise ValueError("project workflow has no initial column")
         result = create_task(
             project_id=body.get("project_id"),
             title=title or "DevWerk workflow task",
             description=user_text,
-            status_key="draft",
+            status_key=initial_status,
             metadata={"entrypoint": "/v1/workflows", "mode": body.get("mode", "agent")},
         )
         task_id = result["task"]["id"]

@@ -67,9 +67,6 @@ class WorkflowEngine:
         self.review_runner = review_runner
         self._job_handlers = {
             "index_project_context": self._run_context_column,
-            "produce_change_plan": self._run_plan_column,
-            "generate_code_change": self._run_coding_column,
-            "review_code_change": self._run_review_column,
         }
         self._scheduler: JobScheduler | None = None
 
@@ -96,9 +93,14 @@ class WorkflowEngine:
         )
 
         if not executable:
-            response = _failure_response(task_id, "WORKFLOW_EMPTY", "Workflow has no executable columns.")
-            apply_workflow_action(task_id, "fail", {"phase": "workflow", "reason": response.error_message})
-            _event(task_id, "workflow_finished", {"ok": False, "phase": "workflow", "status_key": "failed"})
+            response = _failure_response(
+                task_id,
+                "WORKFLOW_EMPTY",
+                "Workflow has no executable columns.",
+                status_key=_failure_status(definition) or _current_status(task_id),
+            )
+            _safe_fail(task_id, {"phase": "workflow", "reason": response.error_message})
+            _event(task_id, "workflow_finished", {"ok": False, "phase": "workflow", "status_key": response.status_key})
             add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
             return
 
@@ -158,9 +160,14 @@ class WorkflowEngine:
             try:
                 result = await self._run_column(task_id, body, definition, workflow_summary, current, state)
             except UnsupportedJobError as exc:
-                response = _failure_response(task_id, "UNSUPPORTED_WORKFLOW_JOB", str(exc))
-                apply_workflow_action(task_id, "fail", {"phase": current.status_key, "reason": response.error_message})
-                _event(task_id, "workflow_finished", {"ok": False, "phase": current.status_key, "status_key": "failed"})
+                response = _failure_response(
+                    task_id,
+                    "UNSUPPORTED_WORKFLOW_JOB",
+                    str(exc),
+                    status_key=_failure_status(definition) or current.status_key,
+                )
+                _safe_fail(task_id, {"phase": current.status_key, "reason": response.error_message})
+                _event(task_id, "workflow_finished", {"ok": False, "phase": current.status_key, "status_key": response.status_key})
                 add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
                 return
 
@@ -190,9 +197,7 @@ class WorkflowEngine:
                     )
                     _event(task_id, "workflow_run_paused", boundary_payload)
                 else:
-                    boundary_payload["terminal"] = bool(
-                        result.response.done or result.response.status_key in {"done", "failed"}
-                    )
+                    boundary_payload["terminal"] = bool(result.response.done or result.response.status_key in _terminal_statuses(definition))
                     _event(task_id, "workflow_finished", boundary_payload)
                 add_artifact(task_id, artifact_type="workflow_result", payload=result.response.model_dump())
                 return
@@ -250,7 +255,7 @@ class WorkflowEngine:
 
             next_column = _next_executable_after_transition(definition, target_status, current)
             if next_column is None:
-                if target_status == "done" and state.execute_response is None and result.decision == "approve":
+                if _is_success_terminal(definition, target_status) and state.execute_response is None and result.decision == "approve":
                     response = _generic_done_response(task_id, project_id, target_status, state)
                     append_conversation_message(
                         task_id,
@@ -314,9 +319,14 @@ class WorkflowEngine:
                 state.review_feedback = None
             current = next_column
 
-        response = _failure_response(task_id, "WORKFLOW_LOOP_EXHAUSTED", "Workflow exhausted without producing a result.")
-        apply_workflow_action(task_id, "fail", {"phase": "workflow", "reason": response.error_message})
-        _event(task_id, "workflow_finished", {"ok": False, "phase": "workflow", "status_key": "failed"})
+        response = _failure_response(
+            task_id,
+            "WORKFLOW_LOOP_EXHAUSTED",
+            "Workflow exhausted without producing a result.",
+            status_key=_failure_status(definition) or "failed",
+        )
+        _safe_fail(task_id, {"phase": "workflow", "reason": response.error_message})
+        _event(task_id, "workflow_finished", {"ok": False, "phase": "workflow", "status_key": response.status_key})
         add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
 
     async def _run_column(
@@ -380,9 +390,7 @@ class WorkflowEngine:
         )
         _event(task_id, "column_run_started", {"column_run_id": run["id"], "run_no": run["run_no"], "status_key": column.status_key, "job_id": job.id, "agent": job.agent.id})
         try:
-            if job.template.id == "generate_code_change":
-                outcome = await handler(task_id, job_body, definition, workflow_summary, column, state)
-            elif handler is None:
+            if handler is None:
                 outcome = await self._run_generic_column(task_id, job_body, definition, workflow_summary, column, state)
             else:
                 result = handler(task_id, job_body, workflow_summary, column, state)
@@ -1089,6 +1097,7 @@ def _generic_column_prompt(
     prompt_context = {
         "task_id": task_id,
         "phase": column.status_key,
+        "agent": agent,
         "column": {
             "status_key": column.status_key,
             "title": column.title,
@@ -1192,7 +1201,8 @@ def _preferred_success_action(definition: WorkflowDefinition, column: WorkflowCo
         target = str(rule.get("to") or "").strip().lower() if isinstance(rule, dict) else ""
         if target in preferred_targets:
             return action
-    if "done" in column.transition_to and _is_valid_column_action(definition, column, "workflow_done"):
+    done_target = _action_target(definition, "workflow_done")
+    if done_target in column.transition_to and _is_valid_column_action(definition, column, "workflow_done"):
         return "workflow_done"
     return None
 
@@ -1227,6 +1237,47 @@ def _generic_done_response(
             "kind": "generic_workflow_result",
         },
     )
+
+
+def _semantic_targets(definition: WorkflowDefinition, actions: tuple[str, ...]) -> set[str]:
+    targets: set[str] = set()
+    for action in actions:
+        target = _action_target(definition, action)
+        if target:
+            targets.add(target)
+    return targets
+
+
+def _success_statuses(definition: WorkflowDefinition) -> set[str]:
+    targets = _semantic_targets(definition, ("workflow_done", "complete", "completed"))
+    return targets or {
+        column.status_key
+        for column in definition.columns
+        if not column.transition_to and column.status_key not in _failure_statuses(definition)
+    }
+
+
+def _failure_statuses(definition: WorkflowDefinition) -> set[str]:
+    return _semantic_targets(definition, ("fail", "abandon"))
+
+
+def _failure_status(definition: WorkflowDefinition) -> str | None:
+    return next(iter(_failure_statuses(definition)), None)
+
+
+def _is_success_terminal(definition: WorkflowDefinition, status_key: str | None) -> bool:
+    return str(status_key or "").strip().lower() in _success_statuses(definition)
+
+
+def _terminal_statuses(definition: WorkflowDefinition) -> set[str]:
+    return _success_statuses(definition) | _failure_statuses(definition)
+
+
+def _safe_fail(task_id: str, payload: dict[str, Any]) -> None:
+    try:
+        apply_workflow_action(task_id, "fail", payload)
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("workflow safe fail skipped task_id=%s error=%s", task_id, exc)
 
 
 def record_agent_message(

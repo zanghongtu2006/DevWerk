@@ -65,8 +65,8 @@ class EvidencePlanningLoop:
 
     def __init__(
         self,
-        model_route: str = "planner",
-        agent_id: str = "planning-agent",
+        model_route: str = "default",
+        agent_id: str = "project-agent",
         event_sink: Callable[[str, dict[str, Any]], None] | None = None,
         max_rounds: int = 128,
     ):

@@ -124,11 +124,11 @@ def apply_workflow_action(task_id: str, action: str, payload: dict[str, Any] | N
     if action_key == ACTION_RETRY:
         task_detail = get_task(task_id)
         current_status = str((task_detail.get("task") or {}).get("status_key") or "")
-        if current_status != "failed":
+        if current_status not in _failure_statuses(_definition_for_task(task_id)):
             add_event(
                 task_id,
                 "workflow_retry_deduplicated",
-                {"status_key": current_status, "reason": "retry is already active or task is not failed"},
+                {"status_key": current_status, "reason": "retry is already active or task is not in a workflow failure terminal"},
             )
             task_detail["action_ignored"] = True
             task_detail["ignored_action"] = ACTION_RETRY
@@ -214,7 +214,7 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     add_event(task_id, "apply_result_received", payload)
 
     if not ok:
-        status_key = _action_target(definition, ACTION_REQUEST_RECODING) or "coding"
+        status_key = _action_target(definition, ACTION_REQUEST_RECODING) or _action_target(definition, ACTION_FAIL) or current_status
         record_phase_output(
             task_id,
             phase="apply",
@@ -235,7 +235,9 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
             "apply_failed",
             {"phase": "apply", "reason": payload.get("error_message") or "Client failed to apply generated changes."},
         )
-        return _apply_configured_action(task_id, definition, ACTION_REQUEST_RECODING, {"phase": "apply", **payload})
+        if definition.action(ACTION_REQUEST_RECODING) is not None:
+            return _apply_configured_action(task_id, definition, ACTION_REQUEST_RECODING, {"phase": "apply", **payload})
+        return _apply_configured_action(task_id, definition, ACTION_FAIL, {"phase": "apply", **payload})
 
     verification = payload.get("verification")
     has_verification_policy = verification_has_policy(verification)
@@ -249,7 +251,7 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         task_id,
         phase="apply",
         agent="plugin",
-        status_key=status_key or ("done" if passed else "failed"),
+        status_key=status_key or current_status,
         summary="Plugin applied generated changes through the snapshot-protected path.",
         outputs={
             "ok": True,
@@ -329,9 +331,11 @@ def available_actions_for_status(status_key: str, definition: WorkflowDefinition
     for action, rule in definition.actions.items():
         if not _is_client_visible_action(action, rule):
             continue
-        if action == ACTION_RETRY and status != "failed":
+        failure_statuses = _failure_statuses(definition)
+        terminal_statuses = _terminal_statuses(definition)
+        if action == ACTION_RETRY and status not in failure_statuses:
             continue
-        if action == ACTION_ABANDON and status in {"done", "failed"}:
+        if action == ACTION_ABANDON and status in terminal_statuses:
             continue
         target = _rule_target(rule)
         if target and _target_allowed(column, target, action=action):
@@ -374,6 +378,27 @@ def _first_action_target(definition: WorkflowDefinition, actions: list[str]) -> 
         if target:
             return target
     return None
+
+
+def _targets(definition: WorkflowDefinition, actions: tuple[str, ...]) -> set[str]:
+    out: set[str] = set()
+    for action in actions:
+        target = _action_target(definition, action)
+        if target:
+            out.add(target)
+    return out
+
+
+def _failure_statuses(definition: WorkflowDefinition) -> set[str]:
+    return _targets(definition, (ACTION_FAIL, ACTION_ABANDON))
+
+
+def _success_statuses(definition: WorkflowDefinition) -> set[str]:
+    return _targets(definition, (ACTION_WORKFLOW_DONE, "complete", "completed"))
+
+
+def _terminal_statuses(definition: WorkflowDefinition) -> set[str]:
+    return _failure_statuses(definition) | _success_statuses(definition)
 
 
 def _apply_optional_action(

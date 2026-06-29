@@ -233,15 +233,9 @@ class Settings(BaseSettings):
         return {
             "routing": {
                 "default": "minimax/m3",
-                "coder": "minimax/m3",
-                "coding": "minimax/m3",
                 "architecture": "minimax/m3",
                 "product": "deepseek/deepseek-chat",
                 "design": "deepseek/deepseek-chat",
-                "planner": "deepseek/deepseek-chat",
-                "executor": "minimax/m3",
-                "reviewer": "minimax/m3",
-                "verifier": "minimax/m3",
                 "compression": "ollama/deepseek-r1:32b",
             },
             "llms": {
@@ -518,16 +512,16 @@ def _split_model_ref(model_ref: str) -> tuple[str, str]:
 
 def _routing_keys(agent: str) -> list[str]:
     aliases = {
-        "coder": ["coder", "coding"],
-        "planner": ["planner", "product", "design"],
+        "coder": ["coder", "coding", "default"],
+        "planner": ["planner", "product", "design", "default"],
         "architect": ["architect", "architecture"],
         "architecture": ["architecture", "architect"],
-        "executor": ["executor", "coding"],
-        "execute": ["executor", "coding"],
-        "reviewer": ["reviewer", "review"],
-        "review": ["reviewer", "review"],
-        "verifier": ["verifier", "verify"],
-        "verify": ["verifier", "verify"],
+        "executor": ["executor", "coding", "default"],
+        "execute": ["executor", "coding", "default"],
+        "reviewer": ["reviewer", "review", "default"],
+        "review": ["reviewer", "review", "default"],
+        "verifier": ["verifier", "verify", "default"],
+        "verify": ["verifier", "verify", "default"],
     }
     return aliases.get(agent, [agent])
 

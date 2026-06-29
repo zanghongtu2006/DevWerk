@@ -70,7 +70,11 @@ def default_workflow_definition() -> WorkflowDefinition:
     path = _default_workflow_path()
     if path.is_file():
         return workflow_from_dict(json.loads(path.read_text(encoding="utf-8")))
-    return workflow_from_dict(_embedded_default_workflow())
+    return empty_workflow_definition()
+
+
+def empty_workflow_definition() -> WorkflowDefinition:
+    return WorkflowDefinition(name="unconfigured", version=1, columns=[], actions={})
 
 
 def workflow_from_dict(value: dict[str, Any]) -> WorkflowDefinition:
@@ -99,7 +103,7 @@ def workflow_from_dict(value: dict[str, Any]) -> WorkflowDefinition:
     return WorkflowDefinition(
         name=str(value.get("name") or "default"),
         version=int(value.get("version") or 1),
-        columns=columns or [WorkflowColumn(**col) for col in _fallback_columns()],
+        columns=columns,
         actions={str(key).strip().lower().replace("-", "_"): val for key, val in actions.items() if isinstance(val, dict)},
     )
 
@@ -111,9 +115,8 @@ def validate_managed_workflow_definition(definition: WorkflowDefinition) -> None
     if len(keys) != len(known):
         raise ValueError("workflow column status_key values must be unique")
 
-    for required in ("done", "failed"):
-        if required not in known:
-            raise ValueError(f"managed workflow requires a {required!r} terminal column")
+    if not keys:
+        raise ValueError("managed workflow requires at least one column")
 
     for column in definition.columns:
         unknown = set(column.transition_to) - known
@@ -128,15 +131,20 @@ def validate_managed_workflow_definition(definition: WorkflowDefinition) -> None
         if target not in known:
             raise ValueError(f"workflow action {action!r} references unknown target {target!r}")
 
-    required_actions = {"fail": "failed", "abandon": "failed"}
-    for action, target in required_actions.items():
+    for action in ("fail", "abandon"):
         rule = definition.action(action)
-        if rule is None or str(rule.get("to") or "").strip().lower() != target:
-            raise ValueError(f"managed workflow action {action!r} must target {target!r}")
+        target = str((rule or {}).get("to") or "").strip().lower()
+        if rule is None or target not in known:
+            raise ValueError(f"managed workflow action {action!r} must target an existing terminal/failure column")
 
     retry = definition.action("retry")
     retry_target = str((retry or {}).get("to") or "").strip().lower()
-    if not retry_target or retry_target in {"done", "failed"}:
+    terminal_targets = {
+        str((definition.action(action) or {}).get("to") or "").strip().lower()
+        for action in ("workflow_done", "complete", "fail", "abandon")
+    }
+    terminal_targets.discard("")
+    if not retry_target or retry_target in terminal_targets:
         raise ValueError("managed workflow action 'retry' must target a non-terminal column")
 
 
@@ -153,86 +161,3 @@ def _none_if_blank(value: object) -> str | None:
     text = str(value or "").strip()
     return text or None
 
-
-def _fallback_columns() -> list[dict[str, Any]]:
-    return [
-        {"status_key": "draft", "title": "Draft", "position": 10, "transition_to": ["context_indexed", "failed"]},
-        {
-            "status_key": "context_indexed",
-            "title": "Context Indexed",
-            "position": 20,
-            "transition_to": ["planned", "failed"],
-            "job_template": "index_project_context",
-            "input_artifacts": ["workflow_request"],
-            "output_artifact": "context_bundle",
-            "success_action": "context_indexed",
-            "failure_actions": ["fail"],
-            "context_policy": {"use_workspace": True, "use_project_memory": True},
-        },
-        {
-            "status_key": "planned",
-            "title": "Planned",
-            "position": 30,
-            "transition_to": ["coding", "draft", "failed"],
-            "job_template": "produce_change_plan",
-            "input_artifacts": ["context_bundle"],
-            "output_artifact": "plan_bundle",
-            "success_action": "plan_ready",
-            "failure_actions": ["request_replan", "fail"],
-            "context_policy": {"use_workspace": True, "use_project_memory": True},
-        },
-        {
-            "status_key": "coding",
-            "title": "Coding",
-            "position": 40,
-            "transition_to": ["reviewed", "planned", "failed"],
-            "job_template": "generate_code_change",
-            "input_artifacts": ["context_bundle", "plan_bundle"],
-            "output_artifact": "code_change_bundle",
-            "success_action": "coding_ready",
-            "failure_actions": ["request_replan", "fail"],
-            "context_policy": {"use_workspace": True, "use_project_memory": True},
-        },
-        {
-            "status_key": "reviewed",
-            "title": "Reviewed",
-            "position": 45,
-            "transition_to": ["ready_to_apply", "coding", "planned", "failed"],
-            "job_template": "review_code_change",
-            "input_artifacts": ["plan_bundle", "code_change_bundle"],
-            "output_artifact": "review_bundle",
-            "success_action": "approve",
-            "failure_actions": ["request_recoding", "request_replan", "fail"],
-            "context_policy": {"use_project_memory": True},
-        },
-        {"status_key": "ready_to_apply", "title": "Ready To Apply", "position": 50, "transition_to": ["applied", "coding", "failed"]},
-        {"status_key": "applied", "title": "Applied", "position": 60, "transition_to": ["verified", "coding", "planned", "failed"]},
-        {"status_key": "verified", "title": "Verified", "position": 70, "transition_to": ["done", "applied", "failed"]},
-        {"status_key": "done", "title": "Done", "position": 80, "transition_to": []},
-        {"status_key": "failed", "title": "Failed", "position": 90, "transition_to": ["draft"]},
-    ]
-
-
-def _embedded_default_workflow() -> dict[str, Any]:
-    return {
-        "name": "default",
-        "version": 1,
-        "columns": _fallback_columns(),
-        "actions": {
-            "context_indexed": {"to": "context_indexed"},
-            "plan_ready": {"to": "planned"},
-            "coding_started": {"to": "coding"},
-            "coding_ready": {"to": "reviewed"},
-            "approve": {"to": "ready_to_apply"},
-            "ready_to_apply": {"to": "ready_to_apply"},
-            "apply_succeeded": {"to": "applied"},
-            "verification_passed": {"to": "verified"},
-            "verification_failed": {"to": "coding"},
-            "workflow_done": {"to": "done"},
-            "request_recoding": {"to": "coding"},
-            "request_replan": {"to": "planned"},
-            "fail": {"to": "failed"},
-            "retry": {"to": "draft"},
-            "abandon": {"to": "failed"},
-        },
-    }

@@ -7,7 +7,6 @@ from typing import Any
 from app.services.llm_factory import get_llm_client
 from app.services.workflow_definition import (
     WorkflowDefinition,
-    default_workflow_definition,
     validate_managed_workflow_definition,
     workflow_from_dict,
 )
@@ -74,8 +73,9 @@ def _ask_llm(
             "content": (
                 "You are DevWerk's workflow designer. Return one JSON object only. "
                 "Design a managed Kanban workflow and project agent overrides. "
-                "The runtime requires terminal columns done and failed, and actions "
-                "fail->failed, abandon->failed, retry->a non-terminal column. "
+                "Do not assume any default columns. The user defines the workflow. "
+                "The runtime requires semantic actions fail, abandon, and retry, but "
+                "their target column names are project-specific. "
                 "Columns may define status_key, title, position, transition_to, "
                 "job_template, input_artifacts, output_artifact, success_action, "
                 "failure_actions, context_policy. Keep workflow implementation-neutral. "
@@ -106,12 +106,12 @@ def _ask_llm(
 def _workflow_payload(value: dict[str, Any] | None) -> dict[str, Any]:
     if isinstance(value, dict) and value.get("columns"):
         return value
-    return _definition_to_payload(default_workflow_definition())
+    return {"name": "project-workflow", "version": 1, "columns": [], "actions": {}}
 
 
 def _normalize_workflow(value: object) -> dict[str, Any]:
     if not isinstance(value, dict):
-        return _definition_to_payload(default_workflow_definition())
+        raise ValueError("workflow designer LLM did not return a workflow object")
     workflow = dict(value)
     workflow["name"] = str(workflow.get("name") or "project-workflow")
     workflow["version"] = int(workflow.get("version") or 1)
@@ -122,7 +122,7 @@ def _normalize_workflow(value: object) -> dict[str, Any]:
 
 def _normalize_columns(value: object) -> list[dict[str, Any]]:
     if not isinstance(value, list):
-        return _definition_to_payload(default_workflow_definition())["columns"]
+        raise ValueError("workflow.columns must be a list")
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
     for index, raw in enumerate(value):
@@ -149,10 +149,8 @@ def _normalize_columns(value: object) -> list[dict[str, Any]]:
             if optional in raw:
                 col[optional] = raw[optional]
         out.append(col)
-    if "done" not in seen:
-        out.append({"status_key": "done", "title": "Done", "position": 900, "transition_to": []})
-    if "failed" not in seen:
-        out.append({"status_key": "failed", "title": "Failed", "position": 990, "transition_to": ["draft"]})
+    if not out:
+        raise ValueError("workflow must define project-specific columns")
     return sorted(out, key=lambda item: int(item.get("position") or 0))
 
 
@@ -176,15 +174,14 @@ def _normalize_actions(value: object, columns: list[dict[str, Any]]) -> dict[str
         target = next((item for item in transitions if item in known and item != "failed"), None)
         if target:
             normalized[success_action] = {"to": target}
-    non_terminal = next((col for col in known if col not in {"done", "failed"}), None)
-    defaults = {
-        "fail": "failed",
-        "abandon": "failed",
-        "retry": "draft" if "draft" in known else (non_terminal or "failed"),
-    }
-    for action, target in defaults.items():
-        if target in known:
-            normalized[action] = {"to": target}
+    non_terminal = next((str(col.get("status_key") or "") for col in columns if col.get("transition_to")), None)
+    terminal = next((str(col.get("status_key") or "") for col in columns if not col.get("transition_to")), None)
+    if "fail" not in normalized and terminal:
+        normalized["fail"] = {"to": terminal}
+    if "abandon" not in normalized and terminal:
+        normalized["abandon"] = {"to": terminal}
+    if "retry" not in normalized and non_terminal:
+        normalized["retry"] = {"to": non_terminal}
     return normalized
 
 

@@ -1,15 +1,9 @@
 {
   "routing": {
     "default": "minimax/m3",
-    "planner": "deepseek/deepseek-chat",
     "product": "deepseek/deepseek-chat",
     "design": "deepseek/deepseek-chat",
     "architecture": "minimax/m3",
-    "coder": "minimax/m3",
-    "coding": "minimax/m3",
-    "executor": "minimax/m3",
-    "reviewer": "minimax/m3",
-    "verifier": "minimax/m3",
     "compression": "ollama/deepseek-r1:32b"
   },
   "llms": {

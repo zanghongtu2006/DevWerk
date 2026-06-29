@@ -547,10 +547,11 @@ def _maybe_resume_after_retry(task_id: str, action: str, result_cursor: str | No
     conversation = get_conversation(task_id, include_messages=False) or {}
     retry_metadata = dict(conversation.get("metadata") or {})
     retry_metadata["retry_nonce"] = retry_nonce
+    retry_status = str((get_task(task_id).get("task") or {}).get("status_key") or "")
     update_conversation(
         task_id,
         state="queued",
-        active_column="draft",
+        active_column=retry_status or None,
         waiting_for=None,
         metadata=retry_metadata,
     )
@@ -743,7 +744,7 @@ def _active_project_task(project_id: str, preferred_task_id: object = None) -> d
         except KeyError:
             continue
         status_key = str(task.get("status_key") or "")
-        if status_key in {"done", "failed"}:
+        if status_key in _project_terminal_statuses(project_id):
             continue
         if str(task.get("project_id") or "") != str(project_id):
             continue
@@ -756,6 +757,19 @@ def _active_project_task(project_id: str, preferred_task_id: object = None) -> d
             "updated_at": task.get("updated_at"),
         }
     return None
+
+
+def _project_terminal_statuses(project_id: str) -> set[str]:
+    workflow = get_project_workflow(project_id).get("workflow") or {}
+    actions = workflow.get("actions") if isinstance(workflow.get("actions"), dict) else {}
+    terminals: set[str] = set()
+    for action in ("workflow_done", "complete", "completed", "fail", "abandon"):
+        rule = actions.get(action) if isinstance(actions, dict) else None
+        if isinstance(rule, dict):
+            target = str(rule.get("to") or "").strip().lower()
+            if target:
+                terminals.add(target)
+    return terminals
 
 
 def _handle_project_workflow_design(

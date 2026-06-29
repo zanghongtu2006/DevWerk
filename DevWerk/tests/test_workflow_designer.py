@@ -179,7 +179,15 @@ def test_workflow_designer_endpoint_can_save_project_override(monkeypatch, tmp_p
     import app.routes.kanban as kanban_routes
     import app.services.workflow_designer as workflow_designer
 
-    monkeypatch.setattr(workflow_designer, "_ask_llm", lambda **kwargs: {"reply": "ok", "workflow": kwargs["base_workflow"], "agents": {"coding-agent": {"model_route": "executor"}}})
+    monkeypatch.setattr(
+        workflow_designer,
+        "_ask_llm",
+        lambda **kwargs: {
+            "reply": "ok",
+            "workflow": _writing_workflow(),
+            "agents": {"publication-agent": {"model_route": "default"}},
+        },
+    )
     kanban_service.upsert_project(project_id="designer-save", name="Designer Save")
 
     response = kanban_routes.kanban_design_project_workflow(
@@ -191,10 +199,10 @@ def test_workflow_designer_endpoint_can_save_project_override(monkeypatch, tmp_p
     )
 
     assert response["saved"] is True
-    assert kanban_service.get_project_workflow("designer-save")["workflow"]["name"] == "default"
+    assert kanban_service.get_project_workflow("designer-save")["workflow"]["name"] == "writing-workflow"
     assert (
-        kanban_service.get_project_settings("designer-save")["settings"]["agents"]["coding-agent"]["model_route"]
-        == "executor"
+        kanban_service.get_project_settings("designer-save")["settings"]["agents"]["publication-agent"]["model_route"]
+        == "default"
     )
 
 
@@ -330,7 +338,8 @@ def test_backend_web_ui_uses_backend_data_not_demo_metrics():
 def test_project_stats_include_status_breakdown(monkeypatch, tmp_path):
     kanban_service = _configure(monkeypatch, tmp_path)
 
-    kanban_service.create_task(project_id="stats-project", title="Active", status_key="coding")
+    kanban_service.update_project_workflow("stats-project", _writing_workflow())
+    kanban_service.create_task(project_id="stats-project", title="Active", status_key="written")
     kanban_service.create_task(project_id="stats-project", title="Done", status_key="done")
     kanban_service.create_task(project_id="stats-project", title="Failed", status_key="failed")
 
@@ -351,7 +360,7 @@ def test_project_conversation_can_save_workflow_design(monkeypatch, tmp_path):
     def fake_llm(**kwargs):
         return {
             "reply": "Writing workflow ready.",
-            "workflow": kwargs["base_workflow"],
+            "workflow": _writing_workflow(),
             "agents": {"default-agent": {"model_route": "default"}},
         }
 
@@ -587,11 +596,12 @@ def test_project_conversation_agent_can_continue_active_task(monkeypatch, tmp_pa
     import app.routes.kanban as kanban_routes
     import app.routes.workflows as workflow_routes
 
+    kanban_service.update_project_workflow("writing-project", _writing_workflow())
     task = kanban_service.create_task(
         project_id="writing-project",
         title="Release note",
         description="Write the release note.",
-        status_key="planned",
+        status_key="written",
     )["task"]
     kanban_service.add_project_event(
         "writing-project",
