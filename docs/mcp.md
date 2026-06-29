@@ -1,6 +1,6 @@
 # DevWerk MCP
 
-DevWerk exposes its service-owned coding workflow as a Streamable HTTP MCP
+DevWerk exposes its service-owned workflow engine as a Streamable HTTP MCP
 server. The endpoint is served by the normal DevWerk service process:
 
 ```text
@@ -38,19 +38,20 @@ should expose nine `devwerk_*` tools.
 
 ## Workflow usage
 
-1. Call `devwerk_start_workflow` with a stable project UUID and coding request.
-2. Call `devwerk_get_workflow` until the task pauses or returns a result.
-3. Use `devwerk_continue_workflow` for plan confirmation, revisions, messages,
+1. Make sure the project already has a saved workflow definition.
+2. Call `devwerk_start_workflow` with a stable project UUID and task request.
+3. Call `devwerk_get_workflow` until the task pauses or returns a result.
+4. Use `devwerk_continue_workflow` for revisions, messages,
    or client tool results.
-4. Apply returned `ops` or `patch_ops` with the coding client's own file tools.
-5. Call `devwerk_report_apply_result` only after the write has actually
+5. Apply returned `ops` or `patch_ops` with the capability client's own file tools.
+6. Call `devwerk_report_apply_result` only after the write has actually
    succeeded. Include verification output when available.
-6. Use `devwerk_get_events` or `devwerk_get_task` for detailed agent and Kanban
+7. Use `devwerk_get_events` or `devwerk_get_task` for detailed agent and Kanban
    history.
 
 The MCP client does not need the IDEA plugin. In this mode Codex or another
-MCP-capable client owns local file access, while DevWerk owns planning, coding,
-review, workflow state, persistence, and observability.
+MCP-capable client owns local file access, while DevWerk owns workflow state,
+dynamic column-agent execution, persistence, and observability.
 
 ## Available tools
 

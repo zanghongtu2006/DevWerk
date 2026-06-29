@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 
@@ -64,13 +62,6 @@ class WorkflowDefinition:
                 for col in self.columns
             ],
         }
-
-
-def default_workflow_definition() -> WorkflowDefinition:
-    path = _default_workflow_path()
-    if path.is_file():
-        return workflow_from_dict(json.loads(path.read_text(encoding="utf-8")))
-    return empty_workflow_definition()
 
 
 def empty_workflow_definition() -> WorkflowDefinition:
@@ -148,16 +139,6 @@ def validate_managed_workflow_definition(definition: WorkflowDefinition) -> None
         raise ValueError("managed workflow action 'retry' must target a non-terminal column")
 
 
-def default_columns() -> list[dict[str, Any]]:
-    return default_workflow_definition().columns_for_kanban()
-
-
-def _default_workflow_path() -> Path:
-    root = Path(__file__).resolve().parents[2]
-    return root / "config" / "workflows" / "default.json"
-
-
 def _none_if_blank(value: object) -> str | None:
     text = str(value or "").strip()
     return text or None
-

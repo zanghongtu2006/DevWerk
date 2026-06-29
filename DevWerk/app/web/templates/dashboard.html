@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" href="data:," />
+  <title>DevWerk</title>
+  <link rel="stylesheet" href="/web/static/dashboard.css" />
+  <script src="/web/static/dashboard.js" defer></script>
+</head>
+<body data-page="{{ active_page }}">
+  <div class="app-shell">
+    <aside class="global-nav">
+      <div class="brand">
+        <span class="brand-mark"></span>
+        <span class="brand-name">DevWerk</span>
+        <button class="nav-collapse" title="Collapse navigation">&laquo;</button>
+      </div>
+      <nav class="nav-list">
+        <a class="nav-link" data-nav="overview" href="/workbench"><span data-icon="O"></span>Overview</a>
+        <a class="nav-link" data-nav="projects" href="/dashboard"><span data-icon="P"></span>Projects</a>
+        <a class="nav-link" data-nav="kanban" href="/kanban"><span data-icon="K"></span>Kanban</a>
+        <a class="nav-link" data-nav="tasks" href="/tasks"><span data-icon="T"></span>Tasks</a>
+        <a class="nav-link" data-nav="events" href="/dashboard#events"><span data-icon="E"></span>Events</a>
+        <a class="nav-link" data-nav="memory" href="/dashboard#memory"><span data-icon="M"></span>Memory</a>
+        <a class="nav-link" data-nav="analytics" href="/dashboard#analytics"><span data-icon="A"></span>Analytics</a>
+        <a class="nav-link" data-nav="settings" href="/dashboard#settings"><span data-icon="S"></span>Settings</a>
+      </nav>
+      <div class="nav-footer">
+        <div class="identity"><span class="avatar">DW</span><span><b>DevWerk Console</b><small>Local backend UI</small></span></div>
+        <div class="footer-links"><span>Docs</span><span>Help</span></div>
+      </div>
+    </aside>
+    <aside class="project-rail">
+      <div class="rail-head">
+        <h2>Projects</h2>
+        <button id="newProjectRail" class="icon-button" title="New project">+</button>
+      </div>
+      <label class="search-box"><span></span><input id="projectSearch" placeholder="Search projects..." /></label>
+      <div id="projectList" class="project-list"></div>
+      <a class="rail-link" href="/dashboard">View all projects &rarr;</a>
+    </aside>
+    <main class="workspace">
+      <header class="topbar">
+        <div class="context-pill"><span class="hex"></span><b id="ctxProject">default</b></div>
+        <span id="ctxStatus" class="badge green">Active</span>
+        <label class="top-select"><span>Environment</span><select id="ctxEnv"><option>default</option></select></label>
+        <label class="top-select wide"><span>Model Route</span><select id="ctxModelRoute"><option>default</option></select></label>
+        <span class="top-spacer"></span>
+        <button id="refresh" class="button ghost">Refresh</button>
+        <button class="icon-button" title="Notifications">N</button>
+        <button class="icon-button" title="Settings">S</button>
+      </header>
+      <section id="page" class="page"></section>
+    </main>
+  </div>
+</body>
+</html>

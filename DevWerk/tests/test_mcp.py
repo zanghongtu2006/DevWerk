@@ -16,7 +16,7 @@ def test_mcp_streamable_http_lists_and_calls_tools(monkeypatch):
         lambda task_id, **_: {
             "ok": True,
             "task_id": task_id,
-            "status_key": "coding",
+            "status_key": "working",
             "ready": False,
             "done": False,
         },
@@ -101,7 +101,7 @@ def test_mcp_streamable_http_lists_and_calls_tools(monkeypatch):
     result = state.json()["result"]
     assert result["isError"] is False
     assert result["structuredContent"]["task_id"] == "mcp-smoke-task"
-    assert result["structuredContent"]["status_key"] == "coding"
+    assert result["structuredContent"]["status_key"] == "working"
     assert start.json()["result"]["structuredContent"]["task_id"] == "mcp-started-task"
     assert started[0]["project_id"] == "mcp-project"
     assert started[0]["project_root"] == "C:/work/project"

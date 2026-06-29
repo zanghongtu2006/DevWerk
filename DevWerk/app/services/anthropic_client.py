@@ -40,7 +40,7 @@ class AnthropicClient:
             self.trust_env_proxy: bool = bool(config.get("trust_env_proxy", False))
         else:
             from app.core.config import settings
-            cfg = settings().get_llm_config("coder")
+            cfg = settings().get_llm_config("project")
             self.api_name = cfg.get("api_name", self.api_name)
             self.base_url = cfg.get("base_url", "https://api.minimaxi.com/anthropic").rstrip("/")
             self.api_key = cfg.get("api_key")

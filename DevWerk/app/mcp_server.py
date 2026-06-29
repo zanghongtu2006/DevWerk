@@ -18,13 +18,13 @@ from app.services.kanban import get_task, list_events, list_projects
 
 
 MCP_INSTRUCTIONS = """
-DevWerk is a backend-owned coding workflow and Kanban state machine.
+DevWerk is a backend-owned workflow and Kanban state machine.
 
-Start coding work with devwerk_start_workflow, then inspect it with
+Start workflow tasks with devwerk_start_workflow, then inspect them with
 devwerk_get_workflow. A workflow may pause for plan confirmation, client tool
 results, or file application. Continue a paused workflow with
 devwerk_continue_workflow. When DevWerk returns file operations, apply them in
-the current coding client and report the outcome with
+the current capability client and report the outcome with
 devwerk_report_apply_result. Never report an apply as successful until the
 client has actually written the files. Use devwerk_get_events when detailed
 agent, phase, and transition history is needed.
@@ -43,7 +43,7 @@ def devwerk_start_workflow(
     interaction_mode: Literal["auto", "confirm_plan"] = "auto",
     client_capabilities: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Start a DevWerk coding workflow and return its task ID and state."""
+    """Start a DevWerk workflow and return its task ID and state."""
     request_text = request.strip()
     if not request_text:
         return _result({"ok": False, "error_code": "BAD_REQUEST", "error_message": "request is required"})

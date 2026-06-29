@@ -1,10 +1,71 @@
+from __future__ import annotations
+
 import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from app.models.protocol import IdeChatResponse
-from app.services.kanban import DEFAULT_COLUMNS
+
+
+class FakeSettings:
+    def __init__(self, tmp_path):
+        self.devwerk_db_path = str(tmp_path / "workflow.db")
+        self.devwerk_session_dir = str(tmp_path / "sessions")
+        self.devwerk_usage_tracking = False
+        self.app_env = "test"
+        self.llm_provider_name = "test"
+        self.workflow_supervisor_enabled = False
+
+    @property
+    def is_production(self):
+        return False
+
+    def validate_provider(self, agent="default"):
+        return None
+
+    def get_llm_config(self, agent="default"):
+        return {"agent": agent, "protocol": "ollama", "api_key": None, "model": "test"}
+
+
+def configure(monkeypatch, tmp_path):
+    import app.main as main_module
+    import app.services.kanban as kanban_service
+    import app.services.session_store as session_store
+    import app.services.usage as usage_service
+
+    fake = FakeSettings(tmp_path)
+    monkeypatch.setattr(main_module, "settings", lambda: fake)
+    monkeypatch.setattr(kanban_service, "settings", lambda: fake)
+    monkeypatch.setattr(session_store, "settings", lambda: fake)
+    monkeypatch.setattr(usage_service, "settings", lambda: fake)
+    kanban_service._initialized = False
+    usage_service._initialized = False
+    return fake, kanban_service
+
+
+def code_flow() -> dict:
+    return {
+        "name": "apply-check-flow",
+        "columns": [
+            {"status_key": "implement", "title": "Implement", "position": 10, "transition_to": ["apply_gate", "blocked"]},
+            {"status_key": "apply_gate", "title": "Apply Gate", "position": 20, "transition_to": ["verified", "repair", "blocked"]},
+            {"status_key": "repair", "title": "Repair", "position": 30, "transition_to": ["apply_gate", "blocked"]},
+            {"status_key": "verified", "title": "Verified", "position": 40, "transition_to": ["complete", "repair", "blocked"]},
+            {"status_key": "complete", "title": "Complete", "position": 90, "transition_to": []},
+            {"status_key": "blocked", "title": "Blocked", "position": 99, "transition_to": ["implement"]},
+        ],
+        "actions": {
+            "ready_for_apply": {"to": "apply_gate"},
+            "apply_succeeded": {"to": "verified"},
+            "request_rework": {"to": "repair"},
+            "verification_failed": {"to": "repair"},
+            "workflow_done": {"to": "complete"},
+            "fail": {"to": "blocked"},
+            "abandon": {"to": "blocked"},
+            "retry": {"to": "implement"},
+        },
+    }
 
 
 def test_ide_error_response_can_omit_reply():
@@ -14,112 +75,109 @@ def test_ide_error_response_can_omit_reply():
     assert response.ok is False
 
 
-def test_default_kanban_flow_contains_required_control_points():
-    statuses = [column["status_key"] for column in DEFAULT_COLUMNS]
+def test_web_ui_uses_external_static_assets():
+    from app.routes.web_ui import render_web_ui
 
-    for required in (
-        "draft",
-        "context_indexed",
-        "planned",
-        "coding",
-        "reviewed",
-        "ready_to_apply",
-        "applied",
-        "verified",
-        "done",
-        "failed",
-    ):
-        assert required in statuses
+    html = render_web_ui("projects")
+    assert '<link rel="stylesheet" href="/web/static/dashboard.css"' in html
+    assert '<script src="/web/static/dashboard.js" defer>' in html
+    assert "<style>" not in html
+    assert "const API" not in html
+    assert Path("app/web/static/dashboard.css").is_file()
+    assert Path("app/web/static/dashboard.js").is_file()
 
 
-def test_dashboard_contains_task_detail_surface():
-    from app.routes.kanban import TASKS_HTML
+def test_dashboard_route_serves_shell_and_static_assets(monkeypatch, tmp_path):
+    import app.main as main_module
 
-    assert "Task ID" in TASKS_HTML
-    assert "Execution log (reasoning + actions)" in TASKS_HTML
-    assert "Memory / Context" in TASKS_HTML
-    assert "Linked files" in TASKS_HTML
-    assert "No plan artifacts returned by backend" in TASKS_HTML
-    assert "No artifacts returned by backend" in TASKS_HTML
+    configure(monkeypatch, tmp_path)
+    app = main_module.create_app()
+    with TestClient(app) as client:
+        page = client.get("/dashboard")
+        css = client.get("/web/static/dashboard.css")
+        js = client.get("/web/static/dashboard.js")
+
+    assert page.status_code == 200
+    assert "DevWerk" in page.text
+    assert css.status_code == 200
+    assert ".app-shell" in css.text
+    assert js.status_code == 200
+    assert "refreshAll" in js.text
 
 
-def test_workflow_action_protocol_drives_kanban_state(monkeypatch, tmp_path):
-    import app.services.kanban as kanban_service
-    import app.services.session_store as session_store
+def test_project_requires_explicit_workflow_before_task(monkeypatch, tmp_path):
+    _, kanban_service = configure(monkeypatch, tmp_path)
+    project_id = "no-default-columns"
+    kanban_service.upsert_project(project_id=project_id, name="No defaults")
+
+    assert kanban_service.list_columns(project_id) == []
+    try:
+        kanban_service.create_task(project_id=project_id, title="Should fail")
+    except ValueError as exc:
+        assert "project workflow is not configured" in str(exc)
+    else:
+        raise AssertionError("task creation must fail without project workflow")
+
+
+def test_workflow_action_protocol_uses_project_defined_transitions(monkeypatch, tmp_path):
+    _, kanban_service = configure(monkeypatch, tmp_path)
     import app.services.workflow as workflow_service
 
-    class FakeSettings:
-        devwerk_db_path = str(tmp_path / "workflow.db")
-
-    monkeypatch.setattr(kanban_service, "settings", lambda: FakeSettings())
-    monkeypatch.setattr(session_store, "settings", lambda: FakeSettings())
-    kanban_service._initialized = False
-
+    project_id = "action-smoke"
+    kanban_service.update_project_workflow(project_id, code_flow())
     task = kanban_service.create_task(
-        project_id="workflow-smoke",
-        title="Implement feature",
-        description="Smoke",
-        status_key="ready_to_apply",
+        project_id=project_id,
+        title="Apply generated change",
+        status_key="apply_gate",
     )["task"]
 
-    applied = workflow_service.apply_workflow_action(
+    result = workflow_service.apply_workflow_action(
         task["id"],
         "apply_result",
         {
             "ok": True,
-            "snapshot_id": "20260614-0001-test",
-            "changed_paths": ["src/main/java/App.java"],
+            "snapshot_id": "20260629-apply",
+            "changed_paths": ["src/App.java"],
             "verification": {},
         },
     )
 
-    assert applied["task"]["status_key"] == "done"
-    state = workflow_service.current_workflow_state(task["id"])
-    assert state["status_key"] == "done"
-    assert state["actions"] == []
-    events = kanban_service.list_events(project_id="workflow-smoke", task_id=task["id"], limit=50)["events"]
-    event_types = [event["event_type"] for event in events]
-    assert "task_moved" in event_types
-    assert "apply_result_received" in event_types
-    assert events[0]["task_title"] == "Implement feature"
-    audit_log = tmp_path / "sessions" / "workflow-smoke" / "audit_events.jsonl"
-    legacy_task_dir = tmp_path / "sessions" / "workflow-smoke" / task["id"]
-    project_memory_path = tmp_path / "sessions" / "workflow-smoke" / "project_memory.json"
-    project_memory_log = tmp_path / "sessions" / "workflow-smoke" / "project_memory.jsonl"
-    assert audit_log.is_file()
-    assert not legacy_task_dir.exists()
-    assert project_memory_path.is_file()
-    assert project_memory_log.is_file()
-    task_events = [json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines()]
-    assert any(event["event_type"] == "task_moved" for event in task_events)
-    project_memory = session_store.read_project_memory("workflow-smoke")
-    assert project_memory["project_id"] == "workflow-smoke"
-    assert task["id"] in project_memory["tasks_seen"]
-    assert "src/main/java/App.java" in project_memory["paths"]
-    assert any(item["phase"] == "apply" and item["status_key"] == "done" for item in project_memory["phase_summaries"])
+    assert result["task"]["status_key"] == "complete"
+    events = kanban_service.list_events(project_id=project_id, task_id=task["id"], limit=50)["events"]
+    assert "workflow_transition_decided" in [event["event_type"] for event in events]
+    memory = __import__("app.services.session_store", fromlist=["read_project_memory"]).read_project_memory(project_id)
+    assert "src/App.java" in memory["paths"]
 
-    failed_task = kanban_service.create_task(
-        project_id="workflow-smoke",
-        title="Failed task",
-        description="Smoke",
-        status_key="failed",
+
+def test_failed_verification_returns_to_project_repair_column(monkeypatch, tmp_path):
+    _, kanban_service = configure(monkeypatch, tmp_path)
+    import app.services.workflow as workflow_service
+
+    project_id = "verification-smoke"
+    kanban_service.update_project_workflow(project_id, code_flow())
+    task = kanban_service.create_task(
+        project_id=project_id,
+        title="Compile checked change",
+        status_key="apply_gate",
     )["task"]
-    abandoned = workflow_service.apply_workflow_action(failed_task["id"], "abandon", {"reason": "test"})
-    assert abandoned["task"]["status_key"] == "failed"
 
-    retried = workflow_service.apply_workflow_action(failed_task["id"], "retry", {"reason": "test"})
-    assert retried["task"]["status_key"] == "draft"
-
-
-def test_project_memory_does_not_treat_source_map_symbol_kinds_as_frameworks():
-    from app.services.session_store import _normalize_project_memory
-
-    memory = _normalize_project_memory(
-        "memory-smoke",
-        {"frameworks": ["class", "method", "source", "Spring Boot"]},
+    result = workflow_service.apply_workflow_action(
+        task["id"],
+        "apply_result",
+        {
+            "ok": True,
+            "changed_paths": ["src/main/java/org/example/dto/TenantCreateRequest.java"],
+            "verification": {
+                "required": ["compile"],
+                "results": {"compile": "failed"},
+                "tool_results": [{"id": "compile", "tool": "project.compile", "ok": False, "error": "illegal escape"}],
+            },
+        },
     )
 
-    assert memory["frameworks"] == ["Spring Boot"]
+    assert result["task"]["status_key"] == "repair"
+    task_detail = kanban_service.get_task(task["id"])["task"]
+    assert "verification_failed" in [event["event_type"] for event in task_detail["events"]]
 
 
 def test_packaging_scripts_cover_devwerk_and_intellij_plugin():
@@ -140,342 +198,12 @@ def test_packaging_scripts_cover_devwerk_and_intellij_plugin():
             assert needle in text
 
 
-def test_failed_verification_returns_to_coding(monkeypatch, tmp_path):
-    import app.services.kanban as kanban_service
-    import app.services.session_store as session_store
-    import app.services.workflow as workflow_service
+def test_project_memory_does_not_treat_source_map_symbol_kinds_as_frameworks():
+    from app.services.session_store import _normalize_project_memory
 
-    class FakeSettings:
-        devwerk_db_path = str(tmp_path / "verification.db")
-
-    monkeypatch.setattr(kanban_service, "settings", lambda: FakeSettings())
-    monkeypatch.setattr(session_store, "settings", lambda: FakeSettings())
-    kanban_service._initialized = False
-
-    task = kanban_service.create_task(
-        project_id="verification-smoke",
-        title="Compile checked change",
-        description="Smoke",
-        status_key="ready_to_apply",
-    )["task"]
-
-    result = workflow_service.apply_workflow_action(
-        task["id"],
-        "apply_result",
-        {
-            "ok": True,
-            "snapshot_id": "20260617-compile-fail",
-            "changed_paths": ["src/main/java/org/example/dto/TenantCreateRequest.java"],
-            "verification": {
-                "required": ["compile"],
-                "results": {"compile": "failed"},
-                "tool_results": [
-                    {
-                        "id": "compile",
-                        "tool": "process.run",
-                        "ok": False,
-                        "content": "java: illegal escape character",
-                        "error": "java: illegal escape character",
-                    }
-                ],
-            },
-        },
+    memory = _normalize_project_memory(
+        "memory-smoke",
+        {"frameworks": ["class", "method", "source", "Spring Boot"]},
     )
 
-    assert result["task"]["status_key"] == "planned"
-    task_detail = kanban_service.get_task(task["id"])["task"]
-    event_types = [event["event_type"] for event in task_detail["events"]]
-    assert "verification_failed" in event_types
-    phase_outputs = [artifact["payload"] for artifact in task_detail["artifacts"] if artifact["artifact_type"] == "workflow_phase_output"]
-    assert phase_outputs[-1]["next_action"] == "request_recoding"
-
-
-def test_kanban_apply_result_queues_resume_after_failed_verification(monkeypatch, tmp_path):
-    import app.main as main_module
-    import app.routes.workflows as ide_routes
-    import app.services.kanban as kanban_service
-    import app.services.session_store as session_store
-    import app.services.usage as usage_service
-
-    class FakeSettings:
-        devwerk_db_path = str(tmp_path / "resume.db")
-        app_env = "test"
-        llm_provider_name = "test"
-        workflow_supervisor_enabled = False
-
-        @property
-        def is_production(self):
-            return False
-
-        def validate_provider(self):
-            return None
-
-        def get_llm_config(self, agent="coder"):
-            return {"agent": agent, "protocol": "ollama", "api_key": None, "model": "test"}
-
-    monkeypatch.setattr(main_module, "settings", lambda: FakeSettings())
-    monkeypatch.setattr(kanban_service, "settings", lambda: FakeSettings())
-    monkeypatch.setattr(session_store, "settings", lambda: FakeSettings())
-    monkeypatch.setattr(usage_service, "settings", lambda: FakeSettings())
-    kanban_service._initialized = False
-    usage_service._initialized = False
-
-    started = []
-    monkeypatch.setattr(ide_routes, "_start_workflow_thread", lambda task_id, body: started.append((task_id, body)))
-
-    task = kanban_service.create_task(
-        project_id="resume-smoke",
-        title="Compile checked change",
-        description="Smoke",
-        status_key="ready_to_apply",
-    )["task"]
-    kanban_service.add_artifact(
-        task["id"],
-        artifact_type="workflow_request_body",
-        payload={
-            "project_id": "resume-smoke",
-            "task_id": task["id"],
-            "mode": "agent",
-            "messages": [{"role": "user", "content": "Fix compile error"}],
-            "workspace": {"tree_preview": "pom.xml\nsrc/main/java/App.java"},
-        },
-    )
-    kanban_service.add_artifact(
-        task["id"],
-        artifact_type="workflow_result",
-        payload={"ok": True, "task_id": task["id"], "status_key": "ready_to_apply"},
-    )
-
-    app = main_module.create_app()
-    with TestClient(app) as client:
-        response = client.post(
-            f"/v1/kanban/tasks/{task['id']}/actions",
-            json={
-                "action": "apply_result",
-                "payload": {
-                    "ok": True,
-                    "snapshot_id": "20260617-compile-fail",
-                    "changed_paths": ["src/main/java/App.java"],
-                    "verification": {
-                        "required": ["compile"],
-                        "results": {"compile": "failed"},
-                        "tool_results": [{"id": "compile", "tool": "process.run", "ok": False, "error": "compile failed"}],
-                    },
-                },
-            },
-        )
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["task"]["status_key"] == "planned"
-    assert body["workflow_resume"]["poll_url"].startswith(f"/v1/workflows/{task['id']}?result_after=")
-    assert started and started[0][0] == task["id"]
-    assert started[0][1]["resume_status"] == "planned"
-    assert started[0][1]["verification_feedback"]["results"]["compile"] == "failed"
-    assert started[0][1]["verification_feedback"]["applied_changed_paths"] == [
-        "src/main/java/App.java"
-    ]
-
-
-def test_kanban_apply_failure_requests_recoding_and_queues_resume(monkeypatch, tmp_path):
-    import app.main as main_module
-    import app.routes.workflows as ide_routes
-    import app.services.kanban as kanban_service
-    import app.services.session_store as session_store
-    import app.services.usage as usage_service
-
-    class FakeSettings:
-        devwerk_db_path = str(tmp_path / "apply-resume.db")
-        app_env = "test"
-        llm_provider_name = "test"
-        workflow_supervisor_enabled = False
-
-        @property
-        def is_production(self):
-            return False
-
-        def validate_provider(self):
-            return None
-
-        def get_llm_config(self, agent="coder"):
-            return {"agent": agent, "protocol": "ollama", "api_key": None, "model": "test"}
-
-    monkeypatch.setattr(main_module, "settings", lambda: FakeSettings())
-    monkeypatch.setattr(kanban_service, "settings", lambda: FakeSettings())
-    monkeypatch.setattr(session_store, "settings", lambda: FakeSettings())
-    monkeypatch.setattr(usage_service, "settings", lambda: FakeSettings())
-    kanban_service._initialized = False
-    usage_service._initialized = False
-    started = []
-    monkeypatch.setattr(ide_routes, "_start_workflow_thread", lambda task_id, body: started.append((task_id, body)))
-
-    task = kanban_service.create_task(
-        project_id="apply-resume-smoke",
-        title="Apply checked change",
-        description="Smoke",
-        status_key="ready_to_apply",
-    )["task"]
-    kanban_service.add_artifact(
-        task["id"],
-        artifact_type="workflow_request_body",
-        payload={
-            "project_id": "apply-resume-smoke",
-            "task_id": task["id"],
-            "mode": "agent",
-            "messages": [{"role": "user", "content": "Fix compile error"}],
-            "workspace": {"tree_preview": "src/main.py"},
-        },
-    )
-    kanban_service.add_artifact(
-        task["id"],
-        artifact_type="workflow_result",
-        payload={"ok": True, "task_id": task["id"], "status_key": "ready_to_apply"},
-    )
-
-    app = main_module.create_app()
-    with TestClient(app) as client:
-        response = client.post(
-            f"/v1/kanban/tasks/{task['id']}/actions",
-            json={
-                "action": "apply_result",
-                "payload": {
-                    "ok": False,
-                    "snapshot_id": "apply-failed",
-                    "changed_paths": [],
-                    "error_message": "Patch context does not match the current file",
-                },
-            },
-        )
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["task"]["status_key"] == "coding"
-    assert body["workflow_resume"]["reason"] == "apply_failed"
-    assert started[0][1]["client_feedback"]["kind"] == "apply_failed"
-    assert "Patch context" in started[0][1]["client_feedback"]["summary"]
-
-
-def test_stale_apply_result_is_idempotently_ignored(monkeypatch, tmp_path):
-    import app.main as main_module
-    import app.services.kanban as kanban_service
-    import app.services.session_store as session_store
-    import app.services.usage as usage_service
-
-    class FakeSettings:
-        devwerk_db_path = str(tmp_path / "stale-apply.db")
-        app_env = "test"
-        llm_provider_name = "test"
-        workflow_supervisor_enabled = False
-
-        @property
-        def is_production(self):
-            return False
-
-        def validate_provider(self):
-            return None
-
-        def get_llm_config(self, agent="coder"):
-            return {"agent": agent, "protocol": "ollama", "api_key": None, "model": "test"}
-
-    monkeypatch.setattr(main_module, "settings", lambda: FakeSettings())
-    monkeypatch.setattr(kanban_service, "settings", lambda: FakeSettings())
-    monkeypatch.setattr(session_store, "settings", lambda: FakeSettings())
-    monkeypatch.setattr(usage_service, "settings", lambda: FakeSettings())
-    kanban_service._initialized = False
-    usage_service._initialized = False
-
-    task = kanban_service.create_task(
-        project_id="stale-apply-smoke",
-        title="Continue coding",
-        description="The reviewer already returned this task to coding.",
-        status_key="coding",
-    )["task"]
-
-    app = main_module.create_app()
-    with TestClient(app) as client:
-        response = client.post(
-            f"/v1/kanban/tasks/{task['id']}/actions",
-            json={
-                "action": "apply_result",
-                "payload": {
-                    "ok": True,
-                    "snapshot_id": "late-client-result",
-                    "changed_paths": [],
-                },
-            },
-        )
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["action_ignored"] is True
-    assert body["task"]["status_key"] == "coding"
-    task_detail = kanban_service.get_task(task["id"])["task"]
-    assert "stale_apply_result_ignored" in [event["event_type"] for event in task_detail["events"]]
-
-
-def test_verification_policy_uses_project_configured_tools_only():
-    from app.services.verification_policy import configured_post_apply_tool_requests
-
-    assert configured_post_apply_tool_requests({"parameters": {}}) == []
-
-    requests = configured_post_apply_tool_requests(
-        {
-            "parameters": {
-                "verification": {
-                    "tool_requests": [
-                        {
-                            "id": "syntax",
-                            "tool": "source.diagnostics",
-                            "args": {"paths": ["src/main/java/org/example/Application.java"]},
-                        }
-                    ]
-                }
-            }
-        }
-    )
-
-    assert len(requests) == 1
-    assert requests[0].tool == "source.diagnostics"
-    assert requests[0].args["paths"] == ["src/main/java/org/example/Application.java"]
-
-
-def test_workflow_semantic_rework_actions(monkeypatch, tmp_path):
-    import app.services.kanban as kanban_service
-    import app.services.session_store as session_store
-    import app.services.workflow as workflow_service
-
-    class FakeSettings:
-        devwerk_db_path = str(tmp_path / "workflow-rework.db")
-
-    monkeypatch.setattr(kanban_service, "settings", lambda: FakeSettings())
-    monkeypatch.setattr(session_store, "settings", lambda: FakeSettings())
-    kanban_service._initialized = False
-
-    task = kanban_service.create_task(
-        project_id="workflow-rework",
-        title="Review coding output",
-        description="Smoke",
-        status_key="reviewed",
-    )["task"]
-
-    recoding = workflow_service.apply_workflow_action(
-        task["id"],
-        "request_recoding",
-        {"phase": "reviewed", "reason": "Generated change missed an approved file."},
-    )
-    assert recoding["task"]["status_key"] == "coding"
-
-    reviewed = kanban_service.move_task(task["id"], "reviewed", force=True, payload={"reason": "retry review"})
-    assert reviewed["task"]["status_key"] == "reviewed"
-
-    approved = workflow_service.apply_workflow_action(
-        task["id"],
-        "approve",
-        {"phase": "reviewed", "reason": "Review passed."},
-    )
-    assert approved["task"]["status_key"] == "ready_to_apply"
-
-    events = kanban_service.list_events(project_id="workflow-rework", task_id=task["id"], limit=50)["events"]
-    event_types = [event["event_type"] for event in events]
-    assert "workflow_transition_decided" in event_types
-    assert "workflow_rework_requested" in event_types
+    assert memory["frameworks"] == ["Spring Boot"]

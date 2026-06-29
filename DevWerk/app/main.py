@@ -9,10 +9,12 @@ import re
 import sys
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 # Ensure the project root is on the import path so 'app' resolves.
 sys.path.insert(0, str(__file__.rsplit("/", 2)[0]))
@@ -51,7 +53,7 @@ async def lifespan(app: FastAPI):
             return v[:4] + "****" + v[-4:]
         return "****"
 
-    llm = cfg.get_llm_config("coder")
+    llm = cfg.get_llm_config("project")
     safe_config = {k: _safe(v) if k == "api_key" else v for k, v in llm.items()}
     log.info("Active LLM config: %s", safe_config)
     init_usage_db()
@@ -155,6 +157,7 @@ def create_app() -> FastAPI:
     app.include_router(kanban_router, prefix="/v1", tags=["Kanban"])
     app.include_router(settings_router, prefix="/v1", tags=["Settings"])
     app.include_router(kanban_ui_router)
+    app.mount("/web/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "web" / "static")), name="web-static")
     # Mount last so existing FastAPI routes win and /mcp is served without a redirect.
     app.mount("/", mcp_http_app, name="mcp")
 

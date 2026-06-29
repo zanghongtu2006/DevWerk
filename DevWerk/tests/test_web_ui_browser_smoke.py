@@ -102,15 +102,37 @@ def test_backend_web_ui_tabs_and_project_context_with_real_browser(tmp_path):
                     "description": "Browser smoke project beta",
                 },
             )
+            smoke_workflow = {
+                "name": "browser-smoke-flow",
+                "columns": [
+                    {"status_key": "intake", "title": "Intake", "position": 10, "transition_to": ["working", "blocked"]},
+                    {"status_key": "working", "title": "Working", "position": 20, "transition_to": ["complete", "blocked"]},
+                    {"status_key": "complete", "title": "Complete", "position": 90, "transition_to": []},
+                    {"status_key": "blocked", "title": "Blocked", "position": 99, "transition_to": ["intake"]},
+                ],
+                "actions": {
+                    "begin": {"to": "working"},
+                    "workflow_done": {"to": "complete"},
+                    "fail": {"to": "blocked"},
+                    "abandon": {"to": "blocked"},
+                    "retry": {"to": "intake"},
+                },
+            }
+            for project_id in ("web-smoke-alpha", "web-smoke-beta"):
+                _request_json(
+                    "PUT",
+                    f"{base_url}/v1/kanban/projects/{project_id}/workflow",
+                    {"workflow": smoke_workflow},
+                )
             _request_json(
                 "POST",
                 f"{base_url}/v1/kanban/tasks",
-                {"project_id": "web-smoke-alpha", "title": "Alpha coding task", "status_key": "coding"},
+                {"project_id": "web-smoke-alpha", "title": "Alpha workflow task", "status_key": "working"},
             )
             _request_json(
                 "POST",
                 f"{base_url}/v1/kanban/tasks",
-                {"project_id": "web-smoke-beta", "title": "Beta failed task", "status_key": "failed"},
+                {"project_id": "web-smoke-beta", "title": "Beta blocked task", "status_key": "blocked"},
             )
 
             playwright_core = repo_root / ".devwerk" / "node_modules" / "playwright-core"

@@ -22,7 +22,7 @@ def test_llm_config_requires_default_route():
     with pytest.raises(ValueError, match="routing.default"):
         _normalize_llm_config(
             {
-                "routing": {"coder": "minimax/m3"},
+                "routing": {"node-agent": "minimax/m3"},
                 "llms": _fallback()["llms"],
             },
             _fallback(),

@@ -19,9 +19,9 @@ SYSTEM_PROMPT = textwrap.dedent(
     Context rules:
     1. Prefer code_context_summary and workspace_summary.source_map when they
        are present. They are client-provided indexes, not full file content.
-    2. If workflow_phase_context is present, treat planner_output as the
-       current coding contract and review_feedback as mandatory rework
-       guidance. Address missing_changed_files before returning done=true.
+    2. If workflow_phase_context is present, treat previous phase artifacts
+       and workflow feedback as the active column contract. Address reported
+       evidence gaps before returning done=true.
     3. Use source_map to locate existing files, symbols, packages/modules,
        imports, and likely boundaries. If exact content is needed, request
        workspace.read before editing.
@@ -60,7 +60,7 @@ SYSTEM_PROMPT = textwrap.dedent(
        ./scripts/check or ./tool-wrapper. Do not use shell wrappers such as cmd,
        powershell, bash, or sh.
     6. Syntax, compile, test, or tool failures are workflow feedback and must be
-       fixed in the next coding round.
+       fixed in the next applicable workflow round.
 
     Implementation rules:
     1. When the user requests code, output real, directly applicable

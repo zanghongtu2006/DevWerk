@@ -206,106 +206,97 @@ def test_workflow_designer_endpoint_can_save_project_override(monkeypatch, tmp_p
     )
 
 
-def test_workbench_exposes_project_workflow_designer():
-    from app.routes import kanban as kanban_routes
-    from app.routes.kanban import WORKBENCH_HTML
-
-    assert callable(kanban_routes.kanban_design_project_workflow)
-    assert "/conversation" in WORKBENCH_HTML
-    assert "New Project" in WORKBENCH_HTML
-    assert "projectList" in WORKBENCH_HTML
-    assert "ctxProject" in WORKBENCH_HTML
-    assert "ctxModelRoute" in WORKBENCH_HTML
-    assert "project-rail" in WORKBENCH_HTML
-    assert "resize: horizontal" in WORKBENCH_HTML
-    assert "overflow-y: auto" in WORKBENCH_HTML
-    assert "composer-box" in WORKBENCH_HTML
-    assert "normalizeMessages" in WORKBENCH_HTML
-    assert "displayMessageContent" in WORKBENCH_HTML
-    assert "sendProjectMessage" in WORKBENCH_HTML
-    assert 'action:"message"' in WORKBENCH_HTML
-    assert "project_id" in WORKBENCH_HTML
-    assert "Save Design" not in WORKBENCH_HTML
-    assert "Start Task" not in WORKBENCH_HTML
-    assert "Workflow JSON" not in WORKBENCH_HTML
-    assert "Agent Overrides" not in WORKBENCH_HTML
-
-
-def test_dashboard_project_creation_opens_workbench():
-    from app.routes.kanban import DASHBOARD_HTML
-
-    assert "New Project" in DASHBOARD_HTML
-    assert "Save Project</button>" not in DASHBOARD_HTML
-    assert "createProjectFromPrompt" in DASHBOARD_HTML
-    assert "/workbench?project_id=" in DASHBOARD_HTML
-    assert "Project Configuration" in DASHBOARD_HTML
-    assert "Workflow Definition" in DASHBOARD_HTML
-    assert "Project Route Summary" in DASHBOARD_HTML
-    assert "Team & Access" in DASHBOARD_HTML
-
-
-def test_backend_web_ui_routes_share_redesigned_shell():
-    from app.routes.web_ui import render_web_ui
-
-    for page in ("overview", "projects", "kanban", "tasks"):
-        html = render_web_ui(page)
-        assert 'class="app-shell"' in html
-        assert 'class="global-nav"' in html
-        assert 'class="project-rail"' in html
-        assert "ctxModelRoute" in html
-        assert "renderProjectsPage" in html
-        assert "renderKanbanPage" in html
-        assert "renderTaskPage" in html
-        assert "renderSectionPage" in html
-        assert "activeSection" in html
-
-
-def test_backend_web_ui_navigation_and_project_tabs_are_interactive():
+def test_backend_web_ui_is_split_into_template_css_and_script():
     from app.routes.web_ui import render_web_ui
 
     html = render_web_ui("projects")
 
-    for nav in ("events", "memory", "analytics", "settings"):
-        assert f'data-nav="{nav}"' in html
-        assert f"render{nav.title()}Section" in html
-
-    for tab in ("configuration", "settings", "workflow", "routing", "integrations", "history", "activity"):
-        assert f'data-project-tab="${{tab.key}}"' in html
-        assert f"{tab}:" in html
-
-    assert "projectWorkflowTab" in html
-    assert "projectRoutingTab" in html
-    assert "projectIntegrationsTab" in html
-    assert "projectHistoryTab" in html
-    assert "projectActivityTab" in html
-    assert "window.addEventListener(\"hashchange\"" in html
+    assert 'class="app-shell"' in html
+    assert 'class="global-nav"' in html
+    assert 'class="project-rail"' in html
+    assert '<style' not in html
+    assert '<script src="/web/static/dashboard.js" defer></script>' in html
+    assert '<link rel="stylesheet" href="/web/static/dashboard.css" />' in html
+    assert "renderProjectsPage" not in html
 
 
-def test_backend_web_ui_all_design_tabs_have_click_handlers():
-    from app.routes.web_ui import render_web_ui
+def test_backend_web_ui_static_files_own_layout_and_interactions():
+    from pathlib import Path
 
-    html = render_web_ui("overview")
+    web_root = Path(__file__).resolve().parents[1] / "app" / "web" / "static"
+    css = (web_root / "dashboard.css").read_text(encoding="utf-8")
+    js = (web_root / "dashboard.js").read_text(encoding="utf-8")
 
-    for tab in ("configuration", "settings", "workflow", "routing", "integrations", "history", "activity"):
-        assert f'data-project-tab="${{tab.key}}"' in html
-    assert 'button.dataset.projectTab' in html
-    assert 'renderProjectsPage();' in html
+    assert ".project-rail" in css
+    assert "resize: horizontal" in css
+    assert "overflow-y: auto" in css
+    assert ".overview-grid" in css
+    assert ".chat-card" in css
+    assert ".chat-body" in css
 
-    for tab in ("conversation", "workflow_log", "artifacts"):
-        assert f'data-chat-tab="${{tab.key}}"' in html
-    assert 'button.dataset.chatTab' in html
-    assert 'renderOverviewPage();' in html
+    for renderer in (
+        "renderOverviewPage",
+        "renderProjectsPage",
+        "renderKanbanPage",
+        "renderTaskPage",
+        "renderEventsSection",
+        "renderMemorySection",
+        "renderAnalyticsSection",
+        "renderSettingsSection",
+    ):
+        assert renderer in js
+    assert "data-nav" in js
+    assert "data-project-tab" in js
+    assert "data-chat-tab" in js
+    assert "data-task-tab" in js
+    assert "saveProjectDesign" not in js
+    assert "startTask" not in js
 
-    for tab in ("summary", "plan", "diff", "events", "memory"):
-        assert f'data-task-tab="${{tab.key}}"' in html
-    assert 'button.dataset.taskTab' in html
-    assert 'renderTaskPage();' in html
+
+def test_backend_web_ui_navigation_has_distinct_routes_and_sections():
+    from pathlib import Path
+
+    template = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "dashboard.html").read_text(encoding="utf-8")
+    js = (Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "dashboard.js").read_text(encoding="utf-8")
+
+    expected_renderers = (
+        "renderOverviewPage",
+        "renderProjectsPage",
+        "renderKanbanPage",
+        "renderTaskPage",
+        "renderEventsSection",
+        "renderMemorySection",
+        "renderAnalyticsSection",
+        "renderSettingsSection",
+    )
+    for renderer in expected_renderers:
+        assert renderer in js
+
+    for nav, href in {
+        "overview": "/workbench",
+        "projects": "/dashboard",
+        "kanban": "/kanban",
+        "tasks": "/tasks",
+        "events": "/dashboard#events",
+        "memory": "/dashboard#memory",
+        "analytics": "/dashboard#analytics",
+        "settings": "/dashboard#settings",
+    }.items():
+        assert f'data-nav="{nav}" href="{href}"' in template
+
+    assert "window.addEventListener(\"hashchange\"" in js
+    assert 'function activeSection()' in js
+    assert "events: renderEventsSection" in js
+    assert "memory: renderMemorySection" in js
+    assert "analytics: renderAnalyticsSection" in js
+    assert "settings: renderSettingsSection" in js
+    assert "renderProjectsPage();" not in js.split("function renderAnalyticsSection", 1)[-1].split("function ", 1)[0]
 
 
 def test_backend_web_ui_uses_backend_data_not_demo_metrics():
-    from app.routes.web_ui import render_web_ui
+    from pathlib import Path
 
-    html = render_web_ui("overview")
+    js = (Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "dashboard.js").read_text(encoding="utf-8")
 
     forbidden = (
         "DEMO_TASKS",
@@ -322,17 +313,12 @@ def test_backend_web_ui_uses_backend_data_not_demo_metrics():
         "anthropic/claude-3-5-sonnet",
     )
     for text in forbidden:
-        assert text not in html
+        assert text not in js
 
-    assert "Backend usage DB" in html
-    assert "Global Settings" in html
-    assert "Task List" in html
-    assert "Task Token Usage" in html
-    assert "Project Token Breakdown" in html
-    assert "Loaded from backend API" in html
-    assert "No artifacts returned by backend" in html
-    assert "pageUrlForCurrentView" in html
-    assert 'state.section ? "#" + encodeURIComponent(state.section)' in html
+    assert "`${API}/usage/summary`" in js
+    assert "`${API}/kanban/projects`" in js
+    assert "`${API}/kanban/tasks`" in js
+    assert "No usage rows returned by backend" in js
 
 
 def test_project_stats_include_status_breakdown(monkeypatch, tmp_path):

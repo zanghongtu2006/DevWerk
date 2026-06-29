@@ -1,220 +1,119 @@
 # DevWerk Smoke Tests
 
-This document lists the smoke tests that should pass before provider/service
-integration work continues. Smoke tests are intentionally small: they verify the
-critical DevWerk loop without depending on a real external LLM unless stated.
+These checks protect the current dynamic workflow architecture. Tests should
+not assume default Kanban columns, fixed planner/coder/reviewer agents, or
+legacy `/v1/plan` and `/v1/execute` APIs.
 
-## Service Unit Smoke
-
-Command:
+## Backend Full Smoke
 
 ```powershell
 cd DevWerk
-.\.venv\Scripts\python.exe -m pytest tests\test_smoke.py -q
+$env:LOG_FILE_ENABLED='false'
+.\.venv\Scripts\python.exe -m pytest tests -q
 ```
 
 Coverage:
 
-- `IdeChatResponse` can represent backend errors without requiring a reply body.
-- The default kanban lifecycle contains the required control states:
-  `draft`, `context_indexed`, `planned`, `coding`, `ready_to_apply`, `applied`,
-  `verified`, `done`, and `failed`.
+- New projects start without workflow columns and cannot create tasks until a
+  workflow is saved.
+- Project conversation can save a non-coding workflow and can dispatch or
+  continue tasks through `/v1/workflows`.
+- Dynamic workflow columns spawn column agents from project workflow settings.
+- A repair-style coding workflow can produce file ops and reach its configured
+  success terminal.
+- A failing dynamic workflow reaches the project-defined failure terminal.
+- Supervisor timeout, queued worker recovery, retry idempotency, and dispatch
+  dedupe use project-defined actions and columns.
+- Web UI routes use external template/CSS/JS files and all operational data is
+  fetched from backend APIs.
+- Usage summary supports global, project, task, and agent breakdowns.
 
 Expected result:
 
 ```text
-3 passed
+44 passed, 2 skipped
 ```
 
-## Service Coding Workflow Smoke
+Skipped tests are opt-in real-browser and real-LLM tests.
 
-Command:
+## Syntax Smoke
 
 ```powershell
 cd DevWerk
+$env:LOG_FILE_ENABLED='false'
+.\.venv\Scripts\python.exe -m compileall app tests
+```
+
+Expected result: no compile errors.
+
+## Web UI Smoke
+
+Unit coverage checks:
+
+- `app/web/templates/dashboard.html` is the only HTML template.
+- `/web/static/dashboard.css` owns layout and scrolling.
+- `/web/static/dashboard.js` owns rendering and event handlers.
+- Overview, Projects, Kanban, Tasks, Events, Memory, Analytics, and Settings
+  have distinct renderers.
+- No demo metrics or mock task data are used for operational views.
+
+The optional browser smoke can be enabled with:
+
+```powershell
+$env:DEVWERK_RUN_BROWSER_SMOKE='1'
+.\.venv\Scripts\python.exe -m pytest tests\test_web_ui_browser_smoke.py -q
+```
+
+## Dynamic Workflow Smoke
+
+The backend coding smoke is intentionally model-free but workflow-real:
+
+```powershell
+cd DevWerk
+$env:LOG_FILE_ENABLED='false'
 .\.venv\Scripts\python.exe -m pytest tests\test_backend_coding_workflow.py -q
 ```
 
-Coverage:
+It creates an isolated project workflow with custom columns, stubs the LLM
+client at the column-agent boundary, and verifies both success and failure
+paths. The test must never depend on default columns.
 
-- Uses an isolated SQLite database under pytest `tmp_path`.
-- Uses stub LLM clients, so no real provider credentials or tokens are required.
-- Calls `POST /v1/workflows` with a normal coding request and workspace summary.
-- Verifies automatic workflow execution reaches `ready_to_apply` with file ops.
-- Verifies interactive execution pauses at `planned`, then the same task resumes
-  through `POST /v1/workflows/{task_id}/messages` after plan confirmation.
-- Verifies durable conversation messages, column runs, candidate revisions,
-  context compression, and result-cursor behavior.
-- Verifies client-side `tool_requests` can accompany generated changes.
-- Verifies a simulated plugin `apply_result` with passing verification moves the
-  same kanban task to `done`.
-- Verifies candidate plan paths are optional unless `required=true`, while
-  unplanned writes and missing required changes still trigger rework.
+## Real LLM Smoke
 
-Expected result:
-
-```text
-All coding workflow tests passed
-```
-
-## Service Full Test Smoke
-
-Command:
+Real LLM smoke is opt-in because it spends provider quota:
 
 ```powershell
-cd DevWerk
-.\.venv\Scripts\python.exe -m pytest tests -q
+$env:DEVWERK_RUN_REAL_LLM_SMOKE='1'
+.\.venv\Scripts\python.exe -m pytest tests\test_real_llm_smoke.py -q
 ```
 
-Coverage:
-
-- Runs all backend smoke tests.
-- This is the default backend-only safety check before IDE/plugin integration.
-
-Expected result:
-
-```text
-8 passed
-```
-
-## Service Debug Log Smoke
-
-The DevWerk service defaults to debug logging. These settings can be overridden
-in `DevWerk/.env`:
-
-```env
-LOG_LEVEL=debug
-LOG_FORMAT=%(asctime)s %(levelname)s [%(name)s] %(message)s
-UVICORN_ACCESS_LOG=true
-```
-
-Command:
-
-```powershell
-cd DevWerk
-startup.bat
-```
-
-Coverage:
-
-- Uvicorn starts with debug log level.
-- `devwerk.*` loggers emit debug logs.
-- Each `/v1/*` request logs start/end, method, path, project id, status, and duration.
-- Usage, kanban, planner, coder harness, and IDE route debug logs are visible.
-
-Expected result:
-
-```text
-[DevWerk] Log level:          debug
-...
-DEBUG [devwerk.request] request start method=...
-DEBUG [devwerk.request] request end method=...
-```
-
-## Service Syntax Smoke
-
-Command:
-
-```powershell
-cd DevWerk
-.\.venv\Scripts\python.exe -m compileall app tests
-```
-
-Coverage:
-
-- Compiles backend application and test modules.
-- Catches syntax/import-level mistakes that pytest might not touch directly.
-
-Expected result:
-
-```text
-Listing 'app'...
-Listing 'tests'...
-```
-
-No compile errors should be printed.
+Use this only after `config/llm.json` has a valid `routing.default` and API key.
 
 ## Plugin Kotlin Smoke
 
-Command:
-
 ```powershell
 cd idea-plugin
-.\gradlew.bat compileKotlin --offline --no-daemon
+.\gradlew.bat compileKotlin
 ```
 
 Coverage:
 
-- Verifies IDE plugin Kotlin sources compile.
-- Does not run a full Gradle build.
-- Does not start IntelliJ sandbox.
+- Verifies IntelliJ-family plugin Kotlin sources compile.
+- Does not start the IntelliJ sandbox.
 
-Expected result:
+## Safety Checks
 
-```text
-BUILD SUCCESSFUL
-```
-
-## Plugin runIde Startup Smoke
-
-Command:
-
-```powershell
-cd idea-plugin
-.\gradlew.bat runIde --no-daemon
-```
-
-Coverage:
-
-- Runs the real IntelliJ sandbox with the DevWerk plugin installed.
-- Verifies `ensureCoroutinesJavaAgent` produces
-  `build/tmp/initializeIntelliJPlugin/coroutines-javaagent.jar`.
-- Verifies `runIde` no longer fails with:
-  `Error opening zip file or JAR manifest missing : ... coroutines-javaagent.jar`.
-
-Expected result:
-
-- IntelliJ starts successfully and stays alive.
-- Stop the IDE manually after startup verification.
-
-## Local End-to-End Developer Smoke
-
-This helper is intentionally stored under `.devwerk/` and ignored by git.
-
-Command:
-
-```powershell
-.\.devwerk\smoke\run-local-smoke.ps1 -IdeHoldSeconds 90
-```
-
-Coverage:
-
-- Deletes and regenerates the coroutine javaagent jar.
-- Runs plugin `compileKotlin`.
-- Starts the DevWerk service with `startup.bat`.
-- Verifies `/docs`.
-- Verifies service API contract for `/v1/workflows`, workflow event/result
-  endpoints, multi-turn messages, and `/v1/ide/attachments`.
-- Starts real `runIde` and requires it to stay alive for the configured window.
-- Cleans service and IDE processes after the run.
-
-Expected result:
-
-```text
-[DevWerk smoke] PASS
-```
-
-## Pre-Integration Checklist
-
-Run this minimum set before provider/service debugging:
+Before pushing:
 
 ```powershell
 cd DevWerk
-.\.venv\Scripts\python.exe -m pytest tests -q
+$env:LOG_FILE_ENABLED='false'
 .\.venv\Scripts\python.exe -m compileall app tests
+.\.venv\Scripts\python.exe -m pytest tests -q
 
 cd ..\idea-plugin
-.\gradlew.bat compileKotlin --offline --no-daemon
+.\gradlew.bat compileKotlin
 ```
 
-Then run `.\gradlew.bat runIde --no-daemon` when the IntelliJ sandbox is free.
+Also run a BOM scan and make sure ignored local files such as
+`config/llm.json`, `.env`, and generated logs are not staged.

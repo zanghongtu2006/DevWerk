@@ -111,16 +111,7 @@ async def test_workflow_spawns_column_agents_without_fixed_stage_names(monkeypat
 
     monkeypatch.setattr(workflow_engine_service, "get_llm_client", lambda route: FakeColumnClient())
 
-    async def unused_plan_runner(body: dict):
-        raise AssertionError("dynamic workflow must not invoke the legacy planner")
-
-    async def unused_coding_runner(body: dict):
-        raise AssertionError("dynamic workflow must not invoke the legacy coding runner")
-
-    engine = workflow_engine_service.WorkflowEngine(
-        plan_runner=unused_plan_runner,
-        coding_runner=unused_coding_runner,
-    )
+    engine = workflow_engine_service.WorkflowEngine()
     await engine.run(
         task["id"],
         {

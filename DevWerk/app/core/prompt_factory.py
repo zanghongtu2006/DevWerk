@@ -22,9 +22,9 @@ OPENAI_SYSTEM_PROMPT = textwrap.dedent(
     3. Prefer code_context_summary and source_map for project structure. They
        are indexes, not full file content. Request workspace.read before modifying
        existing files when exact content matters.
-    4. If workflow_phase_context is present, treat planner_output as the
-       current coding contract and review_feedback as mandatory rework
-       guidance. Address missing_changed_files before returning done=true.
+    4. If workflow_phase_context is present, treat previous phase artifacts
+       and workflow feedback as the active column contract. Address reported
+       evidence gaps before returning done=true.
     5. Backend research tool_requests (workspace.list/workspace.read/workspace.search) must not be
        returned with ops/patch_ops. Client-side post-apply tools such as
        project.compile, source.diagnostics, and process.run may be returned with ops/patch_ops.
@@ -40,7 +40,7 @@ OPENAI_SYSTEM_PROMPT = textwrap.dedent(
        unambiguous. Prefer project-local executable paths. Do not use shell
        wrappers such as cmd, powershell, bash, or sh.
     9. Syntax, compile, test, or tool failures are workflow feedback and must be
-       fixed in the next coding round.
+       fixed in the next applicable workflow round.
 
     JSON Schema:
     __SCHEMA_JSON__

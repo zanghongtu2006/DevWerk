@@ -13,7 +13,7 @@ import logging
 from collections import Counter
 from typing import Any
 
-_log = logging.getLogger("devwerk.coder_harness")
+_log = logging.getLogger("devwerk.code_context")
 
 MAX_REPRESENTATIVE_FILES = 40
 MAX_SYMBOLS = 160
@@ -21,22 +21,21 @@ MAX_IMPORTS = 120
 MAX_DIRECTORIES = 100
 
 
-class CoderHarness:
+class CodeContextBuilder:
     """
     Build a local, zero-token code context from source_map.
 
-    The public build_skill name is retained for existing call sites, but the
-    content is now generic and evidence-only. It does not classify frameworks
+    The content is generic and evidence-only. It does not classify frameworks
     or invent writing rules from backend heuristics.
     """
 
     def build_skill(self, workspace: dict[str, Any] | None) -> str | None:
         summary = build_code_context_summary(workspace)
         if not summary.get("available"):
-            _log.debug("CoderHarness.build_skill: summary unavailable reason=%s", summary.get("reason"))
+            _log.debug("CodeContextBuilder.build_skill: summary unavailable reason=%s", summary.get("reason"))
             return None
         guidance = {
-            "role": "coder",
+            "role": "workflow-column-agent",
             "source": "client source_map",
             "rules": summary.get("path_policy") or [],
             "representative_paths": [
@@ -46,12 +45,12 @@ class CoderHarness:
             ],
         }
         rendered = "code_context_skill:\n" + json.dumps(guidance, ensure_ascii=False, separators=(",", ":"))
-        _log.debug("CoderHarness.build_skill: rendered chars=%s", len(rendered))
+        _log.debug("CodeContextBuilder.build_skill: rendered chars=%s", len(rendered))
         return rendered
 
 
-def build_coder_skill(workspace: dict[str, Any] | None) -> str | None:
-    return CoderHarness().build_skill(workspace)
+def build_code_context_skill(workspace: dict[str, Any] | None) -> str | None:
+    return CodeContextBuilder().build_skill(workspace)
 
 
 def build_code_context_summary(workspace: dict[str, Any] | None) -> dict[str, Any]:
@@ -124,7 +123,7 @@ def build_code_context_summary(workspace: dict[str, Any] | None) -> dict[str, An
         "warnings": _summary_warnings(source_map, normalized),
     }
     _log.debug(
-        "CoderHarness.code_context_summary: files=%s languages=%s dirs=%s symbols=%s representative=%s diagnostics=%s",
+        "CodeContextBuilder.code_context_summary: files=%s languages=%s dirs=%s symbols=%s representative=%s diagnostics=%s",
         len(normalized),
         summary["languages"],
         len(summary["directory_index"]),
@@ -137,13 +136,13 @@ def build_code_context_summary(workspace: dict[str, Any] | None) -> dict[str, An
 
 def _extract_source_map(workspace: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(workspace, dict):
-        _log.debug("CoderHarness.extract_source_map: workspace is not dict")
+        _log.debug("CodeContextBuilder.extract_source_map: workspace is not dict")
         return None
     source_map = workspace.get("source_map")
     if not isinstance(source_map, dict):
-        _log.debug("CoderHarness.extract_source_map: source_map missing or invalid type=%s", type(source_map).__name__)
+        _log.debug("CodeContextBuilder.extract_source_map: source_map missing or invalid type=%s", type(source_map).__name__)
         return None
-    _log.debug("CoderHarness.extract_source_map: source_map found")
+    _log.debug("CodeContextBuilder.extract_source_map: source_map found")
     return source_map
 
 
@@ -151,7 +150,7 @@ def _source_files(source_map: dict[str, Any]) -> list[dict[str, Any]]:
     files = source_map.get("files") or []
     normalized = [f for f in files if isinstance(f, dict)]
     _log.debug(
-        "CoderHarness.source_files: raw_count=%s normalized_count=%s invalid_count=%s",
+        "CodeContextBuilder.source_files: raw_count=%s normalized_count=%s invalid_count=%s",
         len(files) if isinstance(files, list) else "not-list",
         len(normalized),
         (len(files) - len(normalized)) if isinstance(files, list) else "unknown",
@@ -184,7 +183,7 @@ def _extract_syntax_diagnostics(workspace: dict[str, Any] | None) -> list[dict[s
             }
         )
     if diagnostics:
-        _log.debug("CoderHarness.syntax_diagnostics: count=%s sample=%s", len(diagnostics), diagnostics[:10])
+        _log.debug("CodeContextBuilder.syntax_diagnostics: count=%s sample=%s", len(diagnostics), diagnostics[:10])
     return diagnostics
 
 
@@ -312,7 +311,7 @@ def _log_source_map(source_map: dict[str, Any]) -> None:
     files = source_map.get("files") or []
     file_count = len(files) if isinstance(files, list) else 0
     _log.debug(
-        "CoderHarness.source_map: root=%s generated_at=%s total_files=%s indexed_files=%s skipped_files=%s files_payload_count=%s",
+        "CodeContextBuilder.source_map: root=%s generated_at=%s total_files=%s indexed_files=%s skipped_files=%s files_payload_count=%s",
         source_map.get("root"),
         source_map.get("generated_at"),
         source_map.get("total_files"),
@@ -332,4 +331,4 @@ def _log_source_map(source_map: dict[str, Any]) -> None:
                 "symbols": len(item.get("symbols") or []),
                 "imports": len(item.get("imports") or []),
             })
-        _log.debug("CoderHarness.source_map: sample_files=%s", samples)
+        _log.debug("CodeContextBuilder.source_map: sample_files=%s", samples)

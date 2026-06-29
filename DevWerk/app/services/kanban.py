@@ -11,8 +11,7 @@ from typing import Any
 from app.core.config import settings
 from app.services.session_store import append_task_event
 from app.services.workflow_definition import (
-    default_columns,
-    default_workflow_definition,
+    empty_workflow_definition,
     validate_managed_workflow_definition,
     workflow_from_dict,
 )
@@ -32,7 +31,6 @@ T_CONVERSATIONS = f"{TABLE_NAME_PREFIX}conversations"
 T_MESSAGES = f"{TABLE_NAME_PREFIX}messages"
 T_COLUMN_RUNS = f"{TABLE_NAME_PREFIX}column_runs"
 T_REVISIONS = f"{TABLE_NAME_PREFIX}revisions"
-DEFAULT_COLUMNS: list[dict[str, Any]] = default_columns()
 
 
 def init_kanban_db() -> None:
@@ -210,7 +208,6 @@ def init_kanban_db() -> None:
 
 def get_board(project_id: str | None = None) -> dict[str, Any]:
     pid = _project_id(project_id)
-    ensure_default_columns(pid)
     ensure_project(pid)
     with _conn() as conn:
         columns = _columns(conn, pid)
@@ -290,7 +287,6 @@ def upsert_project(
             """,
             (pid, (name or pid).strip() or pid, description or "", now, now),
         )
-    ensure_default_columns(pid)
     ensure_project_settings(pid)
     return get_project(pid)
 
@@ -348,7 +344,7 @@ def get_project_workflow(project_id: str | None = None) -> dict[str, Any]:
     with _conn() as conn:
         row = conn.execute("SELECT workflow_json FROM kb_project_settings WHERE project_id = ?", (pid,)).fetchone()
     raw = _loads(row["workflow_json"], {}) if row is not None else {}
-    definition = workflow_from_dict(raw) if isinstance(raw, dict) and raw else default_workflow_definition()
+    definition = workflow_from_dict(raw) if isinstance(raw, dict) and raw else empty_workflow_definition()
     return {"ok": True, "project_id": pid, "workflow": definition_to_dict(definition)}
 
 
@@ -360,7 +356,7 @@ def update_project_workflow(project_id: str | None, workflow: dict[str, Any]) ->
 
 def list_columns(project_id: str | None = None) -> list[dict[str, Any]]:
     pid = _project_id(project_id)
-    ensure_default_columns(pid)
+    ensure_project(pid)
     with _conn() as conn:
         return _columns(conn, pid)
 
@@ -421,7 +417,7 @@ def create_task(
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     pid = _project_id(project_id)
-    ensure_default_columns(pid)
+    ensure_project(pid)
     with _conn() as conn:
         columns = _columns(conn, pid)
         if not columns:
@@ -927,71 +923,6 @@ def add_artifact(
     return _task_record_response(task_id)
 
 
-def ensure_default_columns(project_id: str | None = None) -> None:
-    pid = _project_id(project_id)
-    init_kanban_db()
-    ensure_project(pid)
-    with _conn() as conn:
-        count = conn.execute(
-            "SELECT COUNT(*) AS count FROM kb_columns WHERE project_id = ?",
-            (pid,),
-        ).fetchone()["count"]
-        if count or not DEFAULT_COLUMNS:
-            _ensure_workflow_columns(conn, pid)
-            return
-        now = _now()
-        for col in DEFAULT_COLUMNS:
-            conn.execute(
-                """
-                INSERT INTO kb_columns (
-                    id, project_id, status_key, title, position, wip_limit,
-                    transition_to, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(uuid.uuid4()),
-                    pid,
-                    col["status_key"],
-                    col["title"],
-                    col["position"],
-                    col.get("wip_limit"),
-                    _json(col["transition_to"]),
-                    now,
-                    now,
-                ),
-            )
-    _log.debug("kanban default columns created project_id=%s", pid)
-
-
-def _ensure_workflow_columns(conn: sqlite3.Connection, pid: str) -> None:
-    now = _now()
-    for col in DEFAULT_COLUMNS:
-        conn.execute(
-            """
-            INSERT INTO kb_columns (
-                id, project_id, status_key, title, position, wip_limit,
-                transition_to, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(project_id, status_key) DO UPDATE SET
-                title = excluded.title,
-                position = excluded.position,
-                transition_to = excluded.transition_to,
-                updated_at = excluded.updated_at
-            """,
-            (
-                str(uuid.uuid4()),
-                pid,
-                col["status_key"],
-                col["title"],
-                col["position"],
-                col.get("wip_limit"),
-                _json(col["transition_to"]),
-                now,
-                now,
-            ),
-        )
-
-
 def ensure_project(project_id: str | None = None) -> None:
     pid = _project_id(project_id)
     init_kanban_db()
@@ -1246,7 +1177,6 @@ def _default_parameters() -> dict[str, Any]:
         "max_tokens": 4096,
         "workflow_max_total_runs": 512,
         "workflow_max_rework_runs": 128,
-        "planner_max_rounds": 128,
         "agent_tool_max_rounds": 128,
     }
 

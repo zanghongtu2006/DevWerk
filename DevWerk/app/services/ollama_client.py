@@ -36,7 +36,7 @@ class OllamaClient:
             self.trust_env_proxy: bool = bool(config.get("trust_env_proxy", False))
         else:
             from app.core.config import settings
-            cfg = settings().get_llm_config("coder")
+            cfg = settings().get_llm_config("project")
             self.base_url = cfg.get("base_url", "http://127.0.0.1:11434").rstrip("/")
             self.model = cfg.get("model", "deepseek-r1:32b")
             self.timeout = float(cfg.get("timeout", 180.0))

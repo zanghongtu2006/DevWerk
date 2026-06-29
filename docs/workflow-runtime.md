@@ -1,81 +1,91 @@
 # Workflow Runtime
 
-DevWerk is a backend-owned coding workflow. A client supplies project facts and
-tools; it does not decide kanban transitions.
+DevWerk is a backend-owned workflow engine. A client supplies project facts,
+workspace capabilities, and apply results; it does not decide Kanban
+transitions.
 
 ## Runtime Records
 
-- `kb_conversations`: one durable conversation per task, including active
-  column, pause reason, rolling summary, and token estimate.
-- `kb_messages`: ordered user, assistant, plan, tool, and status messages.
-- `kb_column_runs`: one checkpointed execution for each column/agent attempt.
-- `kb_revisions`: candidate file/patch operations before client apply.
+- `kb_project_settings`: saved project workflow definition, project agents, and
+  runtime parameters.
+- `kb_columns`: the current project's configured Kanban columns.
+- `kb_tasks`: one workflow task, grouped across related conversation turns.
+- `kb_conversations`: durable task conversation state, active column, pause
+  reason, and rolling summary.
+- `kb_messages`: ordered task messages.
+- `kb_column_runs`: one checkpointed execution for each column-agent attempt.
+- `kb_revisions`: candidate file and patch operations before client apply.
 - `kb_artifacts` and `kb_events`: stable phase outputs and complete audit trail.
 
-Filesystem JSONL is an audit mirror only. It is not used to resume work.
+Filesystem JSONL is an audit mirror only. SQLite is the runtime source of truth.
 
-## Interaction
+## Project First
 
-1. `POST /v1/workflows` creates a task and conversation.
-2. Context and planner columns run.
-3. With `interaction_mode=confirm_plan`, the workflow pauses in `Planned` and
-   returns `waiting_for=plan_confirmation`.
-4. `POST /v1/workflows/{task_id}/messages` confirms or revises the plan.
-5. Coder creates a candidate revision. Reviewer performs protocol checks and a
-   model-backed semantic review.
-6. The client snapshots and applies the revision, runs requested tools, and
-   reports `apply_result`.
-7. Failed verification returns evidence to Coding; successful verification
-   advances to Done.
+New projects have no default columns. The project conversation agent is the
+entry point:
 
-The IntelliJ client stores the complete interaction log at
-`.devwerk/tasks/<task_id>/operation.log`. Each actual write receives a separate
-`.devwerk/tasks/<task_id>/snapshots/<timestamp-uuid>/before|after` pair, so
-conversation turns are grouped without allowing later recoding rounds to
-overwrite an earlier safety snapshot.
+1. User describes the project or operating process.
+2. Project agent proposes and saves workflow columns, actions, node-agent
+   settings, and task policy.
+3. User continues the same conversation to start or continue tasks.
+4. `/v1/workflows` refuses to start if the project workflow is not configured.
 
-Before snapshots are based on the current filesystem, not the model-provided
-operation label. An existing target is backed up even when a model incorrectly
-labels the operation `create_file`. `before/manifest.json` records every target
-and whether it existed; the client verifies all required backups and blocks the
-write if the manifest or any existing-file backup is missing.
+This applies to coding and non-coding work. A writing project may define
+`intake -> research -> draft -> review -> revise -> publish`; a coding project
+may define `context -> repair -> verify -> complete`; DevWerk does not impose
+either shape.
 
-Old messages are compacted into a rolling summary when the project context
-budget is exceeded. Recent turns remain verbatim. Project memory receives only
-compact reusable engineering facts, never the raw transcript.
+## Agent Lifecycle
 
-## Agent And Column Mapping
+Only `project-agent` and `context-indexer` are built in.
 
-- `context_indexed` -> local context agent: source-map summary, workspace facts,
-  project memory, and client capabilities; no model call is required.
-- `planned` -> planner: transcript summary + recent turns + context artifacts;
-  it may use backend read/search tools and emits candidate/required file intent.
-- `coding` -> coder: confirmed plan + latest revision/verification feedback +
-  recent transcript; it emits file operations and client tool requests.
-- `reviewed` -> reviewer: plan + candidate revision + workspace summary; protocol
-  checks enforce path safety, then the configured reviewer model performs
-  semantic review. Backend research evidence used by the coder is retained in
-  the revision context. Missing compile/test evidence alone is not a recoding
-  reason: the reviewer approves snapshot-protected apply and emits
-  capability-bounded `verification_tool_requests` selected from project facts.
-- `verified` is driven by client tool evidence after snapshot-protected apply.
-- Executable columns may pause with `waiting_for=client_tool`. The client runs
-  the declared request, posts `action=tool_result`, and the same task/column
-  resumes with that evidence. Compile-error tasks use this gate before planning
-  when the client declares `ide_compile`.
+Every executable column may define:
 
-Columns and agents remain independent concepts. `default.json` or a project DB
-override determines column order, actions, artifacts, and agent binding. The
-runtime dispatches by configured agent role and the custom-workflow regression
-test ensures this remains configurable.
+- `status_key`
+- `job_template`
+- `input_artifacts`
+- `output_artifact`
+- `success_action`
+- `failure_actions`
+- `context_policy`
+
+When the workflow reaches that column:
+
+1. `JobScheduler` resolves the `job_template`.
+2. If the template is not preconfigured, it creates a generic dynamic template.
+3. The scheduler selects a configured project override or derives a temporary
+   `{column}-agent` from `project-agent`.
+4. The engine builds context from original request, task metadata, workflow
+   summary, required artifacts, task events, task memory, project memory, source
+   map summary, diagnostics, and client capabilities.
+5. The column agent returns JSON with `summary`, `outputs`, `decision`,
+   `next_action`, optional `tool_requests`, and optional `ops/patch_ops`.
+6. DevWerk records phase output, artifacts, events, and revisions.
+7. The state machine applies `next_action` using the project workflow
+   definition.
+8. The temporary agent is gone; only durable artifacts and memory remain.
+
+## Prompt Management
+
+Prompt construction is centralized in the workflow engine:
+
+- project conversation prompt: project design, workflow maintenance, and task
+  dispatch decisions.
+- workflow column prompt: one generic JSON-only column-agent contract using the
+  current column definition and context.
+- source-map summary: generated by `code_context.py` from client source maps and
+  diagnostics without hard-coded framework rules.
+
+There are no fixed planner/coder/reviewer Python agents in the runtime. If a
+project wants planning, coding, reviewing, testing, writing, editing, or
+research phases, those are workflow columns that spawn dynamic agents.
 
 ## Client Capability Direction
 
-The current IntelliJ plugin declares generic capabilities (`read_file`,
-`search`, `apply_ops`, `apply_patch`, `create_snapshot`, `ide_compile`, `ide_syntax_check`,
-`run_command`). This is the migration boundary toward an MCP-style client:
-backend agents select tools by capability, while IntelliJ, VS Code, CLI, or a
-remote workspace adapter may implement them independently.
+Current IntelliJ capabilities include source map, file read/search, guarded
+apply, snapshot creation, diagnostics, compile, and process execution. Future
+VS Code, CI, GitHub, or MCP clients can provide the same semantic capability
+names or their own mapped equivalents.
 
-There is no Java package, Maven, Gradle, Spring, `src`, or `test` path policy in
-the workflow engine. Project structure comes from source maps and tool evidence.
+The workflow engine has no Java package, Maven, Gradle, Spring, `src`, or `test`
+path policy. Project structure comes from source maps and tool evidence.

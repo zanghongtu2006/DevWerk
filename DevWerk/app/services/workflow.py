@@ -16,15 +16,8 @@ from app.services.workflow_definition import WorkflowDefinition, workflow_from_d
 _log = logging.getLogger("devwerk.workflow")
 
 
-ACTION_CONTEXT_INDEXED = "context_indexed"
-ACTION_PLAN_READY = "plan_ready"
-ACTION_PLAN_FAILED = "plan_failed"
-ACTION_CODING_STARTED = "coding_started"
-ACTION_CODING_READY = "coding_ready"
-ACTION_READY_TO_APPLY = "ready_to_apply"
-ACTION_CODING_FAILED = "coding_failed"
-ACTION_REQUEST_RECODING = "request_recoding"
 ACTION_REQUEST_REPLAN = "request_replan"
+ACTION_REQUEST_REWORK = "request_rework"
 ACTION_APPROVE = "approve"
 ACTION_FAIL = "fail"
 ACTION_NEED_CLIENT_TOOL = "need_client_tool"
@@ -57,9 +50,8 @@ def record_phase_output(
     """
     Persist the stable output contract for one workflow phase.
 
-    Today one configured LLM profile may execute every phase. Future planner,
-    coder, and tester agents can keep this same artifact shape while owning
-    their own session context.
+    Each workflow column may spawn a different runtime agent, but all column
+    agents persist the same phase output contract.
     """
     sid = session_id or f"{phase}-{uuid.uuid4()}"
     payload = {
@@ -181,7 +173,7 @@ def _transition_by_definition(task_id: str, action: str, payload: dict[str, Any]
         add_event(task_id, "manual_retry_requested", data or {"reason": "user_requested_retry"})
     if action == ACTION_ABANDON:
         add_event(task_id, "manual_abandon_requested", data or {"reason": "user_abandoned_task"})
-    if action in {ACTION_REQUEST_RECODING, ACTION_REQUEST_REPLAN}:
+    if action in {ACTION_REQUEST_REWORK, ACTION_REQUEST_REPLAN}:
         add_event(task_id, "workflow_rework_requested", data)
     else:
         add_event(task_id, f"workflow_{action}", data)
@@ -214,7 +206,8 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     add_event(task_id, "apply_result_received", payload)
 
     if not ok:
-        status_key = _action_target(definition, ACTION_REQUEST_RECODING) or _action_target(definition, ACTION_FAIL) or current_status
+        rework_action = ACTION_REQUEST_REWORK if definition.action(ACTION_REQUEST_REWORK) is not None else ACTION_FAIL
+        status_key = _action_target(definition, rework_action) or _action_target(definition, ACTION_FAIL) or current_status
         record_phase_output(
             task_id,
             phase="apply",
@@ -228,16 +221,14 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
                 "verification": payload.get("verification") or {},
             },
             warnings=[str(payload.get("error_message") or "apply failed")],
-            next_action=ACTION_REQUEST_RECODING,
+            next_action=rework_action,
         )
         add_event(
             task_id,
             "apply_failed",
             {"phase": "apply", "reason": payload.get("error_message") or "Client failed to apply generated changes."},
         )
-        if definition.action(ACTION_REQUEST_RECODING) is not None:
-            return _apply_configured_action(task_id, definition, ACTION_REQUEST_RECODING, {"phase": "apply", **payload})
-        return _apply_configured_action(task_id, definition, ACTION_FAIL, {"phase": "apply", **payload})
+        return _apply_configured_action(task_id, definition, rework_action, {"phase": "apply", **payload})
 
     verification = payload.get("verification")
     has_verification_policy = verification_has_policy(verification)
@@ -260,7 +251,7 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
             "verification": verification or {},
         },
         warnings=[] if passed else ["Verification requirements did not pass."],
-        next_action=None if passed else ACTION_REQUEST_RECODING,
+        next_action=None if passed else ACTION_REQUEST_REWORK,
     )
 
     latest = _apply_configured_action(task_id, definition, ACTION_APPLY_SUCCEEDED, {"phase": "apply", **payload})

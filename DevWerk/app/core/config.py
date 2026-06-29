@@ -5,10 +5,8 @@ The backend owns model/provider selection. Capability providers only send contex
 
 Configuration is split into:
   - API profiles: protocol + base URL + auth + default model
-  - Agent bindings: which API profile/model each backend agent should use
-
-This keeps today's single coder agent simple while leaving room for planner,
-reviewer, framework-memory, and other future agents to use different APIs.
+  - Route keys: which provider/model each project or dynamically spawned
+    workflow node agent should use
 """
 
 from __future__ import annotations
@@ -126,12 +124,9 @@ class Settings(BaseSettings):
     devwerk_max_tokens: int = Field(default=4096)
     devwerk_trust_env_proxy: bool = Field(default=False)
 
-    # Agent routing. Values are API profile names: openai, anthropic, ollama.
+    # Legacy fallback profile selector. The JSON routing map is preferred.
     devwerk_default_api: str = Field(default="anthropic")
-    devwerk_coder_api: str | None = Field(default=None)
-    devwerk_planner_api: str | None = Field(default=None)
-    devwerk_executor_api: str | None = Field(default=None)
-    devwerk_default_agent: str = Field(default="coder")
+    devwerk_default_agent: str = Field(default="project")
 
     # OpenAI-compatible API profile.
     openai_base_url: str = Field(default="https://api.openai.com/v1")
@@ -163,9 +158,6 @@ class Settings(BaseSettings):
     @field_validator(
         "openai_api_key",
         "anthropic_auth_token",
-        "devwerk_coder_api",
-        "devwerk_planner_api",
-        "devwerk_executor_api",
         "anthropic_default_sonnet_model",
         "anthropic_default_haiku_model",
         "anthropic_default_opus_model",
@@ -369,7 +361,7 @@ class Settings(BaseSettings):
         }
 
     def agent_config(self, agent: str | None = None) -> AgentModelConfig:
-        agent_name = (agent or self.devwerk_default_agent or "coder").strip().lower()
+        agent_name = (agent or self.devwerk_default_agent or "project").strip().lower()
         llm_config = self.llm_config()
         profile, model_key, model_settings = self._resolve_llm_ref(agent_name, llm_config)
         return AgentModelConfig(
@@ -429,12 +421,6 @@ class Settings(BaseSettings):
         return profile, model_key, model_settings
 
     def _agent_profile_name(self, agent: str) -> str:
-        if agent == "coder" and self.devwerk_coder_api:
-            return self.devwerk_coder_api.strip().lower()
-        if agent == "planner" and self.devwerk_planner_api:
-            return self.devwerk_planner_api.strip().lower()
-        if agent in {"executor", "execute"} and self.devwerk_executor_api:
-            return self.devwerk_executor_api.strip().lower()
         return self.active_provider
 
     def get_llm_config(self, agent: str | None = None) -> dict:
@@ -512,18 +498,10 @@ def _split_model_ref(model_ref: str) -> tuple[str, str]:
 
 def _routing_keys(agent: str) -> list[str]:
     aliases = {
-        "coder": ["coder", "coding", "default"],
-        "planner": ["planner", "product", "design", "default"],
-        "architect": ["architect", "architecture"],
-        "architecture": ["architecture", "architect"],
-        "executor": ["executor", "coding", "default"],
-        "execute": ["executor", "coding", "default"],
-        "reviewer": ["reviewer", "review", "default"],
-        "review": ["reviewer", "review", "default"],
-        "verifier": ["verifier", "verify", "default"],
-        "verify": ["verifier", "verify", "default"],
+        "project": ["project", "default"],
+        "context-indexer": ["context-indexer", "default"],
     }
-    return aliases.get(agent, [agent])
+    return aliases.get(agent, [agent, "default"])
 
 
 def _none_if_empty(value: Any) -> str | None:

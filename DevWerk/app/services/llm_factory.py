@@ -1,9 +1,4 @@
-"""
-LLM client factory.
-
-Routes each backend agent to its configured API profile. Today the main agent
-is `coder`, but planner/executor can already be bound to different profiles.
-"""
+"""LLM client factory for project and dynamically spawned workflow agents."""
 
 from __future__ import annotations
 
@@ -21,7 +16,7 @@ from app.services.usage import record_llm_usage
 _log = logging.getLogger("devwerk.llm_factory")
 
 
-def get_llm_client(agent: str = "coder") -> "UsageTrackedClient":
+def get_llm_client(agent: str = "project") -> "UsageTrackedClient":
     cfg = settings().get_llm_config(agent)
     protocol = str(cfg.get("protocol") or "").lower()
 
@@ -76,7 +71,7 @@ class UsageTrackedClient:
             duration_ms = int((time.monotonic() - started) * 1000)
             try:
                 record_llm_usage(
-                    agent_name=str(self._config.get("agent") or "coder"),
+                    agent_name=str(self._config.get("agent") or "project"),
                     provider=str(self._config.get("protocol") or self._config.get("api_name") or "unknown"),
                     model=str(self._config.get("model") or "unknown"),
                     usage=getattr(self._client, "last_usage", None),

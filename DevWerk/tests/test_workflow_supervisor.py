@@ -32,13 +32,55 @@ def _configure(monkeypatch, tmp_path):
     return kanban_service, supervisor_service
 
 
+def _supervisor_workflow() -> dict:
+    return {
+        "name": "supervisor-managed-flow",
+        "version": 1,
+        "columns": [
+            {
+                "status_key": "intake",
+                "title": "Intake",
+                "position": 10,
+                "transition_to": ["waiting_client", "working", "complete", "blocked"],
+            },
+            {
+                "status_key": "waiting_client",
+                "title": "Waiting Client",
+                "position": 20,
+                "transition_to": ["working", "blocked"],
+            },
+            {
+                "status_key": "working",
+                "title": "Working",
+                "position": 30,
+                "transition_to": ["complete", "blocked"],
+            },
+            {"status_key": "complete", "title": "Complete", "position": 90, "transition_to": []},
+            {"status_key": "blocked", "title": "Blocked", "position": 99, "transition_to": ["intake"]},
+        ],
+        "actions": {
+            "begin": {"to": "working"},
+            "workflow_done": {"to": "complete"},
+            "fail": {"to": "blocked"},
+            "abandon": {"to": "blocked"},
+            "retry": {"to": "intake"},
+        },
+    }
+
+
+def _create_project_with_workflow(kanban, project_id: str) -> None:
+    kanban.update_project_workflow(project_id, _supervisor_workflow())
+
+
 def test_waiting_client_timeout_terminates_task_with_auditable_result(monkeypatch, tmp_path):
     kanban, supervisor_module = _configure(monkeypatch, tmp_path)
+    project_id = "supervisor-timeout"
+    _create_project_with_workflow(kanban, project_id)
     task = kanban.create_task(
-        project_id="supervisor-timeout",
+        project_id=project_id,
         title="Compile project",
         description="Wait for an IDE compiler result.",
-        status_key="draft",
+        status_key="waiting_client",
     )["task"]
     kanban.ensure_conversation(task["id"])
     kanban.update_conversation(task["id"], state="waiting_client", waiting_for="client_tool")
@@ -53,33 +95,36 @@ def test_waiting_client_timeout_terminates_task_with_auditable_result(monkeypatc
     supervisor.reconcile_once(now=observed_at)
 
     detail = kanban.get_task(task["id"])["task"]
-    assert detail["status_key"] == "failed"
+    assert detail["status_key"] == "blocked"
     assert kanban.get_conversation(task["id"], include_messages=False)["state"] == "failed"
     assert "workflow_supervisor_timeout" in {event["event_type"] for event in detail["events"]}
     result = [item for item in detail["artifacts"] if item["artifact_type"] == "workflow_result"][-1]
     assert result["payload"]["error_code"] == "WORKFLOW_SUPERVISOR_TIMEOUT"
+    assert result["payload"]["status_key"] == "blocked"
     assert result["payload"]["done"] is True
 
 
 def test_supervisor_recovers_queued_task_from_persisted_request(monkeypatch, tmp_path):
     kanban, supervisor_module = _configure(monkeypatch, tmp_path)
+    project_id = "supervisor-recovery"
+    _create_project_with_workflow(kanban, project_id)
     task = kanban.create_task(
-        project_id="supervisor-recovery",
+        project_id=project_id,
         title="Recover worker",
         description="Resume a lost workflow worker.",
-        status_key="draft",
+        status_key="intake",
     )["task"]
     kanban.ensure_conversation(task["id"])
     kanban.add_artifact(
         task["id"],
         artifact_type="workflow_request_body",
-        payload={"project_id": "supervisor-recovery", "messages": [{"role": "user", "content": "Original."}]},
+        payload={"project_id": project_id, "messages": [{"role": "user", "content": "Original."}]},
     )
     kanban.add_artifact(
         task["id"],
         artifact_type="workflow_run_request",
         payload={
-            "project_id": "supervisor-recovery",
+            "project_id": project_id,
             "messages": [{"role": "user", "content": "Recover."}],
             "tool_results": [{"id": "compile", "ok": False, "error": "compile failed"}],
         },
@@ -109,22 +154,24 @@ def test_retry_action_is_idempotent_and_dispatches_once(monkeypatch, tmp_path):
     import app.routes.kanban as kanban_routes
     import app.routes.workflows as workflow_routes
 
+    project_id = "retry-idempotency"
+    _create_project_with_workflow(kanban, project_id)
     task = kanban.create_task(
-        project_id="retry-idempotency",
+        project_id=project_id,
         title="Retry once",
-        description="A failed task should have one active retry.",
-        status_key="failed",
+        description="A blocked task should have one active retry.",
+        status_key="blocked",
     )["task"]
     kanban.ensure_conversation(task["id"])
     kanban.add_artifact(
         task["id"],
         artifact_type="workflow_request_body",
-        payload={"project_id": "retry-idempotency", "messages": [{"role": "user", "content": "Retry."}]},
+        payload={"project_id": project_id, "messages": [{"role": "user", "content": "Retry."}]},
     )
     kanban.add_artifact(
         task["id"],
         artifact_type="workflow_result",
-        payload={"ok": False, "done": True, "status_key": "failed"},
+        payload={"ok": False, "done": True, "status_key": "blocked"},
     )
     dispatched: list[tuple[str, dict]] = []
     monkeypatch.setattr(
@@ -141,7 +188,7 @@ def test_retry_action_is_idempotent_and_dispatches_once(monkeypatch, tmp_path):
     assert second["action_ignored"] is True
     assert second["ignored_action"] == "retry"
     assert len(dispatched) == 1
-    assert kanban.get_task(task["id"])["task"]["status_key"] == "draft"
+    assert kanban.get_task(task["id"])["task"]["status_key"] == "intake"
     event_types = {event["event_type"] for event in kanban.get_task(task["id"])["task"]["events"]}
     assert "workflow_retry_queued" in event_types
     assert "workflow_retry_deduplicated" in event_types
@@ -152,37 +199,19 @@ def test_custom_workflow_lifecycle_actions_do_not_require_column_edges(monkeypat
     from app.services.workflow import apply_workflow_action
 
     project_id = "custom-lifecycle"
-    kanban.update_project_workflow(
-        project_id,
-        {
-            "name": "custom-lifecycle",
-            "columns": [
-                {"status_key": "draft", "title": "Draft", "position": 10, "transition_to": ["work"]},
-                {"status_key": "work", "title": "Work", "position": 20, "transition_to": ["done"]},
-                {"status_key": "done", "title": "Done", "position": 30, "transition_to": []},
-                {"status_key": "failed", "title": "Failed", "position": 40, "transition_to": []},
-            ],
-            "actions": {
-                "start": {"to": "work"},
-                "workflow_done": {"to": "done"},
-                "fail": {"to": "failed"},
-                "abandon": {"to": "failed"},
-                "retry": {"to": "draft"},
-            },
-        },
-    )
+    _create_project_with_workflow(kanban, project_id)
     task = kanban.create_task(
         project_id=project_id,
         title="Lifecycle",
         description="System lifecycle actions remain available.",
-        status_key="work",
+        status_key="working",
     )["task"]
 
     failed = apply_workflow_action(task["id"], "fail", {"reason": "timeout"})
     retried = apply_workflow_action(task["id"], "retry", {"reason": "operator retry"})
 
-    assert failed["task"]["status_key"] == "failed"
-    assert retried["task"]["status_key"] == "draft"
+    assert failed["task"]["status_key"] == "blocked"
+    assert retried["task"]["status_key"] == "intake"
 
 
 def test_invalid_custom_workflow_is_rejected_before_persistence(monkeypatch, tmp_path):
@@ -195,30 +224,32 @@ def test_invalid_custom_workflow_is_rejected_before_persistence(monkeypatch, tmp
             {
                 "name": "invalid",
                 "columns": [
-                    {"status_key": "draft", "transition_to": ["missing"]},
+                    {"status_key": "intake", "transition_to": ["missing"]},
                     {"status_key": "done", "transition_to": []},
-                    {"status_key": "failed", "transition_to": []},
+                    {"status_key": "blocked", "transition_to": []},
                 ],
                 "actions": {
-                    "fail": {"to": "failed"},
-                    "abandon": {"to": "failed"},
-                    "retry": {"to": "draft"},
+                    "fail": {"to": "blocked"},
+                    "abandon": {"to": "blocked"},
+                    "retry": {"to": "intake"},
                 },
             },
         )
 
-    assert kanban.get_project_workflow(project_id)["workflow"]["name"] == "default"
+    assert kanban.get_project_workflow(project_id)["workflow"]["name"] == "unconfigured"
 
 
 def test_worker_dispatch_deduplicates_same_task_and_payload(monkeypatch, tmp_path):
     kanban, _ = _configure(monkeypatch, tmp_path)
     import app.routes.workflows as workflow_routes
 
+    project_id = "worker-deduplication"
+    _create_project_with_workflow(kanban, project_id)
     task = kanban.create_task(
-        project_id="worker-deduplication",
+        project_id=project_id,
         title="One worker",
         description="Duplicate dispatch must not create concurrent workers.",
-        status_key="draft",
+        status_key="intake",
     )["task"]
     kanban.ensure_conversation(task["id"])
     entered = threading.Event()
@@ -233,7 +264,7 @@ def test_worker_dispatch_deduplicates_same_task_and_payload(monkeypatch, tmp_pat
     monkeypatch.setattr(workflow_routes, "_run_workflow_thread", blocking_runner)
     workflow_routes._active_workflows.clear()
     workflow_routes._pending_workflows.clear()
-    body = {"task_id": task["id"], "project_id": "worker-deduplication", "messages": []}
+    body = {"task_id": task["id"], "project_id": project_id, "messages": []}
 
     assert workflow_routes._start_workflow_thread(task["id"], body) is True
     assert entered.wait(timeout=2)
