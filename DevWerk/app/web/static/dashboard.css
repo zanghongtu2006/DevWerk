@@ -105,6 +105,8 @@ button, input, textarea, select { font: inherit; }
 .stage-icon { width: 24px; height: 24px; border-radius: 50%; border: 1px solid var(--border); display: grid; place-items: center; font-weight: 850; background: #fff; }
 .stage-label { font-size: 12px; font-weight: 750; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .chat-card { padding: 0; overflow: hidden; min-height: 520px; display: grid; grid-template-rows: auto minmax(260px, 1fr) auto; }
+.project-workbench-grid { display: grid; grid-template-columns: minmax(520px, 1fr) 320px; gap: 14px; align-items: stretch; }
+.project-workbench-grid .chat-card { height: 560px; min-height: 560px; }
 .tabs { display: flex; gap: 24px; border-bottom: 1px solid var(--border); padding: 0 16px; min-height: 48px; align-items: end; }
 .tab { padding: 14px 0 11px; color: #334155; font-weight: 750; font-size: 13px; border-bottom: 2px solid transparent; }
 .tab.active { color: var(--blue); border-color: var(--blue); }
@@ -147,6 +149,7 @@ button, input, textarea, select { font: inherit; }
 .page-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
 .title-block { display: flex; align-items: center; gap: 14px; }
 .project-cards { display: grid; grid-template-columns: repeat(5, minmax(180px, 1fr)); gap: 14px; }
+.project-cards.compact { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
 .project-card { border: 1px solid var(--border); border-radius: 10px; background: #fff; padding: 16px; text-align: left; cursor: pointer; min-height: 170px; position: relative; }
 .project-card.selected { border-color: var(--blue); box-shadow: inset 0 0 0 1px #7aa2ff, var(--shadow); }
 .card-top { display: flex; justify-content: space-between; gap: 10px; }
@@ -164,6 +167,7 @@ button, input, textarea, select { font: inherit; }
 .config-panel { padding: 16px; display: grid; gap: 14px; }
 .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--border); padding-bottom: 12px; }
 .config-grid { display: grid; grid-template-columns: minmax(320px,1fr) minmax(320px,1fr) 300px; gap: 14px; }
+.config-grid.single-row { grid-template-columns: minmax(320px, 1fr); margin-top: 14px; }
 .editor-card { padding: 12px; }
 .editor-head, .editor-foot { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .editor { margin-top: 12px; border: 1px solid var(--border); border-radius: 8px; background: #fbfdff; min-height: 250px; display: grid; grid-template-columns: 42px minmax(0,1fr); overflow: auto; }
@@ -188,6 +192,12 @@ button, input, textarea, select { font: inherit; }
 .timeline-list { display: grid; gap: 10px; }
 .timeline-item { display: grid; grid-template-columns: 18px minmax(0,1fr) auto; gap: 10px; align-items: start; border-bottom: 1px solid #eef2f7; padding-bottom: 10px; }
 .json-panel { max-height: 360px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: #fbfdff; padding: 12px; font: 12px Consolas, monospace; white-space: pre; color: #334155; }
+.live-log-card { max-height: 560px; overflow: hidden; display: grid; grid-template-rows: auto minmax(0, 1fr); }
+.live-log-lines { min-height: 160px; overflow-y: auto; display: grid; align-content: start; gap: 8px; margin-top: 12px; }
+.live-log-line { border-left: 2px solid var(--blue); padding-left: 10px; display: grid; gap: 2px; font-size: 12px; color: #334155; }
+.live-log-line span { color: var(--muted); font: 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.live-log-line b { color: #0f172a; }
+.live-log-line small { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .kanban-page { display: grid; grid-template-columns: minmax(0,1fr) 260px; gap: 14px; min-height: calc(100vh - 104px); }
 .kanban-main { min-width: 0; display: grid; grid-template-rows: auto minmax(0,1fr); }
 .kanban-header { padding: 18px; display: flex; justify-content: space-between; align-items: center; gap: 14px; }
@@ -267,5 +277,5 @@ button, input, textarea, select { font: inherit; }
   .nav-link span[data-icon] { font-size: 9px; }
   .overview-grid { grid-template-columns: minmax(0,1fr); }
   .project-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .config-grid, .kanban-page, .task-page, .task-browser { grid-template-columns: minmax(0,1fr); }
+  .config-grid, .project-workbench-grid, .kanban-page, .task-page, .task-browser { grid-template-columns: minmax(0,1fr); }
 }

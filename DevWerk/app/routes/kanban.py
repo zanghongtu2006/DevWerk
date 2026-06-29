@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from urllib.parse import quote
@@ -64,6 +65,10 @@ class ProjectSettingsRequest(BaseModel):
     agents: dict[str, Any] | None = None
     parameters: dict[str, Any] | None = None
     workflow: dict[str, Any] | None = None
+
+
+class ProjectMdRequest(BaseModel):
+    content: str = ""
 
 
 class TaskCreateRequest(BaseModel):
@@ -136,6 +141,39 @@ def kanban_events(project_id: str | None = None, task_id: str | None = None, lim
     return list_events(project_id=project_id, task_id=task_id, limit=limit)
 
 
+@router.websocket("/projects/{project_id}/stream")
+async def kanban_project_stream(websocket: WebSocket, project_id: str):
+    await websocket.accept()
+    seen: set[str] = set()
+    try:
+        initial_events = list_events(project_id=project_id, limit=80).get("events", [])
+        seen.update(str(event.get("id") or "") for event in initial_events if event.get("id"))
+        await websocket.send_json(
+            {
+                "type": "snapshot",
+                "project_id": project_id,
+                "board": get_board(project_id),
+                "events": initial_events,
+            }
+        )
+        while True:
+            events = list_events(project_id=project_id, limit=80).get("events", [])
+            unseen = [event for event in reversed(events) if str(event.get("id") or "") not in seen]
+            if unseen:
+                seen.update(str(event.get("id") or "") for event in events if event.get("id"))
+                await websocket.send_json(
+                    {
+                        "type": "events",
+                        "project_id": project_id,
+                        "events": unseen,
+                        "board": get_board(project_id),
+                    }
+                )
+            await asyncio.sleep(1.0)
+    except WebSocketDisconnect:
+        return
+
+
 @router.post("/projects")
 def kanban_upsert_project(req: ProjectUpsertRequest):
     return upsert_project(project_id=req.project_id, name=req.name, description=req.description)
@@ -154,6 +192,26 @@ def kanban_get_project_settings(project_id: str):
 @router.get("/projects/{project_id}/memory")
 def kanban_get_project_memory(project_id: str):
     return {"ok": True, "project_id": project_id, "memory": read_project_memory(project_id)}
+
+
+@router.get("/projects/{project_id}/project-md")
+def kanban_get_project_md(project_id: str):
+    return {"ok": True, "project_id": project_id, "content": _project_md(project_id)}
+
+
+@router.put("/projects/{project_id}/project-md")
+def kanban_update_project_md(project_id: str, req: ProjectMdRequest):
+    settings_payload = get_project_settings(project_id)
+    settings = settings_payload.get("settings") if isinstance(settings_payload, dict) else {}
+    parameters = dict(settings.get("parameters") or {}) if isinstance(settings, dict) else {}
+    parameters["project_md"] = req.content
+    update_project_settings(project_id, parameters=parameters)
+    add_project_event(
+        project_id,
+        "project_md_updated",
+        {"summary": "Project.MD updated", "chars": len(req.content or "")},
+    )
+    return kanban_get_project_md(project_id)
 
 
 @router.get("/projects/{project_id}/workflow")
@@ -770,6 +828,42 @@ def _project_terminal_statuses(project_id: str) -> set[str]:
             if target:
                 terminals.add(target)
     return terminals
+
+
+def _project_md(project_id: str) -> str:
+    settings_payload = get_project_settings(project_id)
+    settings = settings_payload.get("settings") if isinstance(settings_payload, dict) else {}
+    parameters = settings.get("parameters") if isinstance(settings, dict) else {}
+    value = parameters.get("project_md") if isinstance(parameters, dict) else None
+    if isinstance(value, str) and value.strip():
+        return value
+    workflow = get_project_workflow(project_id).get("workflow") or {}
+    agents = settings.get("agents") if isinstance(settings, dict) else {}
+    agent_names = ", ".join(sorted(agents.keys())) if isinstance(agents, dict) and agents else "project-agent, context-indexer"
+    return "\n".join(
+        [
+            f"# Project.MD: {project_id}",
+            "",
+            "## Project Intent",
+            "Describe the project goal, domain, users, and operating constraints here.",
+            "",
+            "## Workflow Contract",
+            "All work must enter through the project conversation and be executed by the Kanban workflow engine.",
+            f"Current workflow: {workflow.get('name') or 'not configured'}",
+            "",
+            "## Agent Contract",
+            "Workflow nodes spawn temporary agents according to the project workflow and route settings.",
+            f"Configured project agents: {agent_names}",
+            "",
+            "## Constraints",
+            "- Preserve source safety snapshots when a capability provider applies code.",
+            "- Record workflow events, artifacts, and decisions for auditability.",
+            "- Use project memory and task memory as context; do not bypass Kanban.",
+            "",
+            "## Debug Policy",
+            "When a task stalls or fails, inspect workflow events, artifacts, client tool results, and project memory before retrying.",
+        ]
+    )
 
 
 def _handle_project_workflow_design(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from fastapi.testclient import TestClient
+
 
 class FakeSettings:
     def __init__(self, db_path, session_dir):
@@ -264,7 +266,8 @@ def test_backend_web_ui_static_files_own_layout_and_interactions():
     assert ".project-rail" in css
     assert "resize: horizontal" in css
     assert "overflow-y: auto" in css
-    assert ".overview-grid" in css
+    assert ".project-workbench-grid" in css
+    assert ".live-log-card" in css
     assert ".chat-card" in css
     assert ".chat-body" in css
 
@@ -285,6 +288,11 @@ def test_backend_web_ui_static_files_own_layout_and_interactions():
     assert "data-task-tab" in js
     assert "saveProjectDesign" not in js
     assert "startTask" not in js
+    assert "heroNewTask" not in js
+    assert "heroPlan" not in js
+    assert "editor-collapse" not in js
+    assert "Project.MD" in js
+    assert "new WebSocket" in js
 
 
 def test_backend_web_ui_navigation_has_distinct_routes_and_sections():
@@ -352,6 +360,7 @@ def test_backend_web_ui_uses_backend_data_not_demo_metrics():
     assert "`${API}/usage/summary`" in js
     assert "`${API}/kanban/projects`" in js
     assert "`${API}/kanban/tasks`" in js
+    assert "`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/project-md`" in js
     assert "No usage rows returned by backend" in js
 
 
@@ -370,6 +379,45 @@ def test_project_stats_include_status_breakdown(monkeypatch, tmp_path):
     assert stats["active_tasks"] == 1
     assert stats["done_tasks"] == 1
     assert stats["failed_tasks"] == 1
+
+
+def test_project_md_round_trip_and_audit_event(monkeypatch, tmp_path):
+    _configure(monkeypatch, tmp_path)
+    import app.main as main_module
+
+    app = main_module.create_app()
+    with TestClient(app) as client:
+        initial = client.get("/v1/kanban/projects/docs-project/project-md")
+        updated = client.put(
+            "/v1/kanban/projects/docs-project/project-md",
+            json={"content": "# Project.MD: docs-project\n\n## Project Intent\nShip safely.\n"},
+        )
+        events = client.get("/v1/kanban/events?project_id=docs-project&limit=20")
+
+    assert initial.status_code == 200
+    assert "Workflow Contract" in initial.json()["content"]
+    assert updated.status_code == 200
+    assert updated.json()["content"].startswith("# Project.MD: docs-project")
+    assert any(event["event_type"] == "project_md_updated" for event in events.json()["events"])
+
+
+def test_kanban_project_stream_sends_snapshot_and_incremental_events(monkeypatch, tmp_path):
+    kanban_service = _configure(monkeypatch, tmp_path)
+    import app.main as main_module
+
+    project_id = "stream-project"
+    kanban_service.update_project_workflow(project_id, _writing_workflow())
+    app = main_module.create_app()
+    with TestClient(app) as client:
+        with client.websocket_connect(f"/v1/kanban/projects/{project_id}/stream") as websocket:
+            snapshot = websocket.receive_json()
+            kanban_service.add_project_event(project_id, "stream_test_event", {"summary": "hello"})
+            update = websocket.receive_json()
+
+    assert snapshot["type"] == "snapshot"
+    assert snapshot["project_id"] == project_id
+    assert update["type"] == "events"
+    assert any(event["event_type"] == "stream_test_event" for event in update["events"])
 
 
 def test_project_conversation_can_save_workflow_design(monkeypatch, tmp_path):

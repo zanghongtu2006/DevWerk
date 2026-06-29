@@ -10,9 +10,14 @@ const state = {
   settings: {},
   workflow: {},
   memory: {},
+  projectMd: "",
   usage: {},
   globalUsage: {},
   globalSettings: {},
+  stream: null,
+  streamProjectId: "",
+  streamStatus: "disconnected",
+  liveLogs: [],
   activeTask: null,
   projectTab: "configuration",
   conversationTab: "conversation",
@@ -29,8 +34,9 @@ async function api(path, options = {}) {
 }
 async function refreshAll() {
   await loadProjects();
-  await Promise.allSettled([loadBoard(), loadEvents(), loadConversation(), loadSettings(), loadGlobalSettings(), loadWorkflow(), loadMemory(), loadUsage()]);
+  await Promise.allSettled([loadBoard(), loadEvents(), loadConversation(), loadSettings(), loadGlobalSettings(), loadWorkflow(), loadMemory(), loadUsage(), loadProjectMd()]);
   renderShell();
+  connectProjectStream();
 }
 async function loadProjects() {
   const data = await api(`${API}/kanban/projects`);
@@ -48,6 +54,7 @@ async function loadSettings() { try { const data = await api(`${API}/kanban/proj
 async function loadGlobalSettings() { try { const data = await api(`${API}/settings`); state.globalSettings = data.settings || data || {}; } catch (_) { state.globalSettings = {}; } }
 async function loadWorkflow() { try { const data = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/workflow`); state.workflow = data.workflow || data || {}; } catch (_) { state.workflow = {}; } }
 async function loadMemory() { try { state.memory = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/memory`); } catch (_) { state.memory = {}; } }
+async function loadProjectMd() { try { const data = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/project-md`); state.projectMd = data.content || ""; } catch (_) { state.projectMd = ""; } }
 async function loadUsage() {
   try {
     const [globalUsage, projectUsage] = await Promise.all([
@@ -81,34 +88,39 @@ function renderProjectRail() {
   $("projectList").innerHTML = list.map(project => `<button class="project-row ${project.id === state.projectId ? "active" : ""}" data-project="${escAttr(project.id)}"><span class="project-row-title"><span>${esc(project.name || project.id)}</span><span><i class="dot ${projectStatus(project).dot}"></i>${projectStatus(project).label}</span></span><small>${esc(project.description || project.id)}</small></button>`).join("");
 }
 function renderOverviewPage() {
-  const usage = usageTotals();
+  const globalUsage = usageTotals(state.globalUsage);
+  const projectUsage = usageTotals(state.usage);
   $("page").innerHTML = `
-    <div class="overview-grid">
+    <div class="section-stack">
       <section class="card hero">
-        <div class="hero-title"><span class="folder-icon"></span><div><h1 class="h1">${esc(currentProject().name || state.projectId)} <span class="soft">...</span></h1><p class="muted">${esc(currentProject().description || "General purpose development assistant project.")}<br/>DevWerk will plan, build, and ship based on your goals.</p></div></div>
-        <div class="hero-actions"><button id="heroNewTask" class="button primary">New Task</button><button id="heroPlan" class="button">Plan</button><button class="button">Add Context</button><a class="button" href="/dashboard?project_id=${escAttr(state.projectId)}">Settings</a></div>
+        <div class="hero-title"><span class="folder-icon"></span><div><h1 class="h1">DevWerk Overview</h1><p class="muted">Global runtime view across projects, workflow events, memory and token usage.</p></div></div>
       </section>
-      ${pipelineHtml()}
-      <aside class="side-stack">${healthCard()}${usageCard(usage, "Current Project Usage", state.usage.by_task || state.usage.projects || [])}${routingCard()}</aside>
-      ${conversationCard()}
-      <aside class="side-stack">${recentTasksCard()}${memoryCard()}${recentEventsCard()}</aside>
-      <div class="quick-grid">${kpi("Requests", usage.request_count || 0)}${kpi("LLM Calls", usage.calls || 0)}${kpi("Input Tokens", compact(usage.input))}${kpi("Output Tokens", compact(usage.output))}${kpi("Total Tokens", compact(usage.total))}${kpi("Duration", duration(usage.duration))}</div>
+      <div class="quick-grid">${kpi("Projects", state.projects.length)}${kpi("Tasks", compact(projectTotal("tasks")))}${kpi("Active Tasks", compact(projectTotal("active_tasks")))}${kpi("Failed Tasks", compact(projectTotal("failed_tasks")))}${kpi("Global Tokens", compact(globalUsage.total))}${kpi("LLM Calls", compact(globalUsage.calls))}</div>
+      <div class="section-grid">
+        <section class="card card-pad"><div class="page-head"><div><h2 class="h2">Project Health</h2><div class="muted">Status and usage are derived from backend project stats.</div></div></div><div class="project-cards compact">${state.projects.length ? state.projects.map(projectCard).join("") : `<div class="muted">No projects returned by backend.</div>`}</div></section>
+        <aside class="side-stack">${usageCard(globalUsage, "Global Usage", state.globalUsage.by_project || state.globalUsage.projects || [])}${liveLogCard()}</aside>
+      </div>
+      <div class="section-grid"><section class="card card-pad"><div class="h3">Global Token Breakdown</div>${usageTable(state.globalUsage.by_project || [], ["project_id","calls","input_tokens","output_tokens","total_tokens","duration_ms"])}</section><aside class="side-stack">${recentEventsCard()}${memoryCard()}</aside></div>
     </div>`;
-  wireConversation();
 }
 function renderProjectsPage() {
   $("page").innerHTML = `
     <div class="projects-page">
       <div class="page-head"><div class="title-block"><span class="folder-icon"></span><div><h1 class="h2">Projects</h1><div class="muted">Manage and configure your development assistant projects.</div></div></div><div class="toolbar"><label class="search-box" style="margin:0;width:230px"><span></span><input placeholder="Search projects..." /></label><select class="select-pill"><option>All Environments</option></select><select class="select-pill"><option>All Statuses</option></select><button id="newProjectMain" class="button primary">+ New Project</button></div></div>
       <div class="project-cards">${state.projects.length ? state.projects.map(projectCard).join("") : `<div class="card card-pad muted">No projects returned by backend.</div>`}</div>
+      <div class="project-workbench-grid">
+        ${conversationCard()}
+        <aside class="side-stack">${liveLogCard()}${recentTasksCard()}${recentEventsCard()}</aside>
+      </div>
       <section class="card config-panel">
-        <div class="panel-head"><div class="title-block"><span class="folder-icon" style="width:28px;height:28px"></span><div><div class="muted">Project Configuration</div><h2 class="h2">${esc(currentProject().name || state.projectId)} <span class="badge green">Active</span></h2></div></div><div class="toolbar"><button class="button">Preview</button><button class="button">Clone</button><button class="icon-button">...</button></div></div>
+        <div class="panel-head"><div class="title-block"><span class="folder-icon" style="width:28px;height:28px"></span><div><div class="muted">Project Configuration</div><h2 class="h2">${esc(currentProject().name || state.projectId)} <span class="badge green">Active</span></h2></div></div></div>
         <div class="tabs">${projectTabs().map(tab=>`<button class="tab tab-button ${state.projectTab===tab.key?"active":""}" data-project-tab="${tab.key}">${tab.label}</button>`).join("")}</div>
         ${projectTabContent()}
         <div class="card project-overview">${infoItem("Environment","default")}${infoItem("Model Route", modelRoutes()[0] || "default")}${infoItem("Created", dateShort(currentProject().created_at))}${infoItem("Last Updated", relative(currentProject().updated_at))}${infoItem("Project ID", state.projectId)}</div>
       </section>
     </div>`;
   $("newProjectMain").onclick = createProjectFromPrompt;
+  wireConversation();
   document.querySelectorAll("[data-project-tab]").forEach(button => {
     button.onclick = () => {
       state.projectTab = button.dataset.projectTab || "configuration";
@@ -185,7 +197,7 @@ function projectTabContent() {
   return (renderers[state.projectTab] || projectConfigurationTab)();
 }
 function projectConfigurationTab() {
-  return `<div class="config-grid">${editorCard("Agents","Define the agents available in this project.","JSON", JSON.stringify(state.settings.agents || defaultAgents(), null, 2))}${editorCard("Parameters","Configure runtime parameters and defaults.","JSON", JSON.stringify(state.settings.parameters || defaultParameters(), null, 2))}<div class="side-stack">${workflowPresetCard()}${routingSummaryCard()}${teamCard()}</div></div>`;
+  return `<div class="config-grid">${editorCard("Project.MD","Project operating manual injected into project work.","Markdown", state.projectMd || "")}${editorCard("Agents","Define the agents available in this project.","JSON", JSON.stringify(state.settings.agents || defaultAgents(), null, 2))}<div class="side-stack">${workflowPresetCard()}${routingSummaryCard()}${teamCard()}</div></div><div class="config-grid single-row">${editorCard("Parameters","Configure runtime parameters and defaults.","JSON", JSON.stringify(state.settings.parameters || defaultParameters(), null, 2))}</div>`;
 }
 function projectSettingsTab() {
   return `<div class="config-grid">${editorCard("Project Settings","Identity, defaults, and runtime settings for this project.","JSON", JSON.stringify({project: currentProject(), settings: state.settings}, null, 2))}${editorCard("Task Policy","How DevWerk should manage task continuity, memory and approvals.","JSON", JSON.stringify(defaultTaskPolicy(), null, 2))}<div class="side-stack">${settingsTile("Task Continuity","Conversation-driven","Same topic continues active task; explicit new work starts a task.")}${settingsTile("Approval Mode","Automatic","Kanban state machine drives work without manual tab buttons.")}${settingsTile("Memory Scope","Project + Task","Project memory is injected into every task context.")}</div></div>`;
@@ -247,7 +259,7 @@ function pipelineHtml() {
 function healthCard(){ const failed=(currentProject().stats || {}).failed_tasks || 0; const active=activeStage(); const stages=columns().map(c=>c.status_key); return `<div class="card card-pad"><div style="display:flex;gap:10px;align-items:center"><span class="ok">${failed ? "!" : "OK"}</span><div><div class="h3">${failed ? "Attention" : "No failed tasks"}</div><div class="muted" style="font-size:12px">Derived from backend Kanban state.</div></div></div><div style="margin-top:18px" class="muted">Active Stage</div><div style="margin-top:8px"><span class="badge blue">${esc(active ? stageTitle(active) : "-")}</span></div><div class="muted" style="font-size:12px;margin-top:6px">${active ? statusCount(active) : 0} tasks in active stage</div><div class="progress"><span style="width:${active && stages.length ? Math.max(3, Math.round(((stages.indexOf(active) + 1) / stages.length) * 100)) : 0}%"></span></div></div>`; }
 function usageCard(u, title="Token Usage", rows=null){ return `<div class="card card-pad"><div style="display:flex;justify-content:space-between;gap:10px"><div class="h3">${esc(title)}</div><span class="muted" style="font-size:12px">Backend usage DB</span></div><div style="font-size:20px;font-weight:850;margin-top:12px">${compact(u.total)} total tokens</div><div class="progress"><span style="width:${u.total ? 100 : 0}%"></span></div><div class="metric-lines"><div class="metric-line"><span>Input Tokens</span><b>${compact(u.input)}</b></div><div class="metric-line"><span>Output Tokens</span><b>${compact(u.output)}</b></div><div class="metric-line"><span>LLM Calls</span><b>${compact(u.calls)}</b></div><div class="metric-line"><span>Requests</span><b>${compact(u.request_count)}</b></div></div>${usageBars(rows || state.usage.by_task || state.usage.projects || [])}</div>`; }
 function routingCard(){ return `<div class="card card-pad"><div class="h3">Agent Route</div><div class="muted" style="font-size:12px;margin-top:4px">Routes map agent responsibilities to model configs; they are not model names.</div><div class="metric-lines" style="margin-top:12px"><div><div class="muted">Project Default</div><b>${esc(modelRoutes()[0] || "default")}</b></div><div><div class="muted">Project Routes</div><b>${esc(modelRoutes().join(", ") || "default")}</b></div><div><div class="muted">Thinking Mode</div><b>${esc((state.settings.parameters || {}).thinking_mode || "Balanced")}</b></div></div></div>`; }
-function conversationCard(){ return `<section class="card chat-card"><div class="tabs">${conversationTabs().map(tab=>`<button class="tab tab-button ${state.conversationTab===tab.key?"active":""}" data-chat-tab="${tab.key}">${tab.label}</button>`).join("")}<span style="margin-left:auto;display:flex;gap:8px;align-items:center;margin-bottom:8px"><button class="small-button">Auto</button><button class="icon-button">Run</button><button id="clearChat" class="small-button">Clear</button></span></div><div id="chatBody" class="chat-body">${conversationTabContent()}</div><div class="composer"><div class="composer-box"><textarea id="prompt" class="composer-input" placeholder="Message DevWerk about this project, workflow, or task..."></textarea><div class="composer-actions"><div class="tool-row"><span class="tool">A</span><span class="tool">F</span><span class="tool">&lt;/&gt;</span><span class="tool">B</span></div><div style="display:flex;gap:10px"><select class="select-pill">${modelRoutes().map(m=>`<option>${esc(m)}</option>`).join("") || "<option>default</option>"}</select><button id="send" class="send-button">></button></div></div></div></div></section>`; }
+function conversationCard(){ return `<section class="card chat-card"><div class="tabs">${conversationTabs().map(tab=>`<button class="tab tab-button ${state.conversationTab===tab.key?"active":""}" data-chat-tab="${tab.key}">${tab.label}</button>`).join("")}</div><div id="chatBody" class="chat-body">${conversationTabContent()}</div><div class="composer"><div class="composer-box"><textarea id="prompt" class="composer-input" placeholder="Message DevWerk about this project, workflow, or task..."></textarea><div class="composer-actions"><div class="tool-row"><span class="tool">A</span><span class="tool">F</span><span class="tool">&lt;/&gt;</span><span class="tool">B</span></div><div style="display:flex;gap:10px"><select class="select-pill">${modelRoutes().map(m=>`<option>${esc(m)}</option>`).join("") || "<option>default</option>"}</select><button id="send" class="send-button">></button></div></div></div></div></section>`; }
 function conversationHtml() {
   const msgs = state.conversation.length ? state.conversation : [{role:"assistant", content:"I will help you break this down into actionable tasks and move them through the workflow. Tell me what you want DevWerk to build, review, research, or organize."}];
   return msgs.map(message => message.role === "user"
@@ -264,26 +276,29 @@ function wireConversation() {
   if (!send || !prompt) return;
   send.onclick = sendProjectMessage;
   prompt.addEventListener("keydown", event => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) { event.preventDefault(); sendProjectMessage(); }});
-  const task = $("heroNewTask"); if (task) task.onclick = () => { prompt.value = "Start a new workflow task for this project."; prompt.focus(); };
-  const plan = $("heroPlan"); if (plan) plan.onclick = () => { prompt.value = "Design or revise the workflow plan for this project."; prompt.focus(); };
   document.querySelectorAll("[data-chat-tab]").forEach(button => {
     button.onclick = () => {
       state.conversationTab = button.dataset.chatTab || "conversation";
-      renderOverviewPage();
+      renderProjectsPage();
     };
   });
+  scrollConversationToLatest();
+}
+function scrollConversationToLatest() {
+  const body = $("chatBody");
+  if (body) body.scrollTop = body.scrollHeight;
 }
 async function sendProjectMessage() {
   const prompt = $("prompt"); const content = (prompt.value || "").trim();
   if (!content || state.busy) return;
   state.busy = true; prompt.disabled = true; $("send").disabled = true;
   state.conversation.push({role:"user", content});
-  renderOverviewPage();
+  renderProjectsPage();
   try {
     const result = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/conversation`, {method:"POST", body: JSON.stringify({action:"message", message:content, messages:state.conversation, metadata:{active_task_id: state.activeTask?.id || state.activeTask?.task_id || null}})});
     if (result && result.task_id) state.activeTask = {id: result.task_id, status_key: result.status_key || "queued"};
     await Promise.allSettled([loadConversation(), loadBoard(), loadEvents()]);
-    renderOverviewPage();
+    renderProjectsPage();
   } catch (error) {
     alert(error.message || String(error));
   } finally {
@@ -297,9 +312,11 @@ async function sendProjectMessage() {
 function recentTasksCard(){ const tasks=allTasks().slice(0,5); return `<div class="card card-pad"><div style="display:flex;justify-content:space-between;margin-bottom:16px"><div class="h3">Recent Tasks</div><a class="link" href="/tasks?project_id=${escAttr(state.projectId)}">View all</a></div><div class="list">${tasks.map(t=>`<div class="list-row"><span class="timeline-dot"></span><div class="grow"><div class="list-row-title">${esc(t.title)}</div></div><span><i class="dot ${stageColor(t.status_key)}"></i>${esc(STAGE_TITLES[t.status_key] || t.status_key || "Draft")}</span></div>`).join("")}<div class="list-row"><span>+</span><a class="link">New Task</a></div></div></div>`; }
 function memoryCard(){ const mem=state.memory || {}; return `<div class="card card-pad"><div style="display:flex;justify-content:space-between;margin-bottom:16px"><div class="h3">Memory Status</div><a class="link">View</a></div><div class="metric-lines"><div class="metric-line"><b>Frameworks</b><b>${countMemory(mem,"framework")}</b></div><div class="metric-line"><b>Codebase Paths</b><b>${countMemory(mem,"path")}</b></div><div class="metric-line"><b>Commands</b><b>${countMemory(mem,"command")}</b></div><div class="metric-line"><b>Recent Summaries</b><b>${countMemory(mem,"summary")}</b></div></div><div class="muted" style="margin-top:20px;font-size:12px">Last updated: ${relative(mem.updated_at)} <i class="dot green" style="float:right"></i></div></div>`; }
 function recentEventsCard(){ return `<div class="card card-pad"><div style="display:flex;justify-content:space-between;margin-bottom:16px"><div class="h3">Recent Events</div><a class="link">View all</a></div><div class="list">${state.events.slice(0,5).map(e=>`<div class="list-row"><span class="timeline-dot"></span><div><div class="list-row-title">${esc(dateTime(e.created_at))} ${esc(eventTitle(e))}</div><div class="list-row-sub">${esc(e.task_title || e.to_status || state.projectId)}</div></div></div>`).join("") || `<div class="muted">No events yet.</div>`}</div></div>`; }
+function liveLogCard(){ const rows=(state.liveLogs.length ? state.liveLogs : state.events).slice(-80).reverse(); return `<div class="card card-pad live-log-card"><div class="side-title"><div><div class="h3">Live Workflow Log</div><div class="muted" style="font-size:12px">WebSocket ${esc(state.streamStatus)} for ${esc(state.projectId)}</div></div><span class="badge ${state.streamStatus === "connected" ? "green" : "orange"}">${esc(state.streamStatus)}</span></div><div class="live-log-lines">${rows.length ? rows.map(liveLogLine).join("") : `<div class="muted">No workflow events streamed yet.</div>`}</div></div>`; }
+function liveLogLine(event){ const payload=event.payload || {}; return `<div class="live-log-line"><span>${esc(dateTime(event.created_at))}</span><b>${esc(eventTitle(event))}</b><small>${esc(event.task_title || event.task_id || payload.summary || payload.reason || "")}</small></div>`; }
 function kpi(label,value){ return `<div class="card kpi"><div class="kpi-label">${label}</div><div class="kpi-value">${value}</div></div>`; }
 function projectCard(project){ const stats=project.stats || {}; const health=projectHealth(stats); return `<button class="project-card ${project.id === state.projectId ? "selected" : ""}" data-project-card="${escAttr(project.id)}"><div class="card-top"><div class="project-title">${esc(project.name || project.id)}</div><span class="badge ${projectStatus(project).badge}">${projectStatus(project).label}</span></div><div class="muted" style="font-size:12px;line-height:1.45;margin-top:12px">${esc(project.description || project.id)}<br/>${esc(modelRoutes()[0] || "default")}</div><div class="card-meta"><div><div class="meta-label">Tasks</div><div class="meta-value">${stats.tasks || 0}</div></div><div><div class="meta-label">Active</div><div class="meta-value">${stats.active_tasks || 0}</div></div><div><div class="meta-label">Last activity</div><div class="meta-value">${relative(project.updated_at)}</div></div><div><div class="meta-label">Health</div><div class="meta-value">${health.label}</div></div></div>${projectUsageMini(stats)}</button>`; }
-function editorCard(title, desc, mode, content){ const lines=String(content || "").split("\n"); return `<div class="editor-card card" data-editor-title="${escAttr(title)}" data-editor-mode="${escAttr(mode)}"><div class="editor-head"><div><div class="h3">${title}</div><div class="muted" style="font-size:12px;margin-top:4px">${desc}</div></div><div><button class="small-button" data-action="editor-format">${mode}</button><button class="icon-button" data-action="editor-collapse" title="Collapse editor">X</button></div></div><div class="editor"><div class="line-nos">${lines.map((_,i)=>i+1).join("<br/>")}</div><textarea class="code-editor" spellcheck="false">${esc(lines.join("\n"))}</textarea></div><div class="editor-foot"><span class="muted">Loaded from backend API</span><span><button class="small-button" data-action="editor-format">Format</button> <button class="small-button" data-action="editor-save">Save</button></span></div></div>`; }
+function editorCard(title, desc, mode, content){ const lines=String(content || "").split("\n"); return `<div class="editor-card card" data-editor-title="${escAttr(title)}" data-editor-mode="${escAttr(mode)}"><div class="editor-head"><div><div class="h3">${title}</div><div class="muted" style="font-size:12px;margin-top:4px">${desc}</div></div><button class="small-button" data-action="editor-format">${mode}</button></div><div class="editor"><div class="line-nos">${lines.map((_,i)=>i+1).join("<br/>")}</div><textarea class="code-editor" spellcheck="false">${esc(lines.join("\n"))}</textarea></div><div class="editor-foot"><span class="muted">Loaded from backend API</span><span><button class="small-button" data-action="editor-format">Format</button> <button class="small-button" data-action="editor-save">Save</button></span></div></div>`; }
 function workflowPresetCard(){ const workflow=state.workflow || {}; const columnsCount=(workflow.columns || workflow.stages || columns() || []).length; return `<div class="card side-card"><div class="h3">Workflow Definition</div><div class="muted" style="font-size:12px;margin-top:4px">Loaded from backend project workflow.</div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Name</b><span>${esc(workflow.name || "default")}</span></div><div class="metric-line"><b>Columns</b><span>${columnsCount}</span></div><div class="metric-line"><b>Source</b><span>${workflow.source ? esc(workflow.source) : "project settings"}</span></div></div></div>`; }
 function routingSummaryCard(){ const params=state.settings.parameters || {}; return `<div class="card side-card"><div class="h3">Project Route Summary</div><div class="muted" style="font-size:12px;margin-top:4px">Project agent routes. Route keys are responsibilities, not model names.</div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Default Route</b><span>${esc(modelRoutes()[0] || "default")}</span></div><div class="metric-line"><b>Route Count</b><span>${modelRoutes().length}</span></div><div class="metric-line"><b>Strategy</b><span>${esc(params.routing_strategy || "project override")}</span></div></div></div>`; }
 function globalRoutingSummaryCard(){ const routing=state.globalSettings.routing || {}; const rows=Object.entries(routing); return `<div class="card side-card"><div class="h3">Global Route Map</div><div class="muted" style="font-size:12px;margin-top:4px">Agent responsibility -> model route.</div><div class="metric-lines" style="margin-top:12px">${rows.length ? rows.slice(0,8).map(([key,value])=>`<div class="metric-line"><b>${esc(routeKeyLabel(key))}</b><span>${esc(value)}</span></div>`).join("") : `<div class="muted">No global routing returned by backend.</div>`}</div></div>`; }
@@ -469,6 +486,53 @@ function navigatePrimary(section) {
   const path = paths[section] || "/dashboard";
   location.href = `${path}?project_id=${encodeURIComponent(state.projectId)}`;
 }
+function connectProjectStream() {
+  if (!("WebSocket" in window)) {
+    state.streamStatus = "unavailable";
+    return;
+  }
+  if (state.stream && state.streamProjectId === state.projectId) return;
+  if (state.stream) state.stream.close();
+  state.streamProjectId = state.projectId;
+  state.streamStatus = "connecting";
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  const socket = new WebSocket(`${scheme}://${location.host}${API}/kanban/projects/${encodeURIComponent(state.projectId)}/stream`);
+  state.stream = socket;
+  socket.onopen = () => { state.streamStatus = "connected"; renderLivePanels(); };
+  socket.onclose = () => {
+    if (state.stream === socket) {
+      state.streamStatus = "disconnected";
+      renderLivePanels();
+      setTimeout(() => { if (state.stream === socket) connectProjectStream(); }, 2500);
+    }
+  };
+  socket.onerror = () => { state.streamStatus = "error"; renderLivePanels(); };
+  socket.onmessage = event => {
+    try { applyStreamMessage(JSON.parse(event.data)); }
+    catch (error) { console.warn("DevWerk stream message ignored", error); }
+  };
+}
+function applyStreamMessage(message) {
+  if (!message || message.project_id !== state.projectId) return;
+  if (message.board) state.board = message.board;
+  const incoming = Array.isArray(message.events) ? message.events : [];
+  if (incoming.length) {
+    const seen = new Set(state.events.map(event => event.id));
+    const merged = [...incoming.filter(event => !seen.has(event.id)), ...state.events];
+    state.events = merged.slice(0, 200);
+    state.liveLogs = [...incoming, ...state.liveLogs].slice(0, 200);
+  }
+  renderLivePanels();
+}
+function renderLivePanels() {
+  if (state.busy && document.activeElement && document.activeElement.id === "prompt") return;
+  if (state.page === "kanban") renderKanbanPage();
+  else if (state.page === "projects" && !state.section) renderProjectsPage();
+  else if (state.section === "events") renderEventsSection();
+  else {
+    document.querySelectorAll(".live-log-card").forEach(node => { node.outerHTML = liveLogCard(); });
+  }
+}
 async function cloneCurrentProject() {
   const source = currentProject();
   const id = `project-${new Date().toISOString().replace(/[-:TZ.]/g,"").slice(0,17)}`;
@@ -493,6 +557,7 @@ function exportBoard() {
 }
 function editorPayload(card) {
   const text = card.querySelector(".code-editor")?.value || "";
+  if ((card.dataset.editorMode || "").toUpperCase() === "MARKDOWN") return text;
   try { return JSON.parse(text); }
   catch (error) { throw new Error(`Invalid JSON in ${card.dataset.editorTitle}: ${error.message}`); }
 }
@@ -500,18 +565,20 @@ function formatEditor(card) {
   const textarea = card.querySelector(".code-editor");
   if (!textarea) return;
   if ((card.dataset.editorMode || "").toUpperCase() === "JSON") textarea.value = JSON.stringify(JSON.parse(textarea.value || "{}"), null, 2);
+  if ((card.dataset.editorMode || "").toUpperCase() === "MARKDOWN") textarea.value = textarea.value.replace(/\r\n/g, "\n").trim() + "\n";
   notify(`${card.dataset.editorTitle || "Editor"} formatted.`);
 }
 async function saveEditor(card) {
   const title = card.dataset.editorTitle || "";
   const payload = editorPayload(card);
-  if (title === "Agents") await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/settings`, {method:"PUT", body:JSON.stringify({agents: payload})});
+  if (title === "Project.MD") await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/project-md`, {method:"PUT", body:JSON.stringify({content: payload})});
+  else if (title === "Agents") await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/settings`, {method:"PUT", body:JSON.stringify({agents: payload})});
   else if (title === "Parameters") await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/settings`, {method:"PUT", body:JSON.stringify({parameters: payload})});
   else if (title === "Workflow Definition") await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/workflow`, {method:"PUT", body:JSON.stringify({workflow: payload})});
   else if (title === "Global LLM Catalog") await api(`${API}/settings`, {method:"PUT", body:JSON.stringify({llms: payload})});
   else if (title === "Global Routing Map") await api(`${API}/settings`, {method:"PUT", body:JSON.stringify({routing: payload})});
   else { notify(`${title} is read-only in this view.`); return; }
-  await Promise.allSettled([loadSettings(), loadGlobalSettings(), loadWorkflow(), loadBoard()]);
+  await Promise.allSettled([loadSettings(), loadGlobalSettings(), loadWorkflow(), loadBoard(), loadProjectMd(), loadEvents()]);
   renderShell();
   notify(`${title} saved.`);
 }
@@ -542,6 +609,7 @@ function statusCount(stage){ return columns().find(column => column.status_key =
 function activeBoardTask(){ const requested = new URLSearchParams(location.search).get("task_id"); const tasks = allTasks(); return tasks.find(t => t.id === requested) || tasks.find(t => t.status_key === activeStage()) || tasks[0]; }
 function modelRoutes(){ const agents = state.settings.agents || {}; const routes = new Set(); Object.values(agents).forEach(agent => { if(agent && agent.model_route) routes.add(agent.model_route); if(agent && agent.model) routes.add(agent.model); }); const params = state.settings.parameters || {}; if(params.model) routes.add(params.model); if(params.model_route) routes.add(params.model_route); return Array.from(routes); }
 function usageTotals(source=state.usage){ const totals=source.totals || {}; if(Object.keys(totals).length) return {request_count: source.request_count || totals.request_count || 0,calls: totals.calls || 0,input: totals.input_tokens || 0,output: totals.output_tokens || 0,total: totals.total_tokens || 0,duration: totals.duration_ms || 0}; const rows = source.projects || []; return rows.reduce((a,r)=>{ a.calls += r.calls || 0; a.input += r.input_tokens || 0; a.output += r.output_tokens || 0; a.total += r.total_tokens || 0; a.duration += r.duration_ms || 0; return a; }, {request_count: source.request_count || 0,calls:0,input:0,output:0,total:0,duration:0}); }
+function projectTotal(key){ return state.projects.reduce((sum, project) => sum + Number((project.stats || {})[key] || 0), 0); }
 function routeKeyLabel(key){ const labels={default:"Default route", compression:"Compression route"}; return labels[key] || key; }
 function stageTitle(stage){ return columns().find(column => column.status_key === stage)?.title || STAGE_TITLES[stage] || stage || ""; }
 function countMemory(mem, key){ const text = JSON.stringify(mem || {}).toLowerCase(); return (text.match(new RegExp(key, "g")) || []).length; }
@@ -587,7 +655,6 @@ document.addEventListener("click", async event => {
     try {
       if (editorButton.dataset.action === "editor-format" && card) formatEditor(card);
       if (editorButton.dataset.action === "editor-save" && card) await saveEditor(card);
-      if (editorButton.dataset.action === "editor-collapse" && card) { card.classList.toggle("collapsed"); card.querySelector(".editor")?.classList.toggle("hidden"); notify("Editor collapsed."); }
     } catch (error) {
       notify(error.message || String(error), "error");
     }
@@ -600,12 +667,7 @@ document.addEventListener("click", async event => {
   if (label === "N" || target.title === "Notifications" || label === "View all" && target.closest(".card")?.textContent?.includes("Recent Events")) { goSection("events"); return; }
   if (label === "S" || target.title === "Settings") { goSection("settings"); return; }
   if (label === "Add Context") { setPrompt("Add project context: "); return; }
-  if (label === "Preview") { state.projectTab = "workflow"; renderProjectsPage(); notify("Workflow preview opened."); return; }
-  if (label === "Clone") { await cloneCurrentProject(); return; }
   if (label === "..." && target.closest(".config-panel")) { state.projectTab = "activity"; renderProjectsPage(); return; }
-  if (label === "Auto") { notify("Auto mode is active; workflow state machine drives tasks."); return; }
-  if (label === "Run") { const prompt = $("prompt"); if (prompt && prompt.value.trim()) await sendProjectMessage(); else { setPrompt("Start or continue a workflow task: "); notify("Write a task request, then press Send."); } return; }
-  if (label === "Clear") { state.conversation = []; renderShell(); notify("Conversation view cleared locally."); return; }
   if (label === "New Task" || label === "+ Add task") { setPrompt("Start a new workflow task: "); return; }
   if (label === "View" || label === "View in Memory") { goSection("memory"); return; }
   if (label === "Show more files" || label === "View diff") { state.taskTab = "diff"; if (state.page === "tasks") renderTaskPage(); else location.href = `/tasks?project_id=${encodeURIComponent(state.projectId)}`; return; }
