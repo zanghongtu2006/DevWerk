@@ -147,6 +147,39 @@ def test_workflow_designer_can_create_non_coding_writing_workflow(monkeypatch):
     validate_managed_workflow_definition(workflow_from_dict(result["workflow"]))
 
 
+def test_workflow_designer_does_not_infer_terminal_actions(monkeypatch):
+    from app.services import workflow_designer
+
+    monkeypatch.setattr(
+        workflow_designer,
+        "_ask_llm",
+        lambda **kwargs: {
+            "reply": "Draft only.",
+            "workflow": {
+                "name": "ambiguous-flow",
+                "columns": [
+                    {"status_key": "working", "title": "Working", "position": 10, "transition_to": ["done"]},
+                    {"status_key": "done", "title": "Done", "position": 20, "transition_to": []},
+                ],
+                "actions": {},
+            },
+            "agents": {},
+        },
+    )
+
+    try:
+        workflow_designer.design_project_workflow(
+            project_id="ambiguous-flow",
+            messages=[{"role": "user", "content": "Create a tiny workflow."}],
+            current_workflow=None,
+            current_agents=None,
+        )
+    except ValueError as exc:
+        assert "explicit success action" in str(exc) or "managed workflow action 'fail'" in str(exc)
+    else:
+        raise AssertionError("designer must not infer terminal actions from no-transition columns")
+
+
 def test_workflow_designer_uses_project_agent_for_default_llm(monkeypatch):
     from app.services import workflow_designer
 

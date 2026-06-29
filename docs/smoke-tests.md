@@ -19,6 +19,8 @@ Coverage:
 - Project conversation can save a non-coding workflow and can dispatch or
   continue tasks through `/v1/workflows`.
 - Dynamic workflow columns spawn column agents from project workflow settings.
+- Workflow definitions must explicitly declare success and failure semantic
+  actions; no-transition columns are not terminal fallbacks.
 - A repair-style coding workflow can produce file ops and reach its configured
   success terminal.
 - A failing dynamic workflow reaches the project-defined failure terminal.
@@ -31,7 +33,7 @@ Coverage:
 Expected result:
 
 ```text
-44 passed, 2 skipped
+45 passed, 2 skipped
 ```
 
 Skipped tests are opt-in real-browser and real-LLM tests.

@@ -870,12 +870,7 @@ def _semantic_targets(definition: WorkflowDefinition, actions: tuple[str, ...]) 
 
 
 def _success_statuses(definition: WorkflowDefinition) -> set[str]:
-    targets = _semantic_targets(definition, ("workflow_done", "complete", "completed"))
-    return targets or {
-        column.status_key
-        for column in definition.columns
-        if not column.transition_to and column.status_key not in _failure_statuses(definition)
-    }
+    return _semantic_targets(definition, ("workflow_done", "complete", "completed"))
 
 
 def _failure_statuses(definition: WorkflowDefinition) -> set[str]:

@@ -239,6 +239,31 @@ def test_invalid_custom_workflow_is_rejected_before_persistence(monkeypatch, tmp
     assert kanban.get_project_workflow(project_id)["workflow"]["name"] == "unconfigured"
 
 
+def test_workflow_requires_explicit_success_action(monkeypatch, tmp_path):
+    kanban, _ = _configure(monkeypatch, tmp_path)
+    project_id = "missing-success-action"
+
+    with pytest.raises(ValueError, match="explicit success action"):
+        kanban.update_project_workflow(
+            project_id,
+            {
+                "name": "missing-success",
+                "columns": [
+                    {"status_key": "working", "transition_to": ["done", "blocked"]},
+                    {"status_key": "done", "transition_to": []},
+                    {"status_key": "blocked", "transition_to": ["working"]},
+                ],
+                "actions": {
+                    "fail": {"to": "blocked"},
+                    "abandon": {"to": "blocked"},
+                    "retry": {"to": "working"},
+                },
+            },
+        )
+
+    assert kanban.get_project_workflow(project_id)["workflow"]["name"] == "unconfigured"
+
+
 def test_worker_dispatch_deduplicates_same_task_and_payload(monkeypatch, tmp_path):
     kanban, _ = _configure(monkeypatch, tmp_path)
     import app.routes.workflows as workflow_routes

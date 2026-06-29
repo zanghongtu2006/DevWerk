@@ -65,6 +65,21 @@ When the workflow reaches that column:
    definition.
 8. The temporary agent is gone; only durable artifacts and memory remain.
 
+## Completion Semantics
+
+Workflow completion is explicit only. DevWerk never treats a no-transition
+column as an implicit terminal state.
+
+- Success requires a configured semantic action: `workflow_done`, `complete`,
+  or `completed`.
+- Failure requires configured semantic actions: `fail` and `abandon`.
+- `retry` must point to a non-terminal recovery column.
+- The target column names are project-specific. They may be `done`/`failed`,
+  `published`/`blocked`, or any other names selected by the project workflow.
+
+If a project workflow omits the explicit success or failure actions, DevWerk
+rejects the workflow definition instead of guessing.
+
 ## Prompt Management
 
 Prompt construction is centralized in the workflow engine:

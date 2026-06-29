@@ -122,6 +122,16 @@ def validate_managed_workflow_definition(definition: WorkflowDefinition) -> None
         if target not in known:
             raise ValueError(f"workflow action {action!r} references unknown target {target!r}")
 
+    success_targets = {
+        str((definition.action(action) or {}).get("to") or "").strip().lower()
+        for action in ("workflow_done", "complete", "completed")
+    }
+    success_targets.discard("")
+    if not success_targets:
+        raise ValueError(
+            "managed workflow requires an explicit success action: workflow_done, complete, or completed"
+        )
+
     for action in ("fail", "abandon"):
         rule = definition.action(action)
         target = str((rule or {}).get("to") or "").strip().lower()

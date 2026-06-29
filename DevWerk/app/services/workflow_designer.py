@@ -74,8 +74,9 @@ def _ask_llm(
                 "You are DevWerk's workflow designer. Return one JSON object only. "
                 "Design a managed Kanban workflow and project agent overrides. "
                 "Do not assume any default columns. The user defines the workflow. "
-                "The runtime requires semantic actions fail, abandon, and retry, but "
-                "their target column names are project-specific. "
+                "The runtime requires explicit semantic actions workflow_done, fail, "
+                "abandon, and retry, but their target column names are project-specific. "
+                "Never rely on a no-transition column as an implicit terminal state. "
                 "Columns may define status_key, title, position, transition_to, "
                 "job_template, input_artifacts, output_artifact, success_action, "
                 "failure_actions, context_policy. Keep workflow implementation-neutral. "
@@ -174,14 +175,6 @@ def _normalize_actions(value: object, columns: list[dict[str, Any]]) -> dict[str
         target = next((item for item in transitions if item in known and item != "failed"), None)
         if target:
             normalized[success_action] = {"to": target}
-    non_terminal = next((str(col.get("status_key") or "") for col in columns if col.get("transition_to")), None)
-    terminal = next((str(col.get("status_key") or "") for col in columns if not col.get("transition_to")), None)
-    if "fail" not in normalized and terminal:
-        normalized["fail"] = {"to": terminal}
-    if "abandon" not in normalized and terminal:
-        normalized["abandon"] = {"to": terminal}
-    if "retry" not in normalized and non_terminal:
-        normalized["retry"] = {"to": non_terminal}
     return normalized
 
 
