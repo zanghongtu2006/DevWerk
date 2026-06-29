@@ -3060,3 +3060,61 @@ def test_llm_clients_ignore_environment_proxy_by_default():
 def test_usage_cache_hit_rate_is_clamped():
     usage = _normalize_usage({"input_tokens": 232, "cached_input_tokens": 1650, "output_tokens": 10})
     assert usage["input_cache_hit_rate"] == 1.0
+
+
+def test_usage_summary_groups_tokens_by_project_and_task(monkeypatch, tmp_path):
+    import app.services.usage as usage_service
+
+    fake_settings = FakeSettings(tmp_path / "usage-by-task.db")
+    patch_service_settings(monkeypatch, fake_settings, usage_service)
+    usage_service._initialized = False
+
+    ctx_one = usage_service.start_request(
+        "project-a",
+        route="/v1/workflows/task-one/run",
+        action="BACKGROUND",
+        task_id="task-one",
+    )
+    usage_service.record_llm_usage(
+        agent_name="coding-agent",
+        provider="anthropic",
+        model="M3",
+        usage={"input_tokens": 100, "output_tokens": 25},
+        duration_ms=1200,
+        success=True,
+    )
+    usage_service.finish_request(ctx_one, status_code=200, success=True)
+    usage_service.clear_request()
+
+    ctx_two = usage_service.start_request(
+        "project-a",
+        route="/v1/workflows/task-two/run",
+        action="BACKGROUND",
+        task_id="task-two",
+    )
+    usage_service.record_llm_usage(
+        agent_name="review-agent",
+        provider="anthropic",
+        model="M3",
+        usage={"input_tokens": 40, "output_tokens": 10},
+        duration_ms=800,
+        success=True,
+    )
+    usage_service.finish_request(ctx_two, status_code=200, success=True)
+    usage_service.clear_request()
+
+    project_summary = usage_service.usage_summary(project_id="project-a")
+    task_summary = usage_service.usage_summary(project_id="project-a", task_id="task-one")
+
+    assert project_summary["totals"]["total_tokens"] == 175
+    assert project_summary["request_count"] == 2
+    assert {row["task_id"]: row["total_tokens"] for row in project_summary["by_task"]} == {
+        "task-one": 125,
+        "task-two": 50,
+    }
+    assert project_summary["by_project"][0]["project_id"] == "project-a"
+    assert project_summary["by_project"][0]["total_tokens"] == 175
+
+    assert task_summary["totals"]["total_tokens"] == 125
+    assert task_summary["request_count"] == 1
+    assert [row["task_id"] for row in task_summary["by_task"]] == ["task-one"]

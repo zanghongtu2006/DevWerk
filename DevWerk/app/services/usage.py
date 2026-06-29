@@ -24,6 +24,7 @@ _initialized = False
 class UsageRequestContext:
     request_id: str
     project_id: str
+    task_id: str | None
     route: str
     action: str
     started_at: str
@@ -49,6 +50,7 @@ def init_usage_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 request_id TEXT NOT NULL UNIQUE,
                 project_id TEXT NOT NULL,
+                task_id TEXT,
                 route TEXT NOT NULL,
                 action TEXT NOT NULL,
                 started_at TEXT NOT NULL,
@@ -67,6 +69,7 @@ def init_usage_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 request_id TEXT,
                 project_id TEXT NOT NULL,
+                task_id TEXT,
                 agent_name TEXT NOT NULL,
                 provider TEXT NOT NULL,
                 model TEXT NOT NULL,
@@ -90,16 +93,33 @@ def init_usage_db() -> None:
                 ON llm_usage(request_id);
             """
         )
+        _ensure_column(conn, "api_requests", "task_id", "TEXT")
+        _ensure_column(conn, "llm_usage", "task_id", "TEXT")
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_api_requests_task_time
+                ON api_requests(task_id, started_at);
+            CREATE INDEX IF NOT EXISTS idx_llm_usage_task_time
+                ON llm_usage(task_id, created_at);
+            """
+        )
     _initialized = True
     _log.debug("usage db initialized path=%s", path)
 
 
-def start_request(project_id: str | None, route: str, action: str) -> UsageRequestContext:
+def start_request(
+    project_id: str | None,
+    route: str,
+    action: str,
+    task_id: str | None = None,
+) -> UsageRequestContext:
     normalized_project_id = (project_id or "").strip() or str(uuid.uuid4())
+    normalized_task_id = (task_id or "").strip() or None
     now = _now()
     ctx = UsageRequestContext(
         request_id=str(uuid.uuid4()),
         project_id=normalized_project_id,
+        task_id=normalized_task_id,
         route=route,
         action=action,
         started_at=now,
@@ -116,15 +136,16 @@ def start_request(project_id: str | None, route: str, action: str) -> UsageReque
             conn.execute(
                 """
                 INSERT OR IGNORE INTO api_requests (
-                    request_id, project_id, route, action, started_at, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    request_id, project_id, task_id, route, action, started_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (ctx.request_id, ctx.project_id, ctx.route, ctx.action, ctx.started_at, now),
+                (ctx.request_id, ctx.project_id, ctx.task_id, ctx.route, ctx.action, ctx.started_at, now),
             )
         _log.debug(
-            "usage request started request_id=%s project_id=%s route=%s action=%s",
+            "usage request started request_id=%s project_id=%s task_id=%s route=%s action=%s",
             ctx.request_id,
             ctx.project_id,
+            ctx.task_id,
             ctx.route,
             ctx.action,
         )
@@ -203,6 +224,7 @@ def record_llm_usage(
 
     ctx = current_request()
     project_id = ctx.project_id if ctx else str(uuid.uuid4())
+    task_id = ctx.task_id if ctx else None
     request_id = ctx.request_id if ctx else None
     normalized = _normalize_usage(usage or {})
 
@@ -212,16 +234,17 @@ def record_llm_usage(
             conn.execute(
                 """
                 INSERT INTO llm_usage (
-                    request_id, project_id, agent_name, provider, model,
+                    request_id, project_id, task_id, agent_name, provider, model,
                     input_tokens, output_tokens, total_tokens,
                     cached_input_tokens, cache_creation_input_tokens, cached_output_tokens,
                     input_cache_hit_rate, output_cache_hit_rate,
                     duration_ms, success, error_type, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request_id,
                     project_id,
+                    task_id,
                     agent_name,
                     provider,
                     model,
@@ -240,9 +263,10 @@ def record_llm_usage(
                 ),
             )
         _log.debug(
-            "llm usage recorded request_id=%s project_id=%s agent=%s provider=%s model=%s usage=%s duration_ms=%s success=%s error=%s",
+            "llm usage recorded request_id=%s project_id=%s task_id=%s agent=%s provider=%s model=%s usage=%s duration_ms=%s success=%s error=%s",
             request_id,
             project_id,
+            task_id,
             agent_name,
             provider,
             model,
@@ -258,6 +282,7 @@ def record_llm_usage(
 def usage_summary(
     *,
     project_id: str | None = None,
+    task_id: str | None = None,
     start: str | None = None,
     end: str | None = None,
 ) -> dict[str, Any]:
@@ -270,6 +295,9 @@ def usage_summary(
     if project_id:
         filters.append("project_id = ?")
         params.append(project_id)
+    if task_id:
+        filters.append("task_id = ?")
+        params.append(task_id)
     if start:
         filters.append("created_at >= ?")
         params.append(start)
@@ -284,6 +312,7 @@ def usage_summary(
             f"""
             SELECT
                 project_id,
+                task_id,
                 agent_name,
                 provider,
                 model,
@@ -298,8 +327,62 @@ def usage_summary(
                 SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS successful_calls
             FROM llm_usage
             {where}
-            GROUP BY project_id, agent_name, provider, model
-            ORDER BY project_id, agent_name, provider, model
+            GROUP BY project_id, task_id, agent_name, provider, model
+            ORDER BY project_id, task_id, agent_name, provider, model
+            """,
+            params,
+        ).fetchall()
+        project_rows = conn.execute(
+            f"""
+            SELECT
+                project_id,
+                COUNT(*) AS calls,
+                SUM(COALESCE(input_tokens, 0)) AS input_tokens,
+                SUM(COALESCE(output_tokens, 0)) AS output_tokens,
+                SUM(COALESCE(total_tokens, 0)) AS total_tokens,
+                SUM(COALESCE(duration_ms, 0)) AS duration_ms,
+                SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS successful_calls
+            FROM llm_usage
+            {where}
+            GROUP BY project_id
+            ORDER BY total_tokens DESC, project_id
+            """,
+            params,
+        ).fetchall()
+        task_rows = conn.execute(
+            f"""
+            SELECT
+                project_id,
+                task_id,
+                COUNT(*) AS calls,
+                SUM(COALESCE(input_tokens, 0)) AS input_tokens,
+                SUM(COALESCE(output_tokens, 0)) AS output_tokens,
+                SUM(COALESCE(total_tokens, 0)) AS total_tokens,
+                SUM(COALESCE(duration_ms, 0)) AS duration_ms,
+                SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS successful_calls
+            FROM llm_usage
+            {where}
+            GROUP BY project_id, task_id
+            ORDER BY total_tokens DESC, project_id, task_id
+            """,
+            params,
+        ).fetchall()
+        agent_rows = conn.execute(
+            f"""
+            SELECT
+                agent_name,
+                provider,
+                model,
+                COUNT(*) AS calls,
+                SUM(COALESCE(input_tokens, 0)) AS input_tokens,
+                SUM(COALESCE(output_tokens, 0)) AS output_tokens,
+                SUM(COALESCE(total_tokens, 0)) AS total_tokens,
+                SUM(COALESCE(duration_ms, 0)) AS duration_ms,
+                SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS successful_calls
+            FROM llm_usage
+            {where}
+            GROUP BY agent_name, provider, model
+            ORDER BY total_tokens DESC, agent_name, provider, model
             """,
             params,
         ).fetchall()
@@ -309,6 +392,9 @@ def usage_summary(
         if project_id:
             request_filters.append("project_id = ?")
             request_params.append(project_id)
+        if task_id:
+            request_filters.append("task_id = ?")
+            request_params.append(task_id)
         if start:
             request_filters.append("started_at >= ?")
             request_params.append(start)
@@ -321,12 +407,41 @@ def usage_summary(
             request_params,
         ).fetchone()["count"]
 
+    row_dicts = [dict(row) for row in rows]
+    totals = _sum_usage_rows(row_dicts)
+    totals["request_count"] = request_count
+
     return {
         "ok": True,
         "enabled": True,
+        "scope": {
+            "project_id": project_id,
+            "task_id": task_id,
+            "start": start,
+            "end": end,
+        },
+        "totals": totals,
         "request_count": request_count,
-        "projects": [dict(row) for row in rows],
+        "projects": row_dicts,
+        "by_project": [dict(row) for row in project_rows],
+        "by_task": [dict(row) for row in task_rows],
+        "by_agent": [dict(row) for row in agent_rows],
     }
+
+
+def _sum_usage_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    totals = {
+        "calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "duration_ms": 0,
+        "successful_calls": 0,
+    }
+    for row in rows:
+        for key in totals:
+            totals[key] += int(row.get(key) or 0)
+    return totals
 
 
 def _normalize_usage(usage: dict[str, Any]) -> dict[str, Any]:
@@ -365,6 +480,12 @@ def _db_path() -> Path:
 
 def _connect(path: Path) -> sqlite3.Connection:
     return sqlite3.connect(path, timeout=30)
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def _now() -> str:

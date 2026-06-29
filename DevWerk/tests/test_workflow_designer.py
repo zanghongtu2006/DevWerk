@@ -232,7 +232,7 @@ def test_dashboard_project_creation_opens_workbench():
     assert "/workbench?project_id=" in DASHBOARD_HTML
     assert "Project Configuration" in DASHBOARD_HTML
     assert "Workflow Definition" in DASHBOARD_HTML
-    assert "Routing Summary" in DASHBOARD_HTML
+    assert "Project Route Summary" in DASHBOARD_HTML
     assert "Team & Access" in DASHBOARD_HTML
 
 
@@ -317,6 +317,10 @@ def test_backend_web_ui_uses_backend_data_not_demo_metrics():
         assert text not in html
 
     assert "Backend usage DB" in html
+    assert "Global Settings" in html
+    assert "Task List" in html
+    assert "Task Token Usage" in html
+    assert "Project Token Breakdown" in html
     assert "Loaded from backend API" in html
     assert "No artifacts returned by backend" in html
     assert "pageUrlForCurrentView" in html

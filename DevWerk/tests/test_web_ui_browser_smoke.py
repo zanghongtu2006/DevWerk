@@ -156,6 +156,14 @@ const chrome = process.env.DEVWERK_BROWSER_CHROME || 'C:/Program Files/Google/Ch
     if (current.hash !== `#${{key}}`) throw new Error(`nav ${{key}} hash mismatch: ${{JSON.stringify(current)}}`);
     if (!current.url.includes('project_id=web-smoke-alpha')) throw new Error(`nav ${{key}} lost project id: ${{JSON.stringify(current)}}`);
     if (!current.h1.toLowerCase().includes(key)) throw new Error(`nav ${{key}} h1 mismatch: ${{JSON.stringify(current)}}`);
+    if (key === 'analytics') {{
+      await page.waitForSelector('text=Project Token Breakdown');
+      await page.waitForSelector('text=Task Token Breakdown');
+    }}
+    if (key === 'settings') {{
+      await page.waitForSelector('text=Global Settings');
+      await page.waitForSelector('text=Global Route Map');
+    }}
   }}
   await page.goto('{base_url}/workbench?project_id=web-smoke-alpha', {{ waitUntil: 'domcontentloaded' }});
   await page.waitForSelector('button[data-chat-tab="conversation"]');
@@ -167,6 +175,8 @@ const chrome = process.env.DEVWERK_BROWSER_CHROME || 'C:/Program Files/Google/Ch
     if (!current.activeTab.toLowerCase().includes(expected)) throw new Error(`chat tab ${{key}} did not activate: ${{JSON.stringify(current)}}`);
   }}
   await page.goto('{base_url}/tasks?project_id=web-smoke-alpha', {{ waitUntil: 'domcontentloaded' }});
+  await page.waitForSelector('text=Task List');
+  await page.waitForSelector('text=Task Token Usage');
   await page.waitForSelector('button[data-task-tab="summary"]');
   for (const key of ['summary','plan','diff','events','memory']) {{
     await (await one(`button[data-task-tab="${{key}}"]`, `task tab ${{key}}`)).click();

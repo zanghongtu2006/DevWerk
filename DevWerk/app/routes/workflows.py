@@ -82,8 +82,13 @@ async def debug_raw(request: Request):
 
 
 @router.get("/usage/summary")
-async def get_usage_summary(project_id: str | None = None, start: str | None = None, end: str | None = None):
-    return usage_summary(project_id=project_id, start=start, end=end)
+async def get_usage_summary(
+    project_id: str | None = None,
+    task_id: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+):
+    return usage_summary(project_id=project_id, task_id=task_id, start=start, end=end)
 
 
 @router.post("/workflows")
@@ -1513,7 +1518,7 @@ def _workflow_payload_fingerprint(body: dict) -> str:
 
 def _run_workflow_thread(task_id: str, body: dict) -> None:
     project_id = str(body.get("project_id") or "default")
-    ctx = start_request(project_id, route=f"/v1/workflows/{task_id}/run", action="BACKGROUND")
+    ctx = start_request(project_id, route=f"/v1/workflows/{task_id}/run", action="BACKGROUND", task_id=task_id)
     try:
         asyncio.run(_run_workflow(task_id, body))
         finish_request(ctx, status_code=200, success=True)

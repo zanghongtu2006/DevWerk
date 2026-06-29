@@ -5,6 +5,7 @@ DevWerk Backend — FastAPI application entry point.
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -111,12 +112,18 @@ def create_app() -> FastAPI:
             return response
 
         project_id = request.headers.get("X-DevWerk-Project-Id") or request.query_params.get("project_id")
-        ctx = start_request(project_id, route=request.url.path, action=request.method)
+        task_id = (
+            request.headers.get("X-DevWerk-Task-Id")
+            or request.query_params.get("task_id")
+            or _task_id_from_path(request.url.path)
+        )
+        ctx = start_request(project_id, route=request.url.path, action=request.method, task_id=task_id)
         log.debug(
-            "request start method=%s path=%s project_id=%s query=%s",
+            "request start method=%s path=%s project_id=%s task_id=%s query=%s",
             request.method,
             request.url.path,
             project_id,
+            task_id,
             str(request.query_params),
         )
         try:
@@ -155,6 +162,13 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+
+
+def _task_id_from_path(path: str) -> str | None:
+    match = re.match(r"^/v1/(?:workflows|kanban/tasks)/([^/]+)", path)
+    if not match:
+        return None
+    return match.group(1)
 
 
 if __name__ == "__main__":
