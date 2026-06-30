@@ -128,6 +128,8 @@ button, input, textarea, select { font: inherit; }
 .composer { border-top: 1px solid var(--border); padding: 14px 18px; background: #fff; }
 .composer-box { border: 1px solid var(--border); border-radius: 10px; background: #fff; padding: 10px; }
 .composer-input { width: 100%; min-height: 58px; resize: vertical; border: 0; outline: 0; color: var(--text); }
+.slash-hint { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; color: var(--muted); font-size: 12px; margin: 4px 0 10px; }
+.slash-hint span { border: 1px solid var(--border); border-radius: 999px; padding: 3px 8px; background: var(--panel); color: var(--muted); }
 .composer-actions { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
 .tool-row { display: flex; gap: 8px; }
 .tool { width: 30px; height: 30px; border-radius: 8px; border: 1px solid var(--border); display: grid; place-items: center; color: var(--blue); font-weight: 850; }

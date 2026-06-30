@@ -33,7 +33,13 @@ from app.services.kanban import (
     update_task,
     update_conversation,
 )
-from app.services.session_store import read_project_memory
+from app.services.session_store import read_project_memory, record_project_memory
+from app.services.skill_manager import (
+    effective_skill_catalog,
+    get_project_skill,
+    list_project_skills,
+    upsert_project_skill,
+)
 from app.services.verification_policy import verification_failed, verification_has_policy
 from app.services.workflow import apply_workflow_action, current_workflow_state
 from app.services.workflow_designer import design_project_workflow
@@ -126,6 +132,12 @@ class ProjectConversationRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ProjectSkillRequest(BaseModel):
+    skill_md: str = ""
+    enabled: bool = True
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 @router.get("/board")
 def kanban_board(project_id: str | None = None):
     return get_board(project_id)
@@ -214,6 +226,41 @@ def kanban_update_project_md(project_id: str, req: ProjectMdRequest):
     return kanban_get_project_md(project_id)
 
 
+@router.get("/projects/{project_id}/skills")
+def kanban_get_project_skills(project_id: str):
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "entrypoint": "SKILL.md",
+        "skills": list_project_skills(project_id),
+        "catalog": effective_skill_catalog(project_id),
+    }
+
+
+@router.get("/projects/{project_id}/skills/{skill_id}")
+def kanban_get_project_skill(project_id: str, skill_id: str):
+    try:
+        return {"ok": True, "project_id": project_id, "skill": get_project_skill(project_id, skill_id)}
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.put("/projects/{project_id}/skills/{skill_id}")
+def kanban_put_project_skill(project_id: str, skill_id: str, req: ProjectSkillRequest):
+    try:
+        skill = upsert_project_skill(
+            project_id,
+            skill_id,
+            req.skill_md,
+            enabled=req.enabled,
+            metadata=req.metadata,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    add_project_event(project_id, "project_skill_updated", {"skill_id": skill.get("id"), "enabled": skill.get("enabled")})
+    return {"ok": True, "project_id": project_id, "skill": skill}
+
+
 @router.get("/projects/{project_id}/workflow")
 def kanban_get_project_workflow(project_id: str):
     return get_project_workflow(project_id)
@@ -283,6 +330,25 @@ def kanban_project_conversation_message(project_id: str, req: ProjectConversatio
             project_id,
             "project_conversation_message",
             {"role": "user", "content": user_text, "kind": action, "metadata": req.metadata, "active_task_id": active_task.get("id") if active_task else None},
+        )
+
+    slash = _parse_project_slash_command(user_text)
+    if slash is not None and action in {"message", "send"}:
+        return _handle_project_slash_command(
+            project_id,
+            command=slash["command"],
+            argument=slash["argument"],
+            messages=messages,
+            metadata=req.metadata,
+        )
+
+    if action in {"goal", "learn", "distill"}:
+        return _handle_project_slash_command(
+            project_id,
+            command=action,
+            argument=user_text,
+            messages=messages,
+            metadata=req.metadata,
         )
 
     if action in {"message", "send"}:
@@ -658,6 +724,167 @@ def _latest_artifact_created_at(task_id: str, artifact_type: str) -> str | None:
     return None
 
 
+def _parse_project_slash_command(text: str) -> dict[str, str] | None:
+    stripped = str(text or "").strip()
+    if not stripped.startswith("/"):
+        return None
+    head, _, rest = stripped[1:].partition(" ")
+    command = head.strip().lower().replace("-", "_")
+    if command not in {"goal", "learn", "distill"}:
+        raise HTTPException(status_code=400, detail=f"unsupported slash command: /{command}")
+    return {"command": command, "argument": rest.strip()}
+
+
+def _handle_project_slash_command(
+    project_id: str,
+    *,
+    command: str,
+    argument: str,
+    messages: list[dict[str, Any]],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    normalized = str(command or "").strip().lower().replace("-", "_")
+    if normalized == "goal":
+        if not argument.strip():
+            raise HTTPException(status_code=400, detail="/goal requires goal text")
+        updated = _upsert_project_md_section(project_id, "Project Goal", argument.strip())
+        reply = "Project goal recorded in Project.MD."
+        payload = {"command": "goal", "goal": argument.strip(), "project_md_chars": len(updated)}
+    elif normalized == "learn":
+        if not argument.strip():
+            raise HTTPException(status_code=400, detail="/learn requires a note to learn")
+        updated = _append_project_md_bullet(project_id, "Learned Notes", argument.strip())
+        record_project_memory(
+            project_id=project_id,
+            task_id="project-command",
+            phase_output={
+                "phase": "project_conversation",
+                "agent": "project-agent",
+                "status_key": "project",
+                "summary": argument.strip(),
+                "inputs": {"slash_command": "/learn"},
+                "outputs": {"rules": [argument.strip()]},
+                "warnings": [],
+                "decision": "approve",
+                "next_action": "reply",
+            },
+        )
+        reply = "Project learning recorded in Project.MD and project memory."
+        payload = {"command": "learn", "note": argument.strip(), "project_md_chars": len(updated)}
+    elif normalized == "distill":
+        distillation = _distill_project_conversation(project_id, messages, argument)
+        updated = _upsert_project_md_section(project_id, "Distilled Context", distillation)
+        record_project_memory(
+            project_id=project_id,
+            task_id="project-command",
+            phase_output={
+                "phase": "project_conversation",
+                "agent": "project-agent",
+                "status_key": "project",
+                "summary": distillation,
+                "inputs": {"slash_command": "/distill"},
+                "outputs": {"rules": [distillation]},
+                "warnings": [],
+                "decision": "approve",
+                "next_action": "reply",
+            },
+        )
+        reply = "Project conversation distilled into Project.MD and project memory."
+        payload = {"command": "distill", "summary": distillation, "project_md_chars": len(updated)}
+    else:
+        raise HTTPException(status_code=400, detail=f"unsupported slash command: /{normalized}")
+
+    add_project_event(project_id, "project_slash_command", {"command": normalized, **payload, "metadata": metadata})
+    add_project_event(
+        project_id,
+        "project_conversation_message",
+        {"role": "assistant", "content": reply, "kind": f"slash_{normalized}", **payload},
+    )
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "kind": "slash_command",
+        "command": normalized,
+        "reply": reply,
+        "payload": payload,
+    }
+
+
+def _upsert_project_md_section(project_id: str, heading: str, content: str) -> str:
+    current = _project_md(project_id)
+    updated = _replace_markdown_section(current, heading, str(content or "").strip())
+    _store_project_md(project_id, updated, summary=f"{heading} updated")
+    return updated
+
+
+def _append_project_md_bullet(project_id: str, heading: str, content: str) -> str:
+    current = _project_md(project_id)
+    bullet = f"- {str(content or '').strip()}"
+    existing = _section_content(current, heading)
+    next_content = "\n".join([line for line in [existing.strip(), bullet] if line]).strip()
+    updated = _replace_markdown_section(current, heading, next_content)
+    _store_project_md(project_id, updated, summary=f"{heading} updated")
+    return updated
+
+
+def _store_project_md(project_id: str, content: str, *, summary: str) -> None:
+    settings_payload = get_project_settings(project_id)
+    settings = settings_payload.get("settings") if isinstance(settings_payload, dict) else {}
+    parameters = dict(settings.get("parameters") or {}) if isinstance(settings, dict) else {}
+    parameters["project_md"] = content
+    update_project_settings(project_id, parameters=parameters)
+    add_project_event(project_id, "project_md_updated", {"summary": summary, "chars": len(content or "")})
+
+
+def _replace_markdown_section(markdown: str, heading: str, content: str) -> str:
+    lines = str(markdown or "").splitlines()
+    marker = f"## {heading}"
+    start = next((idx for idx, line in enumerate(lines) if line.strip().lower() == marker.lower()), None)
+    replacement = [marker, str(content or "").strip(), ""]
+    if start is None:
+        base = str(markdown or "").rstrip()
+        return "\n".join([base, "", *replacement]).strip() + "\n"
+    end = len(lines)
+    for idx in range(start + 1, len(lines)):
+        if lines[idx].startswith("## "):
+            end = idx
+            break
+    return "\n".join([*lines[:start], *replacement, *lines[end:]]).strip() + "\n"
+
+
+def _section_content(markdown: str, heading: str) -> str:
+    lines = str(markdown or "").splitlines()
+    marker = f"## {heading}"
+    start = next((idx for idx, line in enumerate(lines) if line.strip().lower() == marker.lower()), None)
+    if start is None:
+        return ""
+    end = len(lines)
+    for idx in range(start + 1, len(lines)):
+        if lines[idx].startswith("## "):
+            end = idx
+            break
+    return "\n".join(lines[start + 1 : end]).strip()
+
+
+def _distill_project_conversation(project_id: str, messages: list[dict[str, Any]], instruction: str) -> str:
+    conversation = [
+        f"{str(item.get('role') or 'message')}: {str(item.get('content') or '').strip()}"
+        for item in messages[-12:]
+        if isinstance(item, dict) and str(item.get("content") or "").strip()
+    ]
+    memory = read_project_memory(project_id)
+    parts = [
+        f"Project: {project_id}",
+        f"Instruction: {instruction.strip()}" if instruction.strip() else "",
+        "Recent conversation:",
+        *conversation,
+        "Reusable memory:",
+        f"Frameworks: {', '.join(str(x) for x in (memory.get('frameworks') or [])[-8:]) or '-'}",
+        f"Rules: {'; '.join(str(x) for x in (memory.get('rules') or [])[-8:]) or '-'}",
+    ]
+    return "\n".join(part for part in parts if part).strip()
+
+
 def _ask_project_conversation_agent(
     *,
     project_id: str,
@@ -680,6 +907,9 @@ def _ask_project_conversation_agent(
                 "for example extra guidance, compile feedback, rework, or follow-up details. Use start_task "
                 "when the user begins a distinct work item or the active task is terminal/unrelated. "
                 "Support coding and non-coding projects such as writing, research, review, and revision. "
+                "The chat also supports deterministic slash commands: /goal records a project goal, "
+                "/learn records reusable project knowledge, and /distill compacts the conversation into Project.MD. "
+                "Skill management is based on SKILL.md entries at global and project scope. "
                 "JSON shape: {action, reply, save, task_id, task_request, notes}."
             ),
         },

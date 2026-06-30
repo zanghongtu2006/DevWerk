@@ -26,6 +26,7 @@ from app.routes.workflows import _start_workflow_thread, router as workflow_rout
 from app.routes.kanban import router as kanban_router
 from app.routes.kanban import ui_router as kanban_ui_router
 from app.routes.settings import router as settings_router
+from app.routes.skills import router as skills_router
 from app.services.kanban import init_kanban_db
 from app.services.usage import clear_request, finish_request, init_usage_db, start_request
 from app.services.workflow_supervisor import WorkflowSupervisor
@@ -156,6 +157,7 @@ def create_app() -> FastAPI:
     app.include_router(workflow_router, prefix="/v1", tags=["Workflows"])
     app.include_router(kanban_router, prefix="/v1", tags=["Kanban"])
     app.include_router(settings_router, prefix="/v1", tags=["Settings"])
+    app.include_router(skills_router, prefix="/v1", tags=["Skills"])
     app.include_router(kanban_ui_router)
     app.mount("/web/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "web" / "static")), name="web-static")
     # Mount last so existing FastAPI routes win and /mcp is served without a redirect.

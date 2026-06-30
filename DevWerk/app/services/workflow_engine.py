@@ -27,6 +27,7 @@ from app.services.kanban import (
     update_conversation,
 )
 from app.services.session_store import read_project_memory
+from app.services.skill_manager import resolve_agent_skills
 from app.services.job_scheduler import JobScheduler
 from app.services.llm_factory import get_llm_client
 from app.services.provider_errors import is_retryable_llm_error
@@ -931,6 +932,7 @@ def _build_agent_context(
     project_id = str(task.get("project_id") or body.get("project_id") or "default")
     artifacts = task.get("artifacts") or []
     conversation_context = prepare_conversation_context(task_id, fallback_messages=body.get("messages") or [])
+    skill_ids = [str(item) for item in (body.get("_workflow_agent_skills") or []) if str(item).strip()]
     return {
         "task_id": task_id,
         "project_id": project_id,
@@ -948,6 +950,7 @@ def _build_agent_context(
         "task_events": _event_summary(task.get("events") or []),
         "task_memory": _compact_task_memory(task, conversation_context),
         "project_memory": _compact_project_memory(read_project_memory(project_id)),
+        "skills": resolve_agent_skills(project_id, skill_ids),
         "workspace": _workspace_summary(body.get("workspace")),
     }
 
@@ -1191,6 +1194,16 @@ def _context_log_summary(context: dict[str, Any]) -> dict[str, Any]:
         "event_count": len(context.get("task_events") or []),
         "task_memory_keys": sorted((context.get("task_memory") or {}).keys()),
         "project_memory_keys": sorted((context.get("project_memory") or {}).keys()),
+        "skills": [
+            {
+                "id": skill.get("id"),
+                "scope": skill.get("scope"),
+                "enabled": skill.get("enabled"),
+                "chars": len(str(skill.get("content") or "")),
+            }
+            for skill in (context.get("skills") or [])
+            if isinstance(skill, dict)
+        ],
         "workspace": context.get("workspace"),
     }
 
