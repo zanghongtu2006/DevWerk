@@ -29,9 +29,16 @@ ACTION_APPLY_SUCCEEDED = "apply_succeeded"
 ACTION_VERIFICATION_PASSED = "verification_passed"
 ACTION_VERIFICATION_FAILED = "verification_failed"
 ACTION_WORKFLOW_DONE = "workflow_done"
+ACTION_CODE_READY = "code_ready"
 
 CLIENT_VISIBLE_ACTIONS = {ACTION_RETRY, ACTION_ABANDON}
 LIFECYCLE_ACTIONS = {ACTION_FAIL, ACTION_RETRY, ACTION_ABANDON}
+LIFECYCLE_EVENT_ACTIONS = {
+    ACTION_CODE_READY,
+    ACTION_APPLY_SUCCEEDED,
+    ACTION_VERIFICATION_PASSED,
+    ACTION_VERIFICATION_FAILED,
+}
 
 
 def record_phase_output(
@@ -116,7 +123,7 @@ def apply_workflow_action(task_id: str, action: str, payload: dict[str, Any] | N
 
     if action_key == ACTION_WORKFLOW_DONE:
         definition = _definition_for_task(task_id)
-        if definition.is_coding and not data.get("lifecycle_done_guard_passed"):
+        if definition.is_coding and not _coding_done_guard_satisfied(task_id):
             task_detail = get_task(task_id)
             add_event(
                 task_id,
@@ -195,6 +202,22 @@ def _transition_by_definition(task_id: str, action: str, payload: dict[str, Any]
         add_event(task_id, "workflow_rework_requested", data)
     else:
         add_event(task_id, f"workflow_{action}", data)
+    if action in LIFECYCLE_EVENT_ACTIONS:
+        add_event(task_id, action, data)
+    if (
+        definition.is_coding
+        and to_status in _failure_statuses(definition)
+        and not data.get("_failure_bundle_created")
+    ):
+        _create_failure_bundle(
+            task_id,
+            definition,
+            failure_stage=_failure_stage_from_action(action, data),
+            reason=str(data.get("reason") or data.get("error_message") or f"Workflow action {action!r} entered failure state."),
+            retryable=action != ACTION_ABANDON,
+            payload=data,
+            target_status_key=to_status,
+        )
     return move_task(task_id, to_status, force=True, payload=data)
 
 
@@ -235,6 +258,7 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
             payload=payload,
             target_status_key=status_key,
         )
+        payload["_failure_bundle_created"] = True
         record_phase_output(
             task_id,
             phase="apply",
@@ -325,6 +349,7 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         payload=payload,
         target_status_key=_action_target(definition, ACTION_VERIFICATION_FAILED) or _action_target(definition, ACTION_FAIL) or current_status,
     )
+    payload["_failure_bundle_created"] = True
     add_event(
         task_id,
         "verification_failed",
@@ -471,6 +496,39 @@ def _allow_done_without_verification(definition: WorkflowDefinition) -> bool:
     parameters = definition.parameters if isinstance(definition.parameters, dict) else {}
     lifecycle = parameters.get("coding_lifecycle") if isinstance(parameters, dict) else {}
     return bool(isinstance(lifecycle, dict) and lifecycle.get("allow_done_without_verification") is True)
+
+
+def _coding_done_guard_satisfied(task_id: str) -> bool:
+    task = (get_task(task_id).get("task") or {})
+    artifacts = task.get("artifacts") if isinstance(task.get("artifacts"), list) else []
+    latest_apply = None
+    has_verification_skipped = False
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        artifact_type = artifact.get("artifact_type")
+        payload = artifact.get("payload") if isinstance(artifact.get("payload"), dict) else {}
+        if artifact_type == "apply_result":
+            latest_apply = payload
+        elif artifact_type == "verification_skipped":
+            has_verification_skipped = True
+    if not isinstance(latest_apply, dict) or latest_apply.get("ok") is not True:
+        return False
+    verification = latest_apply.get("verification")
+    if verification_has_policy(verification):
+        return not verification_failed(verification)
+    return has_verification_skipped
+
+
+def _failure_stage_from_action(action: str, payload: dict[str, Any]) -> str:
+    phase = str(payload.get("phase") or "").strip().lower()
+    if phase in {"apply", "verification", "workflow", "agent"}:
+        return phase
+    if action in {ACTION_FAIL, ACTION_REQUEST_REWORK, ACTION_REQUEST_REPLAN}:
+        return "agent" if phase else "workflow"
+    if action == ACTION_ABANDON:
+        return "workflow"
+    return "workflow"
 
 
 def _create_failure_bundle(

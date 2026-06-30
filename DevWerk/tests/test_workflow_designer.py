@@ -99,6 +99,43 @@ def _writing_workflow() -> dict:
     }
 
 
+def _coding_lifecycle_workflow() -> dict:
+    return {
+        "name": "coding-workflow",
+        "version": 1,
+        "workflow_type": "coding",
+        "requires_apply": True,
+        "parameters": {"coding_lifecycle": {"allow_done_without_verification": False}},
+        "columns": [
+            {
+                "status_key": "implement",
+                "title": "Implement",
+                "position": 10,
+                "transition_to": ["ready_to_apply", "failed"],
+                "job_template": "implement_code_change",
+                "output_artifact": "code_change_bundle",
+                "success_action": "code_ready",
+                "failure_actions": ["fail"],
+            },
+            {"status_key": "ready_to_apply", "title": "Ready To Apply", "position": 20, "transition_to": ["applied", "failed"]},
+            {"status_key": "applied", "title": "Applied", "position": 30, "transition_to": ["verified", "failed"]},
+            {"status_key": "verified", "title": "Verified", "position": 40, "transition_to": ["done", "failed"]},
+            {"status_key": "done", "title": "Done", "position": 90, "transition_to": []},
+            {"status_key": "failed", "title": "Failed", "position": 99, "transition_to": ["implement"]},
+        ],
+        "actions": {
+            "code_ready": {"to": "ready_to_apply"},
+            "apply_succeeded": {"to": "applied"},
+            "verification_passed": {"to": "verified"},
+            "verification_failed": {"to": "failed"},
+            "workflow_done": {"to": "done"},
+            "fail": {"to": "failed"},
+            "abandon": {"to": "failed"},
+            "retry": {"to": "implement"},
+        },
+    }
+
+
 def test_workflow_designer_requires_project_llm(monkeypatch):
     from app.services import workflow_designer
 
@@ -118,6 +155,60 @@ def test_workflow_designer_requires_project_llm(monkeypatch):
         assert "project LLM agent failed" in str(exc)
     else:
         raise AssertionError("workflow designer must fail when project LLM is unavailable")
+
+
+def test_workflow_designer_prompt_teaches_coding_lifecycle_contract(monkeypatch):
+    from app.services import workflow_designer
+
+    captured = {}
+
+    class FakeProjectClient:
+        def chat_json(self, messages):
+            captured["system"] = messages[0]["content"]
+            captured["user"] = messages[-1]["content"]
+            return {"reply": "ok", "workflow": _coding_lifecycle_workflow(), "agents": {}}
+
+    monkeypatch.setattr(workflow_designer, "get_llm_client", lambda route: FakeProjectClient())
+
+    result = workflow_designer._ask_llm(
+        project_id="coding-designer",
+        messages=[{"role": "user", "content": "Create a coding workflow."}],
+        base_workflow={},
+        agents={},
+    )
+
+    system = captured["system"]
+    assert result["workflow"]["workflow_type"] == "coding"
+    assert "workflow_type='coding'" in system
+    assert "requires_apply=true" in system
+    assert "ready_to_apply" in system
+    assert "code_ready" in system
+    assert "apply_succeeded" in system
+    assert "verification_failed" in system
+    assert "must not use success_action=workflow_done" in system
+
+
+def test_workflow_designer_preserves_coding_lifecycle_metadata(monkeypatch):
+    from app.services import workflow_designer
+
+    monkeypatch.setattr(
+        workflow_designer,
+        "_ask_llm",
+        lambda **kwargs: {"reply": "Coding lifecycle ready.", "workflow": _coding_lifecycle_workflow(), "agents": {}},
+    )
+
+    result = workflow_designer.design_project_workflow(
+        project_id="coding-designer",
+        messages=[{"role": "user", "content": "Create a coding workflow with apply and verification gates."}],
+        current_workflow=None,
+        current_agents=None,
+    )
+
+    workflow = result["workflow"]
+    assert workflow["workflow_type"] == "coding"
+    assert workflow["requires_apply"] is True
+    assert workflow["parameters"]["coding_lifecycle"]["allow_done_without_verification"] is False
+    assert workflow["columns"][0]["success_action"] == "code_ready"
 
 
 def test_workflow_designer_can_create_non_coding_writing_workflow(monkeypatch):

@@ -196,17 +196,21 @@ def _validate_coding_lifecycle(definition: WorkflowDefinition, known: set[str]) 
     if retry_target in {"done", "failed"}:
         raise ValueError("coding workflow action 'retry' must not target terminal lifecycle columns")
 
-    code_ready_target = str((definition.action("code_ready") or {}).get("to") or "").strip().lower()
     for column in definition.columns:
         if not column.executable:
             continue
         if _column_can_produce_code(column):
+            if column.success_action != "code_ready":
+                raise ValueError(
+                    f"coding workflow code-producing column {column.status_key!r} "
+                    "must use success_action='code_ready'"
+                )
             success_target = str((definition.action(column.success_action or "") or {}).get("to") or "").strip().lower()
-            if success_target == "done" or column.success_action == "workflow_done":
-                if code_ready_target not in set(column.transition_to or []):
-                    raise ValueError(
-                        f"coding workflow code-producing column {column.status_key!r} must transition to ready_to_apply via code_ready"
-                    )
+            if success_target != "ready_to_apply":
+                raise ValueError(
+                    f"coding workflow code-producing column {column.status_key!r} "
+                    "must transition to ready_to_apply via code_ready"
+                )
 
 
 def _column_can_produce_code(column: WorkflowColumn) -> bool:

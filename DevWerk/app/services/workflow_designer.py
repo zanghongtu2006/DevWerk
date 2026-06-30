@@ -77,6 +77,12 @@ def _ask_llm(
                 "The runtime requires explicit semantic actions workflow_done, fail, "
                 "abandon, and retry, but their target column names are project-specific. "
                 "Never rely on a no-transition column as an implicit terminal state. "
+                "For code-producing workflows, set workflow_type='coding' or requires_apply=true, "
+                "include ready_to_apply/done/failed lifecycle columns, define code_ready, "
+                "apply_succeeded, verification_failed, workflow_done, fail, abandon, and retry. "
+                "Code-producing columns must use success_action='code_ready' and must not use "
+                "success_action=workflow_done; generated code must pass through ready_to_apply "
+                "and wait for apply_result before done. "
                 "Columns may define status_key, title, position, transition_to, "
                 "job_template, input_artifacts, output_artifact, success_action, "
                 "failure_actions, context_policy. Keep workflow implementation-neutral. "
@@ -119,6 +125,9 @@ def _normalize_workflow(value: object) -> dict[str, Any]:
     workflow = dict(value)
     workflow["name"] = str(workflow.get("name") or "project-workflow")
     workflow["version"] = int(workflow.get("version") or 1)
+    workflow["workflow_type"] = str(workflow.get("workflow_type") or "").strip().lower()
+    workflow["requires_apply"] = bool(workflow.get("requires_apply", False))
+    workflow["parameters"] = workflow.get("parameters") if isinstance(workflow.get("parameters"), dict) else {}
     workflow["columns"] = _normalize_columns(workflow.get("columns"))
     workflow["actions"] = _normalize_actions(workflow.get("actions"), workflow["columns"])
     return workflow
@@ -185,6 +194,9 @@ def _definition_to_payload(definition: WorkflowDefinition) -> dict[str, Any]:
     return {
         "name": definition.name,
         "version": definition.version,
+        "workflow_type": definition.workflow_type,
+        "requires_apply": bool(definition.requires_apply),
+        "parameters": dict(definition.parameters or {}),
         "columns": [
             {
                 "status_key": column.status_key,

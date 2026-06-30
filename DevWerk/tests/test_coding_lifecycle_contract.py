@@ -45,7 +45,7 @@ def coding_workflow(*, allow_skip_verification: bool = False) -> dict:
                 "transition_to": ["ready_to_apply", "failed"],
                 "job_template": "make_code_change",
                 "output_artifact": "implementation_bundle",
-                "success_action": "workflow_done",
+                "success_action": "code_ready",
                 "failure_actions": ["fail"],
             },
             {
@@ -126,6 +126,7 @@ async def test_code_output_is_forced_to_ready_to_apply_even_when_llm_requests_do
     assert conversation["waiting_for"] == "apply_result"
     assert "workflow_done" not in [event["event_type"] for event in detail["events"]]
     assert "workflow_waiting_apply_result" in [event["event_type"] for event in detail["events"]]
+    assert "code_ready" in [event["event_type"] for event in detail["events"]]
 
 
 def test_coding_workflow_rejects_done_without_apply_result(monkeypatch, tmp_path):
@@ -145,6 +146,27 @@ def test_coding_workflow_rejects_done_without_apply_result(monkeypatch, tmp_path
     detail = kanban.get_task(task["id"])["task"]
     assert result["action_ignored"] is True
     assert detail["status_key"] == "ready_to_apply"
+    event_types = [event["event_type"] for event in detail["events"]]
+    assert "workflow_done_guard_blocked" in event_types
+
+
+def test_coding_workflow_rejects_forged_done_guard_without_apply_artifact(monkeypatch, tmp_path):
+    kanban, _memory = configure(monkeypatch, tmp_path)
+    project_id = "forged-done-guard"
+    kanban.update_project_workflow(project_id, coding_workflow())
+    task = kanban.create_task(project_id=project_id, title="Forged done", status_key="applied")["task"]
+
+    import app.services.workflow as workflow_service
+
+    result = workflow_service.apply_workflow_action(
+        task["id"],
+        "workflow_done",
+        {"phase": "workflow", "reason": "forged", "lifecycle_done_guard_passed": True},
+    )
+
+    detail = kanban.get_task(task["id"])["task"]
+    assert result["action_ignored"] is True
+    assert detail["status_key"] == "applied"
     event_types = [event["event_type"] for event in detail["events"]]
     assert "workflow_done_guard_blocked" in event_types
 
@@ -195,6 +217,8 @@ def test_explicit_verification_skip_records_artifact_and_allows_done(monkeypatch
     event_types = [event["event_type"] for event in detail["events"]]
     assert "verification_skipped" in event_types
     assert "workflow_done_guard_passed" in event_types
+    assert "apply_succeeded" in event_types
+    assert "verification_passed" in event_types
 
 
 def test_apply_failure_creates_failure_bundle_and_task_memory(monkeypatch, tmp_path):
@@ -231,6 +255,31 @@ def test_apply_failure_creates_failure_bundle_and_task_memory(monkeypatch, tmp_p
     assert task_memory["patch_summary"]["latest"]["changed_paths"] == ["src/App.java"]
 
 
+def test_direct_fail_action_creates_failure_bundle(monkeypatch, tmp_path):
+    kanban, memory = configure(monkeypatch, tmp_path)
+    project_id = "direct-fail-bundle"
+    kanban.update_project_workflow(project_id, coding_workflow())
+    task = kanban.create_task(project_id=project_id, title="Agent failed", status_key="implement")["task"]
+
+    import app.services.workflow as workflow_service
+
+    workflow_service.apply_workflow_action(
+        task["id"],
+        "fail",
+        {"phase": "implement", "reason": "Agent could not produce a coherent patch."},
+    )
+
+    detail = kanban.get_task(task["id"])["task"]
+    failure_bundle = [artifact for artifact in detail["artifacts"] if artifact["artifact_type"] == "failure_bundle"][-1]["payload"]
+    task_memory = memory.read_task_memory(task["id"])
+
+    assert detail["status_key"] == "failed"
+    assert failure_bundle["failure_stage"] == "agent"
+    assert failure_bundle["reason"] == "Agent could not produce a coherent patch."
+    assert failure_bundle["target_status_key"] == "failed"
+    assert task_memory["task_handoff_summary"]["items"][-1]["failure_bundle_id"] == failure_bundle["id"]
+
+
 def test_context_pack_loads_latest_failure_bundle_for_rework(monkeypatch, tmp_path):
     kanban, memory = configure(monkeypatch, tmp_path)
     project_id = "failure-context-pack"
@@ -265,3 +314,8 @@ def test_coding_workflow_validator_requires_lifecycle_contract(monkeypatch, tmp_
     workflow["actions"]["workflow_done"] = {"to": "ready_to_apply"}
     with pytest.raises(ValueError, match="workflow_done"):
         kanban.update_project_workflow("bad-done-target", workflow)
+
+    workflow = coding_workflow()
+    workflow["columns"][0]["success_action"] = "workflow_done"
+    with pytest.raises(ValueError, match="must use success_action='code_ready'"):
+        kanban.update_project_workflow("bad-code-success-action", workflow)
