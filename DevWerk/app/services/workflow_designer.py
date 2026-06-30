@@ -82,7 +82,10 @@ def _ask_llm(
                 "failure_actions, context_policy. Keep workflow implementation-neutral. "
                 "Do not hard-code Java, IntelliJ, VS Code, or CI assumptions. "
                 "Use capabilities by name only, such as workspace.read, project.compile, "
-                "source.diagnostics, process.run. JSON shape: {reply, workflow, agents, notes}."
+                "source.diagnostics, process.run, browser.cdp, browser.playwright, "
+                "network.http, and network.web. Add browser-automation/network-access skills "
+                "to agents that need eyes or external information, then let runtime clients "
+                "provide those capabilities. JSON shape: {reply, workflow, agents, notes}."
             ),
         },
         {

@@ -105,6 +105,39 @@ def test_workflow_agent_context_resolves_global_and_project_skills(monkeypatch, 
     assert "capture a screenshot" in skills["local-browser-rule"]["content"]
 
 
+def test_browser_and_network_capabilities_are_first_class_tool_requests():
+    from app.services.tool_protocol import ALL_CAPABILITIES, normalize_tool_requests
+    from app.services.validation import validate_model_response
+
+    for capability in ("browser.cdp", "browser.playwright", "network.http", "network.web"):
+        assert capability in ALL_CAPABILITIES
+
+    requests = normalize_tool_requests(
+        [
+            {"id": "cdp-1", "tool": "browser.cdp", "args": {"method": "capture_console"}},
+            {"id": "pw-1", "tool": "browser.playwright", "args": {"command": "screenshot", "url": "http://127.0.0.1:8000"}},
+            {"id": "http-1", "tool": "network.http", "args": {"uri": "https://example.com"}},
+            {"id": "web-1", "tool": "network.web", "args": {"q": "Playwright documentation"}},
+        ]
+    )
+
+    assert requests[0]["args"]["action"] == "capture_console"
+    assert requests[1]["args"]["action"] == "screenshot"
+    assert requests[2]["args"]["url"] == "https://example.com"
+    assert requests[2]["args"]["method"] == "GET"
+    assert requests[3]["args"]["query"] == "Playwright documentation"
+
+    response = {
+        "reply": "Patch plus browser verification request.",
+        "ops": [{"op": "create_file", "path": "README.md", "language": "markdown", "content": "# Demo\n"}],
+        "tool_requests": [{"id": "pw-verify", "tool": "browser.playwright", "args": {"action": "screenshot"}}],
+        "patch_ops": [],
+        "done": False,
+    }
+    validate_model_response(response)
+    assert response["tool_requests"][0]["tool"] == "browser.playwright"
+
+
 def test_project_conversation_slash_commands_update_project_md_and_memory(monkeypatch, tmp_path):
     _configure(monkeypatch, tmp_path)
     import app.main as main_module

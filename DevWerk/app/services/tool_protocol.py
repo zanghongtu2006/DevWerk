@@ -4,7 +4,15 @@ from typing import Any
 
 
 LOCAL_CAPABILITIES = {"workspace.list", "workspace.read", "workspace.search"}
-REMOTE_CAPABILITIES = {"process.run", "project.compile", "source.diagnostics"}
+BROWSER_CAPABILITIES = {"browser.cdp", "browser.playwright"}
+NETWORK_CAPABILITIES = {"network.http", "network.web"}
+REMOTE_CAPABILITIES = {
+    "process.run",
+    "project.compile",
+    "source.diagnostics",
+    *BROWSER_CAPABILITIES,
+    *NETWORK_CAPABILITIES,
+}
 ALL_CAPABILITIES = LOCAL_CAPABILITIES | REMOTE_CAPABILITIES
 
 
@@ -66,6 +74,36 @@ def normalize_tool_request(raw: dict[str, Any], index: int = 0) -> dict[str, Any
     elif tool == "project.compile":
         args.setdefault("timeout_seconds", 300)
         args.setdefault("max_errors", 200)
+    elif tool == "browser.cdp":
+        _copy_alias(args, "command", "action")
+        _copy_alias(args, "method", "action")
+        args["action"] = str(args.get("action") or "inspect").strip()
+        args.setdefault("timeout_seconds", 60)
+        if not args["action"]:
+            raise ToolProtocolError(f"tool_requests[{index}].args.action missing")
+    elif tool == "browser.playwright":
+        _copy_alias(args, "command", "action")
+        args["action"] = str(args.get("action") or "run").strip()
+        args.setdefault("timeout_seconds", 120)
+        if not args["action"]:
+            raise ToolProtocolError(f"tool_requests[{index}].args.action missing")
+    elif tool == "network.http":
+        _copy_alias(args, "uri", "url")
+        url = str(args.get("url") or "").strip()
+        if not url:
+            raise ToolProtocolError(f"tool_requests[{index}].args.url missing")
+        args["url"] = url
+        args["method"] = str(args.get("method") or "GET").strip().upper()
+        args.setdefault("timeout_seconds", 60)
+    elif tool == "network.web":
+        _copy_alias(args, "q", "query")
+        _copy_alias(args, "url", "query")
+        query = str(args.get("query") or "").strip()
+        if not query:
+            raise ToolProtocolError(f"tool_requests[{index}].args.query missing")
+        args["query"] = query
+        args.setdefault("max_results", 5)
+        args.setdefault("timeout_seconds", 60)
 
     return {"id": request_id, "tool": tool, "args": args}
 

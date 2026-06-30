@@ -5,6 +5,7 @@ import uuid
 from typing import Any
 
 from app.services.kanban import add_artifact, add_event, get_project_workflow, get_task, move_task
+from app.services.memory_system import upsert_memory_item
 from app.services.session_store import record_phase_memory
 from app.services.verification_policy import (
     verification_failed,
@@ -113,6 +114,23 @@ def apply_workflow_action(task_id: str, action: str, payload: dict[str, Any] | N
     if action_key == ACTION_APPLY_RESULT:
         return _apply_result(task_id, data)
 
+    if action_key == ACTION_WORKFLOW_DONE:
+        definition = _definition_for_task(task_id)
+        if definition.is_coding and not data.get("lifecycle_done_guard_passed"):
+            task_detail = get_task(task_id)
+            add_event(
+                task_id,
+                "workflow_done_guard_blocked",
+                {
+                    "action": action_key,
+                    "reason": "coding workflow cannot enter done without apply_result and verification gate",
+                    **data,
+                },
+            )
+            task_detail["action_ignored"] = True
+            task_detail["ignored_action"] = ACTION_WORKFLOW_DONE
+            return task_detail
+
     if action_key == ACTION_RETRY:
         task_detail = get_task(task_id)
         current_status = str((task_detail.get("task") or {}).get("status_key") or "")
@@ -208,6 +226,15 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     if not ok:
         rework_action = ACTION_REQUEST_REWORK if definition.action(ACTION_REQUEST_REWORK) is not None else ACTION_FAIL
         status_key = _action_target(definition, rework_action) or _action_target(definition, ACTION_FAIL) or current_status
+        _create_failure_bundle(
+            task_id,
+            definition,
+            failure_stage="apply",
+            reason=str(payload.get("error_message") or "Client failed to apply generated changes."),
+            retryable=True,
+            payload=payload,
+            target_status_key=status_key,
+        )
         record_phase_output(
             task_id,
             phase="apply",
@@ -232,7 +259,8 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
 
     verification = payload.get("verification")
     has_verification_policy = verification_has_policy(verification)
-    passed = not verification_failed(verification) if has_verification_policy else True
+    allow_skip_verification = (not definition.is_coding) or _allow_done_without_verification(definition)
+    passed = not verification_failed(verification) if has_verification_policy else allow_skip_verification
     status_key = (
         _first_action_target(definition, [ACTION_WORKFLOW_DONE, ACTION_VERIFICATION_PASSED, ACTION_APPLY_SUCCEEDED])
         if passed
@@ -256,6 +284,14 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
 
     latest = _apply_configured_action(task_id, definition, ACTION_APPLY_SUCCEEDED, {"phase": "apply", **payload})
     if passed:
+        if not has_verification_policy:
+            skip_payload = {
+                "reason": "Project policy explicitly allows done without verification.",
+                "changed_paths": payload.get("changed_paths") or [],
+                "snapshot_id": payload.get("snapshot_id"),
+            }
+            add_artifact(task_id, artifact_type="verification_skipped", payload=skip_payload)
+            add_event(task_id, "verification_skipped", skip_payload)
         verified = _apply_optional_action(
             task_id,
             definition,
@@ -264,14 +300,30 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         )
         if verified is not None:
             latest = verified
-        reason = "verification_passed" if has_verification_policy else "apply_completed_without_verification_policy"
-        done = _apply_optional_action(task_id, definition, ACTION_WORKFLOW_DONE, {"phase": "workflow", "reason": reason})
+        reason = "verification_passed" if has_verification_policy else "verification_skipped_explicitly"
+        add_event(task_id, "workflow_done_guard_passed", {"phase": "workflow", "reason": reason})
+        done = _apply_optional_action(
+            task_id,
+            definition,
+            ACTION_WORKFLOW_DONE,
+            {"phase": "workflow", "reason": reason, "lifecycle_done_guard_passed": True},
+        )
         return done or latest
 
     reason = (
         verification_feedback_summary(verification)
         if has_verification_policy
-        else "No verification policy was provided by the generated workflow result."
+        else "No verification policy was provided and project policy does not allow skipping verification."
+    )
+    add_event(task_id, "workflow_done_guard_blocked", {"phase": "verify", "reason": reason})
+    _create_failure_bundle(
+        task_id,
+        definition,
+        failure_stage="verification",
+        reason=reason,
+        retryable=True,
+        payload=payload,
+        target_status_key=_action_target(definition, ACTION_VERIFICATION_FAILED) or _action_target(definition, ACTION_FAIL) or current_status,
     )
     add_event(
         task_id,
@@ -410,7 +462,142 @@ def _rule_target(rule: dict[str, Any]) -> str | None:
 
 def _can_apply_result_from(definition: WorkflowDefinition, column: Any) -> bool:
     target = _action_target(definition, ACTION_APPLY_SUCCEEDED)
+    if definition.is_coding and str(getattr(column, "status_key", "") or "") != "ready_to_apply":
+        return False
     return bool(target and _target_allowed(column, target))
+
+
+def _allow_done_without_verification(definition: WorkflowDefinition) -> bool:
+    parameters = definition.parameters if isinstance(definition.parameters, dict) else {}
+    lifecycle = parameters.get("coding_lifecycle") if isinstance(parameters, dict) else {}
+    return bool(isinstance(lifecycle, dict) and lifecycle.get("allow_done_without_verification") is True)
+
+
+def _create_failure_bundle(
+    task_id: str,
+    definition: WorkflowDefinition,
+    *,
+    failure_stage: str,
+    reason: str,
+    retryable: bool,
+    payload: dict[str, Any],
+    target_status_key: str,
+) -> dict[str, Any]:
+    task_detail = get_task(task_id)
+    task = task_detail.get("task") or {}
+    artifacts = task.get("artifacts") if isinstance(task.get("artifacts"), list) else []
+    phase_outputs = [
+        item.get("payload") or {}
+        for item in artifacts
+        if isinstance(item, dict) and item.get("artifact_type") == "workflow_phase_output"
+    ]
+    revisions = task.get("revisions") if isinstance(task.get("revisions"), list) else []
+    latest_revision = revisions[-1] if revisions else {}
+    verification = payload.get("verification") if isinstance(payload.get("verification"), dict) else {}
+    failed_checks = _failed_verification_checks(verification)
+    bundle = {
+        "id": f"failure-{uuid.uuid4()}",
+        "failure_stage": failure_stage,
+        "reason": reason,
+        "retryable": bool(retryable),
+        "last_status_key": str(task.get("status_key") or ""),
+        "target_status_key": target_status_key,
+        "last_revision_id": latest_revision.get("id"),
+        "changed_paths": payload.get("changed_paths") or latest_revision.get("changed_paths") or [],
+        "apply_result": payload if failure_stage == "apply" or "snapshot_id" in payload else {},
+        "verification": verification,
+        "failed_checks": failed_checks,
+        "last_agent_summary": str((phase_outputs[-1] or {}).get("summary") or "") if phase_outputs else "",
+        "recommended_rework_entry": _recommended_rework_entry(definition),
+        "created_at": _now(),
+    }
+    add_artifact(task_id, artifact_type="failure_bundle", payload=bundle)
+    add_event(
+        task_id,
+        "failure_bundle_created",
+        {
+            "failure_bundle_id": bundle["id"],
+            "failure_stage": failure_stage,
+            "reason": reason,
+            "retryable": retryable,
+            "target_status_key": target_status_key,
+        },
+    )
+    project_id = str(task.get("project_id") or "default")
+    source_ref = {"failure_bundle_id": bundle["id"], "task_id": task_id}
+    upsert_memory_item(
+        project_id=project_id,
+        task_id=task_id,
+        scope="task",
+        memory_type="task_handoff_summary",
+        key=f"failure-{uuid.uuid4()}",
+        content={
+            "failure_bundle_id": bundle["id"],
+            "summary": reason,
+            "recommended_rework_entry": bundle["recommended_rework_entry"],
+            "retryable": bool(retryable),
+        },
+        source_type="failure_bundle",
+        source_ref=source_ref,
+    )
+    upsert_memory_item(
+        project_id=project_id,
+        task_id=task_id,
+        scope="task",
+        memory_type="task_test_state",
+        key="latest",
+        content={
+            "failure_bundle_id": bundle["id"],
+            "failure_stage": failure_stage,
+            "verification": verification,
+            "failed_checks": failed_checks,
+        },
+        source_type="failure_bundle",
+        source_ref=source_ref,
+    )
+    upsert_memory_item(
+        project_id=project_id,
+        task_id=task_id,
+        scope="task",
+        memory_type="patch_summary",
+        key="latest",
+        content={
+            "failure_bundle_id": bundle["id"],
+            "last_revision_id": bundle["last_revision_id"],
+            "changed_paths": bundle["changed_paths"],
+            "apply_result": bundle["apply_result"],
+        },
+        source_type="failure_bundle",
+        source_ref=source_ref,
+    )
+    return bundle
+
+
+def _failed_verification_checks(verification: dict[str, Any]) -> list[dict[str, Any]]:
+    results = verification.get("results") if isinstance(verification, dict) else {}
+    if not isinstance(results, dict):
+        return []
+    failed = []
+    for check, value in results.items():
+        if str(value).lower() not in {"passed", "pass", "ok", "true", "success"}:
+            failed.append({"check": str(check), "result": value})
+    return failed
+
+
+def _recommended_rework_entry(definition: WorkflowDefinition) -> str:
+    retry_target = _action_target(definition, ACTION_RETRY)
+    if retry_target:
+        return retry_target
+    for column in definition.columns:
+        if column.executable:
+            return column.status_key
+    return ""
+
+
+def _now() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _is_client_visible_action(action: str, rule: dict[str, Any]) -> bool:

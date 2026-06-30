@@ -362,6 +362,7 @@ def build_context_pack(
     task_decisions = (task_memory.get("task_decisions") or {}).get("items") or []
     task_handoff = (task_memory.get("task_handoff_summary") or {}).get("items") or []
     task_final_summary = _latest_or_empty(task_memory, "task_final_summary")
+    latest_failure_bundle = _latest_task_artifact_payload(task_id, "failure_bundle")
     conversation = get_conversation(task_id) or {}
     recent_messages = [
         {"role": msg.get("role"), "content": str(msg.get("content") or "")[:600]}
@@ -387,6 +388,7 @@ def build_context_pack(
             "handoff_history": task_handoff[-6:],
             "test_state": _latest_or_empty(task_memory, "task_test_state") or _latest_or_empty(task_memory, "test_state"),
             "final_summary": task_final_summary,
+            "latest_failure_bundle": latest_failure_bundle or {},
         },
         "workflow": {
             "workflow_id": str(workflow_id or ""),
@@ -774,6 +776,19 @@ def _latest_or_empty(task_memory: dict[str, Any], memory_type: str) -> dict[str,
         return {}
     latest = bucket.get("latest")
     return latest if isinstance(latest, dict) else {}
+
+
+def _latest_task_artifact_payload(task_id: str, artifact_type: str) -> dict[str, Any] | None:
+    try:
+        task = get_task(task_id).get("task") or {}
+    except Exception:  # noqa: BLE001
+        return None
+    artifacts = task.get("artifacts") if isinstance(task.get("artifacts"), list) else []
+    for artifact in reversed(artifacts):
+        if isinstance(artifact, dict) and artifact.get("artifact_type") == artifact_type:
+            payload = artifact.get("payload")
+            return payload if isinstance(payload, dict) else None
+    return None
 
 
 def _memory_content(value: Any, *, scalar_key: str = "value") -> dict[str, Any]:

@@ -1337,6 +1337,9 @@ def definition_to_dict(definition: Any) -> dict[str, Any]:
     return {
         "name": definition.name,
         "version": definition.version,
+        "workflow_type": getattr(definition, "workflow_type", ""),
+        "requires_apply": bool(getattr(definition, "requires_apply", False)),
+        "parameters": getattr(definition, "parameters", {}) or {},
         "columns": [
             {
                 "status_key": col.status_key,

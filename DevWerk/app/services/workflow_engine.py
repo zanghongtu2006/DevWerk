@@ -571,6 +571,88 @@ class WorkflowEngine:
                 "tool_requests": len(code_response.tool_requests),
                 "changed_paths": changed_paths,
             }
+            add_artifact(
+                task_id,
+                artifact_type="code_ready_bundle",
+                payload={
+                    "revision_id": revision["id"],
+                    "phase": column.status_key,
+                    "agent": agent,
+                    "changed_paths": changed_paths,
+                    "ops_count": len(code_response.ops),
+                    "patch_ops_count": len(code_response.patch_ops),
+                    "tool_requests_count": len(code_response.tool_requests),
+                    "requires_apply": True,
+                    "created_at": revision.get("created_at"),
+                },
+            )
+            if _should_force_code_ready(definition, column):
+                action = "code_ready"
+                output = record_phase_output(
+                    task_id,
+                    phase=column.status_key,
+                    agent=agent,
+                    status_key=_action_target(definition, action) or "ready_to_apply",
+                    summary=summary,
+                    inputs=context,
+                    outputs=phase_bundle,
+                    warnings=warnings,
+                    decision=decision,
+                    next_action=action,
+                )
+                state.phase_outputs.append(output)
+                if writeback and memory_run.get("run_id"):
+                    writeback_result = handle_agent_writeback(str(memory_run["run_id"]), writeback)
+                    add_artifact(task_id, artifact_type="memory_writeback", payload=writeback_result)
+                moved = apply_workflow_action(
+                    task_id,
+                    action,
+                    {
+                        "phase": column.status_key,
+                        "session_id": output["session_id"],
+                        "reason": summary,
+                        "output_artifact": output_artifact,
+                        "revision_id": revision["id"],
+                        "changed_paths": changed_paths,
+                        "ops_count": len(code_response.ops),
+                        "patch_ops_count": len(code_response.patch_ops),
+                    },
+                )
+                _event(
+                    task_id,
+                    "workflow_column_completed",
+                    {"status_key": column.status_key, "agent": agent, "decision": decision, "action": action},
+                )
+                response = _ready_response(task_id, project_id, (moved.get("task") or {}).get("status_key") or "ready_to_apply", code_response)
+                response.planning = {
+                    **(response.planning or {}),
+                    "revision_id": revision["id"],
+                    "changed_paths": changed_paths,
+                    "ops_count": len(code_response.ops),
+                    "patch_ops_count": len(code_response.patch_ops),
+                    "requires_apply": True,
+                    "requires_verification": _requires_post_apply_verification(project_id),
+                }
+                append_conversation_message(
+                    task_id,
+                    role="assistant",
+                    content=response.reply or "Code changes are ready for snapshot-protected apply and verification.",
+                    message_type="code_result",
+                )
+                update_conversation(task_id, state="waiting_client", waiting_for="apply_result", active_column=response.status_key)
+                _event(
+                    task_id,
+                    "workflow_waiting_apply_result",
+                    {
+                        "phase": column.status_key,
+                        "status_key": response.status_key,
+                        "revision_id": revision["id"],
+                        "changed_paths": changed_paths,
+                        "ops": len(response.ops),
+                        "patch_ops": len(response.patch_ops),
+                    },
+                )
+                return ColumnResult(action=action, target_status=response.status_key, decision=decision, response=response)
 
         add_artifact(task_id, artifact_type=output_artifact, payload=phase_bundle)
         action = _generic_column_action(definition, column, raw, decision)
@@ -836,6 +918,17 @@ def _is_valid_column_action(definition: WorkflowDefinition, column: WorkflowColu
     return target == column.status_key or target in set(column.transition_to or [])
 
 
+def _should_force_code_ready(definition: WorkflowDefinition, column: WorkflowColumn) -> bool:
+    if definition.action("code_ready") is None:
+        return False
+    if definition.is_coding:
+        return True
+    policy = column.context_policy if isinstance(column.context_policy, dict) else {}
+    if policy.get("requires_apply") is True:
+        return True
+    return _action_target(definition, "code_ready") in set(column.transition_to or [])
+
+
 def _generic_done_response(
     task_id: str,
     project_id: str,
@@ -1087,11 +1180,30 @@ def _ready_response(task_id: str, project_id: str, status_key: str, execute_resp
     response = execute_response.model_copy(deep=True)
     response.task_id = task_id
     response.status_key = status_key or "complete"
-    response.next_action = "apply_result"
+    if response.status_key == "ready_to_apply":
+        response.next_action = "apply_result"
+        response.waiting_for = "apply_result"
+        response.done = False
+    else:
+        response.waiting_for = None
+        response.done = bool(response.done)
+    response.ok = True
     verification_requests = _ensure_post_apply_verification_requests(response, project_id)
     if verification_requests:
         response.tool_requests = verification_requests
     return response
+
+
+def _requires_post_apply_verification(project_id: str) -> bool:
+    settings_payload = get_project_settings(project_id)
+    project_settings = settings_payload.get("settings") if isinstance(settings_payload, dict) else {}
+    parameters = project_settings.get("parameters") if isinstance(project_settings, dict) else {}
+    return bool(configured_post_apply_tool_requests(project_settings)) or not _allow_done_without_verification(parameters)
+
+
+def _allow_done_without_verification(parameters: dict[str, Any]) -> bool:
+    lifecycle = parameters.get("coding_lifecycle") if isinstance(parameters, dict) else {}
+    return bool(isinstance(lifecycle, dict) and lifecycle.get("allow_done_without_verification") is True)
 
 
 def _ensure_post_apply_verification_requests(response: IdeChatResponse, project_id: str) -> list[ToolRequest]:

@@ -28,6 +28,13 @@ class WorkflowDefinition:
     version: int
     columns: list[WorkflowColumn]
     actions: dict[str, dict[str, Any]]
+    workflow_type: str = ""
+    requires_apply: bool = False
+    parameters: dict[str, Any] | None = None
+
+    @property
+    def is_coding(self) -> bool:
+        return self.requires_apply or self.workflow_type == "coding"
 
     def column(self, status_key: str) -> WorkflowColumn | None:
         key = str(status_key or "").strip().lower()
@@ -96,6 +103,9 @@ def workflow_from_dict(value: dict[str, Any]) -> WorkflowDefinition:
         version=int(value.get("version") or 1),
         columns=columns,
         actions={str(key).strip().lower().replace("-", "_"): val for key, val in actions.items() if isinstance(val, dict)},
+        workflow_type=str(value.get("workflow_type") or "").strip().lower(),
+        requires_apply=bool(value.get("requires_apply", False)),
+        parameters=value.get("parameters") if isinstance(value.get("parameters"), dict) else {},
     )
 
 
@@ -148,7 +158,63 @@ def validate_managed_workflow_definition(definition: WorkflowDefinition) -> None
     if not retry_target or retry_target in terminal_targets:
         raise ValueError("managed workflow action 'retry' must target a non-terminal column")
 
+    if definition.is_coding:
+        _validate_coding_lifecycle(definition, known)
+
 
 def _none_if_blank(value: object) -> str | None:
     text = str(value or "").strip()
     return text or None
+
+
+def _validate_coding_lifecycle(definition: WorkflowDefinition, known: set[str]) -> None:
+    required_columns = {"ready_to_apply", "done", "failed"}
+    missing_columns = sorted(required_columns - known)
+    if missing_columns:
+        raise ValueError(f"coding workflow missing lifecycle columns: {missing_columns}")
+
+    required_actions = {
+        "code_ready": "ready_to_apply",
+        "apply_succeeded": None,
+        "verification_failed": None,
+        "workflow_done": "done",
+        "fail": "failed",
+        "abandon": "failed",
+        "retry": None,
+    }
+    for action, required_target in required_actions.items():
+        rule = definition.action(action)
+        target = str((rule or {}).get("to") or "").strip().lower()
+        if rule is None or not target:
+            raise ValueError(f"coding workflow missing lifecycle action: {action}")
+        if target not in known:
+            raise ValueError(f"coding workflow action {action!r} references unknown target {target!r}")
+        if required_target is not None and target != required_target:
+            raise ValueError(f"coding workflow action {action!r} must target {required_target!r}, got {target!r}")
+
+    retry_target = str((definition.action("retry") or {}).get("to") or "").strip().lower()
+    if retry_target in {"done", "failed"}:
+        raise ValueError("coding workflow action 'retry' must not target terminal lifecycle columns")
+
+    code_ready_target = str((definition.action("code_ready") or {}).get("to") or "").strip().lower()
+    for column in definition.columns:
+        if not column.executable:
+            continue
+        if _column_can_produce_code(column):
+            success_target = str((definition.action(column.success_action or "") or {}).get("to") or "").strip().lower()
+            if success_target == "done" or column.success_action == "workflow_done":
+                if code_ready_target not in set(column.transition_to or []):
+                    raise ValueError(
+                        f"coding workflow code-producing column {column.status_key!r} must transition to ready_to_apply via code_ready"
+                    )
+
+
+def _column_can_produce_code(column: WorkflowColumn) -> bool:
+    policy = column.context_policy if isinstance(column.context_policy, dict) else {}
+    output = str(column.output_artifact or "").lower()
+    template = str(column.job_template or "").lower()
+    if policy.get("requires_apply") is True or policy.get("output_contract") == "code_change":
+        return True
+    return any(token in template for token in ("implement", "code", "patch", "repair", "change")) or any(
+        token in output for token in ("code", "patch", "repair", "implementation")
+    )
