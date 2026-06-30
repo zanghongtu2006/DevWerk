@@ -27,7 +27,9 @@ from app.routes.kanban import router as kanban_router
 from app.routes.kanban import ui_router as kanban_ui_router
 from app.routes.settings import router as settings_router
 from app.routes.skills import router as skills_router
+from app.routes.memory import router as memory_router
 from app.services.kanban import init_kanban_db
+from app.services.memory_system import init_memory_db
 from app.services.usage import clear_request, finish_request, init_usage_db, start_request
 from app.services.workflow_supervisor import WorkflowSupervisor
 
@@ -59,6 +61,7 @@ async def lifespan(app: FastAPI):
     log.info("Active LLM config: %s", safe_config)
     init_usage_db()
     init_kanban_db()
+    init_memory_db()
     supervisor = WorkflowSupervisor(
         start_workflow=_start_workflow_thread,
         active_worker_age=workflow_worker_age,
@@ -158,6 +161,7 @@ def create_app() -> FastAPI:
     app.include_router(kanban_router, prefix="/v1", tags=["Kanban"])
     app.include_router(settings_router, prefix="/v1", tags=["Settings"])
     app.include_router(skills_router, prefix="/v1", tags=["Skills"])
+    app.include_router(memory_router, prefix="/v1", tags=["Memory"])
     app.include_router(kanban_ui_router)
     app.mount("/web/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "web" / "static")), name="web-static")
     # Mount last so existing FastAPI routes win and /mcp is served without a redirect.

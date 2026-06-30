@@ -30,6 +30,7 @@ from app.services.session_store import read_project_memory
 from app.services.skill_manager import resolve_agent_skills
 from app.services.job_scheduler import JobScheduler
 from app.services.llm_factory import get_llm_client
+from app.services.memory_system import build_context_pack, create_agent_run, handle_agent_writeback
 from app.services.provider_errors import is_retryable_llm_error
 from app.services.verification_policy import configured_post_apply_tool_requests, verification_feedback_summary
 from app.services.workflow import apply_workflow_action, record_phase_output
@@ -420,6 +421,27 @@ class WorkflowEngine:
                 "runtime": "generic_llm_column",
             },
         )
+        project_id = str((get_task(task_id).get("task") or {}).get("project_id") or body.get("project_id") or "default")
+        token_budget = _column_token_budget(column, body)
+        memory_run = create_agent_run(
+            project_id=project_id,
+            task_id=task_id,
+            workflow_id=str(workflow_summary.get("name") or ""),
+            agent_role=agent,
+            stage=column.status_key,
+            token_budget=token_budget,
+        )
+        context_pack_result = build_context_pack(
+            project_id=project_id,
+            task_id=task_id,
+            workflow_id=str(workflow_summary.get("name") or ""),
+            agent_role=agent,
+            stage=column.status_key,
+            token_budget=token_budget,
+            run_id=str(memory_run.get("run_id") or ""),
+            workspace=body.get("workspace") if isinstance(body.get("workspace"), dict) else None,
+        )
+        add_artifact(task_id, artifact_type="context_pack", payload=context_pack_result["context_pack"])
         context = _build_agent_context(
             task_id,
             column.status_key,
@@ -428,6 +450,8 @@ class WorkflowEngine:
             workflow_summary,
             column.input_artifacts or [],
         )
+        context["context_pack"] = context_pack_result["context_pack"]
+        context["memory_run_id"] = memory_run.get("run_id")
         _event(task_id, "agent_context_built", {"phase": column.status_key, "agent": agent, "context": _context_log_summary(context)})
         prompt = _generic_column_prompt(
             task_id=task_id,
@@ -458,11 +482,13 @@ class WorkflowEngine:
         warnings = [str(item) for item in (raw.get("warnings") or []) if str(item).strip()]
         summary = str(raw.get("summary") or raw.get("reply") or f"{column.title} completed.").strip()
         outputs = raw.get("outputs") if isinstance(raw.get("outputs"), dict) else {}
+        writeback = raw.get("writeback") if isinstance(raw.get("writeback"), dict) else {}
         if not outputs:
             outputs = {
                 key: value
                 for key, value in raw.items()
-                if key not in {"phase", "agent", "summary", "reply", "warnings", "decision", "next_action", "tool_requests"}
+                if key
+                not in {"phase", "agent", "summary", "reply", "warnings", "decision", "next_action", "tool_requests", "writeback"}
             }
         phase_bundle = {
             "phase": raw.get("phase") or column.status_key,
@@ -473,6 +499,8 @@ class WorkflowEngine:
             "warnings": warnings,
             "raw": raw,
         }
+        if writeback:
+            phase_bundle["writeback"] = writeback
 
         tool_requests = _allowed_client_tool_requests(
             raw.get("tool_requests") or [],
@@ -561,6 +589,9 @@ class WorkflowEngine:
             next_action=action,
         )
         state.phase_outputs.append(output)
+        if writeback and memory_run.get("run_id"):
+            writeback_result = handle_agent_writeback(str(memory_run["run_id"]), writeback)
+            add_artifact(task_id, artifact_type="memory_writeback", payload=writeback_result)
         _event(
             task_id,
             "agent_output_recorded",
@@ -691,13 +722,35 @@ def _generic_column_prompt(
                 "a semantic next_action from the supplied actions. If the phase succeeds, prefer the "
                 "column success_action. If it cannot succeed, use a configured failure action. "
                 "If external evidence is required and available tools are described in context, return "
-                "decision='need_client_tool' with tool_requests. JSON shape: "
-                "{phase, agent, summary, outputs, warnings, decision, next_action, tool_requests}. "
+                "decision='need_client_tool' with tool_requests. Persist durable learning through an "
+                "optional writeback object instead of repeating raw conversation. writeback may contain "
+                "{task_updates:{progress, analysis_summary, code_context, decisions, handoff_summary, "
+                "patch_summary, test_state, final_summary}, workflow_updates, run_updates, "
+                "project_memory_candidates:[{target_memory_type, content, reason, confidence}]}. "
+                "Project memory candidates are proposals only and are not auto-promoted. JSON shape: "
+                "{phase, agent, summary, outputs, warnings, decision, next_action, tool_requests, writeback}. "
                 "decision must be approve, fail, request_rework, request_replan, or need_client_tool."
             ),
         },
         {"role": "user", "content": json.dumps(prompt_context, ensure_ascii=False)},
     ]
+
+
+def _column_token_budget(column: WorkflowColumn, body: dict[str, Any]) -> int:
+    policy = column.context_policy if isinstance(column.context_policy, dict) else {}
+    for value in (
+        policy.get("token_budget"),
+        policy.get("max_context_tokens"),
+        (body.get("parameters") or {}).get("token_budget") if isinstance(body.get("parameters"), dict) else None,
+        body.get("token_budget"),
+    ):
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return 4096
 
 
 async def _chat_json_with_retry(model_route: str, messages: list[dict[str, str]]) -> dict[str, Any]:

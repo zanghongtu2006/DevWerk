@@ -60,13 +60,16 @@ def _writing_workflow() -> dict:
 def _wait_for_workflow(workflow_routes, task_id: str, *, timeout_seconds: int = 260) -> dict:
     deadline = time.monotonic() + timeout_seconds
     last_state: dict = {}
+    terminal_seen_at: float | None = None
     while time.monotonic() < deadline:
         last_state = workflow_routes.workflow_state_payload(task_id, include_result=True)
         result = last_state.get("result")
         if isinstance(result, dict):
             return last_state
         if last_state.get("status_key") in {"done", "failed"}:
-            return last_state
+            terminal_seen_at = terminal_seen_at or time.monotonic()
+            if time.monotonic() - terminal_seen_at > 20:
+                return last_state
         time.sleep(1.5)
     raise AssertionError(f"workflow did not finish before timeout; last_state={last_state}")
 
@@ -85,12 +88,14 @@ def test_real_minimax_project_conversation_and_dynamic_workflow_smoke(monkeypatc
 
     from app.core.config import reload_settings
     import app.services.kanban as kanban_service
+    import app.services.memory_system as memory_system
     import app.services.usage as usage_service
     from app.routes import kanban as kanban_routes
     from app.routes import workflows as workflow_routes
 
     reload_settings()
     kanban_service._initialized = False
+    memory_system._initialized = False
     usage_service._initialized = False
     workflow_routes._active_workflows.clear()
     workflow_routes._pending_workflows.clear()
@@ -98,6 +103,14 @@ def test_real_minimax_project_conversation_and_dynamic_workflow_smoke(monkeypatc
     project_id = f"real-llm-smoke-{uuid.uuid4().hex[:10]}"
     kanban_routes.kanban_upsert_project(
         kanban_routes.ProjectUpsertRequest(project_id=project_id, name="Real LLM Smoke")
+    )
+    memory_system.upsert_memory_item(
+        project_id=project_id,
+        scope="project",
+        memory_type="project_rules",
+        key="real-llm-memory-rule",
+        content={"rule": "Real smoke agents must receive project memory through context packs."},
+        source_type="test",
     )
 
     design_response = kanban_routes.kanban_project_conversation_message(
@@ -153,3 +166,14 @@ def test_real_minimax_project_conversation_and_dynamic_workflow_smoke(monkeypatc
     artifact_types = [artifact["artifact_type"] for artifact in task_detail["artifacts"]]
     assert "workflow_phase_output" in artifact_types
     assert "workflow_result" in artifact_types
+    context_packs = [
+        artifact["payload"]
+        for artifact in task_detail["artifacts"]
+        if artifact["artifact_type"] == "context_pack" and isinstance(artifact.get("payload"), dict)
+    ]
+    assert context_packs
+    assert any(
+        (pack.get("project") or {}).get("rules", {}).get("real-llm-memory-rule", {}).get("rule", "").startswith("Real smoke")
+        for pack in context_packs
+    )
+    assert all("messages" not in (pack.get("session") or {}) for pack in context_packs)

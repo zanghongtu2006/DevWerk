@@ -33,6 +33,7 @@ from app.services.kanban import (
     update_task,
     update_conversation,
 )
+from app.services.memory_system import read_task_memory
 from app.services.session_store import read_project_memory, record_project_memory
 from app.services.skill_manager import (
     effective_skill_catalog,
@@ -496,6 +497,7 @@ def kanban_get_task_memory(task_id: str):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     conversation = get_conversation(task_id) or {}
     artifacts = task.get("artifacts") if isinstance(task.get("artifacts"), list) else []
+    structured_memory = read_task_memory(task_id)
     return {
         "ok": True,
         "task_id": task_id,
@@ -524,6 +526,7 @@ def kanban_get_task_memory(task_id: str):
                 for event in (task.get("events") or [])[-80:]
                 if isinstance(event, dict)
             ],
+            "structured": structured_memory,
         },
     }
 
