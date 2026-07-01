@@ -113,6 +113,41 @@ def test_plugin_manifest_custom_paths_supplement_default_discovery(monkeypatch, 
     assert {"hooks", "manifest-path"}.issubset(hook_ids)
 
 
+def test_plugin_markdown_components_parse_frontmatter(monkeypatch, tmp_path):
+    plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
+    plugin = _write_plugin(plugins_root, "frontmatter-plugin")
+    (plugin / "commands" / "audit-ui.md").write_text(
+        "---\ndescription: Audit UI with browser evidence\nallowed-tools: [Read, Bash]\nmodel: sonnet\nargument-hint: [url]\n---\n\nInspect the UI with screenshots.\n",
+        encoding="utf-8",
+    )
+    (plugin / "agents" / "ui-observer.md").write_text(
+        "---\nname: ui-observer\ndescription: Browser evidence observer\nmodel: inherit\ntools: [Read, Bash]\n---\n\nUse browser tools before making visual claims.\n",
+        encoding="utf-8",
+    )
+    (plugin / "skills" / "browser-eyes" / "SKILL.md").write_text(
+        "---\nname: browser-eyes\ndescription: Require CDP or Playwright evidence\n---\n\n# Browser Eyes\n\nUse browser.cdp.\n",
+        encoding="utf-8",
+    )
+
+    from app.services.plugin_manager import get_global_plugin
+
+    detail = get_global_plugin("frontmatter-plugin")
+    command = detail["commands"][0]
+    agent = detail["agents"][0]
+    skill = detail["skills"][0]
+
+    assert command["summary"] == "Audit UI with browser evidence"
+    assert command["frontmatter"]["model"] == "sonnet"
+    assert command["frontmatter"]["allowed-tools"] == ["Read", "Bash"]
+    assert "Inspect the UI" in command["body"]
+    assert "---" not in command["body"]
+    assert agent["summary"] == "Browser evidence observer"
+    assert agent["frontmatter"]["name"] == "ui-observer"
+    assert agent["frontmatter"]["tools"] == ["Read", "Bash"]
+    assert skill["summary"] == "Require CDP or Playwright evidence"
+    assert skill["frontmatter"]["name"] == "browser-eyes"
+
+
 def test_plugin_api_round_trip_and_enable_toggle(monkeypatch, tmp_path):
     _patch_roots(monkeypatch, tmp_path)
 

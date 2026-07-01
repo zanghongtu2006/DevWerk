@@ -490,13 +490,18 @@ def _discover_markdown(plugin_root: Path, default_dir: str, manifest_value: obje
             continue
         seen.add(resolved)
         content = _read_text(path)
+        parsed = _parse_frontmatter_markdown(content)
+        frontmatter = parsed["frontmatter"]
+        body = parsed["body"]
         items.append(
             {
                 "id": path.stem,
                 "entrypoint": path.name,
                 "path": str(path),
-                "summary": _first_heading_or_line(content),
+                "summary": _component_summary(frontmatter, body, content),
                 "chars": len(content),
+                "frontmatter": frontmatter,
+                "body": body,
                 "content": content,
             }
         )
@@ -511,6 +516,9 @@ def _discover_skills(path: Path, plugin_id: str) -> list[dict[str, Any]]:
     for skill_path in sorted(skills_root.glob(f"*/{SKILL_ENTRYPOINT}")):
         local_id = _safe_component_id(skill_path.parent.name)
         content = _read_text(skill_path)
+        parsed = _parse_frontmatter_markdown(content)
+        frontmatter = parsed["frontmatter"]
+        body = parsed["body"]
         out.append(
             {
                 "id": local_id,
@@ -520,8 +528,10 @@ def _discover_skills(path: Path, plugin_id: str) -> list[dict[str, Any]]:
                 "enabled": True,
                 "entrypoint": SKILL_ENTRYPOINT,
                 "path": str(skill_path),
-                "summary": _first_heading_or_line(content),
+                "summary": _component_summary(frontmatter, body, content),
                 "chars": len(content),
+                "frontmatter": frontmatter,
+                "body": body,
                 "content": content,
             }
         )
@@ -704,8 +714,19 @@ def _coerce_yaml_scalar(value: str) -> Any:
             value = json.loads(text.replace("'", '"'))
             return value if isinstance(value, list) else text
         except json.JSONDecodeError:
-            return text
+            inner = text[1:-1].strip()
+            if not inner:
+                return []
+            return [item.strip().strip('"').strip("'") for item in inner.split(",") if item.strip()]
     return text
+
+
+def _component_summary(frontmatter: dict[str, Any], body: str, content: str) -> str:
+    for key in ("description", "name", "title"):
+        value = str(frontmatter.get(key) or "").strip()
+        if value:
+            return value[:160]
+    return _first_heading_or_line(body or content)
 
 
 def _first_heading_or_line(content: str) -> str:
