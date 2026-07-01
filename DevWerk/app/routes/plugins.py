@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field
 from app.services.plugin_manager import (
     get_global_plugin,
     import_global_plugin,
+    import_marketplace_plugin,
+    list_marketplace_plugins,
     list_global_plugins,
     set_global_plugin_enabled,
     upsert_global_plugin,
@@ -35,15 +37,38 @@ class PluginImportRequest(BaseModel):
     source_path: str
 
 
+class PluginMarketplaceImportRequest(BaseModel):
+    marketplace_path: str
+    plugin_name: str
+
+
 @router.get("")
 def plugins_list():
     return {"ok": True, "plugins": list_global_plugins()}
+
+
+@router.get("/marketplace")
+def plugins_marketplace(marketplace_path: str):
+    try:
+        return list_marketplace_plugins(marketplace_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/import")
 def plugins_import(req: PluginImportRequest):
     try:
         return {"ok": True, "plugin": import_global_plugin(req.source_path)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/import-marketplace")
+def plugins_import_marketplace(req: PluginMarketplaceImportRequest):
+    try:
+        return {"ok": True, "plugin": import_marketplace_plugin(req.marketplace_path, req.plugin_name)}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

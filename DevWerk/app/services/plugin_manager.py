@@ -96,6 +96,58 @@ def import_global_plugin(source_path: str) -> dict[str, Any]:
     return get_global_plugin(plugin_id)
 
 
+def list_marketplace_plugins(marketplace_path: str) -> dict[str, Any]:
+    path = _marketplace_path(marketplace_path)
+    payload = _read_json(path)
+    plugins = payload.get("plugins") if isinstance(payload.get("plugins"), list) else []
+    items = []
+    installed = {item["id"] for item in list_global_plugins()}
+    for item in plugins:
+        if not isinstance(item, dict):
+            continue
+        name = _safe_plugin_id(str(item.get("name") or ""))
+        source_path = _marketplace_source_path(path, item.get("source"))
+        items.append(
+            {
+                "name": name,
+                "description": str(item.get("description") or ""),
+                "version": str(item.get("version") or ""),
+                "category": str(item.get("category") or ""),
+                "author": item.get("author") if isinstance(item.get("author"), (dict, str)) else "",
+                "source": str(item.get("source") or ""),
+                "source_path": str(source_path) if source_path else "",
+                "installed": name in installed,
+            }
+        )
+    return {
+        "ok": True,
+        "marketplace": {
+            "name": str(payload.get("name") or path.stem),
+            "version": str(payload.get("version") or ""),
+            "description": str(payload.get("description") or ""),
+            "path": str(path),
+        },
+        "plugins": items,
+    }
+
+
+def import_marketplace_plugin(marketplace_path: str, plugin_name: str) -> dict[str, Any]:
+    path = _marketplace_path(marketplace_path)
+    payload = _read_json(path)
+    plugins = payload.get("plugins") if isinstance(payload.get("plugins"), list) else []
+    target_name = _safe_plugin_id(plugin_name)
+    for item in plugins:
+        if not isinstance(item, dict):
+            continue
+        if _safe_plugin_id(str(item.get("name") or "")) != target_name:
+            continue
+        source_path = _marketplace_source_path(path, item.get("source"))
+        if source_path is None:
+            raise ValueError(f"marketplace plugin source is invalid: {target_name}")
+        return import_global_plugin(str(source_path))
+    raise KeyError(f"marketplace plugin not found: {target_name}")
+
+
 def list_enabled_plugin_skills() -> list[dict[str, Any]]:
     skills: list[dict[str, Any]] = []
     for plugin in list_global_plugins():
@@ -254,6 +306,30 @@ def _component_paths(plugin_root: Path, default_path: str, manifest_value: objec
         if path is not None:
             paths.append(path)
     return paths
+
+
+def _marketplace_path(value: str) -> Path:
+    path = Path(str(value or "")).expanduser().resolve()
+    if path.is_dir():
+        path = path / ".claude-plugin" / "marketplace.json"
+    if not path.is_file():
+        raise ValueError(f"marketplace file not found: {path}")
+    return path
+
+
+def _marketplace_source_path(marketplace_path: Path, source: object) -> Path | None:
+    text = str(source or "").strip()
+    if not text:
+        return None
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", text):
+        return None
+    normalized = text.replace("\\", "/")
+    if normalized.startswith("./"):
+        return (marketplace_path.parent.parent / normalized[2:]).resolve()
+    path = Path(text).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    return (marketplace_path.parent.parent / path).resolve()
 
 
 def _manifest_path_values(value: object) -> list[str]:

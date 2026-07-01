@@ -16,6 +16,7 @@ const state = {
   globalSettings: {},
   globalSkills: [],
   globalPlugins: [],
+  pluginMarketplace: null,
   projectSkills: [],
   stream: null,
   streamProjectId: "",
@@ -333,8 +334,14 @@ function pluginSummaryCard(){ const enabled=(state.globalPlugins || []).filter(p
 function globalPluginCards(){
   const plugins = state.globalPlugins || [];
   const importPanel = `<div class="card card-pad"><div class="h3">Import Plugin</div><div class="muted" style="font-size:12px;margin-top:4px">Import a local Claude-style plugin directory containing .claude-plugin/plugin.json.</div><div style="display:flex;gap:8px;margin-top:12px"><input id="pluginImportPath" class="input" placeholder="D:\\workspace\\codex\\devwerk\\3rd\\claude-code\\plugins\\frontend-design" /><button class="btn small" data-plugin-import="true">Import</button></div></div>`;
-  if(!plugins.length) return `<section class="card card-pad"><div class="h3">Global Plugins</div><div class="muted">No global plugins returned by backend. Install Claude-style plugins under config/plugins or use the /v1/plugins API.</div><div style="margin-top:14px">${importPanel}</div></section>`;
-  return `<section class="card card-pad"><div class="page-head"><div><div class="h3">Global Plugins</div><div class="muted">Global plugin packages expose capabilities to workflow-spawned agents. Skills are loaded through each plugin's skills/*/SKILL.md entries.</div></div><span class="badge blue">${plugins.length} installed</span></div><div class="plugin-grid" style="margin-top:14px">${importPanel}${plugins.map(plugin => `<div class="card card-pad"><div class="page-head"><div><div class="h3">${esc(plugin.name || plugin.id)}</div><div class="muted">${esc(plugin.description || "No description")}</div></div><span class="badge ${plugin.enabled === false ? "" : "green"}">${plugin.enabled === false ? "Disabled" : "Enabled"}</span></div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Skills</b><span>${plugin.skills_count || 0}</span></div><div class="metric-line"><b>Commands</b><span>${plugin.commands_count || 0}</span></div><div class="metric-line"><b>Agents</b><span>${plugin.agents_count || 0}</span></div><div class="metric-line"><b>MCP Servers</b><span>${plugin.mcp_servers_count || 0}</span></div></div><div style="display:flex;gap:8px;margin-top:14px"><button class="btn small" data-plugin-toggle="${escAttr(plugin.id)}" data-enabled="${plugin.enabled === false ? "true" : "false"}">${plugin.enabled === false ? "Enable" : "Disable"}</button><span class="muted" style="align-self:center;font-size:12px">${esc(plugin.version || "")}</span></div></div>`).join("")}</div></section>`;
+  const marketplacePanel = `<div class="card card-pad"><div class="h3">Marketplace</div><div class="muted" style="font-size:12px;margin-top:4px">Load a Claude-style .claude-plugin/marketplace.json and import a listed plugin by name.</div><div style="display:grid;gap:8px;margin-top:12px"><input id="pluginMarketplacePath" class="input" placeholder="D:\\workspace\\codex\\devwerk\\3rd\\claude-code\\.claude-plugin\\marketplace.json" /><input id="pluginMarketplaceName" class="input" placeholder="frontend-design" /><div style="display:flex;gap:8px"><button class="btn small" data-plugin-marketplace-load="true">Load Marketplace</button><button class="btn small" data-plugin-marketplace-import="true">Import Listed Plugin</button></div></div>${marketplacePreview()}</div>`;
+  if(!plugins.length) return `<section class="card card-pad"><div class="h3">Global Plugins</div><div class="muted">No global plugins returned by backend. Install Claude-style plugins under config/plugins or use the /v1/plugins API.</div><div class="plugin-grid" style="margin-top:14px">${importPanel}${marketplacePanel}</div></section>`;
+  return `<section class="card card-pad"><div class="page-head"><div><div class="h3">Global Plugins</div><div class="muted">Global plugin packages expose capabilities to workflow-spawned agents. Skills are loaded through each plugin's skills/*/SKILL.md entries.</div></div><span class="badge blue">${plugins.length} installed</span></div><div class="plugin-grid" style="margin-top:14px">${importPanel}${marketplacePanel}${plugins.map(plugin => `<div class="card card-pad"><div class="page-head"><div><div class="h3">${esc(plugin.name || plugin.id)}</div><div class="muted">${esc(plugin.description || "No description")}</div></div><span class="badge ${plugin.enabled === false ? "" : "green"}">${plugin.enabled === false ? "Disabled" : "Enabled"}</span></div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Skills</b><span>${plugin.skills_count || 0}</span></div><div class="metric-line"><b>Commands</b><span>${plugin.commands_count || 0}</span></div><div class="metric-line"><b>Agents</b><span>${plugin.agents_count || 0}</span></div><div class="metric-line"><b>MCP Servers</b><span>${plugin.mcp_servers_count || 0}</span></div></div><div style="display:flex;gap:8px;margin-top:14px"><button class="btn small" data-plugin-toggle="${escAttr(plugin.id)}" data-enabled="${plugin.enabled === false ? "true" : "false"}">${plugin.enabled === false ? "Enable" : "Disable"}</button><span class="muted" style="align-self:center;font-size:12px">${esc(plugin.version || "")}</span></div></div>`).join("")}</div></section>`;
+}
+function marketplacePreview(){
+  const plugins = state.pluginMarketplace?.plugins || [];
+  if(!plugins.length) return "";
+  return `<div class="muted" style="font-size:12px;margin-top:10px">${esc(state.pluginMarketplace.marketplace?.name || "Marketplace")} loaded: ${plugins.slice(0,4).map(plugin => `${plugin.name}${plugin.installed ? " (installed)" : ""}`).join(", ")}${plugins.length > 4 ? "..." : ""}</div>`;
 }
 function globalSkillEditors(){ const skills = state.globalSkills || []; if(!skills.length) return `<div class="card card-pad"><div class="h3">Global Skill Catalog</div><div class="muted">No global SKILL.md files returned by backend.</div></div>`; return skills.map(skill => editorCard(`Global Skill: ${skill.id}`, `Global SKILL.md (${skill.scope || "global"}).`, "Markdown", skill.content || skill.summary || "")).join(""); }
 function projectSkillEditors(){ const skills = state.projectSkills || []; if(!skills.length) return `<div class="card card-pad"><div class="h3">Project Skills</div><div class="muted">No project-level SKILL.md entries configured yet. Use /learn for memory, or create project skills through the skills API.</div></div>`; return skills.map(skill => editorCard(`Project Skill: ${skill.id}`, `Project-scoped SKILL.md (${skill.enabled === false ? "disabled" : "enabled"}).`, "Markdown", skill.content || skill.summary || "")).join(""); }
@@ -618,6 +625,22 @@ async function importGlobalPlugin() {
   renderShell();
   notify("Plugin imported.");
 }
+async function loadPluginMarketplace() {
+  const marketplacePath = ($("pluginMarketplacePath")?.value || "").trim();
+  if (!marketplacePath) { notify("Marketplace path is required.", "error"); return; }
+  state.pluginMarketplace = await api(`${API}/plugins/marketplace?marketplace_path=${encodeURIComponent(marketplacePath)}`);
+  renderShell();
+  notify("Marketplace loaded.");
+}
+async function importMarketplacePlugin() {
+  const marketplacePath = ($("pluginMarketplacePath")?.value || "").trim();
+  const pluginName = ($("pluginMarketplaceName")?.value || "").trim();
+  if (!marketplacePath || !pluginName) { notify("Marketplace path and plugin name are required.", "error"); return; }
+  await api(`${API}/plugins/import-marketplace`, {method:"POST", body:JSON.stringify({marketplace_path: marketplacePath, plugin_name: pluginName})});
+  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills()]);
+  renderShell();
+  notify(`${pluginName} imported.`);
+}
 async function actOnCurrentTask(action) {
   const task = activeBoardTask();
   if (!task) { notify("No task selected.", "error"); return; }
@@ -693,6 +716,16 @@ document.addEventListener("click", async event => {
   const pluginImport = event.target.closest("[data-plugin-import]");
   if (pluginImport) {
     await importGlobalPlugin();
+    return;
+  }
+  const marketplaceLoad = event.target.closest("[data-plugin-marketplace-load]");
+  if (marketplaceLoad) {
+    await loadPluginMarketplace();
+    return;
+  }
+  const marketplaceImport = event.target.closest("[data-plugin-marketplace-import]");
+  if (marketplaceImport) {
+    await importMarketplacePlugin();
     return;
   }
   const editorButton = event.target.closest("[data-action]");

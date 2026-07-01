@@ -162,6 +162,72 @@ def test_plugin_import_copies_claude_plugin_directory(monkeypatch, tmp_path):
     assert "ui-observer" in {item["id"] for item in list_global_plugins()}
 
 
+def test_marketplace_catalog_and_import_by_name(monkeypatch, tmp_path):
+    plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
+    marketplace_root = tmp_path / "marketplace"
+    source = _write_plugin(marketplace_root / "plugins", "market-ui")
+    marketplace_path = marketplace_root / ".claude-plugin" / "marketplace.json"
+    marketplace_path.parent.mkdir(parents=True)
+    marketplace_path.write_text(
+        json.dumps(
+            {
+                "name": "devwerk-marketplace",
+                "plugins": [
+                    {
+                        "name": "market-ui",
+                        "description": "Marketplace UI observer",
+                        "source": "./plugins/market-ui",
+                        "category": "development",
+                    }
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    from app.services.plugin_manager import import_marketplace_plugin, list_marketplace_plugins
+
+    catalog = list_marketplace_plugins(str(marketplace_path))
+    assert catalog["marketplace"]["name"] == "devwerk-marketplace"
+    assert catalog["plugins"][0]["name"] == "market-ui"
+    assert catalog["plugins"][0]["source_path"] == str(source.resolve())
+    assert catalog["plugins"][0]["installed"] is False
+
+    imported = import_marketplace_plugin(str(marketplace_path), "market-ui")
+
+    assert imported["id"] == "market-ui"
+    assert (plugins_root / "market-ui" / ".claude-plugin" / "plugin.json").is_file()
+    assert list_marketplace_plugins(str(marketplace_path))["plugins"][0]["installed"] is True
+
+
+def test_plugin_marketplace_api(monkeypatch, tmp_path):
+    _patch_roots(monkeypatch, tmp_path)
+    marketplace_root = tmp_path / "marketplace"
+    _write_plugin(marketplace_root / "plugins", "market-ui")
+    marketplace_path = marketplace_root / ".claude-plugin" / "marketplace.json"
+    marketplace_path.parent.mkdir(parents=True)
+    marketplace_path.write_text(
+        json.dumps({"name": "devwerk-marketplace", "plugins": [{"name": "market-ui", "source": "./plugins/market-ui"}]}),
+        encoding="utf-8",
+    )
+
+    import app.main as main_module
+
+    app = main_module.create_app()
+    with TestClient(app) as client:
+        catalog = client.get("/v1/plugins/marketplace", params={"marketplace_path": str(marketplace_path)})
+        imported = client.post(
+            "/v1/plugins/import-marketplace",
+            json={"marketplace_path": str(marketplace_path), "plugin_name": "market-ui"},
+        )
+
+    assert catalog.status_code == 200
+    assert catalog.json()["plugins"][0]["name"] == "market-ui"
+    assert imported.status_code == 200
+    assert imported.json()["plugin"]["id"] == "market-ui"
+
+
 def test_plugin_skills_are_available_to_agent_skill_resolution(monkeypatch, tmp_path):
     plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
     _write_plugin(plugins_root)
@@ -188,5 +254,8 @@ def test_backend_web_ui_exposes_plugin_management_controls():
     assert "Global Plugins" in js
     assert "pluginImportPath" in js
     assert "importGlobalPlugin" in js
+    assert "pluginMarketplacePath" in js
+    assert "loadPluginMarketplace" in js
+    assert "importMarketplacePlugin" in js
     assert "togglePluginEnabled" in js
     assert "/plugins" in js
