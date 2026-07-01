@@ -16,6 +16,7 @@ const state = {
   globalSettings: {},
   globalSkills: [],
   globalPlugins: [],
+  pluginCommands: [],
   pluginMarketplace: null,
   pluginValidation: null,
   projectSkills: [],
@@ -39,7 +40,7 @@ async function api(path, options = {}) {
 }
 async function refreshAll() {
   await loadProjects();
-  await Promise.allSettled([loadBoard(), loadEvents(), loadConversation(), loadSettings(), loadGlobalSettings(), loadWorkflow(), loadMemory(), loadUsage(), loadProjectMd(), loadGlobalSkills(), loadGlobalPlugins(), loadProjectSkills()]);
+  await Promise.allSettled([loadBoard(), loadEvents(), loadConversation(), loadSettings(), loadGlobalSettings(), loadWorkflow(), loadMemory(), loadUsage(), loadProjectMd(), loadGlobalSkills(), loadGlobalPlugins(), loadPluginCommands(), loadProjectSkills()]);
   renderShell();
   connectProjectStream();
 }
@@ -59,6 +60,7 @@ async function loadSettings() { try { const data = await api(`${API}/kanban/proj
 async function loadGlobalSettings() { try { const data = await api(`${API}/settings`); state.globalSettings = data.settings || data || {}; } catch (_) { state.globalSettings = {}; } }
 async function loadGlobalSkills() { try { const data = await api(`${API}/skills`); const skills = data.skills || []; const detailed = await Promise.all(skills.map(async skill => (await api(`${API}/skills/${encodeURIComponent(skill.id)}`).catch(() => ({skill}))).skill || skill)); state.globalSkills = detailed; } catch (_) { state.globalSkills = []; } }
 async function loadGlobalPlugins() { try { const data = await api(`${API}/plugins`); state.globalPlugins = data.plugins || []; } catch (_) { state.globalPlugins = []; } }
+async function loadPluginCommands() { try { const data = await api(`${API}/plugins/commands`); state.pluginCommands = data.commands || []; } catch (_) { state.pluginCommands = []; } }
 async function loadProjectSkills() { try { const data = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/skills`); const skills = data.skills || []; const detailed = await Promise.all(skills.map(async skill => (await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/skills/${encodeURIComponent(skill.id)}`).catch(() => ({skill}))).skill || skill)); state.projectSkills = detailed; } catch (_) { state.projectSkills = []; } }
 async function loadWorkflow() { try { const data = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/workflow`); state.workflow = data.workflow || data || {}; } catch (_) { state.workflow = {}; } }
 async function loadMemory() { try { state.memory = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/memory`); } catch (_) { state.memory = {}; } }
@@ -364,7 +366,7 @@ function taskCardHtml(t){ return `<button class="task-card" data-task="${escAttr
 function inspectorHtml(){ const tasks=allTasks(); const failed=tasks.filter(t=>t.status_key === "failed"); const atRisk=tasks.filter(t=>Number(t.priority || 0) >= 2 && t.status_key !== "done"); const completed=tasks.filter(t=>["done","verified"].includes(t.status_key)); const score=workflowScore(tasks); return `<div style="display:flex;justify-content:space-between"><div class="h3">Workflow Health</div><span>^</span></div><div class="ring"><div class="ring-inner"><div class="ring-number">${score}</div><div class="muted" style="font-size:11px">Derived Score</div></div></div><div class="metric-lines"><div class="metric-line"><span><i class="dot green"></i> On Track</span><b>${Math.max(0, tasks.length - failed.length - atRisk.length)}</b></div><div class="metric-line"><span><i class="dot orange"></i> At Risk</span><b>${atRisk.length}</b></div><div class="metric-line"><span><i class="dot red"></i> Failed</span><b>${failed.length}</b></div></div><hr style="border:none;border-top:1px solid var(--border);width:100%"/><div><b>Throughput</b><div class="kpi-value">${completed.length}</div><div class="muted">done or verified tasks from backend board</div></div><div><div style="display:flex;justify-content:space-between"><b>Failed Tasks</b><a class="link">View all</a></div>${failed.length ? failed.slice(0,2).map(t=>`<div class="blocked"><div class="task-id">${esc(shortTaskId(t.id))} <span class="priority"><i class="dot ${priorityColor(t.priority)}"></i>${priorityLabel(t.priority)}</span></div><b>${esc(t.title)}</b><div class="muted">${esc(t.description || "Waiting for workflow progress.")}<br/>Since ${relative(t.updated_at)}</div></div>`).join("") : `<div class="muted" style="margin-top:10px">No failed tasks returned by backend.</div>`}</div><div><div style="display:flex;justify-content:space-between"><b>Recent Activity</b><a class="link">View all</a></div><div class="list" style="margin-top:10px">${state.events.slice(0,4).map(e=>`<div class="list-row"><span class="timeline-dot"></span><div class="grow">${esc(eventTitle(e))}</div><span class="muted">${relative(e.created_at)}</span></div>`).join("") || `<div class="muted">No recent events.</div>`}</div></div><button class="button">Export Board</button>`; }
 function timelineCard(events){ return `<div class="card side-card"><div class="side-title"><div class="h3">Timeline</div><a class="link">View all</a></div><div class="list">${(events.length ? events : state.events.slice(0,5)).map(e=>`<div class="list-row"><span class="timeline-dot"></span><div class="grow">${esc(eventTitle(e))}</div><span class="muted">${dateTime(e.created_at)}</span></div>`).join("") || "<div class='muted'>No timeline yet.</div>"}</div></div>`; }
 function linkedFilesCard(artifacts){ return `<div class="card side-card"><div class="side-title"><div class="h3">Linked files</div><a class="link">View diff</a></div>${filesHtml(artifacts)}<a class="link">Show more files</a></div>`; }
-function commandsCard(){ const commands=configuredCommands(); return `<div class="card side-card"><div class="h3" style="margin-bottom:10px">Related commands</div>${commands.length ? commands.map(c=>`<span class="command">${esc(c)}</span>`).join("") : `<div class="muted">No commands configured by backend project settings.</div>`}</div>`; }
+function commandsCard(){ const commands=configuredCommands(); return `<div class="card side-card"><div class="h3" style="margin-bottom:10px">Related commands</div>${commands.length ? commands.map(c=>`<span class="command">${esc(c)}</span>`).join("") : `<div class="muted">No commands configured by backend project settings or global plugins.</div>`}</div>`; }
 function memorySnippetsCard(){ return `<div class="card side-card"><div class="side-title"><div class="h3">Memory / Context</div><a class="link">View in Memory</a></div><div class="muted" style="font-size:12px">Relevant snippets</div><div class="snippet"><b>Project Memory</b><br/>${esc(JSON.stringify(state.memory || {}).slice(0,120) || "No memory recorded yet.")}</div><div class="snippet"><b>Workflow Context</b><br/>Kanban remains the state-machine driver.</div></div>`; }
 function filesHtml(artifacts){ const paths=[]; (artifacts || []).forEach(a => { if (a.path) paths.push(a.path); const payload = a.payload || {}; (payload.changed_paths || payload.paths || []).forEach(x => paths.push(String(x))); }); const list=paths.slice(0,6); return `<div class="files" style="margin-top:10px">${list.length ? list.map(p=>`<div class="files-row"><span>${esc(p)}</span><span class="muted">artifact</span></div>`).join("") : `<div class="muted">No linked files returned by backend artifacts.</div>`}</div>`; }
 function taskListPanel(active){ const tasks=allTasks(); return `<aside class="card task-list-panel"><div class="page-head" style="align-items:flex-start"><div><div class="h3">Task List</div><div class="muted" style="font-size:12px">${tasks.length} tasks in current project</div></div><button class="small-button" onclick="createTaskFromPrompt()">New</button></div>${tasks.length ? tasks.map(t=>`<button class="task-list-item ${active && active.id===t.id ? "active" : ""}" data-task="${escAttr(t.id)}"><div class="task-list-title">${esc(t.title || "Untitled task")}</div><div class="task-list-meta"><span>${esc(STAGE_TITLES[t.status_key] || t.status_key || "-")}</span><span>${compact(taskUsageTotals(t.id).total)} tokens</span></div></button>`).join("") : `<div class="muted">No tasks returned by backend.</div>`}</aside>`; }
@@ -399,7 +401,7 @@ function workflowHealthSmallCard(){ return `<div class="card card-pad"><div clas
 function defaultTaskPolicy(){ return {task_identity:"conversation_groups_related_messages", new_task_trigger:"explicit_new_work_or_agent_decision", approval_mode:"auto", memory_policy:"task_and_project", workflow_driver:"kanban_state_machine", manual_actions:["retry","abandon"]}; }
 function activeSection(){ const hash = location.hash.replace("#", "").trim().toLowerCase(); return ["events","memory","analytics","settings"].includes(hash) ? hash : ""; }
 function activeNav(){ return state.section || state.page; }
-function configuredCommands(){ const params=state.settings.parameters || {}; const requests=params.post_apply_tool_requests || params.tool_requests || params.commands || []; if(!Array.isArray(requests)) return []; return requests.map(item => Array.isArray(item.command) ? item.command.join(" ") : item.command || item.name || item.tool || String(item)).filter(Boolean); }
+function configuredCommands(){ const params=state.settings.parameters || {}; const requests=params.post_apply_tool_requests || params.tool_requests || params.commands || []; const projectCommands = Array.isArray(requests) ? requests.map(item => Array.isArray(item.command) ? item.command.join(" ") : item.command || item.name || item.tool || String(item)).filter(Boolean) : []; const pluginCommands = (state.pluginCommands || []).map(command => command.slash || `/${command.command_id}`).filter(Boolean); return [...projectCommands, ...pluginCommands]; }
 function projectHealth(stats){ const failed=Number(stats.failed_tasks || 0); const active=Number(stats.active_tasks || 0); if(failed) return {label:"Attention", badge:"orange", dot:"orange"}; if(active) return {label:"Active", badge:"green", dot:"green"}; return {label:"Idle", badge:"blue", dot:"blue"}; }
 function projectSpark(stats){ const values=[stats.request_count || 0, stats.llm_calls || 0, stats.input_tokens || 0, stats.output_tokens || 0].map(Number); const max=Math.max(...values, 1); return `<div class="mini-spark">${values.map(v=>`<i style="height:${Math.max(3, Math.round((v / max) * 24))}px"></i>`).join("")}</div>`; }
 function projectUsageMini(stats){ const values=[stats.request_count || 0, stats.llm_calls || 0, stats.input_tokens || 0, stats.output_tokens || 0].map(Number); const total=values.reduce((a,b)=>a+b,0); if(!total) return `<div class="mini-usage"><div class="mini-usage-label">Usage mix</div><div class="mini-usage-legend">No usage</div></div>`; const max=Math.max(...values, 1); return `<div class="mini-usage"><div class="mini-usage-label">Usage mix</div><div class="mini-usage-bars">${values.map(v=>`<i style="height:${Math.max(3, Math.round((v / max) * 24))}px"></i>`).join("")}</div><div class="mini-usage-legend">Req / LLM / In / Out</div></div>`; }
@@ -623,7 +625,7 @@ async function saveEditor(card) {
 }
 async function togglePluginEnabled(pluginId, enabled) {
   await api(`${API}/plugins/${encodeURIComponent(pluginId)}`, {method:"PATCH", body:JSON.stringify({enabled})});
-  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills()]);
+  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills(), loadPluginCommands()]);
   renderShell();
   notify(`${pluginId} ${enabled ? "enabled" : "disabled"}.`);
 }
@@ -631,7 +633,7 @@ async function importGlobalPlugin() {
   const sourcePath = ($("pluginImportPath")?.value || "").trim();
   if (!sourcePath) { notify("Plugin source path is required.", "error"); return; }
   await api(`${API}/plugins/import`, {method:"POST", body:JSON.stringify({source_path: sourcePath})});
-  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills()]);
+  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills(), loadPluginCommands()]);
   renderShell();
   notify("Plugin imported.");
 }
@@ -644,7 +646,7 @@ async function validateGlobalPlugin() {
 }
 async function removeGlobalPlugin(pluginId) {
   await api(`${API}/plugins/${encodeURIComponent(pluginId)}`, {method:"DELETE"});
-  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills()]);
+  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills(), loadPluginCommands()]);
   renderShell();
   notify(`${pluginId} removed.`);
 }
@@ -660,7 +662,7 @@ async function importMarketplacePlugin() {
   const pluginName = ($("pluginMarketplaceName")?.value || "").trim();
   if (!marketplacePath || !pluginName) { notify("Marketplace path and plugin name are required.", "error"); return; }
   await api(`${API}/plugins/import-marketplace`, {method:"POST", body:JSON.stringify({marketplace_path: marketplacePath, plugin_name: pluginName})});
-  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills()]);
+  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills(), loadPluginCommands()]);
   renderShell();
   notify(`${pluginName} imported.`);
 }

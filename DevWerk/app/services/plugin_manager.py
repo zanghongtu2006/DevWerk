@@ -233,6 +233,54 @@ def list_enabled_plugin_skills() -> list[dict[str, Any]]:
     return skills
 
 
+def list_enabled_plugin_commands() -> list[dict[str, Any]]:
+    commands: list[dict[str, Any]] = []
+    for plugin in list_global_plugins():
+        if not plugin.get("enabled", True):
+            continue
+        try:
+            detail = get_global_plugin(str(plugin["id"]))
+        except KeyError:
+            continue
+        for command in detail.get("commands") or []:
+            if not isinstance(command, dict):
+                continue
+            command_id = f"{plugin['id']}:{command.get('id')}"
+            commands.append(
+                {
+                    **command,
+                    "plugin_id": plugin["id"],
+                    "command_id": command_id,
+                    "scope": "plugin",
+                    "slash": f"/{command_id}",
+                }
+            )
+    return commands
+
+
+def get_plugin_command(command_id: str) -> dict[str, Any]:
+    cid = _safe_command_ref(command_id)
+    plugin_id, _, local_id = cid.partition(":")
+    if not plugin_id or not local_id:
+        plugin_id, _, local_id = cid.partition(".")
+    if not plugin_id or not local_id:
+        raise KeyError(f"plugin command id must be <plugin>:<command>: {cid}")
+    plugin = get_global_plugin(plugin_id)
+    if not plugin.get("enabled", True):
+        raise KeyError(f"plugin is disabled: {plugin_id}")
+    for command in plugin.get("commands") or []:
+        if command.get("id") == local_id:
+            command_id_value = f"{plugin_id}:{local_id}"
+            return {
+                **command,
+                "plugin_id": plugin_id,
+                "command_id": command_id_value,
+                "scope": "plugin",
+                "slash": f"/{command_id_value}",
+            }
+    raise KeyError(f"plugin command not found: {cid}")
+
+
 def get_plugin_skill(skill_id: str) -> dict[str, Any]:
     sid = _safe_skill_ref(skill_id)
     if "." not in sid:
@@ -513,3 +561,11 @@ def _safe_skill_ref(value: str) -> str:
     if not text:
         raise ValueError("skill id is required")
     return text[:160]
+
+
+def _safe_command_ref(value: str) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9._:-]+", "-", text).strip("-._:")
+    if not text:
+        raise ValueError("command id is required")
+    return text[:180]

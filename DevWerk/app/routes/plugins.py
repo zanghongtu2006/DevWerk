@@ -7,8 +7,10 @@ from pydantic import BaseModel, Field
 
 from app.services.plugin_manager import (
     get_global_plugin,
+    get_plugin_command,
     import_global_plugin,
     import_marketplace_plugin,
+    list_enabled_plugin_commands,
     list_marketplace_plugins,
     list_global_plugins,
     remove_global_plugin,
@@ -51,6 +53,19 @@ class PluginMarketplaceImportRequest(BaseModel):
 @router.get("")
 def plugins_list():
     return {"ok": True, "plugins": list_global_plugins()}
+
+
+@router.get("/commands")
+def plugins_commands():
+    return {"ok": True, "commands": list_enabled_plugin_commands()}
+
+
+@router.get("/commands/{command_id}")
+def plugins_command_get(command_id: str):
+    try:
+        return {"ok": True, "command": get_plugin_command(command_id)}
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("/marketplace")

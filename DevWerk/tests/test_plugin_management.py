@@ -288,6 +288,56 @@ def test_plugin_skills_are_available_to_agent_skill_resolution(monkeypatch, tmp_
     assert resolved[0]["scope"] == "plugin"
 
 
+def test_plugin_commands_are_available_as_slash_commands(monkeypatch, tmp_path):
+    plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
+    _write_plugin(plugins_root)
+
+    from app.services.plugin_manager import get_plugin_command, list_enabled_plugin_commands
+
+    commands = {item["command_id"]: item for item in list_enabled_plugin_commands()}
+    assert "ui-observer:audit-ui" in commands
+    assert commands["ui-observer:audit-ui"]["slash"] == "/ui-observer:audit-ui"
+
+    command = get_plugin_command("ui-observer:audit-ui")
+    assert command["plugin_id"] == "ui-observer"
+    assert "Capture browser evidence" in command["content"]
+
+
+def test_project_conversation_executes_plugin_slash_command(monkeypatch, tmp_path):
+    plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
+    _write_plugin(plugins_root)
+
+    class FakeSettings:
+        def __init__(self, db_path, session_dir):
+            self.devwerk_db_path = str(db_path)
+            self.devwerk_usage_tracking = False
+            self.devwerk_session_dir = str(session_dir)
+
+    import app.services.kanban as kanban_service
+    import app.services.session_store as session_store
+    import app.main as main_module
+
+    fake = FakeSettings(tmp_path / "devwerk.db", tmp_path / "sessions")
+    monkeypatch.setattr(kanban_service, "settings", lambda: fake)
+    monkeypatch.setattr(session_store, "settings", lambda: fake)
+    kanban_service._initialized = False
+
+    app = main_module.create_app()
+    with TestClient(app) as client:
+        result = client.post(
+            "/v1/kanban/projects/plugin-command-project/conversation",
+            json={"message": "/ui-observer:audit-ui inspect dashboard"},
+        )
+        events = client.get("/v1/kanban/events", params={"project_id": "plugin-command-project"}).json()["events"]
+
+    assert result.status_code == 200
+    payload = result.json()["payload"]
+    assert payload["command"] == "ui-observer:audit-ui"
+    assert payload["argument"] == "inspect dashboard"
+    assert "Capture browser evidence" in payload["content"]
+    assert any(event["event_type"] == "project_plugin_command" for event in events)
+
+
 def test_backend_web_ui_exposes_plugin_management_controls():
     js = (Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "dashboard.js").read_text(encoding="utf-8")
 
@@ -300,5 +350,6 @@ def test_backend_web_ui_exposes_plugin_management_controls():
     assert "importMarketplacePlugin" in js
     assert "removeGlobalPlugin" in js
     assert "validateGlobalPlugin" in js
+    assert "pluginCommands" in js
     assert "togglePluginEnabled" in js
     assert "/plugins" in js

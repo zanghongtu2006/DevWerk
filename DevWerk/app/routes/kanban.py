@@ -41,6 +41,7 @@ from app.services.skill_manager import (
     list_project_skills,
     upsert_project_skill,
 )
+from app.services.plugin_manager import get_plugin_command
 from app.services.verification_policy import verification_failed, verification_has_policy
 from app.services.workflow import apply_workflow_action, current_workflow_state
 from app.services.workflow_designer import design_project_workflow
@@ -340,7 +341,7 @@ def kanban_project_conversation_message(project_id: str, req: ProjectConversatio
             command=slash["command"],
             argument=slash["argument"],
             messages=messages,
-            metadata=req.metadata,
+            metadata={**req.metadata, "plugin_command": slash.get("plugin_command")},
         )
 
     if action in {"goal", "learn", "distill"}:
@@ -734,6 +735,9 @@ def _parse_project_slash_command(text: str) -> dict[str, str] | None:
     head, _, rest = stripped[1:].partition(" ")
     command = head.strip().lower().replace("-", "_")
     if command not in {"goal", "learn", "distill"}:
+        plugin_command = head.strip().lower()
+        if ":" in plugin_command or "." in plugin_command:
+            return {"command": "plugin_command", "plugin_command": plugin_command, "argument": rest.strip()}
         raise HTTPException(status_code=400, detail=f"unsupported slash command: /{command}")
     return {"command": command, "argument": rest.strip()}
 
@@ -794,6 +798,14 @@ def _handle_project_slash_command(
         )
         reply = "Project conversation distilled into Project.MD and project memory."
         payload = {"command": "distill", "summary": distillation, "project_md_chars": len(updated)}
+    elif normalized == "plugin_command":
+        payload = _handle_project_plugin_command_payload(
+            project_id,
+            command_id=str(metadata.get("plugin_command") or ""),
+            argument=argument,
+            metadata=metadata,
+        )
+        reply = payload["reply"]
     else:
         raise HTTPException(status_code=400, detail=f"unsupported slash command: /{normalized}")
 
@@ -810,6 +822,35 @@ def _handle_project_slash_command(
         "command": normalized,
         "reply": reply,
         "payload": payload,
+    }
+
+
+def _handle_project_plugin_command_payload(
+    project_id: str,
+    *,
+    command_id: str,
+    argument: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        command = get_plugin_command(command_id)
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    summary = command.get("summary") or command.get("id") or command_id
+    content = str(command.get("content") or "")
+    payload = {
+        "command": command.get("command_id") or command_id,
+        "plugin_id": command.get("plugin_id"),
+        "command_id": command.get("id"),
+        "argument": argument.strip(),
+        "summary": summary,
+        "content": content,
+        "metadata": metadata,
+    }
+    add_project_event(project_id, "project_plugin_command", payload)
+    return {
+        **payload,
+        "reply": f"Plugin command loaded: /{payload['command']}. Use the command instructions as project context for the next workflow decision.",
     }
 
 
