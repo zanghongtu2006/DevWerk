@@ -676,6 +676,7 @@ def _create_promotion_candidate(project_id: str, task_id: str, run_id: str, item
         target = "known_issue"
     candidate_id = f"cand_{uuid.uuid4()}"
     now = _now()
+    confidence = _confidence_score(item.get("confidence"))
     with _conn() as conn:
         conn.execute(
             """
@@ -692,7 +693,7 @@ def _create_promotion_candidate(project_id: str, task_id: str, run_id: str, item
                 target,
                 _json(item.get("content") if isinstance(item.get("content"), dict) else {"value": item.get("content")}),
                 str(item.get("reason") or ""),
-                float(item.get("confidence") or 0),
+                confidence,
                 now,
                 now,
             ),
@@ -716,10 +717,44 @@ def _create_promotion_candidate(project_id: str, task_id: str, run_id: str, item
         "target_memory_type": target,
         "content": item.get("content") if isinstance(item.get("content"), dict) else {"value": item.get("content")},
         "reason": str(item.get("reason") or ""),
-        "confidence": float(item.get("confidence") or 0),
+        "confidence": confidence,
         "status": "candidate",
         "created_at": now,
     }
+
+
+def _confidence_score(value: Any) -> float:
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if isinstance(value, (int, float)):
+        return max(0.0, min(1.0, float(value)))
+    text = str(value or "").strip().lower()
+    if not text:
+        return 0.0
+    labels = {
+        "none": 0.0,
+        "unknown": 0.0,
+        "low": 0.25,
+        "weak": 0.25,
+        "medium": 0.5,
+        "moderate": 0.5,
+        "mid": 0.5,
+        "high": 0.75,
+        "strong": 0.75,
+        "certain": 0.95,
+        "very high": 0.95,
+    }
+    if text in labels:
+        return labels[text]
+    if text.endswith("%"):
+        try:
+            return max(0.0, min(1.0, float(text[:-1].strip()) / 100.0))
+        except ValueError:
+            return 0.0
+    try:
+        return max(0.0, min(1.0, float(text)))
+    except ValueError:
+        return 0.0
 
 
 def _get_run(run_id: str) -> dict[str, Any]:

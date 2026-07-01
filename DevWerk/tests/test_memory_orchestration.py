@@ -175,6 +175,39 @@ def test_memory_repository_context_writeback_and_promotion(monkeypatch, tmp_path
     assert any(item["content"].get("rule", "").startswith("Tenant API paths") for item in project_rules)
 
 
+def test_memory_writeback_accepts_text_confidence(monkeypatch, tmp_path):
+    kanban, memory = _configure(monkeypatch, tmp_path)
+    kanban.update_project_workflow("memory-confidence", _memory_workflow())
+    task = kanban.create_task(project_id="memory-confidence", title="Distill note")["task"]
+    run = memory.create_agent_run(
+        project_id="memory-confidence",
+        task_id=task["id"],
+        workflow_id="memory-flow",
+        agent_role="writer",
+        stage="write",
+        token_budget=900,
+    )
+
+    writeback = memory.handle_agent_writeback(
+        run["run_id"],
+        {
+            "project_memory_candidates": [
+                {
+                    "target_memory_type": "known_issue",
+                    "content": {"issue": "Provider may describe confidence as natural language."},
+                    "reason": "Observed in real LLM smoke.",
+                    "confidence": "medium",
+                }
+            ],
+        },
+    )
+
+    candidates = memory.list_promotion_candidates(project_id="memory-confidence", task_id=task["id"])["candidates"]
+    assert writeback["ok"] is True
+    assert candidates[0]["confidence"] == 0.5
+    assert writeback["promotion_candidates"][0]["confidence"] == 0.5
+
+
 def test_memory_api_surface_and_task_memory_view(monkeypatch, tmp_path):
     kanban, _memory = _configure(monkeypatch, tmp_path)
     import app.main as main_module

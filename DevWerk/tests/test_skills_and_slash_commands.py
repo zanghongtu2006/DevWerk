@@ -176,6 +176,41 @@ def test_project_conversation_slash_commands_update_project_md_and_memory(monkey
     assert any(message["kind"] == "slash_distill" for message in conversation)
 
 
+def test_project_slash_command_catalog_includes_builtin_and_plugin_commands(monkeypatch, tmp_path):
+    _configure(monkeypatch, tmp_path)
+    import app.services.plugin_manager as plugin_manager
+    import app.main as main_module
+
+    plugins_root = tmp_path / "plugins"
+    plugins_root.mkdir()
+    monkeypatch.setattr(plugin_manager, "_global_plugins_root", lambda: plugins_root)
+    plugin = plugins_root / "ui-observer"
+    (plugin / ".claude-plugin").mkdir(parents=True)
+    (plugin / "commands").mkdir()
+    (plugin / ".claude-plugin" / "plugin.json").write_text(
+        '{"name":"ui-observer","version":"0.1.0","description":"UI observer"}',
+        encoding="utf-8",
+    )
+    (plugin / "commands" / "audit-ui.md").write_text(
+        "---\ndescription: Audit UI with browser evidence\n---\n\nUse browser evidence.",
+        encoding="utf-8",
+    )
+
+    app = main_module.create_app()
+    with TestClient(app) as client:
+        response = client.get("/v1/kanban/projects/slash-catalog/slash-commands")
+
+    assert response.status_code == 200
+    commands = {item["command"]: item for item in response.json()["commands"]}
+    assert "/goal" in commands
+    assert commands["/goal"]["source"] == "builtin"
+    assert "/learn" in commands
+    assert "/distill" in commands
+    assert "/ui-observer:audit-ui" in commands
+    assert commands["/ui-observer:audit-ui"]["source"] == "plugin"
+    assert commands["/ui-observer:audit-ui"]["summary"] == "Audit UI with browser evidence"
+
+
 def test_backend_web_ui_exposes_skill_management_and_slash_commands():
     from pathlib import Path
 
@@ -186,8 +221,9 @@ def test_backend_web_ui_exposes_skill_management_and_slash_commands():
     assert "loadProjectSkills" in js
     assert "Global Skill:" in js
     assert "Project Skill:" in js
-    assert "/goal project objective" in js
-    assert "/learn reusable rule" in js
-    assert "/distill compact this project context" in js
+    assert "loadSlashCommands" in js
+    assert 'command:"/goal", argument_hint:"project objective"' in js
+    assert 'command:"/learn", argument_hint:"reusable rule"' in js
+    assert 'command:"/distill", argument_hint:"compact this project context"' in js
     assert "parseSlashCommand" in js
     assert ".slash-hint" in css

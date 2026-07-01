@@ -41,7 +41,7 @@ from app.services.skill_manager import (
     list_project_skills,
     upsert_project_skill,
 )
-from app.services.plugin_manager import get_plugin_command
+from app.services.plugin_manager import get_plugin_command, list_enabled_plugin_commands
 from app.services.verification_policy import verification_failed, verification_has_policy
 from app.services.workflow import apply_workflow_action, current_workflow_state
 from app.services.workflow_designer import design_project_workflow
@@ -314,6 +314,50 @@ def kanban_project_conversation(project_id: str, limit: int = 80):
             }
         )
     return {"ok": True, "project_id": project_id, "messages": messages, "active_task": _active_project_task(project_id)}
+
+
+@router.get("/projects/{project_id}/slash-commands")
+def kanban_project_slash_commands(project_id: str):
+    builtin = [
+        {
+            "command": "/goal",
+            "id": "goal",
+            "source": "builtin",
+            "summary": "Record or update the project goal in Project.MD.",
+            "argument_hint": "project objective",
+        },
+        {
+            "command": "/learn",
+            "id": "learn",
+            "source": "builtin",
+            "summary": "Record reusable project knowledge in Project.MD and project memory.",
+            "argument_hint": "reusable rule",
+        },
+        {
+            "command": "/distill",
+            "id": "distill",
+            "source": "builtin",
+            "summary": "Compact recent project conversation into Project.MD and project memory.",
+            "argument_hint": "compact this project context",
+        },
+    ]
+    plugin_commands = []
+    for item in list_enabled_plugin_commands():
+        if not isinstance(item, dict):
+            continue
+        frontmatter = item.get("frontmatter") if isinstance(item.get("frontmatter"), dict) else {}
+        plugin_commands.append(
+            {
+                "command": str(item.get("slash") or f"/{item.get('command_id')}"),
+                "id": str(item.get("command_id") or ""),
+                "source": "plugin",
+                "plugin_id": str(item.get("plugin_id") or ""),
+                "summary": str(item.get("summary") or item.get("id") or item.get("command_id") or ""),
+                "argument_hint": str(item.get("argument_hint") or frontmatter.get("argument-hint") or ""),
+                "frontmatter": frontmatter,
+            }
+        )
+    return {"ok": True, "project_id": project_id, "commands": [*builtin, *plugin_commands]}
 
 
 @router.post("/projects/{project_id}/conversation")

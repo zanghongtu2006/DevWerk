@@ -24,6 +24,7 @@ const state = {
   pluginMarketplace: null,
   pluginValidation: null,
   projectSkills: [],
+  slashCommands: [],
   stream: null,
   streamProjectId: "",
   streamStatus: "disconnected",
@@ -44,7 +45,7 @@ async function api(path, options = {}) {
 }
 async function refreshAll() {
   await loadProjects();
-  await Promise.allSettled([loadBoard(), loadEvents(), loadConversation(), loadSettings(), loadGlobalSettings(), loadWorkflow(), loadMemory(), loadUsage(), loadProjectMd(), loadGlobalSkills(), loadGlobalPlugins(), loadPluginCommands(), loadPluginAgents(), loadPluginHooks(), loadPluginMcpServers(), loadPluginSettings(), loadProjectSkills()]);
+  await Promise.allSettled([loadBoard(), loadEvents(), loadConversation(), loadSettings(), loadGlobalSettings(), loadWorkflow(), loadMemory(), loadUsage(), loadProjectMd(), loadGlobalSkills(), loadGlobalPlugins(), loadPluginCommands(), loadPluginAgents(), loadPluginHooks(), loadPluginMcpServers(), loadPluginSettings(), loadProjectSkills(), loadSlashCommands()]);
   renderShell();
   connectProjectStream();
 }
@@ -81,6 +82,7 @@ async function loadPluginSettings() {
   state.pluginSettings = out;
 }
 async function loadProjectSkills() { try { const data = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/skills`); const skills = data.skills || []; const detailed = await Promise.all(skills.map(async skill => (await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/skills/${encodeURIComponent(skill.id)}`).catch(() => ({skill}))).skill || skill)); state.projectSkills = detailed; } catch (_) { state.projectSkills = []; } }
+async function loadSlashCommands() { try { const data = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/slash-commands`); state.slashCommands = data.commands || []; } catch (_) { state.slashCommands = []; } }
 async function loadWorkflow() { try { const data = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/workflow`); state.workflow = data.workflow || data || {}; } catch (_) { state.workflow = {}; } }
 async function loadMemory() { try { state.memory = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/memory`); } catch (_) { state.memory = {}; } }
 async function loadProjectMd() { try { const data = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/project-md`); state.projectMd = data.content || ""; } catch (_) { state.projectMd = ""; } }
@@ -293,7 +295,15 @@ function pipelineHtml() {
 function healthCard(){ const failed=(currentProject().stats || {}).failed_tasks || 0; const active=activeStage(); const stages=columns().map(c=>c.status_key); return `<div class="card card-pad"><div style="display:flex;gap:10px;align-items:center"><span class="ok">${failed ? "!" : "OK"}</span><div><div class="h3">${failed ? "Attention" : "No failed tasks"}</div><div class="muted" style="font-size:12px">Derived from backend Kanban state.</div></div></div><div style="margin-top:18px" class="muted">Active Stage</div><div style="margin-top:8px"><span class="badge blue">${esc(active ? stageTitle(active) : "-")}</span></div><div class="muted" style="font-size:12px;margin-top:6px">${active ? statusCount(active) : 0} tasks in active stage</div><div class="progress"><span style="width:${active && stages.length ? Math.max(3, Math.round(((stages.indexOf(active) + 1) / stages.length) * 100)) : 0}%"></span></div></div>`; }
 function usageCard(u, title="Token Usage", rows=null){ return `<div class="card card-pad"><div style="display:flex;justify-content:space-between;gap:10px"><div class="h3">${esc(title)}</div><span class="muted" style="font-size:12px">Backend usage DB</span></div><div style="font-size:20px;font-weight:850;margin-top:12px">${compact(u.total)} total tokens</div><div class="progress"><span style="width:${u.total ? 100 : 0}%"></span></div><div class="metric-lines"><div class="metric-line"><span>Input Tokens</span><b>${compact(u.input)}</b></div><div class="metric-line"><span>Output Tokens</span><b>${compact(u.output)}</b></div><div class="metric-line"><span>LLM Calls</span><b>${compact(u.calls)}</b></div><div class="metric-line"><span>Requests</span><b>${compact(u.request_count)}</b></div></div>${usageBars(rows || state.usage.by_task || state.usage.projects || [])}</div>`; }
 function routingCard(){ return `<div class="card card-pad"><div class="h3">Agent Route</div><div class="muted" style="font-size:12px;margin-top:4px">Routes map agent responsibilities to model configs; they are not model names.</div><div class="metric-lines" style="margin-top:12px"><div><div class="muted">Project Default</div><b>${esc(modelRoutes()[0] || "default")}</b></div><div><div class="muted">Project Routes</div><b>${esc(modelRoutes().join(", ") || "default")}</b></div><div><div class="muted">Thinking Mode</div><b>${esc((state.settings.parameters || {}).thinking_mode || "Balanced")}</b></div></div></div>`; }
-function conversationCard(){ return `<section class="card chat-card"><div class="tabs">${conversationTabs().map(tab=>`<button class="tab tab-button ${state.conversationTab===tab.key?"active":""}" data-chat-tab="${tab.key}">${tab.label}</button>`).join("")}</div><div id="chatBody" class="chat-body">${conversationTabContent()}</div><div class="composer"><div class="composer-box"><textarea id="prompt" class="composer-input" placeholder="Message DevWerk, or use /goal, /learn, /distill..."></textarea><div class="slash-hint"><b>Slash commands</b><span>/goal project objective</span><span>/learn reusable rule</span><span>/distill compact this project context</span></div><div class="composer-actions"><div class="tool-row"><span class="tool">A</span><span class="tool">F</span><span class="tool">&lt;/&gt;</span><span class="tool">B</span></div><div style="display:flex;gap:10px"><select class="select-pill">${modelRoutes().map(m=>`<option>${esc(m)}</option>`).join("") || "<option>default</option>"}</select><button id="send" class="send-button">></button></div></div></div></div></section>`; }
+function conversationCard(){ return `<section class="card chat-card"><div class="tabs">${conversationTabs().map(tab=>`<button class="tab tab-button ${state.conversationTab===tab.key?"active":""}" data-chat-tab="${tab.key}">${tab.label}</button>`).join("")}</div><div id="chatBody" class="chat-body">${conversationTabContent()}</div><div class="composer"><div class="composer-box"><textarea id="prompt" class="composer-input" placeholder="Message DevWerk, or use slash commands..."></textarea>${slashHintHtml()}<div class="composer-actions"><div class="tool-row"><span class="tool">A</span><span class="tool">F</span><span class="tool">&lt;/&gt;</span><span class="tool">B</span></div><div style="display:flex;gap:10px"><select class="select-pill">${modelRoutes().map(m=>`<option>${esc(m)}</option>`).join("") || "<option>default</option>"}</select><button id="send" class="send-button">></button></div></div></div></div></section>`; }
+function slashHintHtml(){
+  const commands = state.slashCommands && state.slashCommands.length ? state.slashCommands : [
+    {command:"/goal", argument_hint:"project objective", source:"builtin"},
+    {command:"/learn", argument_hint:"reusable rule", source:"builtin"},
+    {command:"/distill", argument_hint:"compact this project context", source:"builtin"}
+  ];
+  return `<div class="slash-hint"><b>Slash commands</b>${commands.slice(0,8).map(item => `<span title="${escAttr(item.summary || "")}">${esc(item.command)}${item.argument_hint ? " " + esc(item.argument_hint) : ""}${item.source === "plugin" ? " · plugin" : ""}</span>`).join("")}</div>`;
+}
 function conversationHtml() {
   const msgs = state.conversation.length ? state.conversation : [{role:"assistant", content:"I will help you break this down into actionable tasks and move them through the workflow. Tell me what you want DevWerk to build, review, research, or organize."}];
   return msgs.map(message => message.role === "user"
