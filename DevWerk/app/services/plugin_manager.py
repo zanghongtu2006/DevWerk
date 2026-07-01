@@ -364,6 +364,8 @@ def list_enabled_plugin_mcp_servers() -> list[dict[str, Any]]:
                     "plugin_id": plugin["id"],
                     "server_ref": f"{plugin['id']}:{local_id}",
                     "scope": "plugin",
+                    "plugin_root": plugin.get("path"),
+                    "resolved_config": _resolve_plugin_runtime_value(server.get("config") or {}, plugin.get("path")),
                 }
             )
     return servers
@@ -402,6 +404,18 @@ def get_plugin_agent(agent_id: str) -> dict[str, Any]:
     plugin = get_global_plugin(plugin_id)
     if not plugin.get("enabled", True):
         raise KeyError(f"plugin is disabled: {plugin_id}")
+    mcp_servers = [
+        {
+            **item,
+            "plugin_id": plugin_id,
+            "server_ref": f"{plugin_id}:{item.get('id')}",
+            "scope": "plugin",
+            "plugin_root": plugin.get("path"),
+            "resolved_config": _resolve_plugin_runtime_value(item.get("config") or {}, plugin.get("path")),
+        }
+        for item in plugin.get("mcp_servers") or []
+        if isinstance(item, dict)
+    ]
     for agent in plugin.get("agents") or []:
         if agent.get("id") == local_id:
             agent_id_value = f"{plugin_id}:{local_id}"
@@ -410,11 +424,7 @@ def get_plugin_agent(agent_id: str) -> dict[str, Any]:
                 "plugin_id": plugin_id,
                 "agent_id": agent_id_value,
                 "scope": "plugin",
-                "mcp_servers": [
-                    {"id": item.get("id"), "path": item.get("path")}
-                    for item in plugin.get("mcp_servers") or []
-                    if isinstance(item, dict)
-                ],
+                "mcp_servers": mcp_servers,
             }
     raise KeyError(f"plugin agent not found: {aid}")
 
@@ -565,6 +575,25 @@ def _discover_mcp_servers(path: Path, manifest: dict[str, Any]) -> list[dict[str
         for server_id, config in inline.items():
             discovered[str(server_id)] = {"config": config if isinstance(config, dict) else {}, "path": str(path / MANIFEST_PATH)}
     return [{"id": server_id, **payload} for server_id, payload in sorted(discovered.items())]
+
+
+def _resolve_plugin_runtime_value(value: Any, plugin_root: object) -> Any:
+    root = str(plugin_root or "")
+    if isinstance(value, dict):
+        return {key: _resolve_plugin_runtime_value(item, root) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_resolve_plugin_runtime_value(item, root) for item in value]
+    if not isinstance(value, str):
+        return value
+    resolved = (
+        value.replace("${CLAUDE_PLUGIN_ROOT}", root)
+        .replace("${DEVWERK_PLUGIN_ROOT}", root)
+        .replace("$CLAUDE_PLUGIN_ROOT", root)
+        .replace("$DEVWERK_PLUGIN_ROOT", root)
+    )
+    if root and resolved.startswith(root) and ("/" in resolved or "\\" in resolved):
+        return str(Path(resolved))
+    return resolved
 
 
 def _component_paths(plugin_root: Path, default_path: str, manifest_value: object = None) -> list[Path]:

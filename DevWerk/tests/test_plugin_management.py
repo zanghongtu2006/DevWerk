@@ -429,6 +429,37 @@ def test_plugin_hooks_and_mcp_servers_are_available_as_runtime_catalog(monkeypat
     assert servers["ui-observer:playwright"]["scope"] == "plugin"
 
 
+def test_plugin_mcp_server_runtime_config_resolves_plugin_root(monkeypatch, tmp_path):
+    plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
+    plugin = _write_plugin(plugins_root, "runtime-mcp")
+    (plugin / "servers").mkdir()
+    (plugin / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "browser": {
+                        "command": "node",
+                        "args": ["${CLAUDE_PLUGIN_ROOT}/servers/browser.js"],
+                        "env": {"PLUGIN_HOME": "${DEVWERK_PLUGIN_ROOT}"},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    from app.services.plugin_manager import get_plugin_agent, list_enabled_plugin_mcp_servers
+
+    server = {item["server_ref"]: item for item in list_enabled_plugin_mcp_servers()}["runtime-mcp:browser"]
+    assert server["plugin_root"] == str(plugin)
+    assert server["resolved_config"]["args"][0] == str(plugin / "servers" / "browser.js")
+    assert server["resolved_config"]["env"]["PLUGIN_HOME"] == str(plugin)
+
+    agent = get_plugin_agent("runtime-mcp:ui-observer")
+    assert agent["mcp_servers"][0]["server_ref"] == "runtime-mcp:browser"
+    assert agent["mcp_servers"][0]["resolved_config"]["command"] == "node"
+
+
 def test_plugin_hooks_and_mcp_servers_api(monkeypatch, tmp_path):
     plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
     _write_plugin(plugins_root)
