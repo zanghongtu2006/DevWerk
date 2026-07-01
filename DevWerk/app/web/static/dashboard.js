@@ -18,6 +18,7 @@ const state = {
   globalPlugins: [],
   pluginCommands: [],
   pluginAgents: [],
+  pluginSettings: {},
   pluginMarketplace: null,
   pluginValidation: null,
   projectSkills: [],
@@ -41,7 +42,7 @@ async function api(path, options = {}) {
 }
 async function refreshAll() {
   await loadProjects();
-  await Promise.allSettled([loadBoard(), loadEvents(), loadConversation(), loadSettings(), loadGlobalSettings(), loadWorkflow(), loadMemory(), loadUsage(), loadProjectMd(), loadGlobalSkills(), loadGlobalPlugins(), loadPluginCommands(), loadPluginAgents(), loadProjectSkills()]);
+  await Promise.allSettled([loadBoard(), loadEvents(), loadConversation(), loadSettings(), loadGlobalSettings(), loadWorkflow(), loadMemory(), loadUsage(), loadProjectMd(), loadGlobalSkills(), loadGlobalPlugins(), loadPluginCommands(), loadPluginAgents(), loadPluginSettings(), loadProjectSkills()]);
   renderShell();
   connectProjectStream();
 }
@@ -63,6 +64,18 @@ async function loadGlobalSkills() { try { const data = await api(`${API}/skills`
 async function loadGlobalPlugins() { try { const data = await api(`${API}/plugins`); state.globalPlugins = data.plugins || []; } catch (_) { state.globalPlugins = []; } }
 async function loadPluginCommands() { try { const data = await api(`${API}/plugins/commands`); state.pluginCommands = data.commands || []; } catch (_) { state.pluginCommands = []; } }
 async function loadPluginAgents() { try { const data = await api(`${API}/plugins/agents`); state.pluginAgents = data.agents || []; } catch (_) { state.pluginAgents = []; } }
+async function loadPluginSettings() {
+  const out = {};
+  await Promise.all((state.globalPlugins || []).map(async plugin => {
+    try {
+      const data = await api(`${API}/plugins/${encodeURIComponent(plugin.id)}/settings`);
+      out[plugin.id] = data.settings || {};
+    } catch (_) {
+      out[plugin.id] = {};
+    }
+  }));
+  state.pluginSettings = out;
+}
 async function loadProjectSkills() { try { const data = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/skills`); const skills = data.skills || []; const detailed = await Promise.all(skills.map(async skill => (await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/skills/${encodeURIComponent(skill.id)}`).catch(() => ({skill}))).skill || skill)); state.projectSkills = detailed; } catch (_) { state.projectSkills = []; } }
 async function loadWorkflow() { try { const data = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/workflow`); state.workflow = data.workflow || data || {}; } catch (_) { state.workflow = {}; } }
 async function loadMemory() { try { state.memory = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/memory`); } catch (_) { state.memory = {}; } }
@@ -183,6 +196,7 @@ function renderSettingsSection() {
       <div style="margin-top:14px" class="config-grid">${editorCard("Global LLM Catalog","Provider credentials, base URLs, and model definitions.","JSON", JSON.stringify(global.llms || {}, null, 2))}${editorCard("Global Routing Map","Model route aliases mapped to provider/model configs. These are not workflow columns or agent names.","JSON", JSON.stringify(global.routing || {}, null, 2))}<div class="side-stack">${globalRoutingSummaryCard()}${skillSummaryCard()}${pluginSummaryCard()}${settingsTile("Dynamic Node Agents", "Workflow driven", "Project workflow nodes spawn temporary agents at runtime. Only project-agent and context-indexer are built in.")}</div></div>
       <div style="margin-top:14px" class="config-grid single-row">${globalPluginCards()}</div>
       <div style="margin-top:14px" class="config-grid single-row">${pluginAgentCards()}</div>
+      <div style="margin-top:14px" class="config-grid single-row">${pluginSettingsEditors()}</div>
       <div style="margin-top:14px" class="config-grid single-row">${globalSkillEditors()}</div>
     </section>
     <aside class="side-stack">${usageCard(usageTotals(state.globalUsage), "Global Usage", state.globalUsage.by_project || state.globalUsage.projects || [])}${recentEventsCard()}</aside>
@@ -347,6 +361,15 @@ function globalPluginCards(){
 function pluginAgentCards(){
   const agents = state.pluginAgents || [];
   return `<section class="card card-pad"><div class="page-head"><div><div class="h3">Plugin Agents</div><div class="muted">Enabled plugin agent markdown is exposed as selectable runtime agent context. Use the stable agent_id in project workflow or agent settings.</div></div><span class="badge blue">${agents.length} available</span></div><div class="plugin-grid" style="margin-top:14px">${agents.length ? agents.map(agent => `<div class="card card-pad"><div class="h3">${esc(agent.summary || agent.id || agent.agent_id)}</div><div class="muted" style="font-size:12px">${esc(agent.agent_id || "")}</div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Plugin</b><span>${esc(agent.plugin_id || "-")}</span></div><div class="metric-line"><b>MCP Servers</b><span>${(agent.mcp_servers || []).length}</span></div><div class="metric-line"><b>Chars</b><span>${agent.chars || 0}</span></div></div></div>`).join("") : `<div class="muted">No enabled plugin agents returned by backend.</div>`}</div></section>`;
+}
+function pluginSettingsEditors(){
+  const plugins = state.globalPlugins || [];
+  if(!plugins.length) return "";
+  return `<section class="card card-pad"><div class="page-head"><div><div class="h3">Plugin Settings</div><div class="muted">Global per-plugin settings use frontmatter plus markdown, inspired by Claude Code .local.md configuration files.</div></div><span class="badge blue">Markdown</span></div><div class="config-grid single-row" style="margin-top:14px">${plugins.map(plugin => {
+    const settings = state.pluginSettings[plugin.id] || {};
+    const content = settings.content || `---\nenabled: ${plugin.enabled === false ? "false" : "true"}\n---\n\n# ${plugin.name || plugin.id} Settings\n`;
+    return editorCard(`Plugin Settings: ${plugin.id}`, "Frontmatter is parsed by the backend and markdown can carry plugin-specific instructions.", "Markdown", content);
+  }).join("")}</div></section>`;
 }
 function marketplacePreview(){
   const plugins = state.pluginMarketplace?.plugins || [];
@@ -623,16 +646,17 @@ async function saveEditor(card) {
   else if (title === "Workflow Definition") await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/workflow`, {method:"PUT", body:JSON.stringify({workflow: payload})});
   else if (title === "Global LLM Catalog") await api(`${API}/settings`, {method:"PUT", body:JSON.stringify({llms: payload})});
   else if (title === "Global Routing Map") await api(`${API}/settings`, {method:"PUT", body:JSON.stringify({routing: payload})});
+  else if (title.startsWith("Plugin Settings: ")) await api(`${API}/plugins/${encodeURIComponent(title.replace("Plugin Settings: ", ""))}/settings`, {method:"PUT", body:JSON.stringify({content: payload})});
   else if (title.startsWith("Global Skill: ")) await api(`${API}/skills/${encodeURIComponent(title.replace("Global Skill: ", ""))}`, {method:"PUT", body:JSON.stringify({skill_md: payload})});
   else if (title.startsWith("Project Skill: ")) await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/skills/${encodeURIComponent(title.replace("Project Skill: ", ""))}`, {method:"PUT", body:JSON.stringify({skill_md: payload, enabled:true})});
   else { notify(`${title} is read-only in this view.`); return; }
-  await Promise.allSettled([loadSettings(), loadGlobalSettings(), loadGlobalSkills(), loadGlobalPlugins(), loadPluginAgents(), loadProjectSkills(), loadWorkflow(), loadBoard(), loadProjectMd(), loadEvents()]);
+  await Promise.allSettled([loadSettings(), loadGlobalSettings(), loadGlobalSkills(), loadGlobalPlugins(), loadPluginAgents(), loadPluginSettings(), loadProjectSkills(), loadWorkflow(), loadBoard(), loadProjectMd(), loadEvents()]);
   renderShell();
   notify(`${title} saved.`);
 }
 async function togglePluginEnabled(pluginId, enabled) {
   await api(`${API}/plugins/${encodeURIComponent(pluginId)}`, {method:"PATCH", body:JSON.stringify({enabled})});
-  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills(), loadPluginCommands(), loadPluginAgents()]);
+  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills(), loadPluginCommands(), loadPluginAgents(), loadPluginSettings()]);
   renderShell();
   notify(`${pluginId} ${enabled ? "enabled" : "disabled"}.`);
 }
@@ -640,7 +664,7 @@ async function importGlobalPlugin() {
   const sourcePath = ($("pluginImportPath")?.value || "").trim();
   if (!sourcePath) { notify("Plugin source path is required.", "error"); return; }
   await api(`${API}/plugins/import`, {method:"POST", body:JSON.stringify({source_path: sourcePath})});
-  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills(), loadPluginCommands(), loadPluginAgents()]);
+  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills(), loadPluginCommands(), loadPluginAgents(), loadPluginSettings()]);
   renderShell();
   notify("Plugin imported.");
 }
@@ -653,7 +677,7 @@ async function validateGlobalPlugin() {
 }
 async function removeGlobalPlugin(pluginId) {
   await api(`${API}/plugins/${encodeURIComponent(pluginId)}`, {method:"DELETE"});
-  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills(), loadPluginCommands(), loadPluginAgents()]);
+  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills(), loadPluginCommands(), loadPluginAgents(), loadPluginSettings()]);
   renderShell();
   notify(`${pluginId} removed.`);
 }
@@ -669,7 +693,7 @@ async function importMarketplacePlugin() {
   const pluginName = ($("pluginMarketplaceName")?.value || "").trim();
   if (!marketplacePath || !pluginName) { notify("Marketplace path and plugin name are required.", "error"); return; }
   await api(`${API}/plugins/import-marketplace`, {method:"POST", body:JSON.stringify({marketplace_path: marketplacePath, plugin_name: pluginName})});
-  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills(), loadPluginCommands(), loadPluginAgents()]);
+  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills(), loadPluginCommands(), loadPluginAgents(), loadPluginSettings()]);
   renderShell();
   notify(`${pluginName} imported.`);
 }

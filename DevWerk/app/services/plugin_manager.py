@@ -9,6 +9,7 @@ from typing import Any
 
 MANIFEST_PATH = ".claude-plugin/plugin.json"
 STATE_PATH = ".devwerk-plugin.json"
+SETTINGS_PATH = ".devwerk-plugin-settings.md"
 SKILL_ENTRYPOINT = "SKILL.md"
 
 
@@ -90,6 +91,31 @@ def remove_global_plugin(plugin_id: str) -> dict[str, Any]:
         raise KeyError(f"global plugin not found: {pid}")
     shutil.rmtree(target)
     return {"ok": True, "id": pid, "removed": True}
+
+
+def get_plugin_settings(plugin_id: str) -> dict[str, Any]:
+    pid = _safe_plugin_id(plugin_id)
+    path = _global_plugin_path(pid)
+    if not (path / MANIFEST_PATH).is_file():
+        raise KeyError(f"global plugin not found: {pid}")
+    content = _read_text(path / SETTINGS_PATH)
+    parsed = _parse_frontmatter_markdown(content)
+    return {
+        "plugin_id": pid,
+        "path": str(path / SETTINGS_PATH),
+        "exists": bool(content),
+        "content": content,
+        **parsed,
+    }
+
+
+def update_plugin_settings(plugin_id: str, content: str) -> dict[str, Any]:
+    pid = _safe_plugin_id(plugin_id)
+    path = _global_plugin_path(pid)
+    if not (path / MANIFEST_PATH).is_file():
+        raise KeyError(f"global plugin not found: {pid}")
+    _write_markdown(path / SETTINGS_PATH, content)
+    return get_plugin_settings(pid)
 
 
 def import_global_plugin(source_path: str) -> dict[str, Any]:
@@ -573,6 +599,61 @@ def _read_text(path: Path) -> str:
         return path.read_text(encoding="utf-8-sig")
     except OSError:
         return ""
+
+
+def _parse_frontmatter_markdown(content: str) -> dict[str, Any]:
+    text = str(content or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not text.startswith("---\n"):
+        return {"frontmatter": {}, "body": text}
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        return {"frontmatter": {}, "body": text}
+    raw_frontmatter = text[4:end]
+    body = text[end + len("\n---\n") :]
+    return {"frontmatter": _parse_simple_yaml(raw_frontmatter), "body": body}
+
+
+def _parse_simple_yaml(raw: str) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or ":" not in stripped:
+            continue
+        key, value = stripped.split(":", 1)
+        key = key.strip()
+        if not key:
+            continue
+        out[key] = _coerce_yaml_scalar(value.strip())
+    return out
+
+
+def _coerce_yaml_scalar(value: str) -> Any:
+    text = value.strip()
+    if text.lower() == "true":
+        return True
+    if text.lower() == "false":
+        return False
+    if text.lower() in {"null", "none", "~"}:
+        return None
+    if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
+        return text[1:-1]
+    if re.match(r"^-?\d+$", text):
+        try:
+            return int(text)
+        except ValueError:
+            return text
+    if re.match(r"^-?\d+\.\d+$", text):
+        try:
+            return float(text)
+        except ValueError:
+            return text
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            value = json.loads(text.replace("'", '"'))
+            return value if isinstance(value, list) else text
+        except json.JSONDecodeError:
+            return text
+    return text
 
 
 def _first_heading_or_line(content: str) -> str:

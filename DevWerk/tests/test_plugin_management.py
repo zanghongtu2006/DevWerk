@@ -174,6 +174,46 @@ def test_plugin_validation_and_uninstall_api(monkeypatch, tmp_path):
     assert not any(item["id"] == "validated-plugin" for item in listed_after.json()["plugins"])
 
 
+def test_plugin_settings_markdown_round_trip_and_frontmatter(monkeypatch, tmp_path):
+    plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
+    _write_plugin(plugins_root, "settings-plugin")
+
+    from app.services.plugin_manager import get_plugin_settings, update_plugin_settings
+
+    updated = update_plugin_settings(
+        "settings-plugin",
+        "---\nenabled: true\nstrict_mode: false\nmax_retries: 3\n---\n\n# Settings\nUse browser evidence.\n",
+    )
+    loaded = get_plugin_settings("settings-plugin")
+
+    assert updated["plugin_id"] == "settings-plugin"
+    assert updated["frontmatter"]["enabled"] is True
+    assert updated["frontmatter"]["strict_mode"] is False
+    assert updated["frontmatter"]["max_retries"] == 3
+    assert "Use browser evidence" in loaded["body"]
+    assert (plugins_root / "settings-plugin" / ".devwerk-plugin-settings.md").is_file()
+
+
+def test_plugin_settings_api(monkeypatch, tmp_path):
+    plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
+    _write_plugin(plugins_root, "settings-api")
+
+    import app.main as main_module
+
+    app = main_module.create_app()
+    with TestClient(app) as client:
+        put = client.put(
+            "/v1/plugins/settings-api/settings",
+            json={"content": "---\nenabled: true\n---\n\n# API Settings\n"},
+        )
+        got = client.get("/v1/plugins/settings-api/settings")
+
+    assert put.status_code == 200
+    assert got.status_code == 200
+    assert got.json()["settings"]["frontmatter"]["enabled"] is True
+    assert "# API Settings" in got.json()["settings"]["content"]
+
+
 def test_plugin_validation_reports_invalid_manifest(monkeypatch, tmp_path):
     _patch_roots(monkeypatch, tmp_path)
     broken = tmp_path / "broken-plugin"
@@ -443,5 +483,7 @@ def test_backend_web_ui_exposes_plugin_management_controls():
     assert "pluginCommands" in js
     assert "pluginAgents" in js
     assert "loadPluginAgents" in js
+    assert "loadPluginSettings" in js
+    assert "Plugin Settings: " in js
     assert "togglePluginEnabled" in js
     assert "/plugins" in js

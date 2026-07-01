@@ -9,6 +9,7 @@ from app.services.plugin_manager import (
     get_global_plugin,
     get_plugin_agent,
     get_plugin_command,
+    get_plugin_settings,
     import_global_plugin,
     import_marketplace_plugin,
     list_enabled_plugin_agents,
@@ -17,6 +18,7 @@ from app.services.plugin_manager import (
     list_global_plugins,
     remove_global_plugin,
     set_global_plugin_enabled,
+    update_plugin_settings,
     upsert_global_plugin,
     validate_plugin_source,
 )
@@ -45,6 +47,10 @@ class PluginImportRequest(BaseModel):
 
 class PluginValidateRequest(BaseModel):
     source_path: str
+
+
+class PluginSettingsRequest(BaseModel):
+    content: str
 
 
 class PluginMarketplaceImportRequest(BaseModel):
@@ -79,6 +85,22 @@ def plugins_agents():
 def plugins_agent_get(agent_id: str):
     try:
         return {"ok": True, "agent": get_plugin_agent(agent_id)}
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/{plugin_id}/settings")
+def plugins_settings_get(plugin_id: str):
+    try:
+        return {"ok": True, "settings": get_plugin_settings(plugin_id)}
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.put("/{plugin_id}/settings")
+def plugins_settings_put(plugin_id: str, req: PluginSettingsRequest):
+    try:
+        return {"ok": True, "settings": update_plugin_settings(plugin_id, req.content)}
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
