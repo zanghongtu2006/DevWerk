@@ -31,6 +31,7 @@ from app.services.skill_manager import resolve_agent_skills
 from app.services.job_scheduler import JobScheduler
 from app.services.llm_factory import get_llm_client
 from app.services.memory_system import build_context_pack, create_agent_run, handle_agent_writeback
+from app.services.plugin_manager import get_plugin_agent
 from app.services.provider_errors import is_retryable_llm_error
 from app.services.verification_policy import configured_post_apply_tool_requests, verification_feedback_summary
 from app.services.workflow import apply_workflow_action, record_phase_output
@@ -1079,6 +1080,7 @@ def _build_agent_context(
     artifacts = task.get("artifacts") or []
     conversation_context = prepare_conversation_context(task_id, fallback_messages=body.get("messages") or [])
     skill_ids = [str(item) for item in (body.get("_workflow_agent_skills") or []) if str(item).strip()]
+    plugin_agent = _plugin_agent_context(body.get("_workflow_plugin_agent_id") or agent)
     return {
         "task_id": task_id,
         "project_id": project_id,
@@ -1096,8 +1098,33 @@ def _build_agent_context(
         "task_events": _event_summary(task.get("events") or []),
         "task_memory": _compact_task_memory(task, conversation_context),
         "project_memory": _compact_project_memory(read_project_memory(project_id)),
+        "plugin_agent": plugin_agent,
         "skills": resolve_agent_skills(project_id, skill_ids),
         "workspace": _workspace_summary(body.get("workspace")),
+    }
+
+
+def _plugin_agent_context(agent_ref: object) -> dict[str, Any] | None:
+    text = str(agent_ref or "").strip()
+    if not text or (":" not in text and "." not in text):
+        return None
+    try:
+        agent = get_plugin_agent(text)
+    except (KeyError, ValueError):
+        return {
+            "agent_id": text,
+            "scope": "plugin",
+            "available": False,
+            "reason": "plugin agent is not installed, enabled, or valid",
+        }
+    return {
+        "agent_id": agent.get("agent_id"),
+        "plugin_id": agent.get("plugin_id"),
+        "scope": "plugin",
+        "available": True,
+        "summary": agent.get("summary"),
+        "content": agent.get("content"),
+        "mcp_servers": agent.get("mcp_servers") or [],
     }
 
 
@@ -1359,6 +1386,13 @@ def _context_log_summary(context: dict[str, Any]) -> dict[str, Any]:
         "event_count": len(context.get("task_events") or []),
         "task_memory_keys": sorted((context.get("task_memory") or {}).keys()),
         "project_memory_keys": sorted((context.get("project_memory") or {}).keys()),
+        "plugin_agent": {
+            "agent_id": (context.get("plugin_agent") or {}).get("agent_id"),
+            "available": (context.get("plugin_agent") or {}).get("available"),
+            "plugin_id": (context.get("plugin_agent") or {}).get("plugin_id"),
+        }
+        if isinstance(context.get("plugin_agent"), dict)
+        else None,
         "skills": [
             {
                 "id": skill.get("id"),

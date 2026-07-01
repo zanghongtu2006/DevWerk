@@ -7,9 +7,11 @@ from pydantic import BaseModel, Field
 
 from app.services.plugin_manager import (
     get_global_plugin,
+    get_plugin_agent,
     get_plugin_command,
     import_global_plugin,
     import_marketplace_plugin,
+    list_enabled_plugin_agents,
     list_enabled_plugin_commands,
     list_marketplace_plugins,
     list_global_plugins,
@@ -64,6 +66,19 @@ def plugins_commands():
 def plugins_command_get(command_id: str):
     try:
         return {"ok": True, "command": get_plugin_command(command_id)}
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/agents")
+def plugins_agents():
+    return {"ok": True, "agents": list_enabled_plugin_agents()}
+
+
+@router.get("/agents/{agent_id}")
+def plugins_agent_get(agent_id: str):
+    try:
+        return {"ok": True, "agent": get_plugin_agent(agent_id)}
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

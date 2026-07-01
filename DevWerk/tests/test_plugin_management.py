@@ -303,6 +303,96 @@ def test_plugin_commands_are_available_as_slash_commands(monkeypatch, tmp_path):
     assert "Capture browser evidence" in command["content"]
 
 
+def test_plugin_agents_are_available_as_runtime_catalog(monkeypatch, tmp_path):
+    plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
+    _write_plugin(plugins_root)
+
+    from app.services.plugin_manager import get_plugin_agent, list_enabled_plugin_agents
+
+    agents = {item["agent_id"]: item for item in list_enabled_plugin_agents()}
+    assert "ui-observer:ui-observer" in agents
+    assert agents["ui-observer:ui-observer"]["plugin_id"] == "ui-observer"
+    assert agents["ui-observer:ui-observer"]["scope"] == "plugin"
+    assert "Use browser tools" in agents["ui-observer:ui-observer"]["content"]
+
+    agent = get_plugin_agent("ui-observer:ui-observer")
+    assert agent["agent_id"] == "ui-observer:ui-observer"
+    assert agent["summary"] == "UI Observer"
+
+
+def test_plugin_agents_api(monkeypatch, tmp_path):
+    plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
+    _write_plugin(plugins_root)
+
+    import app.main as main_module
+
+    app = main_module.create_app()
+    with TestClient(app) as client:
+        listed = client.get("/v1/plugins/agents")
+        detail = client.get("/v1/plugins/agents/ui-observer:ui-observer")
+
+    assert listed.status_code == 200
+    assert any(item["agent_id"] == "ui-observer:ui-observer" for item in listed.json()["agents"])
+    assert detail.status_code == 200
+    assert detail.json()["agent"]["plugin_id"] == "ui-observer"
+
+
+def test_plugin_agent_is_injected_into_workflow_agent_context(monkeypatch, tmp_path):
+    plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
+    _write_plugin(plugins_root)
+
+    class FakeSettings:
+        def __init__(self, db_path, session_dir):
+            self.devwerk_db_path = str(db_path)
+            self.devwerk_usage_tracking = False
+            self.devwerk_session_dir = str(session_dir)
+
+    import app.services.kanban as kanban_service
+    import app.services.session_store as session_store
+    from app.services.workflow_engine import _build_agent_context
+
+    fake = FakeSettings(tmp_path / "devwerk.db", tmp_path / "sessions")
+    monkeypatch.setattr(kanban_service, "settings", lambda: fake)
+    monkeypatch.setattr(session_store, "settings", lambda: fake)
+    kanban_service._initialized = False
+
+    kanban_service.update_project_workflow(
+        "plugin-agent-project",
+        {
+            "name": "plugin-agent-flow",
+            "columns": [
+                {"status_key": "inspect", "title": "Inspect", "position": 10, "transition_to": ["done", "failed"]},
+                {"status_key": "done", "title": "Done", "position": 90, "transition_to": []},
+                {"status_key": "failed", "title": "Failed", "position": 99, "transition_to": ["inspect"]},
+            ],
+            "actions": {
+                "workflow_done": {"to": "done"},
+                "fail": {"to": "failed"},
+                "retry": {"to": "inspect"},
+                "abandon": {"to": "failed"},
+            },
+        },
+    )
+    task = kanban_service.create_task(project_id="plugin-agent-project", title="Inspect UI")["task"]
+    context = _build_agent_context(
+        task["id"],
+        "inspect",
+        "ui-observer:ui-observer",
+        {
+            "project_id": "plugin-agent-project",
+            "messages": [{"role": "user", "content": "Inspect the dashboard."}],
+            "_workflow_agent_id": "ui-observer:ui-observer",
+            "_workflow_agent_skills": ["ui-observer.browser-eyes"],
+        },
+        {"name": "custom"},
+        [],
+    )
+
+    assert context["plugin_agent"]["agent_id"] == "ui-observer:ui-observer"
+    assert "Use browser tools" in context["plugin_agent"]["content"]
+    assert context["skills"][0]["id"] == "ui-observer.browser-eyes"
+
+
 def test_project_conversation_executes_plugin_slash_command(monkeypatch, tmp_path):
     plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
     _write_plugin(plugins_root)
@@ -351,5 +441,7 @@ def test_backend_web_ui_exposes_plugin_management_controls():
     assert "removeGlobalPlugin" in js
     assert "validateGlobalPlugin" in js
     assert "pluginCommands" in js
+    assert "pluginAgents" in js
+    assert "loadPluginAgents" in js
     assert "togglePluginEnabled" in js
     assert "/plugins" in js

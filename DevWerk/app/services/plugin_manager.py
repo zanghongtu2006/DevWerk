@@ -258,6 +258,39 @@ def list_enabled_plugin_commands() -> list[dict[str, Any]]:
     return commands
 
 
+def list_enabled_plugin_agents() -> list[dict[str, Any]]:
+    agents: list[dict[str, Any]] = []
+    for plugin in list_global_plugins():
+        if not plugin.get("enabled", True):
+            continue
+        try:
+            detail = get_global_plugin(str(plugin["id"]))
+        except KeyError:
+            continue
+        mcp_servers = detail.get("mcp_servers") or []
+        for agent in detail.get("agents") or []:
+            if not isinstance(agent, dict):
+                continue
+            local_id = str(agent.get("id") or "").strip()
+            if not local_id:
+                continue
+            agent_id = f"{plugin['id']}:{local_id}"
+            agents.append(
+                {
+                    **agent,
+                    "plugin_id": plugin["id"],
+                    "agent_id": agent_id,
+                    "scope": "plugin",
+                    "mcp_servers": [
+                        {"id": item.get("id"), "path": item.get("path")}
+                        for item in mcp_servers
+                        if isinstance(item, dict)
+                    ],
+                }
+            )
+    return agents
+
+
 def get_plugin_command(command_id: str) -> dict[str, Any]:
     cid = _safe_command_ref(command_id)
     plugin_id, _, local_id = cid.partition(":")
@@ -279,6 +312,33 @@ def get_plugin_command(command_id: str) -> dict[str, Any]:
                 "slash": f"/{command_id_value}",
             }
     raise KeyError(f"plugin command not found: {cid}")
+
+
+def get_plugin_agent(agent_id: str) -> dict[str, Any]:
+    aid = _safe_agent_ref(agent_id)
+    plugin_id, _, local_id = aid.partition(":")
+    if not plugin_id or not local_id:
+        plugin_id, _, local_id = aid.partition(".")
+    if not plugin_id or not local_id:
+        raise KeyError(f"plugin agent id must be <plugin>:<agent>: {aid}")
+    plugin = get_global_plugin(plugin_id)
+    if not plugin.get("enabled", True):
+        raise KeyError(f"plugin is disabled: {plugin_id}")
+    for agent in plugin.get("agents") or []:
+        if agent.get("id") == local_id:
+            agent_id_value = f"{plugin_id}:{local_id}"
+            return {
+                **agent,
+                "plugin_id": plugin_id,
+                "agent_id": agent_id_value,
+                "scope": "plugin",
+                "mcp_servers": [
+                    {"id": item.get("id"), "path": item.get("path")}
+                    for item in plugin.get("mcp_servers") or []
+                    if isinstance(item, dict)
+                ],
+            }
+    raise KeyError(f"plugin agent not found: {aid}")
 
 
 def get_plugin_skill(skill_id: str) -> dict[str, Any]:
@@ -568,4 +628,12 @@ def _safe_command_ref(value: str) -> str:
     text = re.sub(r"[^a-z0-9._:-]+", "-", text).strip("-._:")
     if not text:
         raise ValueError("command id is required")
+    return text[:180]
+
+
+def _safe_agent_ref(value: str) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9._:-]+", "-", text).strip("-._:")
+    if not text:
+        raise ValueError("agent id is required")
     return text[:180]
