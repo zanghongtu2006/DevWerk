@@ -128,8 +128,8 @@ def _plugin_summary(path: Path) -> dict[str, Any]:
     plugin_id = _safe_plugin_id(str(manifest.get("name") or path.name))
     state = _read_json(path / STATE_PATH)
     enabled = bool(state.get("enabled", True))
-    commands = _discover_markdown(path / "commands")
-    agents = _discover_markdown(path / "agents")
+    commands = _discover_markdown(path, "commands", manifest.get("commands"))
+    agents = _discover_markdown(path, "agents", manifest.get("agents"))
     skills = _discover_skills(path, plugin_id)
     hooks = _discover_hooks(path, manifest)
     mcp_servers = _discover_mcp_servers(path, manifest)
@@ -156,8 +156,8 @@ def _plugin_detail(path: Path) -> dict[str, Any]:
     return {
         **_plugin_summary(path),
         "manifest": manifest,
-        "commands": _discover_markdown(path / "commands"),
-        "agents": _discover_markdown(path / "agents"),
+        "commands": _discover_markdown(path, "commands", manifest.get("commands")),
+        "agents": _discover_markdown(path, "agents", manifest.get("agents")),
         "skills": _discover_skills(path, plugin_id),
         "hooks": _discover_hooks(path, manifest),
         "mcp_servers": _discover_mcp_servers(path, manifest),
@@ -165,11 +165,20 @@ def _plugin_detail(path: Path) -> dict[str, Any]:
     }
 
 
-def _discover_markdown(directory: Path) -> list[dict[str, Any]]:
-    if not directory.exists():
-        return []
+def _discover_markdown(plugin_root: Path, default_dir: str, manifest_value: object = None) -> list[dict[str, Any]]:
     items = []
-    for path in sorted(directory.glob("*.md")):
+    seen: set[Path] = set()
+    paths: list[Path] = []
+    for candidate in _component_paths(plugin_root, default_dir, manifest_value):
+        if candidate.is_file() and candidate.suffix.lower() == ".md":
+            paths.append(candidate)
+        elif candidate.is_dir():
+            paths.extend(sorted(candidate.glob("*.md")))
+    for path in paths:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
         content = _read_text(path)
         items.append(
             {
@@ -211,9 +220,10 @@ def _discover_skills(path: Path, plugin_id: str) -> list[dict[str, Any]]:
 
 def _discover_hooks(path: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
     hooks: list[dict[str, Any]] = []
-    hook_file = path / "hooks" / "hooks.json"
-    if hook_file.is_file():
-        hooks.append({"id": "hooks", "path": str(hook_file), "payload": _read_json(hook_file)})
+    for hook_file in _component_paths(path, "hooks/hooks.json", manifest.get("hooks")):
+        if hook_file.is_file():
+            hook_id = "hooks" if hook_file == path / "hooks" / "hooks.json" else "manifest-path"
+            hooks.append({"id": hook_id, "path": str(hook_file), "payload": _read_json(hook_file)})
     manifest_hooks = manifest.get("hooks")
     if isinstance(manifest_hooks, (dict, list)):
         hooks.append({"id": "manifest", "path": str(path / MANIFEST_PATH), "payload": manifest_hooks})
@@ -221,14 +231,49 @@ def _discover_hooks(path: Path, manifest: dict[str, Any]) -> list[dict[str, Any]
 
 
 def _discover_mcp_servers(path: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
-    payload = _read_json(path / ".mcp.json")
-    servers = payload.get("mcpServers") if isinstance(payload, dict) else None
-    if not isinstance(servers, dict):
-        servers = manifest.get("mcpServers") if isinstance(manifest.get("mcpServers"), dict) else {}
-    return [
-        {"id": str(server_id), "config": config if isinstance(config, dict) else {}, "path": str(path / ".mcp.json")}
-        for server_id, config in sorted(servers.items())
-    ]
+    discovered: dict[str, dict[str, Any]] = {}
+    for mcp_file in _component_paths(path, ".mcp.json", manifest.get("mcpServers")):
+        if not mcp_file.is_file():
+            continue
+        payload = _read_json(mcp_file)
+        servers = payload.get("mcpServers") if isinstance(payload, dict) else {}
+        if isinstance(servers, dict):
+            for server_id, config in servers.items():
+                discovered[str(server_id)] = {"config": config if isinstance(config, dict) else {}, "path": str(mcp_file)}
+    inline = manifest.get("mcpServers")
+    if isinstance(inline, dict):
+        for server_id, config in inline.items():
+            discovered[str(server_id)] = {"config": config if isinstance(config, dict) else {}, "path": str(path / MANIFEST_PATH)}
+    return [{"id": server_id, **payload} for server_id, payload in sorted(discovered.items())]
+
+
+def _component_paths(plugin_root: Path, default_path: str, manifest_value: object = None) -> list[Path]:
+    paths = [plugin_root / default_path]
+    for raw_path in _manifest_path_values(manifest_value):
+        path = _safe_manifest_path(plugin_root, raw_path)
+        if path is not None:
+            paths.append(path)
+    return paths
+
+
+def _manifest_path_values(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value if isinstance(item, str)]
+    return []
+
+
+def _safe_manifest_path(plugin_root: Path, raw_path: str) -> Path | None:
+    text = str(raw_path or "").strip().replace("\\", "/")
+    if not text.startswith("./") or "../" in text or text in {"./", "."}:
+        return None
+    candidate = (plugin_root / text[2:]).resolve()
+    try:
+        candidate.relative_to(plugin_root.resolve())
+    except ValueError:
+        return None
+    return candidate
 
 
 def _read_json(path: Path) -> dict[str, Any]:

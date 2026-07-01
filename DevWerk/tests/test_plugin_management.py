@@ -71,6 +71,48 @@ def test_claude_style_plugin_catalog_discovers_components(monkeypatch, tmp_path)
     assert "browser.playwright" in detail["skills"][0]["content"]
 
 
+def test_plugin_manifest_custom_paths_supplement_default_discovery(monkeypatch, tmp_path):
+    plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
+    plugin = _write_plugin(plugins_root, "custom-paths")
+    (plugin / "extra-commands").mkdir()
+    (plugin / "specialized-agents").mkdir()
+    (plugin / "config").mkdir()
+    (plugin / "extra-commands" / "trace-ui.md").write_text("# Trace UI\n\nUse CDP tracing.", encoding="utf-8")
+    (plugin / "specialized-agents" / "trace-agent.md").write_text("# Trace Agent\n\nTrace browser state.", encoding="utf-8")
+    (plugin / "config" / "hooks.json").write_text('{"SessionStart":[]}', encoding="utf-8")
+    (plugin / "config" / "mcp.json").write_text(
+        '{"mcpServers":{"cdp-proxy":{"command":"node","args":["${CLAUDE_PLUGIN_ROOT}/servers/cdp.js"]}}}',
+        encoding="utf-8",
+    )
+    (plugin / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "custom-paths",
+                "version": "0.2.0",
+                "commands": ["./extra-commands"],
+                "agents": "./specialized-agents",
+                "hooks": "./config/hooks.json",
+                "mcpServers": "./config/mcp.json",
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    from app.services.plugin_manager import get_global_plugin
+
+    detail = get_global_plugin("custom-paths")
+    command_ids = {item["id"] for item in detail["commands"]}
+    agent_ids = {item["id"] for item in detail["agents"]}
+    mcp_ids = {item["id"] for item in detail["mcp_servers"]}
+    hook_ids = {item["id"] for item in detail["hooks"]}
+
+    assert {"audit-ui", "trace-ui"}.issubset(command_ids)
+    assert {"ui-observer", "trace-agent"}.issubset(agent_ids)
+    assert {"playwright", "cdp-proxy"}.issubset(mcp_ids)
+    assert {"hooks", "manifest-path"}.issubset(hook_ids)
+
+
 def test_plugin_api_round_trip_and_enable_toggle(monkeypatch, tmp_path):
     _patch_roots(monkeypatch, tmp_path)
 
@@ -144,5 +186,7 @@ def test_backend_web_ui_exposes_plugin_management_controls():
 
     assert "loadGlobalPlugins" in js
     assert "Global Plugins" in js
+    assert "pluginImportPath" in js
+    assert "importGlobalPlugin" in js
     assert "togglePluginEnabled" in js
     assert "/plugins" in js

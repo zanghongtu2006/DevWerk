@@ -332,8 +332,9 @@ function skillSummaryCard(){ return `<div class="card side-card"><div class="h3"
 function pluginSummaryCard(){ const enabled=(state.globalPlugins || []).filter(plugin => plugin.enabled !== false).length; const skills=(state.globalPlugins || []).reduce((sum, plugin) => sum + Number(plugin.skills_count || 0), 0); return `<div class="card side-card"><div class="h3">Plugins</div><div class="muted" style="font-size:12px;margin-top:4px">Claude-style plugin packages can provide skills, commands, agent templates, hooks, and MCP server configs.</div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Installed</b><span>${state.globalPlugins.length}</span></div><div class="metric-line"><b>Enabled</b><span>${enabled}</span></div><div class="metric-line"><b>Plugin Skills</b><span>${skills}</span></div></div></div>`; }
 function globalPluginCards(){
   const plugins = state.globalPlugins || [];
-  if(!plugins.length) return `<div class="card card-pad"><div class="h3">Global Plugins</div><div class="muted">No global plugins returned by backend. Install Claude-style plugins under config/plugins or use the /v1/plugins API.</div></div>`;
-  return `<section class="card card-pad"><div class="page-head"><div><div class="h3">Global Plugins</div><div class="muted">Global plugin packages expose capabilities to workflow-spawned agents. Skills are loaded through each plugin's skills/*/SKILL.md entries.</div></div><span class="badge blue">${plugins.length} installed</span></div><div class="plugin-grid" style="margin-top:14px">${plugins.map(plugin => `<div class="card card-pad"><div class="page-head"><div><div class="h3">${esc(plugin.name || plugin.id)}</div><div class="muted">${esc(plugin.description || "No description")}</div></div><span class="badge ${plugin.enabled === false ? "" : "green"}">${plugin.enabled === false ? "Disabled" : "Enabled"}</span></div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Skills</b><span>${plugin.skills_count || 0}</span></div><div class="metric-line"><b>Commands</b><span>${plugin.commands_count || 0}</span></div><div class="metric-line"><b>Agents</b><span>${plugin.agents_count || 0}</span></div><div class="metric-line"><b>MCP Servers</b><span>${plugin.mcp_servers_count || 0}</span></div></div><div style="display:flex;gap:8px;margin-top:14px"><button class="btn small" data-plugin-toggle="${escAttr(plugin.id)}" data-enabled="${plugin.enabled === false ? "true" : "false"}">${plugin.enabled === false ? "Enable" : "Disable"}</button><span class="muted" style="align-self:center;font-size:12px">${esc(plugin.version || "")}</span></div></div>`).join("")}</div></section>`;
+  const importPanel = `<div class="card card-pad"><div class="h3">Import Plugin</div><div class="muted" style="font-size:12px;margin-top:4px">Import a local Claude-style plugin directory containing .claude-plugin/plugin.json.</div><div style="display:flex;gap:8px;margin-top:12px"><input id="pluginImportPath" class="input" placeholder="D:\\workspace\\codex\\devwerk\\3rd\\claude-code\\plugins\\frontend-design" /><button class="btn small" data-plugin-import="true">Import</button></div></div>`;
+  if(!plugins.length) return `<section class="card card-pad"><div class="h3">Global Plugins</div><div class="muted">No global plugins returned by backend. Install Claude-style plugins under config/plugins or use the /v1/plugins API.</div><div style="margin-top:14px">${importPanel}</div></section>`;
+  return `<section class="card card-pad"><div class="page-head"><div><div class="h3">Global Plugins</div><div class="muted">Global plugin packages expose capabilities to workflow-spawned agents. Skills are loaded through each plugin's skills/*/SKILL.md entries.</div></div><span class="badge blue">${plugins.length} installed</span></div><div class="plugin-grid" style="margin-top:14px">${importPanel}${plugins.map(plugin => `<div class="card card-pad"><div class="page-head"><div><div class="h3">${esc(plugin.name || plugin.id)}</div><div class="muted">${esc(plugin.description || "No description")}</div></div><span class="badge ${plugin.enabled === false ? "" : "green"}">${plugin.enabled === false ? "Disabled" : "Enabled"}</span></div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Skills</b><span>${plugin.skills_count || 0}</span></div><div class="metric-line"><b>Commands</b><span>${plugin.commands_count || 0}</span></div><div class="metric-line"><b>Agents</b><span>${plugin.agents_count || 0}</span></div><div class="metric-line"><b>MCP Servers</b><span>${plugin.mcp_servers_count || 0}</span></div></div><div style="display:flex;gap:8px;margin-top:14px"><button class="btn small" data-plugin-toggle="${escAttr(plugin.id)}" data-enabled="${plugin.enabled === false ? "true" : "false"}">${plugin.enabled === false ? "Enable" : "Disable"}</button><span class="muted" style="align-self:center;font-size:12px">${esc(plugin.version || "")}</span></div></div>`).join("")}</div></section>`;
 }
 function globalSkillEditors(){ const skills = state.globalSkills || []; if(!skills.length) return `<div class="card card-pad"><div class="h3">Global Skill Catalog</div><div class="muted">No global SKILL.md files returned by backend.</div></div>`; return skills.map(skill => editorCard(`Global Skill: ${skill.id}`, `Global SKILL.md (${skill.scope || "global"}).`, "Markdown", skill.content || skill.summary || "")).join(""); }
 function projectSkillEditors(){ const skills = state.projectSkills || []; if(!skills.length) return `<div class="card card-pad"><div class="h3">Project Skills</div><div class="muted">No project-level SKILL.md entries configured yet. Use /learn for memory, or create project skills through the skills API.</div></div>`; return skills.map(skill => editorCard(`Project Skill: ${skill.id}`, `Project-scoped SKILL.md (${skill.enabled === false ? "disabled" : "enabled"}).`, "Markdown", skill.content || skill.summary || "")).join(""); }
@@ -609,6 +610,14 @@ async function togglePluginEnabled(pluginId, enabled) {
   renderShell();
   notify(`${pluginId} ${enabled ? "enabled" : "disabled"}.`);
 }
+async function importGlobalPlugin() {
+  const sourcePath = ($("pluginImportPath")?.value || "").trim();
+  if (!sourcePath) { notify("Plugin source path is required.", "error"); return; }
+  await api(`${API}/plugins/import`, {method:"POST", body:JSON.stringify({source_path: sourcePath})});
+  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills()]);
+  renderShell();
+  notify("Plugin imported.");
+}
 async function actOnCurrentTask(action) {
   const task = activeBoardTask();
   if (!task) { notify("No task selected.", "error"); return; }
@@ -679,6 +688,11 @@ document.addEventListener("click", async event => {
   const pluginToggle = event.target.closest("[data-plugin-toggle]");
   if (pluginToggle) {
     await togglePluginEnabled(pluginToggle.dataset.pluginToggle, pluginToggle.dataset.enabled === "true");
+    return;
+  }
+  const pluginImport = event.target.closest("[data-plugin-import]");
+  if (pluginImport) {
+    await importGlobalPlugin();
     return;
   }
   const editorButton = event.target.closest("[data-action]");
