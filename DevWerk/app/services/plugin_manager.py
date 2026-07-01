@@ -317,6 +317,58 @@ def list_enabled_plugin_agents() -> list[dict[str, Any]]:
     return agents
 
 
+def list_enabled_plugin_hooks() -> list[dict[str, Any]]:
+    hooks: list[dict[str, Any]] = []
+    for plugin in list_global_plugins():
+        if not plugin.get("enabled", True):
+            continue
+        try:
+            detail = get_global_plugin(str(plugin["id"]))
+        except KeyError:
+            continue
+        for hook in detail.get("hooks") or []:
+            if not isinstance(hook, dict):
+                continue
+            local_id = str(hook.get("id") or "").strip()
+            if not local_id:
+                continue
+            hooks.append(
+                {
+                    **hook,
+                    "plugin_id": plugin["id"],
+                    "hook_id": f"{plugin['id']}:{local_id}",
+                    "scope": "plugin",
+                }
+            )
+    return hooks
+
+
+def list_enabled_plugin_mcp_servers() -> list[dict[str, Any]]:
+    servers: list[dict[str, Any]] = []
+    for plugin in list_global_plugins():
+        if not plugin.get("enabled", True):
+            continue
+        try:
+            detail = get_global_plugin(str(plugin["id"]))
+        except KeyError:
+            continue
+        for server in detail.get("mcp_servers") or []:
+            if not isinstance(server, dict):
+                continue
+            local_id = str(server.get("id") or "").strip()
+            if not local_id:
+                continue
+            servers.append(
+                {
+                    **server,
+                    "plugin_id": plugin["id"],
+                    "server_ref": f"{plugin['id']}:{local_id}",
+                    "scope": "plugin",
+                }
+            )
+    return servers
+
+
 def get_plugin_command(command_id: str) -> dict[str, Any]:
     cid = _safe_command_ref(command_id)
     plugin_id, _, local_id = cid.partition(":")

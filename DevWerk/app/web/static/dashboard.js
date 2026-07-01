@@ -18,6 +18,8 @@ const state = {
   globalPlugins: [],
   pluginCommands: [],
   pluginAgents: [],
+  pluginHooks: [],
+  pluginMcpServers: [],
   pluginSettings: {},
   pluginMarketplace: null,
   pluginValidation: null,
@@ -42,7 +44,7 @@ async function api(path, options = {}) {
 }
 async function refreshAll() {
   await loadProjects();
-  await Promise.allSettled([loadBoard(), loadEvents(), loadConversation(), loadSettings(), loadGlobalSettings(), loadWorkflow(), loadMemory(), loadUsage(), loadProjectMd(), loadGlobalSkills(), loadGlobalPlugins(), loadPluginCommands(), loadPluginAgents(), loadPluginSettings(), loadProjectSkills()]);
+  await Promise.allSettled([loadBoard(), loadEvents(), loadConversation(), loadSettings(), loadGlobalSettings(), loadWorkflow(), loadMemory(), loadUsage(), loadProjectMd(), loadGlobalSkills(), loadGlobalPlugins(), loadPluginCommands(), loadPluginAgents(), loadPluginHooks(), loadPluginMcpServers(), loadPluginSettings(), loadProjectSkills()]);
   renderShell();
   connectProjectStream();
 }
@@ -64,6 +66,8 @@ async function loadGlobalSkills() { try { const data = await api(`${API}/skills`
 async function loadGlobalPlugins() { try { const data = await api(`${API}/plugins`); state.globalPlugins = data.plugins || []; } catch (_) { state.globalPlugins = []; } }
 async function loadPluginCommands() { try { const data = await api(`${API}/plugins/commands`); state.pluginCommands = data.commands || []; } catch (_) { state.pluginCommands = []; } }
 async function loadPluginAgents() { try { const data = await api(`${API}/plugins/agents`); state.pluginAgents = data.agents || []; } catch (_) { state.pluginAgents = []; } }
+async function loadPluginHooks() { try { const data = await api(`${API}/plugins/hooks`); state.pluginHooks = data.hooks || []; } catch (_) { state.pluginHooks = []; } }
+async function loadPluginMcpServers() { try { const data = await api(`${API}/plugins/mcp-servers`); state.pluginMcpServers = data.mcp_servers || []; } catch (_) { state.pluginMcpServers = []; } }
 async function loadPluginSettings() {
   const out = {};
   await Promise.all((state.globalPlugins || []).map(async plugin => {
@@ -196,6 +200,7 @@ function renderSettingsSection() {
       <div style="margin-top:14px" class="config-grid">${editorCard("Global LLM Catalog","Provider credentials, base URLs, and model definitions.","JSON", JSON.stringify(global.llms || {}, null, 2))}${editorCard("Global Routing Map","Model route aliases mapped to provider/model configs. These are not workflow columns or agent names.","JSON", JSON.stringify(global.routing || {}, null, 2))}<div class="side-stack">${globalRoutingSummaryCard()}${skillSummaryCard()}${pluginSummaryCard()}${settingsTile("Dynamic Node Agents", "Workflow driven", "Project workflow nodes spawn temporary agents at runtime. Only project-agent and context-indexer are built in.")}</div></div>
       <div style="margin-top:14px" class="config-grid single-row">${globalPluginCards()}</div>
       <div style="margin-top:14px" class="config-grid single-row">${pluginAgentCards()}</div>
+      <div style="margin-top:14px" class="config-grid single-row">${pluginRuntimeCatalogCards()}</div>
       <div style="margin-top:14px" class="config-grid single-row">${pluginSettingsEditors()}</div>
       <div style="margin-top:14px" class="config-grid single-row">${globalSkillEditors()}</div>
     </section>
@@ -350,7 +355,7 @@ function projectCard(project){ const stats=project.stats || {}; const health=pro
 function editorCard(title, desc, mode, content){ const lines=String(content || "").split("\n"); return `<div class="editor-card card" data-editor-title="${escAttr(title)}" data-editor-mode="${escAttr(mode)}"><div class="editor-head"><div><div class="h3">${title}</div><div class="muted" style="font-size:12px;margin-top:4px">${desc}</div></div><button class="small-button" data-action="editor-format">${mode}</button></div><div class="editor"><div class="line-nos">${lines.map((_,i)=>i+1).join("<br/>")}</div><textarea class="code-editor" spellcheck="false">${esc(lines.join("\n"))}</textarea></div><div class="editor-foot"><span class="muted">Loaded from backend API</span><span><button class="small-button" data-action="editor-format">Format</button> <button class="small-button" data-action="editor-save">Save</button></span></div></div>`; }
 function workflowPresetCard(){ const workflow=state.workflow || {}; const columnsCount=(workflow.columns || workflow.stages || columns() || []).length; return `<div class="card side-card"><div class="h3">Workflow Definition</div><div class="muted" style="font-size:12px;margin-top:4px">Loaded from backend project workflow.</div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Name</b><span>${esc(workflow.name || "default")}</span></div><div class="metric-line"><b>Columns</b><span>${columnsCount}</span></div><div class="metric-line"><b>Source</b><span>${workflow.source ? esc(workflow.source) : "project settings"}</span></div></div></div>`; }
 function skillSummaryCard(){ return `<div class="card side-card"><div class="h3">Skills</div><div class="muted" style="font-size:12px;margin-top:4px">Agents load SKILL.md entries from global and project scope.</div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Global</b><span>${state.globalSkills.length}</span></div><div class="metric-line"><b>Project</b><span>${state.projectSkills.length}</span></div><div class="metric-line"><b>Entrypoint</b><span>SKILL.md</span></div></div></div>`; }
-function pluginSummaryCard(){ const enabled=(state.globalPlugins || []).filter(plugin => plugin.enabled !== false).length; const skills=(state.globalPlugins || []).reduce((sum, plugin) => sum + Number(plugin.skills_count || 0), 0); return `<div class="card side-card"><div class="h3">Plugins</div><div class="muted" style="font-size:12px;margin-top:4px">Claude-style plugin packages can provide skills, commands, agent templates, hooks, and MCP server configs.</div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Installed</b><span>${state.globalPlugins.length}</span></div><div class="metric-line"><b>Enabled</b><span>${enabled}</span></div><div class="metric-line"><b>Plugin Skills</b><span>${skills}</span></div><div class="metric-line"><b>Plugin Agents</b><span>${state.pluginAgents.length}</span></div></div></div>`; }
+function pluginSummaryCard(){ const enabled=(state.globalPlugins || []).filter(plugin => plugin.enabled !== false).length; const skills=(state.globalPlugins || []).reduce((sum, plugin) => sum + Number(plugin.skills_count || 0), 0); return `<div class="card side-card"><div class="h3">Plugins</div><div class="muted" style="font-size:12px;margin-top:4px">Claude-style plugin packages can provide skills, commands, agent templates, hooks, and MCP server configs.</div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Installed</b><span>${state.globalPlugins.length}</span></div><div class="metric-line"><b>Enabled</b><span>${enabled}</span></div><div class="metric-line"><b>Plugin Skills</b><span>${skills}</span></div><div class="metric-line"><b>Plugin Agents</b><span>${state.pluginAgents.length}</span></div><div class="metric-line"><b>Hooks</b><span>${state.pluginHooks.length}</span></div><div class="metric-line"><b>MCP Servers</b><span>${state.pluginMcpServers.length}</span></div></div></div>`; }
 function globalPluginCards(){
   const plugins = state.globalPlugins || [];
   const importPanel = `<div class="card card-pad"><div class="h3">Import Plugin</div><div class="muted" style="font-size:12px;margin-top:4px">Import a local Claude-style plugin directory containing .claude-plugin/plugin.json.</div><div style="display:flex;gap:8px;margin-top:12px"><input id="pluginImportPath" class="input" placeholder="D:\\workspace\\codex\\devwerk\\3rd\\claude-code\\plugins\\frontend-design" /><button class="btn small" data-plugin-validate="true">Validate</button><button class="btn small" data-plugin-import="true">Import</button></div>${pluginValidationPreview()}</div>`;
@@ -361,6 +366,11 @@ function globalPluginCards(){
 function pluginAgentCards(){
   const agents = state.pluginAgents || [];
   return `<section class="card card-pad"><div class="page-head"><div><div class="h3">Plugin Agents</div><div class="muted">Enabled plugin agent markdown is exposed as selectable runtime agent context. Use the stable agent_id in project workflow or agent settings.</div></div><span class="badge blue">${agents.length} available</span></div><div class="plugin-grid" style="margin-top:14px">${agents.length ? agents.map(agent => `<div class="card card-pad"><div class="h3">${esc(agent.summary || agent.id || agent.agent_id)}</div><div class="muted" style="font-size:12px">${esc(agent.agent_id || "")}</div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Plugin</b><span>${esc(agent.plugin_id || "-")}</span></div><div class="metric-line"><b>MCP Servers</b><span>${(agent.mcp_servers || []).length}</span></div><div class="metric-line"><b>Chars</b><span>${agent.chars || 0}</span></div></div></div>`).join("") : `<div class="muted">No enabled plugin agents returned by backend.</div>`}</div></section>`;
+}
+function pluginRuntimeCatalogCards(){
+  const hooks = state.pluginHooks || [];
+  const servers = state.pluginMcpServers || [];
+  return `<section class="card card-pad"><div class="page-head"><div><div class="h3">Plugin Runtime Catalog</div><div class="muted">Enabled plugin hooks and MCP server configs are loaded from backend APIs for future workflow/runtime integration.</div></div><span class="badge blue">${hooks.length + servers.length} entries</span></div><div class="config-grid" style="margin-top:14px"><div class="card card-pad"><div class="h3">Hooks</div><table class="data-table" style="margin-top:12px"><thead><tr><th>Hook</th><th>Plugin</th><th>Source</th></tr></thead><tbody>${hooks.length ? hooks.map(hook => `<tr><td>${esc(hook.hook_id || hook.id)}</td><td>${esc(hook.plugin_id || "-")}</td><td>${esc(hook.path || "manifest")}</td></tr>`).join("") : `<tr><td colspan="3" class="muted">No enabled plugin hooks returned by backend.</td></tr>`}</tbody></table></div><div class="card card-pad"><div class="h3">MCP Servers</div><table class="data-table" style="margin-top:12px"><thead><tr><th>Server</th><th>Plugin</th><th>Command</th></tr></thead><tbody>${servers.length ? servers.map(server => `<tr><td>${esc(server.server_ref || server.id)}</td><td>${esc(server.plugin_id || "-")}</td><td>${esc((server.config || {}).command || "-")}</td></tr>`).join("") : `<tr><td colspan="3" class="muted">No enabled plugin MCP servers returned by backend.</td></tr>`}</tbody></table></div></div></section>`;
 }
 function pluginSettingsEditors(){
   const plugins = state.globalPlugins || [];
@@ -650,13 +660,13 @@ async function saveEditor(card) {
   else if (title.startsWith("Global Skill: ")) await api(`${API}/skills/${encodeURIComponent(title.replace("Global Skill: ", ""))}`, {method:"PUT", body:JSON.stringify({skill_md: payload})});
   else if (title.startsWith("Project Skill: ")) await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/skills/${encodeURIComponent(title.replace("Project Skill: ", ""))}`, {method:"PUT", body:JSON.stringify({skill_md: payload, enabled:true})});
   else { notify(`${title} is read-only in this view.`); return; }
-  await Promise.allSettled([loadSettings(), loadGlobalSettings(), loadGlobalSkills(), loadGlobalPlugins(), loadPluginAgents(), loadPluginSettings(), loadProjectSkills(), loadWorkflow(), loadBoard(), loadProjectMd(), loadEvents()]);
+  await Promise.allSettled([loadSettings(), loadGlobalSettings(), loadGlobalSkills(), loadGlobalPlugins(), loadPluginAgents(), loadPluginHooks(), loadPluginMcpServers(), loadPluginSettings(), loadProjectSkills(), loadWorkflow(), loadBoard(), loadProjectMd(), loadEvents()]);
   renderShell();
   notify(`${title} saved.`);
 }
 async function togglePluginEnabled(pluginId, enabled) {
   await api(`${API}/plugins/${encodeURIComponent(pluginId)}`, {method:"PATCH", body:JSON.stringify({enabled})});
-  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills(), loadPluginCommands(), loadPluginAgents(), loadPluginSettings()]);
+  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills(), loadPluginCommands(), loadPluginAgents(), loadPluginHooks(), loadPluginMcpServers(), loadPluginSettings()]);
   renderShell();
   notify(`${pluginId} ${enabled ? "enabled" : "disabled"}.`);
 }
@@ -664,7 +674,7 @@ async function importGlobalPlugin() {
   const sourcePath = ($("pluginImportPath")?.value || "").trim();
   if (!sourcePath) { notify("Plugin source path is required.", "error"); return; }
   await api(`${API}/plugins/import`, {method:"POST", body:JSON.stringify({source_path: sourcePath})});
-  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills(), loadPluginCommands(), loadPluginAgents(), loadPluginSettings()]);
+  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills(), loadPluginCommands(), loadPluginAgents(), loadPluginHooks(), loadPluginMcpServers(), loadPluginSettings()]);
   renderShell();
   notify("Plugin imported.");
 }
@@ -677,7 +687,7 @@ async function validateGlobalPlugin() {
 }
 async function removeGlobalPlugin(pluginId) {
   await api(`${API}/plugins/${encodeURIComponent(pluginId)}`, {method:"DELETE"});
-  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills(), loadPluginCommands(), loadPluginAgents(), loadPluginSettings()]);
+  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills(), loadPluginCommands(), loadPluginAgents(), loadPluginHooks(), loadPluginMcpServers(), loadPluginSettings()]);
   renderShell();
   notify(`${pluginId} removed.`);
 }
@@ -693,7 +703,7 @@ async function importMarketplacePlugin() {
   const pluginName = ($("pluginMarketplaceName")?.value || "").trim();
   if (!marketplacePath || !pluginName) { notify("Marketplace path and plugin name are required.", "error"); return; }
   await api(`${API}/plugins/import-marketplace`, {method:"POST", body:JSON.stringify({marketplace_path: marketplacePath, plugin_name: pluginName})});
-  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills(), loadPluginCommands(), loadPluginAgents(), loadPluginSettings()]);
+  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills(), loadPluginCommands(), loadPluginAgents(), loadPluginHooks(), loadPluginMcpServers(), loadPluginSettings()]);
   renderShell();
   notify(`${pluginName} imported.`);
 }

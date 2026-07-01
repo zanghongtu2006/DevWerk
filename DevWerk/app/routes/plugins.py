@@ -14,6 +14,8 @@ from app.services.plugin_manager import (
     import_marketplace_plugin,
     list_enabled_plugin_agents,
     list_enabled_plugin_commands,
+    list_enabled_plugin_hooks,
+    list_enabled_plugin_mcp_servers,
     list_marketplace_plugins,
     list_global_plugins,
     remove_global_plugin,
@@ -87,6 +89,16 @@ def plugins_agent_get(agent_id: str):
         return {"ok": True, "agent": get_plugin_agent(agent_id)}
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/hooks")
+def plugins_hooks():
+    return {"ok": True, "hooks": list_enabled_plugin_hooks()}
+
+
+@router.get("/mcp-servers")
+def plugins_mcp_servers():
+    return {"ok": True, "mcp_servers": list_enabled_plugin_mcp_servers()}
 
 
 @router.get("/{plugin_id}/settings")

@@ -377,6 +377,40 @@ def test_plugin_agents_api(monkeypatch, tmp_path):
     assert detail.json()["agent"]["plugin_id"] == "ui-observer"
 
 
+def test_plugin_hooks_and_mcp_servers_are_available_as_runtime_catalog(monkeypatch, tmp_path):
+    plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
+    _write_plugin(plugins_root)
+
+    from app.services.plugin_manager import list_enabled_plugin_hooks, list_enabled_plugin_mcp_servers
+
+    hooks = {item["hook_id"]: item for item in list_enabled_plugin_hooks()}
+    servers = {item["server_ref"]: item for item in list_enabled_plugin_mcp_servers()}
+
+    assert "ui-observer:hooks" in hooks
+    assert hooks["ui-observer:hooks"]["plugin_id"] == "ui-observer"
+    assert hooks["ui-observer:hooks"]["payload"]["events"] == ["workflow_column_started"]
+    assert "ui-observer:playwright" in servers
+    assert servers["ui-observer:playwright"]["config"]["command"] == "npx"
+    assert servers["ui-observer:playwright"]["scope"] == "plugin"
+
+
+def test_plugin_hooks_and_mcp_servers_api(monkeypatch, tmp_path):
+    plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
+    _write_plugin(plugins_root)
+
+    import app.main as main_module
+
+    app = main_module.create_app()
+    with TestClient(app) as client:
+        hooks = client.get("/v1/plugins/hooks")
+        servers = client.get("/v1/plugins/mcp-servers")
+
+    assert hooks.status_code == 200
+    assert any(item["hook_id"] == "ui-observer:hooks" for item in hooks.json()["hooks"])
+    assert servers.status_code == 200
+    assert any(item["server_ref"] == "ui-observer:playwright" for item in servers.json()["mcp_servers"])
+
+
 def test_plugin_agent_is_injected_into_workflow_agent_context(monkeypatch, tmp_path):
     plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
     _write_plugin(plugins_root)
@@ -483,6 +517,10 @@ def test_backend_web_ui_exposes_plugin_management_controls():
     assert "pluginCommands" in js
     assert "pluginAgents" in js
     assert "loadPluginAgents" in js
+    assert "pluginHooks" in js
+    assert "pluginMcpServers" in js
+    assert "loadPluginHooks" in js
+    assert "loadPluginMcpServers" in js
     assert "loadPluginSettings" in js
     assert "Plugin Settings: " in js
     assert "togglePluginEnabled" in js
