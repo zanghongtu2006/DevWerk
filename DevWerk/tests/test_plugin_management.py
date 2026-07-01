@@ -183,6 +183,22 @@ def test_plugin_api_round_trip_and_enable_toggle(monkeypatch, tmp_path):
     assert any(item["id"] == "ui-observer" for item in listed.json()["plugins"])
 
 
+def test_plugin_api_rejects_invalid_semver(monkeypatch, tmp_path):
+    _patch_roots(monkeypatch, tmp_path)
+
+    import app.main as main_module
+
+    app = main_module.create_app()
+    with TestClient(app) as client:
+        response = client.put(
+            "/v1/plugins/bad-version",
+            json={"manifest": {"version": "release-one"}},
+        )
+
+    assert response.status_code == 400
+    assert "invalid plugin version" in response.text
+
+
 def test_plugin_validation_and_uninstall_api(monkeypatch, tmp_path):
     plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
     source = _write_plugin(tmp_path / "source", "validated-plugin")
@@ -262,6 +278,29 @@ def test_plugin_validation_reports_invalid_manifest(monkeypatch, tmp_path):
     assert validation["ok"] is False
     assert any("invalid plugin name" in issue for issue in validation["issues"])
     assert any("must start with './'" in issue for issue in validation["issues"])
+
+
+def test_plugin_validation_and_import_reject_invalid_semver(monkeypatch, tmp_path):
+    _patch_roots(monkeypatch, tmp_path)
+    broken = tmp_path / "bad-version"
+    (broken / ".claude-plugin").mkdir(parents=True)
+    (broken / ".claude-plugin" / "plugin.json").write_text(
+        '{"name":"bad-version","version":"release-one"}',
+        encoding="utf-8",
+    )
+
+    from app.services.plugin_manager import import_global_plugin, validate_plugin_source
+
+    validation = validate_plugin_source(str(broken))
+
+    assert validation["ok"] is False
+    assert any("invalid plugin version" in issue for issue in validation["issues"])
+    try:
+        import_global_plugin(str(broken))
+    except ValueError as exc:
+        assert "invalid plugin version" in str(exc)
+    else:
+        raise AssertionError("invalid semver plugin import should fail")
 
 
 def test_plugin_import_copies_claude_plugin_directory(monkeypatch, tmp_path):

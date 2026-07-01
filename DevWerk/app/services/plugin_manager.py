@@ -52,6 +52,7 @@ def upsert_global_plugin(
     manifest_payload = dict(manifest or {})
     manifest_payload["name"] = pid
     manifest_payload.setdefault("version", "0.1.0")
+    _require_valid_semver(str(manifest_payload.get("version") or "0.1.0"))
     manifest_payload.setdefault("description", "")
     _write_json(path / MANIFEST_PATH, manifest_payload)
     _write_json(path / STATE_PATH, {"enabled": bool(enabled)})
@@ -122,6 +123,9 @@ def import_global_plugin(source_path: str) -> dict[str, Any]:
     source = Path(source_path).expanduser().resolve()
     if not source.is_dir():
         raise ValueError(f"plugin source directory not found: {source}")
+    validation = validate_plugin_source(str(source))
+    if not validation.get("ok"):
+        raise ValueError("; ".join(str(item) for item in validation.get("issues") or []) or "plugin validation failed")
     manifest = _read_json(source / MANIFEST_PATH)
     plugin_id = _safe_plugin_id(str(manifest.get("name") or source.name))
     target = _global_plugin_path(plugin_id)
@@ -165,6 +169,10 @@ def validate_plugin_source(source_path: str) -> dict[str, Any]:
         issues.append(f"invalid plugin name: {raw_name}")
     if raw_name and not re.match(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$", raw_name):
         issues.append(f"invalid plugin name: {raw_name}")
+    version = str(manifest.get("version") or "0.1.0")
+    version_issue = _validate_semver(version)
+    if version_issue:
+        issues.append(version_issue)
 
     for field in ("commands", "agents", "hooks", "mcpServers"):
         for raw_path in _manifest_path_values(manifest.get(field)):
@@ -657,6 +665,21 @@ def _validate_manifest_path(raw_path: str) -> str:
         return "must stay inside the plugin root"
     if Path(text).is_absolute():
         return "must be relative"
+    return ""
+
+
+def _require_valid_semver(version: str) -> None:
+    issue = _validate_semver(version)
+    if issue:
+        raise ValueError(issue)
+
+
+def _validate_semver(version: str) -> str:
+    text = str(version or "").strip()
+    if not text:
+        return "invalid plugin version: version is required"
+    if not re.match(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$", text):
+        return f"invalid plugin version: {text} must use semantic versioning"
     return ""
 
 
