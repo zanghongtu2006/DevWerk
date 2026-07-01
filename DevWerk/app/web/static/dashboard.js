@@ -15,6 +15,7 @@ const state = {
   globalUsage: {},
   globalSettings: {},
   globalSkills: [],
+  globalPlugins: [],
   projectSkills: [],
   stream: null,
   streamProjectId: "",
@@ -36,7 +37,7 @@ async function api(path, options = {}) {
 }
 async function refreshAll() {
   await loadProjects();
-  await Promise.allSettled([loadBoard(), loadEvents(), loadConversation(), loadSettings(), loadGlobalSettings(), loadWorkflow(), loadMemory(), loadUsage(), loadProjectMd(), loadGlobalSkills(), loadProjectSkills()]);
+  await Promise.allSettled([loadBoard(), loadEvents(), loadConversation(), loadSettings(), loadGlobalSettings(), loadWorkflow(), loadMemory(), loadUsage(), loadProjectMd(), loadGlobalSkills(), loadGlobalPlugins(), loadProjectSkills()]);
   renderShell();
   connectProjectStream();
 }
@@ -55,6 +56,7 @@ async function loadConversation() {
 async function loadSettings() { try { const data = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/settings`); state.settings = data.settings || data || {}; } catch (_) { state.settings = {}; } }
 async function loadGlobalSettings() { try { const data = await api(`${API}/settings`); state.globalSettings = data.settings || data || {}; } catch (_) { state.globalSettings = {}; } }
 async function loadGlobalSkills() { try { const data = await api(`${API}/skills`); const skills = data.skills || []; const detailed = await Promise.all(skills.map(async skill => (await api(`${API}/skills/${encodeURIComponent(skill.id)}`).catch(() => ({skill}))).skill || skill)); state.globalSkills = detailed; } catch (_) { state.globalSkills = []; } }
+async function loadGlobalPlugins() { try { const data = await api(`${API}/plugins`); state.globalPlugins = data.plugins || []; } catch (_) { state.globalPlugins = []; } }
 async function loadProjectSkills() { try { const data = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/skills`); const skills = data.skills || []; const detailed = await Promise.all(skills.map(async skill => (await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/skills/${encodeURIComponent(skill.id)}`).catch(() => ({skill}))).skill || skill)); state.projectSkills = detailed; } catch (_) { state.projectSkills = []; } }
 async function loadWorkflow() { try { const data = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/workflow`); state.workflow = data.workflow || data || {}; } catch (_) { state.workflow = {}; } }
 async function loadMemory() { try { state.memory = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/memory`); } catch (_) { state.memory = {}; } }
@@ -172,7 +174,8 @@ function renderSettingsSection() {
   $("page").innerHTML = `<div class="section-grid">
     <section class="card card-pad"><div class="page-head"><div><h1 class="h2">Global Settings</h1><div class="muted">System-wide LLM APIs and route keys. Project workflow and agent settings live under Projects.</div></div><span class="badge blue">Global</span></div>
       <div class="dense-grid" style="margin-top:16px">${settingsTile("Default Route", (global.routing || {}).default || "default", "Default model route used when a project or dynamically spawned node agent has no override.")}${settingsTile("Route Keys", Object.keys(global.routing || {}).length || 0, "Route keys are model aliases. Workflow nodes choose agents and may bind those agents to a route.")}${settingsTile("LLM Providers", Object.keys(global.llms || {}).length || 0, "Configured provider blocks from llm.json or global settings API.")}</div>
-      <div style="margin-top:14px" class="config-grid">${editorCard("Global LLM Catalog","Provider credentials, base URLs, and model definitions.","JSON", JSON.stringify(global.llms || {}, null, 2))}${editorCard("Global Routing Map","Model route aliases mapped to provider/model configs. These are not workflow columns or agent names.","JSON", JSON.stringify(global.routing || {}, null, 2))}<div class="side-stack">${globalRoutingSummaryCard()}${skillSummaryCard()}${settingsTile("Dynamic Node Agents", "Workflow driven", "Project workflow nodes spawn temporary agents at runtime. Only project-agent and context-indexer are built in.")}</div></div>
+      <div style="margin-top:14px" class="config-grid">${editorCard("Global LLM Catalog","Provider credentials, base URLs, and model definitions.","JSON", JSON.stringify(global.llms || {}, null, 2))}${editorCard("Global Routing Map","Model route aliases mapped to provider/model configs. These are not workflow columns or agent names.","JSON", JSON.stringify(global.routing || {}, null, 2))}<div class="side-stack">${globalRoutingSummaryCard()}${skillSummaryCard()}${pluginSummaryCard()}${settingsTile("Dynamic Node Agents", "Workflow driven", "Project workflow nodes spawn temporary agents at runtime. Only project-agent and context-indexer are built in.")}</div></div>
+      <div style="margin-top:14px" class="config-grid single-row">${globalPluginCards()}</div>
       <div style="margin-top:14px" class="config-grid single-row">${globalSkillEditors()}</div>
     </section>
     <aside class="side-stack">${usageCard(usageTotals(state.globalUsage), "Global Usage", state.globalUsage.by_project || state.globalUsage.projects || [])}${recentEventsCard()}</aside>
@@ -326,6 +329,12 @@ function projectCard(project){ const stats=project.stats || {}; const health=pro
 function editorCard(title, desc, mode, content){ const lines=String(content || "").split("\n"); return `<div class="editor-card card" data-editor-title="${escAttr(title)}" data-editor-mode="${escAttr(mode)}"><div class="editor-head"><div><div class="h3">${title}</div><div class="muted" style="font-size:12px;margin-top:4px">${desc}</div></div><button class="small-button" data-action="editor-format">${mode}</button></div><div class="editor"><div class="line-nos">${lines.map((_,i)=>i+1).join("<br/>")}</div><textarea class="code-editor" spellcheck="false">${esc(lines.join("\n"))}</textarea></div><div class="editor-foot"><span class="muted">Loaded from backend API</span><span><button class="small-button" data-action="editor-format">Format</button> <button class="small-button" data-action="editor-save">Save</button></span></div></div>`; }
 function workflowPresetCard(){ const workflow=state.workflow || {}; const columnsCount=(workflow.columns || workflow.stages || columns() || []).length; return `<div class="card side-card"><div class="h3">Workflow Definition</div><div class="muted" style="font-size:12px;margin-top:4px">Loaded from backend project workflow.</div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Name</b><span>${esc(workflow.name || "default")}</span></div><div class="metric-line"><b>Columns</b><span>${columnsCount}</span></div><div class="metric-line"><b>Source</b><span>${workflow.source ? esc(workflow.source) : "project settings"}</span></div></div></div>`; }
 function skillSummaryCard(){ return `<div class="card side-card"><div class="h3">Skills</div><div class="muted" style="font-size:12px;margin-top:4px">Agents load SKILL.md entries from global and project scope.</div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Global</b><span>${state.globalSkills.length}</span></div><div class="metric-line"><b>Project</b><span>${state.projectSkills.length}</span></div><div class="metric-line"><b>Entrypoint</b><span>SKILL.md</span></div></div></div>`; }
+function pluginSummaryCard(){ const enabled=(state.globalPlugins || []).filter(plugin => plugin.enabled !== false).length; const skills=(state.globalPlugins || []).reduce((sum, plugin) => sum + Number(plugin.skills_count || 0), 0); return `<div class="card side-card"><div class="h3">Plugins</div><div class="muted" style="font-size:12px;margin-top:4px">Claude-style plugin packages can provide skills, commands, agent templates, hooks, and MCP server configs.</div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Installed</b><span>${state.globalPlugins.length}</span></div><div class="metric-line"><b>Enabled</b><span>${enabled}</span></div><div class="metric-line"><b>Plugin Skills</b><span>${skills}</span></div></div></div>`; }
+function globalPluginCards(){
+  const plugins = state.globalPlugins || [];
+  if(!plugins.length) return `<div class="card card-pad"><div class="h3">Global Plugins</div><div class="muted">No global plugins returned by backend. Install Claude-style plugins under config/plugins or use the /v1/plugins API.</div></div>`;
+  return `<section class="card card-pad"><div class="page-head"><div><div class="h3">Global Plugins</div><div class="muted">Global plugin packages expose capabilities to workflow-spawned agents. Skills are loaded through each plugin's skills/*/SKILL.md entries.</div></div><span class="badge blue">${plugins.length} installed</span></div><div class="plugin-grid" style="margin-top:14px">${plugins.map(plugin => `<div class="card card-pad"><div class="page-head"><div><div class="h3">${esc(plugin.name || plugin.id)}</div><div class="muted">${esc(plugin.description || "No description")}</div></div><span class="badge ${plugin.enabled === false ? "" : "green"}">${plugin.enabled === false ? "Disabled" : "Enabled"}</span></div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Skills</b><span>${plugin.skills_count || 0}</span></div><div class="metric-line"><b>Commands</b><span>${plugin.commands_count || 0}</span></div><div class="metric-line"><b>Agents</b><span>${plugin.agents_count || 0}</span></div><div class="metric-line"><b>MCP Servers</b><span>${plugin.mcp_servers_count || 0}</span></div></div><div style="display:flex;gap:8px;margin-top:14px"><button class="btn small" data-plugin-toggle="${escAttr(plugin.id)}" data-enabled="${plugin.enabled === false ? "true" : "false"}">${plugin.enabled === false ? "Enable" : "Disable"}</button><span class="muted" style="align-self:center;font-size:12px">${esc(plugin.version || "")}</span></div></div>`).join("")}</div></section>`;
+}
 function globalSkillEditors(){ const skills = state.globalSkills || []; if(!skills.length) return `<div class="card card-pad"><div class="h3">Global Skill Catalog</div><div class="muted">No global SKILL.md files returned by backend.</div></div>`; return skills.map(skill => editorCard(`Global Skill: ${skill.id}`, `Global SKILL.md (${skill.scope || "global"}).`, "Markdown", skill.content || skill.summary || "")).join(""); }
 function projectSkillEditors(){ const skills = state.projectSkills || []; if(!skills.length) return `<div class="card card-pad"><div class="h3">Project Skills</div><div class="muted">No project-level SKILL.md entries configured yet. Use /learn for memory, or create project skills through the skills API.</div></div>`; return skills.map(skill => editorCard(`Project Skill: ${skill.id}`, `Project-scoped SKILL.md (${skill.enabled === false ? "disabled" : "enabled"}).`, "Markdown", skill.content || skill.summary || "")).join(""); }
 function routingSummaryCard(){ const params=state.settings.parameters || {}; return `<div class="card side-card"><div class="h3">Project Route Summary</div><div class="muted" style="font-size:12px;margin-top:4px">Project agent routes. Route keys are responsibilities, not model names.</div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Default Route</b><span>${esc(modelRoutes()[0] || "default")}</span></div><div class="metric-line"><b>Route Count</b><span>${modelRoutes().length}</span></div><div class="metric-line"><b>Strategy</b><span>${esc(params.routing_strategy || "project override")}</span></div></div></div>`; }
@@ -590,9 +599,15 @@ async function saveEditor(card) {
   else if (title.startsWith("Global Skill: ")) await api(`${API}/skills/${encodeURIComponent(title.replace("Global Skill: ", ""))}`, {method:"PUT", body:JSON.stringify({skill_md: payload})});
   else if (title.startsWith("Project Skill: ")) await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/skills/${encodeURIComponent(title.replace("Project Skill: ", ""))}`, {method:"PUT", body:JSON.stringify({skill_md: payload, enabled:true})});
   else { notify(`${title} is read-only in this view.`); return; }
-  await Promise.allSettled([loadSettings(), loadGlobalSettings(), loadGlobalSkills(), loadProjectSkills(), loadWorkflow(), loadBoard(), loadProjectMd(), loadEvents()]);
+  await Promise.allSettled([loadSettings(), loadGlobalSettings(), loadGlobalSkills(), loadGlobalPlugins(), loadProjectSkills(), loadWorkflow(), loadBoard(), loadProjectMd(), loadEvents()]);
   renderShell();
   notify(`${title} saved.`);
+}
+async function togglePluginEnabled(pluginId, enabled) {
+  await api(`${API}/plugins/${encodeURIComponent(pluginId)}`, {method:"PATCH", body:JSON.stringify({enabled})});
+  await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills()]);
+  renderShell();
+  notify(`${pluginId} ${enabled ? "enabled" : "disabled"}.`);
 }
 async function actOnCurrentTask(action) {
   const task = activeBoardTask();
@@ -661,6 +676,11 @@ document.addEventListener("click", async event => {
   if(project) { state.projectId = project.dataset.projectCard; history.replaceState(null, "", pageUrlForCurrentView()); await refreshAll(); }
   const task = event.target.closest("[data-task]");
   if(task) location.href = `/tasks?project_id=${encodeURIComponent(state.projectId)}&task_id=${encodeURIComponent(task.dataset.task)}`;
+  const pluginToggle = event.target.closest("[data-plugin-toggle]");
+  if (pluginToggle) {
+    await togglePluginEnabled(pluginToggle.dataset.pluginToggle, pluginToggle.dataset.enabled === "true");
+    return;
+  }
   const editorButton = event.target.closest("[data-action]");
   if (editorButton) {
     const card = editorButton.closest(".editor-card");

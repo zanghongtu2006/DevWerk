@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,18 @@ from typing import Any
 
 _CONFIGURED = False
 _DEFAULT_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+
+
+class SafeTimedRotatingFileHandler(TimedRotatingFileHandler):
+    """Daily file handler that keeps logging if Windows refuses log rollover."""
+
+    def doRollover(self) -> None:  # noqa: N802 - stdlib override name
+        try:
+            super().doRollover()
+        except PermissionError as exc:
+            current_time = int(time.time())
+            self.rolloverAt = self.computeRollover(current_time)
+            sys.stderr.write(f"DevWerk log rollover skipped because the log file is locked: {exc}\n")
 
 
 def configure_logging(config: Any) -> None:
@@ -36,7 +49,7 @@ def configure_logging(config: Any) -> None:
         file_name = Path(str(getattr(config, "log_file_name", "devwerk.log") or "devwerk.log")).name
         log_path = (log_dir / file_name).resolve()
         retention_days = _positive_int(getattr(config, "log_retention_days", 30), 30)
-        file_handler = TimedRotatingFileHandler(
+        file_handler = SafeTimedRotatingFileHandler(
             log_path,
             when="midnight",
             interval=1,

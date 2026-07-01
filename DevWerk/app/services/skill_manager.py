@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -8,22 +9,27 @@ from app.services.kanban import get_project_settings, update_project_settings
 
 
 SKILL_ENTRYPOINT = "SKILL.md"
+_log = logging.getLogger("devwerk.skill_manager")
 
 
 def list_global_skills() -> list[dict[str, Any]]:
-    return [
+    filesystem_skills = [
         _skill_summary(path.parent.name, path, scope="global")
         for path in sorted(_global_skills_root().glob(f"*/{SKILL_ENTRYPOINT}"))
         if path.is_file()
     ]
+    return [*filesystem_skills, *_plugin_global_skill_summaries()]
 
 
 def get_global_skill(skill_id: str) -> dict[str, Any]:
     sid = _safe_skill_id(skill_id)
     path = _global_skill_path(sid)
-    if not path.is_file():
-        raise KeyError(f"global skill not found: {sid}")
-    return _skill_detail(sid, path, scope="global")
+    if path.is_file():
+        return _skill_detail(sid, path, scope="global")
+    try:
+        return _plugin_global_skill_detail(sid)
+    except KeyError as exc:
+        raise KeyError(f"global skill not found: {sid}") from exc
 
 
 def upsert_global_skill(skill_id: str, skill_md: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -124,16 +130,19 @@ def resolve_agent_skills(project_id: str, skill_ids: list[str] | tuple[str, ...]
         if path.is_file():
             resolved.append(_skill_detail(sid, path, scope="global"))
         else:
-            resolved.append(
-                {
-                    "id": sid,
-                    "scope": "missing",
-                    "enabled": False,
-                    "entrypoint": SKILL_ENTRYPOINT,
-                    "content": "",
-                    "summary": f"Skill {sid!r} is referenced but no SKILL.md was found.",
-                }
-            )
+            try:
+                resolved.append(_plugin_global_skill_detail(sid))
+            except KeyError:
+                resolved.append(
+                    {
+                        "id": sid,
+                        "scope": "missing",
+                        "enabled": False,
+                        "entrypoint": SKILL_ENTRYPOINT,
+                        "content": "",
+                        "summary": f"Skill {sid!r} is referenced but no SKILL.md was found.",
+                    }
+                )
     return resolved
 
 
@@ -224,3 +233,51 @@ def _global_skills_root() -> Path:
 
 def _global_skill_path(skill_id: str) -> Path:
     return _global_skills_root() / _safe_skill_id(skill_id) / SKILL_ENTRYPOINT
+
+
+def _plugin_global_skill_summaries() -> list[dict[str, Any]]:
+    try:
+        return [
+            _plugin_skill_without_content(item)
+            for item in _plugin_manager_module().list_enabled_plugin_skills()
+            if isinstance(item, dict)
+        ]
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("plugin skill catalog unavailable: %s", exc)
+        return []
+
+
+def _plugin_global_skill_detail(skill_id: str) -> dict[str, Any]:
+    item = _plugin_manager_module().get_plugin_skill(skill_id)
+    if not isinstance(item, dict):
+        raise KeyError(skill_id)
+    return {
+        "id": str(item.get("skill_id") or item.get("id") or skill_id),
+        "scope": "plugin",
+        "enabled": bool(item.get("enabled", True)),
+        "entrypoint": str(item.get("entrypoint") or SKILL_ENTRYPOINT),
+        "plugin_id": str(item.get("plugin_id") or ""),
+        "path": str(item.get("path") or ""),
+        "summary": str(item.get("summary") or ""),
+        "chars": int(item.get("chars") or len(str(item.get("content") or ""))),
+        "content": str(item.get("content") or ""),
+    }
+
+
+def _plugin_skill_without_content(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(item.get("skill_id") or item.get("id") or ""),
+        "scope": "plugin",
+        "enabled": bool(item.get("enabled", True)),
+        "entrypoint": str(item.get("entrypoint") or SKILL_ENTRYPOINT),
+        "plugin_id": str(item.get("plugin_id") or ""),
+        "path": str(item.get("path") or ""),
+        "summary": str(item.get("summary") or ""),
+        "chars": int(item.get("chars") or len(str(item.get("content") or ""))),
+    }
+
+
+def _plugin_manager_module():
+    from app.services import plugin_manager
+
+    return plugin_manager

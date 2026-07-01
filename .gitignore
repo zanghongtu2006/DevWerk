@@ -1,3 +1,7 @@
 .devwerk/
 backend/
 dist/
+DevWerk/config/llm.json
+DevWerk/data/
+__pycache__/
+*.py[cod]

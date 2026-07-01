@@ -27,6 +27,7 @@ from app.routes.kanban import router as kanban_router
 from app.routes.kanban import ui_router as kanban_ui_router
 from app.routes.settings import router as settings_router
 from app.routes.skills import router as skills_router
+from app.routes.plugins import router as plugins_router
 from app.routes.memory import router as memory_router
 from app.services.kanban import init_kanban_db
 from app.services.memory_system import init_memory_db
@@ -161,6 +162,7 @@ def create_app() -> FastAPI:
     app.include_router(kanban_router, prefix="/v1", tags=["Kanban"])
     app.include_router(settings_router, prefix="/v1", tags=["Settings"])
     app.include_router(skills_router, prefix="/v1", tags=["Skills"])
+    app.include_router(plugins_router, prefix="/v1", tags=["Plugins"])
     app.include_router(memory_router, prefix="/v1", tags=["Memory"])
     app.include_router(kanban_ui_router)
     app.mount("/web/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "web" / "static")), name="web-static")

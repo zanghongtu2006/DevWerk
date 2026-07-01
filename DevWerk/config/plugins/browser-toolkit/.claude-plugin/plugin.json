@@ -1,0 +1,6 @@
+{
+  "name": "browser-toolkit",
+  "version": "0.1.0",
+  "description": "Browser, Playwright, CDP, and network evidence skills for workflow agents.",
+  "author": "DevWerk"
+}
