@@ -568,6 +568,48 @@ def test_project_conversation_executes_plugin_slash_command(monkeypatch, tmp_pat
     assert any(event["event_type"] == "project_plugin_command" for event in events)
 
 
+def test_project_conversation_plugin_slash_command_uses_body_not_frontmatter(monkeypatch, tmp_path):
+    plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
+    plugin = _write_plugin(plugins_root)
+    (plugin / "commands" / "audit-ui.md").write_text(
+        "---\ndescription: Audit UI with browser evidence\nallowed-tools: [Read, Bash]\n---\n\nCapture browser evidence with screenshots.\n",
+        encoding="utf-8",
+    )
+
+    class FakeSettings:
+        def __init__(self, db_path, session_dir):
+            self.devwerk_db_path = str(db_path)
+            self.devwerk_usage_tracking = False
+            self.devwerk_session_dir = str(session_dir)
+
+    import app.services.kanban as kanban_service
+    import app.services.session_store as session_store
+    import app.main as main_module
+
+    fake = FakeSettings(tmp_path / "devwerk.db", tmp_path / "sessions")
+    monkeypatch.setattr(kanban_service, "settings", lambda: fake)
+    monkeypatch.setattr(session_store, "settings", lambda: fake)
+    kanban_service._initialized = False
+
+    app = main_module.create_app()
+    with TestClient(app) as client:
+        result = client.post(
+            "/v1/kanban/projects/plugin-command-frontmatter/conversation",
+            json={"message": "/ui-observer:audit-ui inspect dashboard"},
+        )
+        events = client.get("/v1/kanban/events", params={"project_id": "plugin-command-frontmatter"}).json()["events"]
+
+    assert result.status_code == 200
+    payload = result.json()["payload"]
+    assert payload["summary"] == "Audit UI with browser evidence"
+    assert payload["frontmatter"]["allowed-tools"] == ["Read", "Bash"]
+    assert payload["instructions"].strip() == "Capture browser evidence with screenshots."
+    assert "---" not in payload["instructions"]
+    assert payload["content"].startswith("---")
+    plugin_event = next(event for event in events if event["event_type"] == "project_plugin_command")
+    assert plugin_event["payload"]["instructions"].strip() == "Capture browser evidence with screenshots."
+
+
 def test_backend_web_ui_exposes_plugin_management_controls():
     js = (Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "dashboard.js").read_text(encoding="utf-8")
 

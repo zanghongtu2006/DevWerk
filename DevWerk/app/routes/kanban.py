@@ -838,12 +838,15 @@ def _handle_project_plugin_command_payload(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     summary = command.get("summary") or command.get("id") or command_id
     content = str(command.get("content") or "")
+    instructions = str(command.get("body") or content)
     payload = {
         "command": command.get("command_id") or command_id,
         "plugin_id": command.get("plugin_id"),
         "command_id": command.get("id"),
         "argument": argument.strip(),
         "summary": summary,
+        "frontmatter": command.get("frontmatter") if isinstance(command.get("frontmatter"), dict) else {},
+        "instructions": instructions,
         "content": content,
         "metadata": metadata,
     }
