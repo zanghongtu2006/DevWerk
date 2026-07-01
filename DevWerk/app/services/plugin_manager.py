@@ -78,6 +78,20 @@ def set_global_plugin_enabled(plugin_id: str, enabled: bool) -> dict[str, Any]:
     return get_global_plugin(plugin_id)
 
 
+def remove_global_plugin(plugin_id: str) -> dict[str, Any]:
+    pid = _safe_plugin_id(plugin_id)
+    root = _global_plugins_root().resolve()
+    target = (root / pid).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"plugin path escapes global plugin root: {pid}") from exc
+    if not target.exists():
+        raise KeyError(f"global plugin not found: {pid}")
+    shutil.rmtree(target)
+    return {"ok": True, "id": pid, "removed": True}
+
+
 def import_global_plugin(source_path: str) -> dict[str, Any]:
     source = Path(source_path).expanduser().resolve()
     if not source.is_dir():
@@ -94,6 +108,64 @@ def import_global_plugin(source_path: str) -> dict[str, Any]:
     state.setdefault("enabled", True)
     _write_json(target / STATE_PATH, state)
     return get_global_plugin(plugin_id)
+
+
+def validate_plugin_source(source_path: str) -> dict[str, Any]:
+    source = Path(source_path).expanduser().resolve()
+    issues: list[str] = []
+    warnings: list[str] = []
+    if not source.is_dir():
+        return {
+            "ok": False,
+            "source_path": str(source),
+            "issues": [f"plugin source directory not found: {source}"],
+            "warnings": [],
+            "manifest": {},
+            "components": _empty_component_counts(),
+        }
+
+    manifest_path = source / MANIFEST_PATH
+    manifest = _read_json(manifest_path)
+    if not manifest_path.is_file():
+        issues.append(f"plugin manifest is required at {MANIFEST_PATH}")
+    elif not manifest:
+        issues.append(f"plugin manifest is invalid JSON or not an object: {MANIFEST_PATH}")
+
+    raw_name = str(manifest.get("name") or source.name)
+    try:
+        plugin_id = _safe_plugin_id(raw_name)
+    except ValueError:
+        plugin_id = ""
+        issues.append(f"invalid plugin name: {raw_name}")
+    if raw_name and not re.match(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$", raw_name):
+        issues.append(f"invalid plugin name: {raw_name}")
+
+    for field in ("commands", "agents", "hooks", "mcpServers"):
+        for raw_path in _manifest_path_values(manifest.get(field)):
+            path_issue = _validate_manifest_path(raw_path)
+            if path_issue:
+                issues.append(f"{field} path {raw_path!r} {path_issue}")
+
+    components = {
+        "commands": len(_discover_markdown(source, "commands", manifest.get("commands"))),
+        "agents": len(_discover_markdown(source, "agents", manifest.get("agents"))),
+        "skills": len(_discover_skills(source, plugin_id or "invalid-plugin")),
+        "hooks": len(_discover_hooks(source, manifest)),
+        "mcp_servers": len(_discover_mcp_servers(source, manifest)),
+    }
+    if not any(components.values()):
+        warnings.append("plugin has no discovered commands, agents, skills, hooks, or MCP servers")
+
+    return {
+        "ok": not issues,
+        "source_path": str(source),
+        "plugin_id": plugin_id,
+        "manifest_path": str(manifest_path),
+        "manifest": manifest,
+        "components": components,
+        "issues": issues,
+        "warnings": warnings,
+    }
 
 
 def list_marketplace_plugins(marketplace_path: str) -> dict[str, Any]:
@@ -342,7 +414,7 @@ def _manifest_path_values(value: object) -> list[str]:
 
 def _safe_manifest_path(plugin_root: Path, raw_path: str) -> Path | None:
     text = str(raw_path or "").strip().replace("\\", "/")
-    if not text.startswith("./") or "../" in text or text in {"./", "."}:
+    if _validate_manifest_path(text):
         return None
     candidate = (plugin_root / text[2:]).resolve()
     try:
@@ -350,6 +422,21 @@ def _safe_manifest_path(plugin_root: Path, raw_path: str) -> Path | None:
     except ValueError:
         return None
     return candidate
+
+
+def _validate_manifest_path(raw_path: str) -> str:
+    text = str(raw_path or "").strip().replace("\\", "/")
+    if not text.startswith("./"):
+        return "must start with './'"
+    if "../" in text or text in {"./", "."}:
+        return "must stay inside the plugin root"
+    if Path(text).is_absolute():
+        return "must be relative"
+    return ""
+
+
+def _empty_component_counts() -> dict[str, int]:
+    return {"commands": 0, "agents": 0, "skills": 0, "hooks": 0, "mcp_servers": 0}
 
 
 def _read_json(path: Path) -> dict[str, Any]:

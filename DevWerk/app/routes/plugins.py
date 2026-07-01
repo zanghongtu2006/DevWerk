@@ -11,8 +11,10 @@ from app.services.plugin_manager import (
     import_marketplace_plugin,
     list_marketplace_plugins,
     list_global_plugins,
+    remove_global_plugin,
     set_global_plugin_enabled,
     upsert_global_plugin,
+    validate_plugin_source,
 )
 
 
@@ -34,6 +36,10 @@ class PluginEnabledRequest(BaseModel):
 
 
 class PluginImportRequest(BaseModel):
+    source_path: str
+
+
+class PluginValidateRequest(BaseModel):
     source_path: str
 
 
@@ -61,6 +67,11 @@ def plugins_import(req: PluginImportRequest):
         return {"ok": True, "plugin": import_global_plugin(req.source_path)}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/validate")
+def plugins_validate(req: PluginValidateRequest):
+    return {"ok": True, "validation": validate_plugin_source(req.source_path)}
 
 
 @router.post("/import-marketplace")
@@ -105,3 +116,13 @@ def plugins_patch(plugin_id: str, req: PluginEnabledRequest):
         return {"ok": True, "plugin": set_global_plugin_enabled(plugin_id, req.enabled)}
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.delete("/{plugin_id}")
+def plugins_delete(plugin_id: str):
+    try:
+        return remove_global_plugin(plugin_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

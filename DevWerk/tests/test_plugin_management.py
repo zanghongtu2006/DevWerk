@@ -148,6 +148,47 @@ def test_plugin_api_round_trip_and_enable_toggle(monkeypatch, tmp_path):
     assert any(item["id"] == "ui-observer" for item in listed.json()["plugins"])
 
 
+def test_plugin_validation_and_uninstall_api(monkeypatch, tmp_path):
+    plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
+    source = _write_plugin(tmp_path / "source", "validated-plugin")
+
+    import app.main as main_module
+
+    app = main_module.create_app()
+    with TestClient(app) as client:
+        validation = client.post("/v1/plugins/validate", json={"source_path": str(source)})
+        imported = client.post("/v1/plugins/import", json={"source_path": str(source)})
+        listed_before = client.get("/v1/plugins")
+        removed = client.delete("/v1/plugins/validated-plugin")
+        listed_after = client.get("/v1/plugins")
+
+    assert validation.status_code == 200
+    assert validation.json()["validation"]["ok"] is True
+    assert validation.json()["validation"]["components"]["skills"] == 1
+    assert imported.status_code == 200
+    assert listed_before.status_code == 200
+    assert any(item["id"] == "validated-plugin" for item in listed_before.json()["plugins"])
+    assert removed.status_code == 200
+    assert removed.json()["removed"] is True
+    assert not (plugins_root / "validated-plugin").exists()
+    assert not any(item["id"] == "validated-plugin" for item in listed_after.json()["plugins"])
+
+
+def test_plugin_validation_reports_invalid_manifest(monkeypatch, tmp_path):
+    _patch_roots(monkeypatch, tmp_path)
+    broken = tmp_path / "broken-plugin"
+    (broken / ".claude-plugin").mkdir(parents=True)
+    (broken / ".claude-plugin" / "plugin.json").write_text('{"name":"Bad Plugin Name","commands":"commands"}', encoding="utf-8")
+
+    from app.services.plugin_manager import validate_plugin_source
+
+    validation = validate_plugin_source(str(broken))
+
+    assert validation["ok"] is False
+    assert any("invalid plugin name" in issue for issue in validation["issues"])
+    assert any("must start with './'" in issue for issue in validation["issues"])
+
+
 def test_plugin_import_copies_claude_plugin_directory(monkeypatch, tmp_path):
     plugins_root, imported_root = _patch_roots(monkeypatch, tmp_path)
     source = _write_plugin(tmp_path / "source")
@@ -257,5 +298,7 @@ def test_backend_web_ui_exposes_plugin_management_controls():
     assert "pluginMarketplacePath" in js
     assert "loadPluginMarketplace" in js
     assert "importMarketplacePlugin" in js
+    assert "removeGlobalPlugin" in js
+    assert "validateGlobalPlugin" in js
     assert "togglePluginEnabled" in js
     assert "/plugins" in js
