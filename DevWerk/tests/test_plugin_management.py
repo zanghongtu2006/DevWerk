@@ -369,6 +369,41 @@ def test_plugin_validation_warns_for_unknown_manifest_fields(monkeypatch, tmp_pa
     assert any("unknown manifest field: mysteryFeature" in warning for warning in validation["warnings"])
 
 
+def test_plugin_validation_rejects_missing_manifest_component_paths(monkeypatch, tmp_path):
+    _patch_roots(monkeypatch, tmp_path)
+    source = _write_plugin(tmp_path / "source", "missing-paths")
+    (source / "config").mkdir()
+    (source / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "missing-paths",
+                "version": "0.1.0",
+                "commands": "./missing-commands",
+                "agents": ["./agents", "./missing-agents"],
+                "hooks": "./missing-hooks.json",
+                "mcpServers": "./config",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    from app.services.plugin_manager import import_global_plugin, validate_plugin_source
+
+    validation = validate_plugin_source(str(source))
+
+    assert validation["ok"] is False
+    assert any("commands path './missing-commands' does not exist" in issue for issue in validation["issues"])
+    assert any("agents path './missing-agents' does not exist" in issue for issue in validation["issues"])
+    assert any("hooks path './missing-hooks.json' does not exist" in issue for issue in validation["issues"])
+    assert any("mcpServers path './config' must be a file" in issue for issue in validation["issues"])
+    try:
+        import_global_plugin(str(source))
+    except ValueError as exc:
+        assert "commands path './missing-commands' does not exist" in str(exc)
+    else:
+        raise AssertionError("missing component path plugin import should fail")
+
+
 def test_plugin_validation_warns_for_weak_markdown_components(monkeypatch, tmp_path):
     _patch_roots(monkeypatch, tmp_path)
     source = _write_plugin(tmp_path / "source", "weak-markdown")

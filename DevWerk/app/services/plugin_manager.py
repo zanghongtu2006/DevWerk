@@ -198,6 +198,8 @@ def validate_plugin_source(source_path: str) -> dict[str, Any]:
             path_issue = _validate_manifest_path(raw_path)
             if path_issue:
                 issues.append(f"{field} path {raw_path!r} {path_issue}")
+            else:
+                issues.extend(_manifest_component_path_issues(source, field, raw_path))
 
     commands = _discover_markdown(source, "commands", manifest.get("commands"))
     agents = _discover_markdown(source, "agents", manifest.get("agents"))
@@ -754,6 +756,19 @@ def _mcp_server_config_issues(items: list[dict[str, Any]]) -> list[str]:
         elif not re.match(r"^https?://", url):
             issues.append(f"mcpServers {server_id} url must be http(s)")
     return issues
+
+
+def _manifest_component_path_issues(plugin_root: Path, field: str, raw_path: str) -> list[str]:
+    path = _safe_manifest_path(plugin_root, raw_path)
+    if path is None:
+        return []
+    if not path.exists():
+        return [f"{field} path {raw_path!r} does not exist"]
+    if field in {"hooks", "mcpServers"} and not path.is_file():
+        return [f"{field} path {raw_path!r} must be a file"]
+    if field in {"commands", "agents"} and not (path.is_dir() or (path.is_file() and path.suffix.lower() == ".md")):
+        return [f"{field} path {raw_path!r} must be a directory or markdown file"]
+    return []
 
 
 def _hook_config_issues(items: list[dict[str, Any]]) -> list[str]:
