@@ -139,18 +139,45 @@ def test_browser_and_network_capabilities_are_first_class_tool_requests():
 
 
 def test_builtin_browser_toolkit_plugin_exposes_mcp_servers():
-    from app.services.plugin_manager import get_global_plugin, list_enabled_plugin_mcp_servers
+    from app.services.plugin_manager import get_global_plugin, list_enabled_plugin_agents, list_enabled_plugin_mcp_servers
 
     plugin = get_global_plugin("browser-toolkit")
     servers = {server["id"]: server for server in plugin["mcp_servers"]}
+    agents = {agent["agent_id"]: agent for agent in list_enabled_plugin_agents()}
     runtime = {server["server_ref"]: server for server in list_enabled_plugin_mcp_servers()}
 
     assert servers["playwright"]["config"]["command"] == "npx"
     assert "@playwright/mcp@latest" in servers["playwright"]["config"]["args"]
     assert servers["chrome-devtools"]["config"]["command"] == "npx"
     assert "chrome-devtools-mcp@latest" in servers["chrome-devtools"]["config"]["args"]
+    assert "browser-toolkit:browser-agent" in agents
+    assert "browser.playwright" in agents["browser-toolkit:browser-agent"]["content"]
+    assert {server["id"] for server in agents["browser-toolkit:browser-agent"]["mcp_servers"]} == {
+        "playwright",
+        "chrome-devtools",
+    }
     assert runtime["browser-toolkit:playwright"]["resolved_config"]["command"] == "npx"
     assert runtime["browser-toolkit:chrome-devtools"]["resolved_config"]["command"] == "npx"
+
+
+def test_capability_catalog_api_exposes_browser_network_and_plugin_runtime(monkeypatch, tmp_path):
+    _configure(monkeypatch, tmp_path)
+    import app.main as main_module
+
+    app = main_module.create_app()
+    with TestClient(app) as client:
+        response = client.get("/v1/capabilities")
+
+    assert response.status_code == 200
+    payload = response.json()
+    capabilities = {item["capability"]: item for item in payload["capabilities"]}
+    assert capabilities["browser.cdp"]["category"] == "browser"
+    assert capabilities["browser.playwright"]["category"] == "browser"
+    assert capabilities["network.http"]["category"] == "network"
+    assert capabilities["network.web"]["category"] == "network"
+    assert "browser-toolkit:playwright" in capabilities["browser.playwright"]["plugin_mcp_servers"]
+    assert "browser-toolkit:chrome-devtools" in capabilities["browser.cdp"]["plugin_mcp_servers"]
+    assert "browser-toolkit:browser-agent" in payload["browser_agents"]
 
 
 def test_project_conversation_slash_commands_update_project_md_and_memory(monkeypatch, tmp_path):
@@ -243,9 +270,13 @@ def test_backend_web_ui_exposes_skill_management_and_slash_commands():
     assert "globalSkillId" in js
     assert "globalSkillMd" in js
     assert "loadSlashCommands" in js
+    assert "loadCapabilities" in js
+    assert "/capabilities" in js
+    assert "capabilityCatalogCard" in js
     assert 'command:"/goal", argument_hint:"project objective"' in js
     assert 'command:"/learn", argument_hint:"reusable rule"' in js
     assert 'command:"/distill", argument_hint:"compact this project context"' in js
+    assert "data-slash-command" in js
     assert "parseSlashCommand" in js
     assert ".slash-hint" in css
 

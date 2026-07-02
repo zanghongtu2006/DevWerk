@@ -12,6 +12,7 @@ STATE_PATH = ".devwerk-plugin.json"
 SETTINGS_PATH = ".devwerk-plugin-settings.md"
 SKILL_ENTRYPOINT = "SKILL.md"
 SECRET_SCAN_EXCLUDED_DIRS = {".git", ".hg", ".svn", "__pycache__", "node_modules", ".venv", "venv", "dist", "build"}
+PACKAGE_WARNING_NAMES = {".DS_Store", "node_modules", "__pycache__"}
 SECRET_SCAN_EXTENSIONS = {
     ".bat",
     ".cmd",
@@ -236,6 +237,7 @@ def validate_plugin_source(source_path: str) -> dict[str, Any]:
     issues.extend(_hook_config_issues(hooks))
     issues.extend(_mcp_server_config_issues(mcp_servers))
     issues.extend(_plugin_secret_issues(source))
+    warnings.extend(_plugin_organization_warnings(source))
     warnings.extend(_markdown_component_warnings("commands", commands, required_frontmatter=("description",)))
     warnings.extend(_markdown_component_warnings("agents", agents, required_frontmatter=("name", "description", "model")))
     warnings.extend(_markdown_component_warnings("skills", skills, required_frontmatter=("name", "description")))
@@ -816,6 +818,25 @@ def _plugin_secret_issues(plugin_root: Path) -> list[str]:
         if any(pattern.search(text) for pattern in SECRET_PATTERNS):
             issues.append(f"{rel} contains hardcoded secret-like value")
     return issues
+
+
+def _plugin_organization_warnings(plugin_root: Path) -> list[str]:
+    warnings: list[str] = []
+    if not (plugin_root / "README.md").is_file():
+        warnings.append("README.md is missing")
+    if not any((plugin_root / name).is_file() for name in ("LICENSE", "LICENSE.md", "LICENSE.txt")):
+        warnings.append("LICENSE is missing")
+    root = plugin_root.resolve()
+    for path in sorted(root.rglob("*")):
+        name = path.name
+        if name not in PACKAGE_WARNING_NAMES:
+            continue
+        try:
+            rel = path.relative_to(root).as_posix()
+        except ValueError:
+            rel = name
+        warnings.append(f"{rel} should not be packaged")
+    return warnings
 
 
 def _hook_config_issues(items: list[dict[str, Any]]) -> list[str]:

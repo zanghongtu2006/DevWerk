@@ -431,6 +431,25 @@ def test_plugin_validation_rejects_hardcoded_plugin_secrets(monkeypatch, tmp_pat
         raise AssertionError("secret-bearing plugin import should fail")
 
 
+def test_plugin_validation_warns_for_package_organization_issues(monkeypatch, tmp_path):
+    _patch_roots(monkeypatch, tmp_path)
+    source = _write_plugin(tmp_path / "source", "messy-plugin")
+    (source / "node_modules" / "left-pad").mkdir(parents=True)
+    (source / ".DS_Store").write_text("finder metadata", encoding="utf-8")
+    (source / "__pycache__").mkdir()
+
+    from app.services.plugin_manager import validate_plugin_source
+
+    validation = validate_plugin_source(str(source))
+
+    assert validation["ok"] is True
+    assert any("README.md is missing" in warning for warning in validation["warnings"])
+    assert any("LICENSE is missing" in warning for warning in validation["warnings"])
+    assert any("node_modules should not be packaged" in warning for warning in validation["warnings"])
+    assert any(".DS_Store should not be packaged" in warning for warning in validation["warnings"])
+    assert any("__pycache__ should not be packaged" in warning for warning in validation["warnings"])
+
+
 def test_plugin_validation_warns_for_weak_markdown_components(monkeypatch, tmp_path):
     _patch_roots(monkeypatch, tmp_path)
     source = _write_plugin(tmp_path / "source", "weak-markdown")

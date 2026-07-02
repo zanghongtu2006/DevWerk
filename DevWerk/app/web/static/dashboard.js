@@ -20,6 +20,7 @@ const state = {
   pluginAgents: [],
   pluginHooks: [],
   pluginMcpServers: [],
+  capabilities: {},
   pluginSettings: {},
   pluginMarketplace: null,
   pluginValidation: null,
@@ -45,7 +46,7 @@ async function api(path, options = {}) {
 }
 async function refreshAll() {
   await loadProjects();
-  await Promise.allSettled([loadBoard(), loadEvents(), loadConversation(), loadSettings(), loadGlobalSettings(), loadWorkflow(), loadMemory(), loadUsage(), loadProjectMd(), loadGlobalSkills(), loadGlobalPlugins(), loadPluginCommands(), loadPluginAgents(), loadPluginHooks(), loadPluginMcpServers(), loadPluginSettings(), loadProjectSkills(), loadSlashCommands()]);
+  await Promise.allSettled([loadBoard(), loadEvents(), loadConversation(), loadSettings(), loadGlobalSettings(), loadWorkflow(), loadMemory(), loadUsage(), loadProjectMd(), loadGlobalSkills(), loadGlobalPlugins(), loadPluginCommands(), loadPluginAgents(), loadPluginHooks(), loadPluginMcpServers(), loadCapabilities(), loadPluginSettings(), loadProjectSkills(), loadSlashCommands()]);
   renderShell();
   connectProjectStream();
 }
@@ -69,6 +70,7 @@ async function loadPluginCommands() { try { const data = await api(`${API}/plugi
 async function loadPluginAgents() { try { const data = await api(`${API}/plugins/agents`); state.pluginAgents = data.agents || []; } catch (_) { state.pluginAgents = []; } }
 async function loadPluginHooks() { try { const data = await api(`${API}/plugins/hooks`); state.pluginHooks = data.hooks || []; } catch (_) { state.pluginHooks = []; } }
 async function loadPluginMcpServers() { try { const data = await api(`${API}/plugins/mcp-servers`); state.pluginMcpServers = data.mcp_servers || []; } catch (_) { state.pluginMcpServers = []; } }
+async function loadCapabilities() { try { state.capabilities = await api(`${API}/capabilities`); } catch (_) { state.capabilities = {}; } }
 async function loadPluginSettings() {
   const out = {};
   await Promise.all((state.globalPlugins || []).map(async plugin => {
@@ -198,8 +200,8 @@ function renderSettingsSection() {
   const global = state.globalSettings || {};
   $("page").innerHTML = `<div class="section-grid">
     <section class="card card-pad"><div class="page-head"><div><h1 class="h2">Global Settings</h1><div class="muted">System-wide LLM APIs and route keys. Project workflow and agent settings live under Projects.</div></div><span class="badge blue">Global</span></div>
-      <div class="dense-grid" style="margin-top:16px">${settingsTile("Default Route", (global.routing || {}).default || "default", "Default model route used when a project or dynamically spawned node agent has no override.")}${settingsTile("Route Keys", Object.keys(global.routing || {}).length || 0, "Route keys are model aliases. Workflow nodes choose agents and may bind those agents to a route.")}${settingsTile("LLM Providers", Object.keys(global.llms || {}).length || 0, "Configured provider blocks from llm.json or global settings API.")}</div>
-      <div style="margin-top:14px" class="config-grid">${editorCard("Global LLM Catalog","Provider credentials, base URLs, and model definitions.","JSON", JSON.stringify(global.llms || {}, null, 2))}${editorCard("Global Routing Map","Model route aliases mapped to provider/model configs. These are not workflow columns or agent names.","JSON", JSON.stringify(global.routing || {}, null, 2))}<div class="side-stack">${globalRoutingSummaryCard()}${skillSummaryCard()}${pluginSummaryCard()}${settingsTile("Dynamic Node Agents", "Workflow driven", "Project workflow nodes spawn temporary agents at runtime. Only project-agent and context-indexer are built in.")}</div></div>
+      <div class="dense-grid" style="margin-top:16px">${settingsTile("Default Route", (global.routing || {}).default || "default", "Default model route used when a project or dynamically spawned node agent has no override.")}${settingsTile("Route Keys", Object.keys(global.routing || {}).length || 0, "Route keys are model aliases. Workflow nodes choose agents and may bind those agents to a route.")}${settingsTile("Capabilities", (state.capabilities.capabilities || []).length || 0, "Semantic tool contracts available to workflow agents and capability providers.")}</div>
+      <div style="margin-top:14px" class="config-grid">${editorCard("Global LLM Catalog","Provider credentials, base URLs, and model definitions.","JSON", JSON.stringify(global.llms || {}, null, 2))}${editorCard("Global Routing Map","Model route aliases mapped to provider/model configs. These are not workflow columns or agent names.","JSON", JSON.stringify(global.routing || {}, null, 2))}<div class="side-stack">${globalRoutingSummaryCard()}${capabilityCatalogCard()}${skillSummaryCard()}${pluginSummaryCard()}${settingsTile("Dynamic Node Agents", "Workflow driven", "Project workflow nodes spawn temporary agents at runtime. Only project-agent and context-indexer are built in.")}</div></div>
       <div style="margin-top:14px" class="config-grid single-row">${globalPluginCards()}</div>
       <div style="margin-top:14px" class="config-grid single-row">${pluginAgentCards()}</div>
       <div style="margin-top:14px" class="config-grid single-row">${pluginRuntimeCatalogCards()}</div>
@@ -302,7 +304,7 @@ function slashHintHtml(){
     {command:"/learn", argument_hint:"reusable rule", source:"builtin"},
     {command:"/distill", argument_hint:"compact this project context", source:"builtin"}
   ];
-  return `<div class="slash-hint"><b>Slash commands</b>${commands.slice(0,8).map(item => `<span title="${escAttr(item.summary || "")}">${esc(item.command)}${item.argument_hint ? " " + esc(item.argument_hint) : ""}${item.source === "plugin" ? " · plugin" : ""}</span>`).join("")}</div>`;
+  return `<div class="slash-hint"><b>Slash commands</b>${commands.slice(0,8).map(item => `<span data-slash-command="${escAttr(item.command)}" title="${escAttr(item.summary || "")}">${esc(item.command)}${item.argument_hint ? " " + esc(item.argument_hint) : ""}${item.source === "plugin" ? " · plugin" : ""}</span>`).join("")}</div>`;
 }
 function conversationHtml() {
   const msgs = state.conversation.length ? state.conversation : [{role:"assistant", content:"I will help you break this down into actionable tasks and move them through the workflow. Tell me what you want DevWerk to build, review, research, or organize."}];
@@ -354,7 +356,14 @@ async function sendProjectMessage() {
     if (currentSend) currentSend.disabled = false;
   }
 }
-function parseSlashCommand(content){ const match = String(content || "").trim().match(/^\/(goal|learn|distill)(?:\s+([\s\S]*))?$/i); if(!match) return null; const command = match[1].toLowerCase(); return {command, action: command, argument: (match[2] || "").trim()}; }
+function parseSlashCommand(content){
+  const text = String(content || "").trim();
+  const match = text.match(/^\/(goal|learn|distill)(?:\s+([\s\S]*))?$/i);
+  if(match) { const command = match[1].toLowerCase(); return {command, action: command, argument: (match[2] || "").trim()}; }
+  const head = text.split(/\s+/, 1)[0];
+  if(head.startsWith("/") && (state.slashCommands || []).some(item => item.command === head)) return {command: head.slice(1), action: "message", argument: text};
+  return null;
+}
 function recentTasksCard(){ const tasks=allTasks().slice(0,5); return `<div class="card card-pad"><div style="display:flex;justify-content:space-between;margin-bottom:16px"><div class="h3">Recent Tasks</div><a class="link" href="/tasks?project_id=${escAttr(state.projectId)}">View all</a></div><div class="list">${tasks.map(t=>`<div class="list-row"><span class="timeline-dot"></span><div class="grow"><div class="list-row-title">${esc(t.title)}</div></div><span><i class="dot ${stageColor(t.status_key)}"></i>${esc(STAGE_TITLES[t.status_key] || t.status_key || "Draft")}</span></div>`).join("")}<div class="list-row"><span>+</span><a class="link">New Task</a></div></div></div>`; }
 function memoryCard(){ const mem=state.memory || {}; return `<div class="card card-pad"><div style="display:flex;justify-content:space-between;margin-bottom:16px"><div class="h3">Memory Status</div><a class="link">View</a></div><div class="metric-lines"><div class="metric-line"><b>Frameworks</b><b>${countMemory(mem,"framework")}</b></div><div class="metric-line"><b>Codebase Paths</b><b>${countMemory(mem,"path")}</b></div><div class="metric-line"><b>Commands</b><b>${countMemory(mem,"command")}</b></div><div class="metric-line"><b>Recent Summaries</b><b>${countMemory(mem,"summary")}</b></div></div><div class="muted" style="margin-top:20px;font-size:12px">Last updated: ${relative(mem.updated_at)} <i class="dot green" style="float:right"></i></div></div>`; }
 function recentEventsCard(){ return `<div class="card card-pad"><div style="display:flex;justify-content:space-between;margin-bottom:16px"><div class="h3">Recent Events</div><a class="link">View all</a></div><div class="list">${state.events.slice(0,5).map(e=>`<div class="list-row"><span class="timeline-dot"></span><div><div class="list-row-title">${esc(dateTime(e.created_at))} ${esc(eventTitle(e))}</div><div class="list-row-sub">${esc(e.task_title || e.to_status || state.projectId)}</div></div></div>`).join("") || `<div class="muted">No events yet.</div>`}</div></div>`; }
@@ -365,6 +374,13 @@ function projectCard(project){ const stats=project.stats || {}; const health=pro
 function editorCard(title, desc, mode, content){ const lines=String(content || "").split("\n"); return `<div class="editor-card card" data-editor-title="${escAttr(title)}" data-editor-mode="${escAttr(mode)}"><div class="editor-head"><div><div class="h3">${title}</div><div class="muted" style="font-size:12px;margin-top:4px">${desc}</div></div><button class="small-button" data-action="editor-format">${mode}</button></div><div class="editor"><div class="line-nos">${lines.map((_,i)=>i+1).join("<br/>")}</div><textarea class="code-editor" spellcheck="false">${esc(lines.join("\n"))}</textarea></div><div class="editor-foot"><span class="muted">Loaded from backend API</span><span><button class="small-button" data-action="editor-format">Format</button> <button class="small-button" data-action="editor-save">Save</button></span></div></div>`; }
 function workflowPresetCard(){ const workflow=state.workflow || {}; const columnsCount=(workflow.columns || workflow.stages || columns() || []).length; return `<div class="card side-card"><div class="h3">Workflow Definition</div><div class="muted" style="font-size:12px;margin-top:4px">Loaded from backend project workflow.</div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Name</b><span>${esc(workflow.name || "default")}</span></div><div class="metric-line"><b>Columns</b><span>${columnsCount}</span></div><div class="metric-line"><b>Source</b><span>${workflow.source ? esc(workflow.source) : "project settings"}</span></div></div></div>`; }
 function skillSummaryCard(){ return `<div class="card side-card"><div class="h3">Skills</div><div class="muted" style="font-size:12px;margin-top:4px">Agents load SKILL.md entries from global and project scope.</div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Global</b><span>${state.globalSkills.length}</span></div><div class="metric-line"><b>Project</b><span>${state.projectSkills.length}</span></div><div class="metric-line"><b>Entrypoint</b><span>SKILL.md</span></div></div></div>`; }
+function capabilityCatalogCard(){
+  const capabilities = state.capabilities.capabilities || [];
+  const browserAgents = state.capabilities.browser_agents || [];
+  const browser = capabilities.filter(item => item.category === "browser");
+  const network = capabilities.filter(item => item.category === "network");
+  return `<div class="card side-card"><div class="h3">Capability Catalog</div><div class="muted" style="font-size:12px;margin-top:4px">Semantic tools that agents may request. Providers can be IDE, browser, CI, MCP, or another client.</div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Browser</b><span>${browser.map(item=>item.capability).join(", ") || "-"}</span></div><div class="metric-line"><b>Network</b><span>${network.map(item=>item.capability).join(", ") || "-"}</span></div><div class="metric-line"><b>Browser Agents</b><span>${browserAgents.length}</span></div></div></div>`;
+}
 function pluginSummaryCard(){ const enabled=(state.globalPlugins || []).filter(plugin => plugin.enabled !== false).length; const skills=(state.globalPlugins || []).reduce((sum, plugin) => sum + Number(plugin.skills_count || 0), 0); return `<div class="card side-card"><div class="h3">Plugins</div><div class="muted" style="font-size:12px;margin-top:4px">Claude-style plugin packages can provide skills, commands, agent templates, hooks, and MCP server configs.</div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Installed</b><span>${state.globalPlugins.length}</span></div><div class="metric-line"><b>Enabled</b><span>${enabled}</span></div><div class="metric-line"><b>Plugin Skills</b><span>${skills}</span></div><div class="metric-line"><b>Plugin Agents</b><span>${state.pluginAgents.length}</span></div><div class="metric-line"><b>Hooks</b><span>${state.pluginHooks.length}</span></div><div class="metric-line"><b>MCP Servers</b><span>${state.pluginMcpServers.length}</span></div></div></div>`; }
 function globalPluginCards(){
   const plugins = state.globalPlugins || [];
@@ -800,6 +816,11 @@ document.addEventListener("click", async event => {
   const collapse = event.target.closest(".nav-collapse");
   if (collapse) {
     document.querySelector(".app-shell")?.classList.toggle("nav-collapsed");
+    return;
+  }
+  const slashChip = event.target.closest("[data-slash-command]");
+  if (slashChip) {
+    setPrompt(`${slashChip.dataset.slashCommand || ""} `);
     return;
   }
   const sectionLink = event.target.closest("a[data-nav]");
