@@ -189,6 +189,7 @@ def validate_plugin_source(source_path: str) -> dict[str, Any]:
     issues.extend(_duplicate_component_issues("agents", agents))
     issues.extend(_duplicate_component_issues("skills", skills))
     issues.extend(_duplicate_component_issues("mcpServers", mcp_servers))
+    issues.extend(_mcp_server_config_issues(mcp_servers))
 
     components = {
         "commands": len(commands),
@@ -706,6 +707,30 @@ def _duplicate_component_issues(kind: str, items: list[dict[str, Any]]) -> list[
             continue
         counts[component_id] = counts.get(component_id, 0) + 1
     return [f"duplicate {kind} id: {component_id}" for component_id, count in sorted(counts.items()) if count > 1]
+
+
+def _mcp_server_config_issues(items: list[dict[str, Any]]) -> list[str]:
+    issues: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        server_id = str(item.get("id") or "").strip() or "<unknown>"
+        config = item.get("config") if isinstance(item.get("config"), dict) else {}
+        server_type = str(config.get("type") or "stdio").strip().lower()
+        if server_type not in {"stdio", "http", "sse"}:
+            issues.append(f"mcpServers {server_id} unsupported type: {server_type}")
+            continue
+        if server_type == "stdio":
+            command = str(config.get("command") or "").strip()
+            if not command:
+                issues.append(f"mcpServers {server_id} requires command for stdio server")
+            continue
+        url = str(config.get("url") or "").strip()
+        if not url:
+            issues.append(f"mcpServers {server_id} requires url for {server_type} server")
+        elif not re.match(r"^https?://", url):
+            issues.append(f"mcpServers {server_id} url must be http(s)")
+    return issues
 
 
 def _empty_component_counts() -> dict[str, int]:

@@ -359,6 +359,73 @@ def test_plugin_validation_rejects_duplicate_component_ids(monkeypatch, tmp_path
         raise AssertionError("duplicate component plugin import should fail")
 
 
+def test_plugin_validation_rejects_invalid_mcp_server_configs(monkeypatch, tmp_path):
+    _patch_roots(monkeypatch, tmp_path)
+    source = _write_plugin(tmp_path / "source", "invalid-mcp")
+    (source / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "missing-command": {"args": ["server.js"]},
+                    "missing-url": {"type": "sse"},
+                    "bad-type": {"type": "websocket", "url": "https://example.com/mcp"},
+                    "bad-url": {"type": "http", "url": "example.com/mcp"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    from app.services.plugin_manager import import_global_plugin, validate_plugin_source
+
+    validation = validate_plugin_source(str(source))
+
+    assert validation["ok"] is False
+    assert any("mcpServers missing-command requires command for stdio server" in issue for issue in validation["issues"])
+    assert any("mcpServers missing-url requires url for sse server" in issue for issue in validation["issues"])
+    assert any("mcpServers bad-type unsupported type: websocket" in issue for issue in validation["issues"])
+    assert any("mcpServers bad-url url must be http(s)" in issue for issue in validation["issues"])
+    try:
+        import_global_plugin(str(source))
+    except ValueError as exc:
+        assert "mcpServers missing-command requires command for stdio server" in str(exc)
+    else:
+        raise AssertionError("invalid MCP server plugin import should fail")
+
+
+def test_plugin_validation_accepts_stdio_http_and_sse_mcp_configs(monkeypatch, tmp_path):
+    _patch_roots(monkeypatch, tmp_path)
+    source = _write_plugin(tmp_path / "source", "valid-mcp")
+    (source / ".mcp.json").unlink()
+    (source / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "valid-mcp",
+                "version": "0.1.0",
+                "mcpServers": {
+                    "remote-http": {
+                        "type": "http",
+                        "url": "https://example.com/mcp",
+                        "headers": {"Authorization": "Bearer ${TOKEN}"},
+                    },
+                    "remote-sse": {"type": "sse", "url": "http://127.0.0.1:8765/sse"},
+                    "stdio": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem"]},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    from app.services.plugin_manager import import_global_plugin, validate_plugin_source
+
+    validation = validate_plugin_source(str(source))
+    imported = import_global_plugin(str(source))
+
+    assert validation["ok"] is True
+    assert validation["components"]["mcp_servers"] == 3
+    assert {server["id"] for server in imported["mcp_servers"]} == {"remote-http", "remote-sse", "stdio"}
+
+
 def test_plugin_import_copies_claude_plugin_directory(monkeypatch, tmp_path):
     plugins_root, imported_root = _patch_roots(monkeypatch, tmp_path)
     source = _write_plugin(tmp_path / "source")
