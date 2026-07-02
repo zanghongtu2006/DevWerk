@@ -405,7 +405,12 @@ function pluginValidationPreview(){
   const details = issues.length ? issues.join("; ") : (warnings.length ? warnings.join("; ") : `${validation.plugin_id || "plugin"} can be imported.`);
   return `<div class="muted" style="font-size:12px;margin-top:10px"><b>${esc(label)}</b>: ${esc(details)}</div>`;
 }
-function globalSkillEditors(){ const skills = state.globalSkills || []; if(!skills.length) return `<div class="card card-pad"><div class="h3">Global Skill Catalog</div><div class="muted">No global SKILL.md files returned by backend.</div></div>`; return skills.map(skill => editorCard(`Global Skill: ${skill.id}`, `Global SKILL.md (${skill.scope || "global"}).`, "Markdown", skill.content || skill.summary || "")).join(""); }
+function globalSkillEditors(){
+  const skills = state.globalSkills || [];
+  const createCard = `<div class="card card-pad"><div class="h3">Create Global Skill</div><div class="muted" style="font-size:12px;margin-top:4px">Global skills are SKILL.md entries available to every project workflow agent when selected by node configuration.</div><div style="display:grid;gap:8px;margin-top:12px"><input id="globalSkillId" class="input" placeholder="skill-id" /><textarea id="globalSkillMd" class="code-editor small-editor" placeholder="# Skill name&#10;&#10;Describe when this global skill applies and how agents should use it."></textarea><button class="btn small" data-global-skill-create="true">Create Global Skill</button></div></div>`;
+  const editors = skills.length ? skills.map(skill => editorCard(`Global Skill: ${skill.id}`, `Global SKILL.md (${skill.scope || "global"}).`, "Markdown", skill.content || skill.summary || "")).join("") : `<div class="card card-pad"><div class="h3">Global Skill Catalog</div><div class="muted">No global SKILL.md files returned by backend.</div></div>`;
+  return `${createCard}${editors}`;
+}
 function projectSkillEditors(){
   const skills = state.projectSkills || [];
   const createCard = `<div class="card card-pad"><div class="h3">Create Project Skill</div><div class="muted" style="font-size:12px;margin-top:4px">Project-scoped skills are loaded from SKILL.md content and can be selected by workflow node agents.</div><div style="display:grid;gap:8px;margin-top:12px"><input id="projectSkillId" class="input" placeholder="skill-id" /><textarea id="projectSkillMd" class="code-editor small-editor" placeholder="# Skill name&#10;&#10;Describe when this skill applies and how agents should use it."></textarea><button class="btn small" data-project-skill-create="true">Create Project Skill</button></div></div>`;
@@ -722,6 +727,15 @@ async function importMarketplacePlugin() {
   renderShell();
   notify(`${pluginName} imported.`);
 }
+async function createGlobalSkill() {
+  const skillId = ($("globalSkillId")?.value || "").trim();
+  const skillMd = ($("globalSkillMd")?.value || "").trim();
+  if (!skillId) { notify("Global skill id is required.", "error"); return; }
+  await api(`${API}/skills/${encodeURIComponent(skillId)}`, {method:"PUT", body:JSON.stringify({skill_md: skillMd})});
+  await loadGlobalSkills();
+  renderShell();
+  notify(`Global skill ${skillId} created.`);
+}
 async function createProjectSkill() {
   const skillId = ($("projectSkillId")?.value || "").trim();
   const skillMd = ($("projectSkillMd")?.value || "").trim();
@@ -826,6 +840,11 @@ document.addEventListener("click", async event => {
   const marketplaceImport = event.target.closest("[data-plugin-marketplace-import]");
   if (marketplaceImport) {
     await importMarketplacePlugin();
+    return;
+  }
+  const globalSkillCreate = event.target.closest("[data-global-skill-create]");
+  if (globalSkillCreate) {
+    await createGlobalSkill();
     return;
   }
   const projectSkillCreate = event.target.closest("[data-project-skill-create]");

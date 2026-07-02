@@ -239,6 +239,9 @@ def test_backend_web_ui_exposes_skill_management_and_slash_commands():
     assert "loadProjectSkills" in js
     assert "Global Skill:" in js
     assert "Project Skill:" in js
+    assert "createGlobalSkill" in js
+    assert "globalSkillId" in js
+    assert "globalSkillMd" in js
     assert "loadSlashCommands" in js
     assert 'command:"/goal", argument_hint:"project objective"' in js
     assert 'command:"/learn", argument_hint:"reusable rule"' in js

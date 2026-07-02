@@ -138,7 +138,13 @@ def test_real_minimax_project_conversation_and_dynamic_workflow_smoke(monkeypatc
     assert design_response["ok"] is True
     assert design_response["saved"] is True
     saved_workflow = kanban_service.get_project_workflow(project_id)["workflow"]
-    assert saved_workflow["actions"]["fail"]["to"] == "failed"
+    success_status = str((saved_workflow.get("actions") or {}).get("workflow_done", {}).get("to") or "").strip()
+    failure_status = str((saved_workflow.get("actions") or {}).get("fail", {}).get("to") or "").strip()
+    column_keys = {str(column.get("status_key") or "") for column in saved_workflow.get("columns") or []}
+    assert success_status
+    assert failure_status
+    assert success_status in column_keys
+    assert failure_status in column_keys
     assert any(column.get("job_template") for column in saved_workflow["columns"])
 
     start_response = kanban_routes.kanban_project_conversation_message(
@@ -152,11 +158,11 @@ def test_real_minimax_project_conversation_and_dynamic_workflow_smoke(monkeypatc
     task_id = start_response["task_id"]
     final_state = _wait_for_workflow(workflow_routes, task_id)
 
-    assert final_state["status_key"] == "done"
+    assert final_state["status_key"] == success_status
     result = final_state["result"]
     assert result["ok"] is True
     assert result["done"] is True
-    assert result["status_key"] == "done"
+    assert result["status_key"] == success_status
 
     task_detail = kanban_service.get_task(task_id)["task"]
     event_types = [event["event_type"] for event in task_detail["events"]]
