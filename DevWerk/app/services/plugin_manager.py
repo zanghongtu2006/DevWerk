@@ -269,22 +269,26 @@ def list_marketplace_plugins(marketplace_path: str) -> dict[str, Any]:
     payload = _read_json(path)
     plugins = payload.get("plugins") if isinstance(payload.get("plugins"), list) else []
     items = []
-    installed = {item["id"] for item in list_global_plugins()}
+    installed_plugins = {item["id"]: item for item in list_global_plugins()}
     for item in plugins:
         if not isinstance(item, dict):
             continue
         name = _safe_plugin_id(str(item.get("name") or ""))
         source_path = _marketplace_source_path(path, item.get("source"))
+        manifest_name = _marketplace_manifest_name(source_path) or name
+        installed_id = _installed_marketplace_plugin_id(name, manifest_name, installed_plugins)
         items.append(
             {
                 "name": name,
+                "manifest_name": manifest_name,
                 "description": str(item.get("description") or ""),
                 "version": str(item.get("version") or ""),
                 "category": str(item.get("category") or ""),
                 "author": item.get("author") if isinstance(item.get("author"), (dict, str)) else "",
                 "source": str(item.get("source") or ""),
                 "source_path": str(source_path) if source_path else "",
-                "installed": name in installed,
+                "installed": bool(installed_id),
+                "installed_id": installed_id or "",
             }
         )
     return {
@@ -312,7 +316,13 @@ def import_marketplace_plugin(marketplace_path: str, plugin_name: str) -> dict[s
         source_path = _marketplace_source_path(path, item.get("source"))
         if source_path is None:
             raise ValueError(f"marketplace plugin source is invalid: {target_name}")
-        return import_global_plugin(str(source_path))
+        plugin = import_global_plugin(str(source_path))
+        _record_marketplace_alias(
+            str(plugin.get("id") or ""),
+            marketplace_name=target_name,
+            marketplace_path=str(path),
+        )
+        return {**plugin, "marketplace_name": target_name}
     raise KeyError(f"marketplace plugin not found: {target_name}")
 
 
@@ -700,6 +710,56 @@ def _marketplace_source_path(marketplace_path: Path, source: object) -> Path | N
     if path.is_absolute():
         return path.resolve()
     return (marketplace_path.parent.parent / path).resolve()
+
+
+def _marketplace_manifest_name(source_path: Path | None) -> str:
+    if source_path is None:
+        return ""
+    manifest = _read_json(source_path / MANIFEST_PATH)
+    try:
+        return _safe_plugin_id(str(manifest.get("name") or ""))
+    except ValueError:
+        return ""
+
+
+def _installed_marketplace_plugin_id(
+    marketplace_name: str,
+    manifest_name: str,
+    installed_plugins: dict[str, dict[str, Any]],
+) -> str:
+    for candidate in (marketplace_name, manifest_name):
+        if candidate and candidate in installed_plugins:
+            return candidate
+    for plugin_id, plugin in installed_plugins.items():
+        state = _read_json(Path(str(plugin.get("path") or "")) / STATE_PATH)
+        aliases = state.get("marketplace_names")
+        if isinstance(aliases, list) and marketplace_name in {str(item) for item in aliases}:
+            return plugin_id
+    return ""
+
+
+def _record_marketplace_alias(plugin_id: str, *, marketplace_name: str, marketplace_path: str) -> None:
+    pid = _safe_plugin_id(plugin_id)
+    if not marketplace_name:
+        return
+    path = _global_plugin_path(pid)
+    if not (path / MANIFEST_PATH).is_file():
+        return
+    state = _read_json(path / STATE_PATH)
+    names = [str(item) for item in (state.get("marketplace_names") or []) if str(item).strip()]
+    if marketplace_name not in names:
+        names.append(marketplace_name)
+    entries = [
+        item
+        for item in (state.get("marketplace_entries") or [])
+        if isinstance(item, dict)
+    ]
+    entry = {"name": marketplace_name, "marketplace_path": marketplace_path}
+    if entry not in entries:
+        entries.append(entry)
+    state["marketplace_names"] = sorted(names)
+    state["marketplace_entries"] = entries
+    _write_json(path / STATE_PATH, state)
 
 
 def _manifest_path_values(value: object) -> list[str]:

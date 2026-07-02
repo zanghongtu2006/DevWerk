@@ -695,6 +695,47 @@ def test_marketplace_catalog_and_import_by_name(monkeypatch, tmp_path):
     assert list_marketplace_plugins(str(marketplace_path))["plugins"][0]["installed"] is True
 
 
+def test_marketplace_entry_can_differ_from_plugin_manifest_name(monkeypatch, tmp_path):
+    plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
+    marketplace_root = tmp_path / "marketplace"
+    source = _write_plugin(marketplace_root / "plugins", "actual-ui-observer")
+    marketplace_path = marketplace_root / ".claude-plugin" / "marketplace.json"
+    marketplace_path.parent.mkdir(parents=True)
+    marketplace_path.write_text(
+        json.dumps(
+            {
+                "name": "devwerk-marketplace",
+                "plugins": [
+                    {
+                        "name": "market-ui",
+                        "description": "Marketplace alias for the UI observer plugin",
+                        "source": "./plugins/actual-ui-observer",
+                    }
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    from app.services.plugin_manager import import_marketplace_plugin, list_marketplace_plugins, set_global_plugin_enabled
+
+    before = list_marketplace_plugins(str(marketplace_path))["plugins"][0]
+    imported = import_marketplace_plugin(str(marketplace_path), "market-ui")
+    after = list_marketplace_plugins(str(marketplace_path))["plugins"][0]
+    disabled = set_global_plugin_enabled(after["installed_id"], False)
+
+    assert before["name"] == "market-ui"
+    assert before["manifest_name"] == "actual-ui-observer"
+    assert before["installed"] is False
+    assert imported["id"] == "actual-ui-observer"
+    assert imported["marketplace_name"] == "market-ui"
+    assert (plugins_root / "actual-ui-observer" / ".claude-plugin" / "plugin.json").is_file()
+    assert after["installed"] is True
+    assert after["installed_id"] == "actual-ui-observer"
+    assert disabled["enabled"] is False
+
+
 def test_plugin_marketplace_api(monkeypatch, tmp_path):
     _patch_roots(monkeypatch, tmp_path)
     marketplace_root = tmp_path / "marketplace"
