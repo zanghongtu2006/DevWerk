@@ -180,12 +180,22 @@ def validate_plugin_source(source_path: str) -> dict[str, Any]:
             if path_issue:
                 issues.append(f"{field} path {raw_path!r} {path_issue}")
 
+    commands = _discover_markdown(source, "commands", manifest.get("commands"))
+    agents = _discover_markdown(source, "agents", manifest.get("agents"))
+    skills = _discover_skills(source, plugin_id or "invalid-plugin")
+    hooks = _discover_hooks(source, manifest)
+    mcp_servers = _discover_mcp_servers(source, manifest)
+    issues.extend(_duplicate_component_issues("commands", commands))
+    issues.extend(_duplicate_component_issues("agents", agents))
+    issues.extend(_duplicate_component_issues("skills", skills))
+    issues.extend(_duplicate_component_issues("mcpServers", mcp_servers))
+
     components = {
-        "commands": len(_discover_markdown(source, "commands", manifest.get("commands"))),
-        "agents": len(_discover_markdown(source, "agents", manifest.get("agents"))),
-        "skills": len(_discover_skills(source, plugin_id or "invalid-plugin")),
-        "hooks": len(_discover_hooks(source, manifest)),
-        "mcp_servers": len(_discover_mcp_servers(source, manifest)),
+        "commands": len(commands),
+        "agents": len(agents),
+        "skills": len(skills),
+        "hooks": len(hooks),
+        "mcp_servers": len(mcp_servers),
     }
     if not any(components.values()):
         warnings.append("plugin has no discovered commands, agents, skills, hooks, or MCP servers")
@@ -684,6 +694,18 @@ def _validate_semver(version: str) -> str:
     if not re.match(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$", text):
         return f"invalid plugin version: {text} must use semantic versioning"
     return ""
+
+
+def _duplicate_component_issues(kind: str, items: list[dict[str, Any]]) -> list[str]:
+    counts: dict[str, int] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        component_id = str(item.get("id") or "").strip()
+        if not component_id:
+            continue
+        counts[component_id] = counts.get(component_id, 0) + 1
+    return [f"duplicate {kind} id: {component_id}" for component_id, count in sorted(counts.items()) if count > 1]
 
 
 def _empty_component_counts() -> dict[str, int]:

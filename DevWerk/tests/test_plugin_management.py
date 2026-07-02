@@ -323,6 +323,42 @@ def test_plugin_validation_and_import_reject_invalid_semver(monkeypatch, tmp_pat
         raise AssertionError("invalid semver plugin import should fail")
 
 
+def test_plugin_validation_rejects_duplicate_component_ids(monkeypatch, tmp_path):
+    _patch_roots(monkeypatch, tmp_path)
+    source = _write_plugin(tmp_path / "source", "duplicate-components")
+    (source / "more-commands").mkdir()
+    (source / "more-agents").mkdir()
+    (source / "commands" / "build.md").write_text("# Build\n\nDefault build command.", encoding="utf-8")
+    (source / "more-commands" / "build.md").write_text("# Build\n\nDuplicate build command.", encoding="utf-8")
+    (source / "agents" / "reviewer.md").write_text("# Reviewer\n\nDefault reviewer.", encoding="utf-8")
+    (source / "more-agents" / "reviewer.md").write_text("# Reviewer\n\nDuplicate reviewer.", encoding="utf-8")
+    (source / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "duplicate-components",
+                "version": "0.1.0",
+                "commands": "./more-commands",
+                "agents": "./more-agents",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    from app.services.plugin_manager import import_global_plugin, validate_plugin_source
+
+    validation = validate_plugin_source(str(source))
+
+    assert validation["ok"] is False
+    assert any("duplicate commands id: build" in issue for issue in validation["issues"])
+    assert any("duplicate agents id: reviewer" in issue for issue in validation["issues"])
+    try:
+        import_global_plugin(str(source))
+    except ValueError as exc:
+        assert "duplicate commands id: build" in str(exc)
+    else:
+        raise AssertionError("duplicate component plugin import should fail")
+
+
 def test_plugin_import_copies_claude_plugin_directory(monkeypatch, tmp_path):
     plugins_root, imported_root = _patch_roots(monkeypatch, tmp_path)
     source = _write_plugin(tmp_path / "source")
