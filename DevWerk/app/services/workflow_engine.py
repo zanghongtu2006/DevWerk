@@ -11,6 +11,7 @@ from typing import Any
 from app.models.protocol import FileOp, IdeChatResponse, PatchOp, ToolRequest
 from app.services.agent_definition import default_agent_catalog
 from app.services.capability_broker import CapabilityBroker
+from app.services.capability_catalog import capability_catalog
 from app.services.code_context import build_code_context_summary
 from app.services.conversation_context import context_debug_payload, prepare_conversation_context
 from app.services.kanban import (
@@ -1100,7 +1101,29 @@ def _build_agent_context(
         "project_memory": _compact_project_memory(read_project_memory(project_id)),
         "plugin_agent": plugin_agent,
         "skills": resolve_agent_skills(project_id, skill_ids),
+        "capabilities": _capability_context(body),
         "workspace": _workspace_summary(body.get("workspace")),
+    }
+
+
+def _capability_context(body: dict[str, Any]) -> dict[str, Any]:
+    broker = CapabilityBroker()
+    client_offers = []
+    for offer in broker.offers(body.get("client_capabilities")).values():
+        client_offers.append(
+            {
+                "capability": offer.capability,
+                "provider": offer.provider,
+                "implementation": offer.implementation,
+            }
+        )
+    catalog = capability_catalog()
+    return {
+        "agent": [str(item) for item in (body.get("_workflow_agent_capabilities") or []) if str(item).strip()],
+        "client_offers": sorted(client_offers, key=lambda item: item["capability"]),
+        "catalog": catalog.get("capabilities") or [],
+        "plugin_mcp_servers": catalog.get("plugin_mcp_servers") or [],
+        "plugin_agents": catalog.get("plugin_agents") or [],
     }
 
 

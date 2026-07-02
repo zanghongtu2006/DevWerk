@@ -105,6 +105,60 @@ def test_workflow_agent_context_resolves_global_and_project_skills(monkeypatch, 
     assert "capture a screenshot" in skills["local-browser-rule"]["content"]
 
 
+def test_workflow_agent_context_includes_capability_catalog_and_client_offers(monkeypatch, tmp_path):
+    kanban_service = _configure(monkeypatch, tmp_path)
+    from app.services.workflow_engine import _build_agent_context
+
+    kanban_service.update_project_workflow(
+        "context-capabilities",
+        {
+            "name": "context-capabilities-flow",
+            "columns": [
+                {"status_key": "inspect", "title": "Inspect", "position": 10, "transition_to": ["done", "failed"]},
+                {"status_key": "done", "title": "Done", "position": 90, "terminal": "success", "transition_to": []},
+                {"status_key": "failed", "title": "Failed", "position": 99, "terminal": "failure", "transition_to": ["inspect"]},
+            ],
+            "actions": {
+                "workflow_done": {"to": "done"},
+                "fail": {"to": "failed"},
+                "retry": {"to": "inspect"},
+                "abandon": {"to": "failed"},
+            },
+        },
+    )
+    task = kanban_service.create_task(project_id="context-capabilities", title="Task")["task"]
+
+    context = _build_agent_context(
+        task["id"],
+        "inspect",
+        "browser-agent",
+        {
+            "project_id": "context-capabilities",
+            "messages": [{"role": "user", "content": "Inspect the dashboard with browser evidence."}],
+            "_workflow_agent_capabilities": ["browser.cdp", "browser.playwright", "network.web"],
+            "client_capabilities": {
+                "provider": "vscode",
+                "capabilities": [
+                    {"capability": "browser.playwright", "implementation": "mcp__playwright__browser_snapshot"},
+                    {"capability": "network.web", "implementation": "web.search"},
+                ],
+            },
+        },
+        {"name": "dynamic"},
+        [],
+    )
+
+    capabilities = context["capabilities"]
+    catalog_by_name = {item["capability"]: item for item in capabilities["catalog"]}
+    client_by_name = {item["capability"]: item for item in capabilities["client_offers"]}
+
+    assert capabilities["agent"] == ["browser.cdp", "browser.playwright", "network.web"]
+    assert catalog_by_name["browser.cdp"]["category"] == "browser"
+    assert catalog_by_name["browser.playwright"]["category"] == "browser"
+    assert client_by_name["browser.playwright"]["implementation"] == "mcp__playwright__browser_snapshot"
+    assert client_by_name["network.web"]["provider"] == "vscode"
+
+
 def test_browser_and_network_capabilities_are_first_class_tool_requests():
     from app.services.tool_protocol import ALL_CAPABILITIES, normalize_tool_requests
     from app.services.validation import validate_model_response
