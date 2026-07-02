@@ -517,6 +517,9 @@ def _discover_markdown(plugin_root: Path, default_dir: str, manifest_value: obje
                 "entrypoint": path.name,
                 "path": str(path),
                 "summary": _component_summary(frontmatter, body, content),
+                "allowed_tools": _frontmatter_list(frontmatter, "allowed-tools"),
+                "argument_hint": _argument_hint(frontmatter),
+                "model": str(frontmatter.get("model") or ""),
                 "chars": len(content),
                 "frontmatter": frontmatter,
                 "body": body,
@@ -779,6 +782,29 @@ def _component_summary(frontmatter: dict[str, Any], body: str, content: str) -> 
         if value:
             return value[:160]
     return _first_heading_or_line(body or content)
+
+
+def _frontmatter_list(frontmatter: dict[str, Any], key: str) -> list[str]:
+    raw = frontmatter.get(key)
+    if raw is None:
+        raw = frontmatter.get(key.replace("-", "_"))
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    if text == "*":
+        return ["*"]
+    return [item.strip() for item in text.split(",") if item.strip()]
+
+
+def _argument_hint(frontmatter: dict[str, Any]) -> str:
+    raw = frontmatter.get("argument-hint")
+    if raw is None:
+        raw = frontmatter.get("argument_hint")
+    if isinstance(raw, list):
+        return " ".join(f"[{str(item).strip('[]')}]" for item in raw if str(item).strip())
+    return str(raw or "")
 
 
 def _first_heading_or_line(content: str) -> str:

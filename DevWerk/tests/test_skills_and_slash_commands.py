@@ -192,7 +192,7 @@ def test_project_slash_command_catalog_includes_builtin_and_plugin_commands(monk
         encoding="utf-8",
     )
     (plugin / "commands" / "audit-ui.md").write_text(
-        "---\ndescription: Audit UI with browser evidence\n---\n\nUse browser evidence.",
+        "---\ndescription: Audit UI with browser evidence\nallowed-tools: Read, browser.playwright\nmodel: sonnet\nargument-hint: [url]\n---\n\nUse browser evidence.",
         encoding="utf-8",
     )
 
@@ -209,6 +209,9 @@ def test_project_slash_command_catalog_includes_builtin_and_plugin_commands(monk
     assert "/ui-observer:audit-ui" in commands
     assert commands["/ui-observer:audit-ui"]["source"] == "plugin"
     assert commands["/ui-observer:audit-ui"]["summary"] == "Audit UI with browser evidence"
+    assert commands["/ui-observer:audit-ui"]["allowed_tools"] == ["Read", "browser.playwright"]
+    assert commands["/ui-observer:audit-ui"]["model"] == "sonnet"
+    assert commands["/ui-observer:audit-ui"]["argument_hint"] == "[url]"
 
 
 def test_backend_web_ui_exposes_skill_management_and_slash_commands():

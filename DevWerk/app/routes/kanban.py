@@ -354,6 +354,8 @@ def kanban_project_slash_commands(project_id: str):
                 "plugin_id": str(item.get("plugin_id") or ""),
                 "summary": str(item.get("summary") or item.get("id") or item.get("command_id") or ""),
                 "argument_hint": str(item.get("argument_hint") or frontmatter.get("argument-hint") or ""),
+                "allowed_tools": item.get("allowed_tools") if isinstance(item.get("allowed_tools"), list) else [],
+                "model": str(item.get("model") or ""),
                 "frontmatter": frontmatter,
             }
         )

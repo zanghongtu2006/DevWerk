@@ -148,6 +148,26 @@ def test_plugin_markdown_components_parse_frontmatter(monkeypatch, tmp_path):
     assert skill["frontmatter"]["name"] == "browser-eyes"
 
 
+def test_plugin_command_frontmatter_normalizes_allowed_tools_and_argument_hint(monkeypatch, tmp_path):
+    plugins_root, _ = _patch_roots(monkeypatch, tmp_path)
+    plugin = _write_plugin(plugins_root, "command-tools")
+    (plugin / "commands" / "review.md").write_text(
+        "---\ndescription: Review with browser evidence\nallowed-tools: Read, Bash(git:*), browser.playwright\nmodel: sonnet\nargument-hint: [target]\n---\n\nReview the requested target.\n",
+        encoding="utf-8",
+    )
+
+    from app.services.plugin_manager import get_plugin_command, list_enabled_plugin_commands
+
+    command = get_plugin_command("command-tools:review")
+    listed = {item["command_id"]: item for item in list_enabled_plugin_commands()}["command-tools:review"]
+
+    assert command["allowed_tools"] == ["Read", "Bash(git:*)", "browser.playwright"]
+    assert command["argument_hint"] == "[target]"
+    assert command["model"] == "sonnet"
+    assert listed["allowed_tools"] == command["allowed_tools"]
+    assert listed["argument_hint"] == "[target]"
+
+
 def test_plugin_api_round_trip_and_enable_toggle(monkeypatch, tmp_path):
     _patch_roots(monkeypatch, tmp_path)
 
