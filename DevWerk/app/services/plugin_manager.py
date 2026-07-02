@@ -209,6 +209,9 @@ def validate_plugin_source(source_path: str) -> dict[str, Any]:
     issues.extend(_duplicate_component_issues("skills", skills))
     issues.extend(_duplicate_component_issues("mcpServers", mcp_servers))
     issues.extend(_mcp_server_config_issues(mcp_servers))
+    warnings.extend(_markdown_component_warnings("commands", commands, required_frontmatter=("description",)))
+    warnings.extend(_markdown_component_warnings("agents", agents, required_frontmatter=("name", "description", "model")))
+    warnings.extend(_markdown_component_warnings("skills", skills, required_frontmatter=("name", "description")))
 
     components = {
         "commands": len(commands),
@@ -750,6 +753,27 @@ def _mcp_server_config_issues(items: list[dict[str, Any]]) -> list[str]:
         elif not re.match(r"^https?://", url):
             issues.append(f"mcpServers {server_id} url must be http(s)")
     return issues
+
+
+def _markdown_component_warnings(
+    kind: str,
+    items: list[dict[str, Any]],
+    *,
+    required_frontmatter: tuple[str, ...],
+) -> list[str]:
+    warnings: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        component_id = str(item.get("id") or item.get("skill_id") or "").strip() or "<unknown>"
+        frontmatter = item.get("frontmatter") if isinstance(item.get("frontmatter"), dict) else {}
+        for key in required_frontmatter:
+            if not str(frontmatter.get(key) or "").strip():
+                warnings.append(f"{kind} {component_id} missing frontmatter {key}")
+        body = str(item.get("body") or "").strip()
+        if not body:
+            warnings.append(f"{kind} {component_id} markdown body is empty")
+    return warnings
 
 
 def _empty_component_counts() -> dict[str, int]:

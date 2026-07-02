@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 import uuid
@@ -14,6 +15,26 @@ def _real_smoke_enabled() -> bool:
 
 def _local_llm_config_path() -> Path:
     return Path(__file__).resolve().parents[1] / "config" / "llm.json"
+
+
+def _smoke_llm_config_path(tmp_path: Path) -> Path:
+    source = _local_llm_config_path()
+    config = json.loads(source.read_text(encoding="utf-8-sig"))
+    for provider in (config.get("llms") or {}).values():
+        if not isinstance(provider, dict):
+            continue
+        provider["timeout"] = max(int(provider.get("timeout") or 180), 240)
+        for model_settings in (provider.get("models") or {}).values():
+            if not isinstance(model_settings, dict):
+                continue
+            model_settings["max_tokens"] = min(int(model_settings.get("max_tokens") or 2048), 2048)
+            if model_settings.get("thinking_mode") == "max":
+                model_settings["thinking_mode"] = "balanced"
+            if model_settings.get("effort_level") == "max":
+                model_settings["effort_level"] = "medium"
+    target = tmp_path / "llm-smoke.json"
+    target.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return target
 
 
 def _writing_workflow() -> dict:
@@ -60,16 +81,11 @@ def _writing_workflow() -> dict:
 def _wait_for_workflow(workflow_routes, task_id: str, *, timeout_seconds: int = 260) -> dict:
     deadline = time.monotonic() + timeout_seconds
     last_state: dict = {}
-    terminal_seen_at: float | None = None
     while time.monotonic() < deadline:
         last_state = workflow_routes.workflow_state_payload(task_id, include_result=True)
         result = last_state.get("result")
         if isinstance(result, dict):
             return last_state
-        if last_state.get("status_key") in {"done", "failed"}:
-            terminal_seen_at = terminal_seen_at or time.monotonic()
-            if time.monotonic() - terminal_seen_at > 20:
-                return last_state
         time.sleep(1.5)
     raise AssertionError(f"workflow did not finish before timeout; last_state={last_state}")
 
@@ -81,7 +97,7 @@ def test_real_minimax_project_conversation_and_dynamic_workflow_smoke(monkeypatc
         pytest.skip(f"local LLM config is missing: {config_path}")
 
     monkeypatch.setenv("APP_ENV", "test")
-    monkeypatch.setenv("DEVWERK_LLM_CONFIG_PATH", str(config_path))
+    monkeypatch.setenv("DEVWERK_LLM_CONFIG_PATH", str(_smoke_llm_config_path(tmp_path)))
     monkeypatch.setenv("DEVWERK_DB_PATH", str(tmp_path / "real-llm-smoke.db"))
     monkeypatch.setenv("DEVWERK_SESSION_DIR", str(tmp_path / "sessions"))
     monkeypatch.setenv("DEVWERK_USAGE_TRACKING", "true")

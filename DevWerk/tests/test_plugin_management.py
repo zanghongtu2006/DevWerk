@@ -369,6 +369,31 @@ def test_plugin_validation_warns_for_unknown_manifest_fields(monkeypatch, tmp_pa
     assert any("unknown manifest field: mysteryFeature" in warning for warning in validation["warnings"])
 
 
+def test_plugin_validation_warns_for_weak_markdown_components(monkeypatch, tmp_path):
+    _patch_roots(monkeypatch, tmp_path)
+    source = _write_plugin(tmp_path / "source", "weak-markdown")
+    (source / "commands" / "audit-ui.md").write_text("# Audit UI\n\nCapture browser evidence.", encoding="utf-8")
+    (source / "agents" / "ui-observer.md").write_text(
+        "---\nname: ui-observer\n---\n\nUse browser tools.",
+        encoding="utf-8",
+    )
+    (source / "skills" / "browser-eyes" / "SKILL.md").write_text(
+        "---\ndescription: Require browser evidence\n---\n\n",
+        encoding="utf-8",
+    )
+
+    from app.services.plugin_manager import validate_plugin_source
+
+    validation = validate_plugin_source(str(source))
+
+    assert validation["ok"] is True
+    assert any("commands audit-ui missing frontmatter description" in warning for warning in validation["warnings"])
+    assert any("agents ui-observer missing frontmatter description" in warning for warning in validation["warnings"])
+    assert any("agents ui-observer missing frontmatter model" in warning for warning in validation["warnings"])
+    assert any("skills browser-eyes missing frontmatter name" in warning for warning in validation["warnings"])
+    assert any("skills browser-eyes markdown body is empty" in warning for warning in validation["warnings"])
+
+
 def test_plugin_validation_rejects_duplicate_component_ids(monkeypatch, tmp_path):
     _patch_roots(monkeypatch, tmp_path)
     source = _write_plugin(tmp_path / "source", "duplicate-components")
