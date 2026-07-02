@@ -394,6 +394,70 @@ def test_plugin_validation_warns_for_weak_markdown_components(monkeypatch, tmp_p
     assert any("skills browser-eyes markdown body is empty" in warning for warning in validation["warnings"])
 
 
+def test_plugin_validation_accepts_devwerk_and_claude_style_hooks(monkeypatch, tmp_path):
+    _patch_roots(monkeypatch, tmp_path)
+    source = _write_plugin(tmp_path / "source", "valid-hooks")
+    (source / "hooks" / "hooks.json").write_text(
+        json.dumps(
+            {
+                "events": ["workflow_column_started"],
+                "PreToolUse": [
+                    {
+                        "matcher": "Write",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "python ${CLAUDE_PLUGIN_ROOT}/scripts/check.py",
+                                "timeout": 30,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    from app.services.plugin_manager import validate_plugin_source
+
+    validation = validate_plugin_source(str(source))
+
+    assert validation["ok"] is True
+    assert not [issue for issue in validation["issues"] if "hooks hooks" in issue]
+
+
+def test_plugin_validation_rejects_invalid_hook_config(monkeypatch, tmp_path):
+    _patch_roots(monkeypatch, tmp_path)
+    source = _write_plugin(tmp_path / "source", "invalid-hooks")
+    (source / "hooks" / "hooks.json").write_text(
+        json.dumps(
+            {
+                "events": "workflow_column_started",
+                "PreToolUse": [{"hooks": [{"type": "command"}]}],
+                "PostToolUse": [{"matcher": "Write", "hooks": [{"type": "shell", "command": "echo hi"}]}],
+                "Stop": [{"matcher": "*", "hooks": "echo hi"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    from app.services.plugin_manager import import_global_plugin, validate_plugin_source
+
+    validation = validate_plugin_source(str(source))
+
+    assert validation["ok"] is False
+    assert any("hooks hooks events must be a list" in issue for issue in validation["issues"])
+    assert any("hooks hooks PreToolUse[0].hooks[0].command required" in issue for issue in validation["issues"])
+    assert any("hooks hooks PostToolUse[0].hooks[0].type unsupported: shell" in issue for issue in validation["issues"])
+    assert any("hooks hooks Stop[0].hooks must be a list" in issue for issue in validation["issues"])
+    try:
+        import_global_plugin(str(source))
+    except ValueError as exc:
+        assert "hooks hooks events must be a list" in str(exc)
+    else:
+        raise AssertionError("invalid hook plugin import should fail")
+
+
 def test_plugin_validation_rejects_duplicate_component_ids(monkeypatch, tmp_path):
     _patch_roots(monkeypatch, tmp_path)
     source = _write_plugin(tmp_path / "source", "duplicate-components")

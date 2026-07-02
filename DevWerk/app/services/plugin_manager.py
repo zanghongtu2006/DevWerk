@@ -208,6 +208,7 @@ def validate_plugin_source(source_path: str) -> dict[str, Any]:
     issues.extend(_duplicate_component_issues("agents", agents))
     issues.extend(_duplicate_component_issues("skills", skills))
     issues.extend(_duplicate_component_issues("mcpServers", mcp_servers))
+    issues.extend(_hook_config_issues(hooks))
     issues.extend(_mcp_server_config_issues(mcp_servers))
     warnings.extend(_markdown_component_warnings("commands", commands, required_frontmatter=("description",)))
     warnings.extend(_markdown_component_warnings("agents", agents, required_frontmatter=("name", "description", "model")))
@@ -752,6 +753,50 @@ def _mcp_server_config_issues(items: list[dict[str, Any]]) -> list[str]:
             issues.append(f"mcpServers {server_id} requires url for {server_type} server")
         elif not re.match(r"^https?://", url):
             issues.append(f"mcpServers {server_id} url must be http(s)")
+    return issues
+
+
+def _hook_config_issues(items: list[dict[str, Any]]) -> list[str]:
+    issues: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        hook_id = str(item.get("id") or "").strip() or "<unknown>"
+        payload = item.get("payload")
+        if not isinstance(payload, dict):
+            issues.append(f"hooks {hook_id} payload must be an object")
+            continue
+        events = payload.get("events")
+        if events is not None:
+            if not isinstance(events, list):
+                issues.append(f"hooks {hook_id} events must be a list")
+            elif any(not str(event or "").strip() for event in events):
+                issues.append(f"hooks {hook_id} events must contain non-empty strings")
+        for event_name, entries in payload.items():
+            if event_name == "events":
+                continue
+            if not isinstance(entries, list):
+                issues.append(f"hooks {hook_id} {event_name} must be a list")
+                continue
+            for entry_index, entry in enumerate(entries):
+                if not isinstance(entry, dict):
+                    issues.append(f"hooks {hook_id} {event_name}[{entry_index}] must be an object")
+                    continue
+                hook_entries = entry.get("hooks")
+                if not isinstance(hook_entries, list):
+                    issues.append(f"hooks {hook_id} {event_name}[{entry_index}].hooks must be a list")
+                    continue
+                for hook_index, hook in enumerate(hook_entries):
+                    if not isinstance(hook, dict):
+                        issues.append(f"hooks {hook_id} {event_name}[{entry_index}].hooks[{hook_index}] must be an object")
+                        continue
+                    hook_type = str(hook.get("type") or "").strip()
+                    if hook_type not in {"command", "prompt"}:
+                        issues.append(f"hooks {hook_id} {event_name}[{entry_index}].hooks[{hook_index}].type unsupported: {hook_type or '<missing>'}")
+                        continue
+                    required_field = "command" if hook_type == "command" else "prompt"
+                    if not str(hook.get(required_field) or "").strip():
+                        issues.append(f"hooks {hook_id} {event_name}[{entry_index}].hooks[{hook_index}].{required_field} required")
     return issues
 
 
