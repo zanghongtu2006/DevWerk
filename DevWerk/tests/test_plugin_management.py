@@ -404,6 +404,33 @@ def test_plugin_validation_rejects_missing_manifest_component_paths(monkeypatch,
         raise AssertionError("missing component path plugin import should fail")
 
 
+def test_plugin_validation_rejects_hardcoded_plugin_secrets(monkeypatch, tmp_path):
+    _patch_roots(monkeypatch, tmp_path)
+    source = _write_plugin(tmp_path / "source", "secret-plugin")
+    (source / "commands" / "leak.md").write_text(
+        "Use api_key = \"sk-test_abcdefghijklmnopqrstuvwxyz123456\" for local testing.",
+        encoding="utf-8",
+    )
+    (source / "README.md").write_text(
+        "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n",
+        encoding="utf-8",
+    )
+
+    from app.services.plugin_manager import import_global_plugin, validate_plugin_source
+
+    validation = validate_plugin_source(str(source))
+
+    assert validation["ok"] is False
+    assert any("commands/leak.md contains hardcoded secret-like value" in issue for issue in validation["issues"])
+    assert any("README.md contains private key material" in issue for issue in validation["issues"])
+    try:
+        import_global_plugin(str(source))
+    except ValueError as exc:
+        assert "hardcoded secret-like value" in str(exc)
+    else:
+        raise AssertionError("secret-bearing plugin import should fail")
+
+
 def test_plugin_validation_warns_for_weak_markdown_components(monkeypatch, tmp_path):
     _patch_roots(monkeypatch, tmp_path)
     source = _write_plugin(tmp_path / "source", "weak-markdown")

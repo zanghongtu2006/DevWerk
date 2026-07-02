@@ -11,6 +11,29 @@ MANIFEST_PATH = ".claude-plugin/plugin.json"
 STATE_PATH = ".devwerk-plugin.json"
 SETTINGS_PATH = ".devwerk-plugin-settings.md"
 SKILL_ENTRYPOINT = "SKILL.md"
+SECRET_SCAN_EXCLUDED_DIRS = {".git", ".hg", ".svn", "__pycache__", "node_modules", ".venv", "venv", "dist", "build"}
+SECRET_SCAN_EXTENSIONS = {
+    ".bat",
+    ".cmd",
+    ".env",
+    ".js",
+    ".json",
+    ".jsonl",
+    ".md",
+    ".mjs",
+    ".ps1",
+    ".py",
+    ".sh",
+    ".toml",
+    ".ts",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
+SECRET_PATTERNS = (
+    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"(?i)\b(api[_-]?key|auth[_-]?token|access[_-]?token|secret)\b\s*[:=]\s*['\"](?:sk-|ghp_|gho_|xoxb-|xoxp-)[^'\"]{12,}['\"]"),
+)
 MANIFEST_ALLOWED_FIELDS = {
     "name",
     "version",
@@ -212,6 +235,7 @@ def validate_plugin_source(source_path: str) -> dict[str, Any]:
     issues.extend(_duplicate_component_issues("mcpServers", mcp_servers))
     issues.extend(_hook_config_issues(hooks))
     issues.extend(_mcp_server_config_issues(mcp_servers))
+    issues.extend(_plugin_secret_issues(source))
     warnings.extend(_markdown_component_warnings("commands", commands, required_frontmatter=("description",)))
     warnings.extend(_markdown_component_warnings("agents", agents, required_frontmatter=("name", "description", "model")))
     warnings.extend(_markdown_component_warnings("skills", skills, required_frontmatter=("name", "description")))
@@ -769,6 +793,29 @@ def _manifest_component_path_issues(plugin_root: Path, field: str, raw_path: str
     if field in {"commands", "agents"} and not (path.is_dir() or (path.is_file() and path.suffix.lower() == ".md")):
         return [f"{field} path {raw_path!r} must be a directory or markdown file"]
     return []
+
+
+def _plugin_secret_issues(plugin_root: Path) -> list[str]:
+    issues: list[str] = []
+    root = plugin_root.resolve()
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        if any(part in SECRET_SCAN_EXCLUDED_DIRS for part in path.relative_to(root).parts):
+            continue
+        if path.suffix.lower() not in SECRET_SCAN_EXTENSIONS:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError):
+            continue
+        rel = path.relative_to(root).as_posix()
+        if "-----BEGIN " in text and "PRIVATE KEY-----" in text:
+            issues.append(f"{rel} contains private key material")
+            continue
+        if any(pattern.search(text) for pattern in SECRET_PATTERNS):
+            issues.append(f"{rel} contains hardcoded secret-like value")
+    return issues
 
 
 def _hook_config_issues(items: list[dict[str, Any]]) -> list[str]:
