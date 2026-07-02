@@ -507,6 +507,55 @@ def test_plugin_validation_accepts_devwerk_and_claude_style_hooks(monkeypatch, t
     assert not [issue for issue in validation["issues"] if "hooks hooks" in issue]
 
 
+def test_plugin_validation_accepts_claude_plugin_hooks_wrapper(monkeypatch, tmp_path):
+    _patch_roots(monkeypatch, tmp_path)
+    source = _write_plugin(tmp_path / "source", "wrapped-hooks")
+    (source / "hooks" / "hooks.json").write_text(
+        json.dumps(
+            {
+                "description": "Load browser review context and validate writes.",
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "matcher": "*",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python ${CLAUDE_PLUGIN_ROOT}/hooks/load_context.py",
+                                }
+                            ],
+                        }
+                    ],
+                    "PreToolUse": [
+                        {
+                            "matcher": "Write|Edit",
+                            "hooks": [
+                                {
+                                    "type": "prompt",
+                                    "prompt": "Check whether this write is safe and evidence-backed.",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    from app.services.plugin_manager import import_global_plugin, validate_plugin_source
+
+    validation = validate_plugin_source(str(source))
+    imported = import_global_plugin(str(source))
+
+    assert validation["ok"] is True
+    assert validation["components"]["hooks"] == 1
+    assert imported["hooks"][0]["payload"]["description"] == "Load browser review context and validate writes."
+    assert "SessionStart" in imported["hooks"][0]["events"]
+    assert "PreToolUse" in imported["hooks"][0]["events"]
+
+
 def test_plugin_validation_rejects_invalid_hook_config(monkeypatch, tmp_path):
     _patch_roots(monkeypatch, tmp_path)
     source = _write_plugin(tmp_path / "source", "invalid-hooks")

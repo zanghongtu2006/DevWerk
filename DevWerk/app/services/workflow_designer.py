@@ -41,7 +41,7 @@ def design_project_workflow(
         _log.warning("workflow designer llm failed project_id=%s error=%s", project_id, llm_error)
         raise ValueError(f"project LLM agent failed: {llm_error}") from exc
 
-    workflow = _normalize_workflow(raw_reply.get("workflow") or base_workflow)
+    workflow = _normalize_workflow(raw_reply.get("workflow") or base_workflow, base_workflow=base_workflow)
     agent_overrides = _normalize_agents(raw_reply.get("agents") or agents)
     reply = str(raw_reply.get("reply") or "Workflow draft updated.")
 
@@ -119,7 +119,7 @@ def _workflow_payload(value: dict[str, Any] | None) -> dict[str, Any]:
     return {"name": "project-workflow", "version": 1, "columns": [], "actions": {}}
 
 
-def _normalize_workflow(value: object) -> dict[str, Any]:
+def _normalize_workflow(value: object, *, base_workflow: dict[str, Any] | None = None) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("workflow designer LLM did not return a workflow object")
     workflow = dict(value)
@@ -128,16 +128,21 @@ def _normalize_workflow(value: object) -> dict[str, Any]:
     workflow["workflow_type"] = str(workflow.get("workflow_type") or "").strip().lower()
     workflow["requires_apply"] = bool(workflow.get("requires_apply", False))
     workflow["parameters"] = workflow.get("parameters") if isinstance(workflow.get("parameters"), dict) else {}
-    workflow["columns"] = _normalize_columns(workflow.get("columns"))
+    workflow["columns"] = _normalize_columns(workflow.get("columns"), base_workflow=base_workflow)
     workflow["actions"] = _normalize_actions(workflow.get("actions"), workflow["columns"])
     return workflow
 
 
-def _normalize_columns(value: object) -> list[dict[str, Any]]:
+def _normalize_columns(value: object, *, base_workflow: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise ValueError("workflow.columns must be a list")
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
+    base_columns = {
+        _status_key(item.get("status_key")): item
+        for item in ((base_workflow or {}).get("columns") or [])
+        if isinstance(item, dict) and _status_key(item.get("status_key"))
+    }
     for index, raw in enumerate(value):
         if not isinstance(raw, dict):
             continue
@@ -151,6 +156,7 @@ def _normalize_columns(value: object) -> list[dict[str, Any]]:
             "position": int(raw.get("position") or (index + 1) * 10),
             "transition_to": [_status_key(item) for item in raw.get("transition_to") or [] if _status_key(item)],
         }
+        base_col = base_columns.get(key) if isinstance(base_columns.get(key), dict) else {}
         for optional in (
             "job_template",
             "input_artifacts",
@@ -161,6 +167,8 @@ def _normalize_columns(value: object) -> list[dict[str, Any]]:
         ):
             if optional in raw:
                 col[optional] = raw[optional]
+            elif optional in base_col:
+                col[optional] = base_col[optional]
         out.append(col)
     if not out:
         raise ValueError("workflow must define project-specific columns")

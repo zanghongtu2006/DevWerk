@@ -240,6 +240,43 @@ def test_workflow_designer_can_create_non_coding_writing_workflow(monkeypatch):
     validate_managed_workflow_definition(workflow_from_dict(result["workflow"]))
 
 
+def test_workflow_designer_preserves_current_job_templates_when_llm_omits_them(monkeypatch):
+    from app.services import workflow_designer
+
+    llm_workflow = _writing_workflow()
+    for column in llm_workflow["columns"]:
+        column.pop("job_template", None)
+        column.pop("input_artifacts", None)
+        column.pop("output_artifact", None)
+        column.pop("success_action", None)
+        column.pop("failure_actions", None)
+
+    monkeypatch.setattr(
+        workflow_designer,
+        "_ask_llm",
+        lambda **kwargs: {
+            "reply": "Writing workflow wording revised.",
+            "workflow": llm_workflow,
+            "agents": {"default-agent": {"model_route": "default"}},
+        },
+    )
+
+    result = workflow_designer.design_project_workflow(
+        project_id="writing-flow",
+        messages=[{"role": "user", "content": "Keep this writing workflow but make labels concise."}],
+        current_workflow=_writing_workflow(),
+        current_agents={"default-agent": {"model_route": "default"}},
+    )
+
+    columns = {column["status_key"]: column for column in result["workflow"]["columns"]}
+    assert columns["topic_defined"]["job_template"] == "define_writing_topic"
+    assert columns["topic_defined"]["output_artifact"] == "topic_bundle"
+    assert columns["written"]["job_template"] == "write_draft"
+    assert columns["written"]["input_artifacts"] == ["topic_bundle", "research_bundle"]
+    assert columns["revised"]["success_action"] == "workflow_done"
+    assert columns["reviewed"]["failure_actions"] == ["request_rewrite", "fail"]
+
+
 def test_workflow_designer_does_not_infer_terminal_actions(monkeypatch):
     from app.services import workflow_designer
 

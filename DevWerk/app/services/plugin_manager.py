@@ -13,6 +13,17 @@ SETTINGS_PATH = ".devwerk-plugin-settings.md"
 SKILL_ENTRYPOINT = "SKILL.md"
 SECRET_SCAN_EXCLUDED_DIRS = {".git", ".hg", ".svn", "__pycache__", "node_modules", ".venv", "venv", "dist", "build"}
 PACKAGE_WARNING_NAMES = {".DS_Store", "node_modules", "__pycache__"}
+CLAUDE_HOOK_EVENTS = {
+    "PreToolUse",
+    "PostToolUse",
+    "Stop",
+    "SubagentStop",
+    "SessionStart",
+    "SessionEnd",
+    "UserPromptSubmit",
+    "PreCompact",
+    "Notification",
+}
 SECRET_SCAN_EXTENSIONS = {
     ".bat",
     ".cmd",
@@ -636,11 +647,37 @@ def _discover_hooks(path: Path, manifest: dict[str, Any]) -> list[dict[str, Any]
     for hook_file in _component_paths(path, "hooks/hooks.json", manifest.get("hooks")):
         if hook_file.is_file():
             hook_id = "hooks" if hook_file == path / "hooks" / "hooks.json" else "manifest-path"
-            hooks.append({"id": hook_id, "path": str(hook_file), "payload": _read_json(hook_file)})
+            payload = _normalize_hook_payload(_read_json(hook_file))
+            hooks.append({"id": hook_id, "path": str(hook_file), "events": _hook_events(payload), "payload": payload})
     manifest_hooks = manifest.get("hooks")
     if isinstance(manifest_hooks, (dict, list)):
-        hooks.append({"id": "manifest", "path": str(path / MANIFEST_PATH), "payload": manifest_hooks})
+        payload = _normalize_hook_payload(manifest_hooks)
+        hooks.append({"id": "manifest", "path": str(path / MANIFEST_PATH), "events": _hook_events(payload), "payload": payload})
     return hooks
+
+
+def _normalize_hook_payload(value: object) -> dict[str, Any]:
+    if isinstance(value, list):
+        return {"events": value}
+    if not isinstance(value, dict):
+        return {}
+    payload = dict(value)
+    wrapped = payload.get("hooks")
+    if isinstance(wrapped, dict):
+        normalized = {key: item for key, item in payload.items() if key not in {"hooks"}}
+        for event_name, entries in wrapped.items():
+            normalized[str(event_name)] = entries
+        return normalized
+    return payload
+
+
+def _hook_events(payload: dict[str, Any]) -> list[str]:
+    events: set[str] = set()
+    raw_events = payload.get("events")
+    if isinstance(raw_events, list):
+        events.update(str(item) for item in raw_events if str(item).strip())
+    events.update(key for key in payload if key in CLAUDE_HOOK_EVENTS)
+    return sorted(events)
 
 
 def _discover_mcp_servers(path: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
@@ -916,7 +953,7 @@ def _hook_config_issues(items: list[dict[str, Any]]) -> list[str]:
             elif any(not str(event or "").strip() for event in events):
                 issues.append(f"hooks {hook_id} events must contain non-empty strings")
         for event_name, entries in payload.items():
-            if event_name == "events":
+            if event_name in {"events", "description"}:
                 continue
             if not isinstance(entries, list):
                 issues.append(f"hooks {hook_id} {event_name} must be a list")
