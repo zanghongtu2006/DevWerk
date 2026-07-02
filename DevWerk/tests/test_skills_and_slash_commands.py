@@ -245,3 +245,15 @@ def test_backend_web_ui_exposes_skill_management_and_slash_commands():
     assert 'command:"/distill", argument_hint:"compact this project context"' in js
     assert "parseSlashCommand" in js
     assert ".slash-hint" in css
+
+
+def test_backend_web_ui_uses_standard_project_skill_api_and_create_form():
+    from pathlib import Path
+
+    js = (Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "dashboard.js").read_text(encoding="utf-8")
+
+    assert "/skills/projects/" in js
+    assert "/kanban/projects/${encodeURIComponent(state.projectId)}/skills" not in js
+    assert "createProjectSkill" in js
+    assert "projectSkillId" in js
+    assert "projectSkillMd" in js

@@ -81,7 +81,7 @@ async function loadPluginSettings() {
   }));
   state.pluginSettings = out;
 }
-async function loadProjectSkills() { try { const data = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/skills`); const skills = data.skills || []; const detailed = await Promise.all(skills.map(async skill => (await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/skills/${encodeURIComponent(skill.id)}`).catch(() => ({skill}))).skill || skill)); state.projectSkills = detailed; } catch (_) { state.projectSkills = []; } }
+async function loadProjectSkills() { try { const data = await api(`${API}/skills/projects/${encodeURIComponent(state.projectId)}`); const skills = data.skills || []; const detailed = await Promise.all(skills.map(async skill => (await api(`${API}/skills/projects/${encodeURIComponent(state.projectId)}/${encodeURIComponent(skill.id)}`).catch(() => ({skill}))).skill || skill)); state.projectSkills = detailed; } catch (_) { state.projectSkills = []; } }
 async function loadSlashCommands() { try { const data = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/slash-commands`); state.slashCommands = data.commands || []; } catch (_) { state.slashCommands = []; } }
 async function loadWorkflow() { try { const data = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/workflow`); state.workflow = data.workflow || data || {}; } catch (_) { state.workflow = {}; } }
 async function loadMemory() { try { state.memory = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/memory`); } catch (_) { state.memory = {}; } }
@@ -406,7 +406,12 @@ function pluginValidationPreview(){
   return `<div class="muted" style="font-size:12px;margin-top:10px"><b>${esc(label)}</b>: ${esc(details)}</div>`;
 }
 function globalSkillEditors(){ const skills = state.globalSkills || []; if(!skills.length) return `<div class="card card-pad"><div class="h3">Global Skill Catalog</div><div class="muted">No global SKILL.md files returned by backend.</div></div>`; return skills.map(skill => editorCard(`Global Skill: ${skill.id}`, `Global SKILL.md (${skill.scope || "global"}).`, "Markdown", skill.content || skill.summary || "")).join(""); }
-function projectSkillEditors(){ const skills = state.projectSkills || []; if(!skills.length) return `<div class="card card-pad"><div class="h3">Project Skills</div><div class="muted">No project-level SKILL.md entries configured yet. Use /learn for memory, or create project skills through the skills API.</div></div>`; return skills.map(skill => editorCard(`Project Skill: ${skill.id}`, `Project-scoped SKILL.md (${skill.enabled === false ? "disabled" : "enabled"}).`, "Markdown", skill.content || skill.summary || "")).join(""); }
+function projectSkillEditors(){
+  const skills = state.projectSkills || [];
+  const createCard = `<div class="card card-pad"><div class="h3">Create Project Skill</div><div class="muted" style="font-size:12px;margin-top:4px">Project-scoped skills are loaded from SKILL.md content and can be selected by workflow node agents.</div><div style="display:grid;gap:8px;margin-top:12px"><input id="projectSkillId" class="input" placeholder="skill-id" /><textarea id="projectSkillMd" class="code-editor small-editor" placeholder="# Skill name&#10;&#10;Describe when this skill applies and how agents should use it."></textarea><button class="btn small" data-project-skill-create="true">Create Project Skill</button></div></div>`;
+  const editors = skills.length ? skills.map(skill => editorCard(`Project Skill: ${skill.id}`, `Project-scoped SKILL.md (${skill.enabled === false ? "disabled" : "enabled"}).`, "Markdown", skill.content || skill.summary || "")).join("") : `<div class="card card-pad"><div class="h3">Project Skills</div><div class="muted">No project-level SKILL.md entries configured yet.</div></div>`;
+  return `${createCard}${editors}`;
+}
 function routingSummaryCard(){ const params=state.settings.parameters || {}; return `<div class="card side-card"><div class="h3">Project Route Summary</div><div class="muted" style="font-size:12px;margin-top:4px">Project agent routes. Route keys are responsibilities, not model names.</div><div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Default Route</b><span>${esc(modelRoutes()[0] || "default")}</span></div><div class="metric-line"><b>Route Count</b><span>${modelRoutes().length}</span></div><div class="metric-line"><b>Strategy</b><span>${esc(params.routing_strategy || "project override")}</span></div></div></div>`; }
 function globalRoutingSummaryCard(){ const routing=state.globalSettings.routing || {}; const rows=Object.entries(routing); return `<div class="card side-card"><div class="h3">Global Route Map</div><div class="muted" style="font-size:12px;margin-top:4px">Agent responsibility -> model route.</div><div class="metric-lines" style="margin-top:12px">${rows.length ? rows.slice(0,8).map(([key,value])=>`<div class="metric-line"><b>${esc(routeKeyLabel(key))}</b><span>${esc(value)}</span></div>`).join("") : `<div class="muted">No global routing returned by backend.</div>`}</div></div>`; }
 function teamCard(){ const access=state.settings.access || state.settings.team || {}; const members=Array.isArray(access.members) ? access.members : []; return `<div class="card side-card"><div class="h3">Team & Access</div><div class="muted" style="font-size:12px;margin-top:4px">Access data from project settings.</div>${members.length ? `<div style="display:flex;gap:6px;margin:14px 0">${members.map(member=>`<span class="avatar">${esc(initials(member.name || member.id || member.email || "?"))}</span>`).join("")}</div>` : `<div class="muted" style="margin-top:14px">No team access configured.</div>`}<div class="metric-lines" style="margin-top:12px"><div class="metric-line"><b>Members</b><span>${members.length}</span></div><div class="metric-line"><b>Role</b><span>${esc(access.role || "-")}</span></div></div></div>`; }
@@ -668,7 +673,7 @@ async function saveEditor(card) {
   else if (title === "Global Routing Map") await api(`${API}/settings`, {method:"PUT", body:JSON.stringify({routing: payload})});
   else if (title.startsWith("Plugin Settings: ")) await api(`${API}/plugins/${encodeURIComponent(title.replace("Plugin Settings: ", ""))}/settings`, {method:"PUT", body:JSON.stringify({content: payload})});
   else if (title.startsWith("Global Skill: ")) await api(`${API}/skills/${encodeURIComponent(title.replace("Global Skill: ", ""))}`, {method:"PUT", body:JSON.stringify({skill_md: payload})});
-  else if (title.startsWith("Project Skill: ")) await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/skills/${encodeURIComponent(title.replace("Project Skill: ", ""))}`, {method:"PUT", body:JSON.stringify({skill_md: payload, enabled:true})});
+  else if (title.startsWith("Project Skill: ")) await api(`${API}/skills/projects/${encodeURIComponent(state.projectId)}/${encodeURIComponent(title.replace("Project Skill: ", ""))}`, {method:"PUT", body:JSON.stringify({skill_md: payload, enabled:true})});
   else { notify(`${title} is read-only in this view.`); return; }
   await Promise.allSettled([loadSettings(), loadGlobalSettings(), loadGlobalSkills(), loadGlobalPlugins(), loadPluginAgents(), loadPluginHooks(), loadPluginMcpServers(), loadPluginSettings(), loadProjectSkills(), loadWorkflow(), loadBoard(), loadProjectMd(), loadEvents()]);
   renderShell();
@@ -716,6 +721,15 @@ async function importMarketplacePlugin() {
   await Promise.allSettled([loadGlobalPlugins(), loadGlobalSkills(), loadPluginCommands(), loadPluginAgents(), loadPluginHooks(), loadPluginMcpServers(), loadPluginSettings()]);
   renderShell();
   notify(`${pluginName} imported.`);
+}
+async function createProjectSkill() {
+  const skillId = ($("projectSkillId")?.value || "").trim();
+  const skillMd = ($("projectSkillMd")?.value || "").trim();
+  if (!skillId) { notify("Project skill id is required.", "error"); return; }
+  await api(`${API}/skills/projects/${encodeURIComponent(state.projectId)}/${encodeURIComponent(skillId)}`, {method:"PUT", body:JSON.stringify({skill_md: skillMd, enabled:true})});
+  await loadProjectSkills();
+  renderShell();
+  notify(`Project skill ${skillId} created.`);
 }
 async function actOnCurrentTask(action) {
   const task = activeBoardTask();
@@ -812,6 +826,11 @@ document.addEventListener("click", async event => {
   const marketplaceImport = event.target.closest("[data-plugin-marketplace-import]");
   if (marketplaceImport) {
     await importMarketplacePlugin();
+    return;
+  }
+  const projectSkillCreate = event.target.closest("[data-project-skill-create]");
+  if (projectSkillCreate) {
+    await createProjectSkill();
     return;
   }
   const editorButton = event.target.closest("[data-action]");
