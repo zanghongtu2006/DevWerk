@@ -14,6 +14,12 @@ from app.services.workflow_definition import (
 _log = logging.getLogger("devwerk.workflow_designer")
 
 
+class WorkflowDesignError(ValueError):
+    def __init__(self, message: str, *, debug: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.debug = debug or {}
+
+
 def design_project_workflow(
     *,
     project_id: str,
@@ -34,20 +40,38 @@ def design_project_workflow(
     if not user_text:
         raise ValueError("project conversation requires a user message")
 
+    debug: dict[str, Any] = {"normalization_notes": []}
     try:
-        raw_reply = _ask_llm(project_id=project_id, messages=messages, base_workflow=base_workflow, agents=agents)
+        raw_reply = _ask_llm(
+            project_id=project_id,
+            messages=messages,
+            base_workflow=base_workflow,
+            agents=agents,
+            debug=debug,
+        )
     except Exception as exc:  # noqa: BLE001
         llm_error = f"{type(exc).__name__}: {exc}"
         _log.warning("workflow designer llm failed project_id=%s error=%s", project_id, llm_error)
-        raise ValueError(f"project LLM agent failed: {llm_error}") from exc
+        raise WorkflowDesignError(f"project LLM agent failed: {llm_error}", debug=debug) from exc
+    debug.setdefault("llm_output", raw_reply)
 
-    workflow = _normalize_workflow(raw_reply.get("workflow") or base_workflow, base_workflow=base_workflow)
+    workflow = _normalize_workflow(
+        raw_reply.get("workflow") or base_workflow,
+        base_workflow=base_workflow,
+        debug=debug,
+    )
     agent_overrides = _normalize_agents(raw_reply.get("agents") or agents)
     reply = str(raw_reply.get("reply") or "Workflow draft updated.")
 
     definition = workflow_from_dict(workflow)
-    validate_managed_workflow_definition(definition)
+    try:
+        validate_managed_workflow_definition(definition)
+    except ValueError as exc:
+        debug["validation_error"] = str(exc)
+        raise WorkflowDesignError(str(exc), debug=debug) from exc
     workflow = _definition_to_payload(definition)
+    debug["validated_workflow"] = workflow
+    debug["agents"] = agent_overrides
     return {
         "ok": True,
         "project_id": project_id,
@@ -57,6 +81,7 @@ def design_project_workflow(
         "agents": agent_overrides,
         "warnings": [],
         "summary": _workflow_summary(definition, agent_overrides),
+        "debug": debug,
     }
 
 
@@ -66,6 +91,7 @@ def _ask_llm(
     messages: list[dict[str, Any]],
     base_workflow: dict[str, Any],
     agents: dict[str, Any],
+    debug: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     prompt = [
         {
@@ -107,9 +133,15 @@ def _ask_llm(
             ),
         },
     ]
+    if debug is not None:
+        debug["llm_input"] = prompt
+    _log.debug("workflow designer llm input project_id=%s messages=%s", project_id, _safe_json(prompt))
     obj = get_llm_client("project").chat_json(prompt)
     if not isinstance(obj, dict):
         raise ValueError("workflow designer LLM returned non-object JSON")
+    if debug is not None:
+        debug["llm_output"] = obj
+    _log.debug("workflow designer llm output project_id=%s response=%s", project_id, _safe_json(obj))
     return obj
 
 
@@ -119,7 +151,12 @@ def _workflow_payload(value: dict[str, Any] | None) -> dict[str, Any]:
     return {"name": "project-workflow", "version": 1, "columns": [], "actions": {}}
 
 
-def _normalize_workflow(value: object, *, base_workflow: dict[str, Any] | None = None) -> dict[str, Any]:
+def _normalize_workflow(
+    value: object,
+    *,
+    base_workflow: dict[str, Any] | None = None,
+    debug: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("workflow designer LLM did not return a workflow object")
     workflow = dict(value)
@@ -129,7 +166,9 @@ def _normalize_workflow(value: object, *, base_workflow: dict[str, Any] | None =
     workflow["requires_apply"] = bool(workflow.get("requires_apply", False))
     workflow["parameters"] = workflow.get("parameters") if isinstance(workflow.get("parameters"), dict) else {}
     workflow["columns"] = _normalize_columns(workflow.get("columns"), base_workflow=base_workflow)
-    workflow["actions"] = _normalize_actions(workflow.get("actions"), workflow["columns"])
+    workflow["actions"] = _normalize_actions(workflow.get("actions"), workflow["columns"], debug=debug)
+    if debug is not None:
+        debug["normalized_workflow"] = workflow
     return workflow
 
 
@@ -175,7 +214,12 @@ def _normalize_columns(value: object, *, base_workflow: dict[str, Any] | None = 
     return sorted(out, key=lambda item: int(item.get("position") or 0))
 
 
-def _normalize_actions(value: object, columns: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def _normalize_actions(
+    value: object,
+    columns: list[dict[str, Any]],
+    *,
+    debug: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
     known = {str(col.get("status_key") or "") for col in columns}
     actions = dict(value) if isinstance(value, dict) else {}
     normalized: dict[str, dict[str, Any]] = {}
@@ -183,6 +227,10 @@ def _normalize_actions(value: object, columns: list[dict[str, Any]]) -> dict[str
         if not isinstance(raw, dict):
             continue
         target = _status_key(raw.get("to"))
+        repaired = _repair_action_target(_status_key(key), target, known)
+        if repaired != target:
+            _note(debug, f"action {_status_key(key)!r} target {target!r} normalized to {repaired!r}")
+            target = repaired
         if target in known:
             normalized[_status_key(key)] = {"to": target}
     for column in columns:
@@ -195,7 +243,32 @@ def _normalize_actions(value: object, columns: list[dict[str, Any]]) -> dict[str
         target = next((item for item in transitions if item in known and item != "failed"), None)
         if target:
             normalized[success_action] = {"to": target}
+            _note(debug, f"action {success_action!r} inferred from explicit column success_action")
+    fail_target = str((normalized.get("fail") or {}).get("to") or "")
+    if fail_target and "abandon" not in normalized:
+        normalized["abandon"] = {"to": fail_target}
+        _note(debug, f"action 'abandon' aligned to explicit fail target {fail_target!r}")
     return normalized
+
+
+def _repair_action_target(action: str, target: str, known: set[str]) -> str:
+    if target in known:
+        return target
+    failure_aliases = {"abandoned", "abandon", "blocked", "failure", "error", "cancelled", "canceled"}
+    success_aliases = {"complete", "completed", "success", "successful"}
+    if action in {"fail", "abandon"} and target in failure_aliases and "failed" in known:
+        return "failed"
+    if action in {"workflow_done", "complete", "completed"} and target in success_aliases and "done" in known:
+        return "done"
+    return target
+
+
+def _note(debug: dict[str, Any] | None, message: str) -> None:
+    if debug is None:
+        return
+    notes = debug.setdefault("normalization_notes", [])
+    if isinstance(notes, list):
+        notes.append(message)
 
 
 def _definition_to_payload(definition: WorkflowDefinition) -> dict[str, Any]:
@@ -246,3 +319,10 @@ def _workflow_summary(definition: WorkflowDefinition, agents: dict[str, Any]) ->
         "actions": sorted(definition.actions.keys()),
         "agent_overrides": sorted(agents.keys()),
     }
+
+
+def _safe_json(value: object) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except TypeError:
+        return str(value)

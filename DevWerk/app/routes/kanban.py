@@ -17,6 +17,7 @@ from app.services.kanban import (
     add_event,
     add_project_event,
     create_task,
+    delete_project,
     get_board,
     get_conversation,
     get_project,
@@ -198,6 +199,16 @@ def kanban_get_project(project_id: str):
     return get_project(project_id)
 
 
+@router.delete("/projects/{project_id}")
+def kanban_delete_project(project_id: str):
+    try:
+        return delete_project(project_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/projects/{project_id}/settings")
 def kanban_get_project_settings(project_id: str):
     return get_project_settings(project_id)
@@ -291,8 +302,30 @@ def kanban_design_project_workflow(project_id: str, req: WorkflowDesignRequest):
             result["saved"] = True
         else:
             result["saved"] = False
+        add_project_event(
+            project_id,
+            "project_workflow_design_debug",
+            {
+                "saved": result.get("saved", False),
+                "summary": result.get("summary") or {},
+                "reply": result.get("reply") or "",
+                "debug": result.get("debug") or {},
+            },
+        )
         return result
     except ValueError as exc:
+        add_project_event(
+            project_id,
+            "project_workflow_design_failed",
+            {
+                "error": str(exc),
+                "messages": req.messages,
+                "current_workflow": req.current_workflow or {},
+                "current_agents": req.current_agents or {},
+                "save": req.save,
+                "debug": getattr(exc, "debug", {}),
+            },
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

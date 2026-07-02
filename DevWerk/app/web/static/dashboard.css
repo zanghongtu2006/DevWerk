@@ -78,6 +78,8 @@ button, input, textarea, select { font: inherit; }
 .top-spacer { flex: 1; }
 .button { min-height: 34px; border-radius: 8px; border: 1px solid var(--border); background: #fff; padding: 0 14px; cursor: pointer; font-weight: 700; color: #0f172a; }
 .button.primary, .send-button { background: var(--blue); border-color: var(--blue); color: #fff; }
+.button.danger { color: #b42318; border-color: #fecdca; background: #fff5f5; }
+.button.danger:hover { background: #fee4e2; }
 .button.ghost { background: #fff; }
 .page { min-height: 0; overflow: auto; padding: 16px 24px 28px; }
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); }
@@ -130,6 +132,10 @@ button, input, textarea, select { font: inherit; }
 .composer-input { width: 100%; min-height: 58px; resize: vertical; border: 0; outline: 0; color: var(--text); }
 .slash-hint { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; color: var(--muted); font-size: 12px; margin: 4px 0 10px; }
 .slash-hint span { border: 1px solid var(--border); border-radius: 999px; padding: 3px 8px; background: var(--panel); color: var(--muted); }
+.workflow-event-list { display: grid; gap: 8px; margin-top: 12px; }
+.workflow-event-detail { border: 1px solid var(--border); border-radius: 8px; background: var(--panel); padding: 8px 10px; }
+.workflow-event-detail summary { cursor: pointer; font-size: 12px; color: var(--text); }
+.workflow-event-detail .json-panel { margin-top: 8px; max-height: 360px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
 .composer-actions { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
 .tool-row { display: flex; gap: 8px; }
 .tool { width: 30px; height: 30px; border-radius: 8px; border: 1px solid var(--border); display: grid; place-items: center; color: var(--blue); font-weight: 850; }

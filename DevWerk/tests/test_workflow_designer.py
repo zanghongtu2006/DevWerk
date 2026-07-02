@@ -310,6 +310,175 @@ def test_workflow_designer_does_not_infer_terminal_actions(monkeypatch):
         raise AssertionError("designer must not infer terminal actions from no-transition columns")
 
 
+def test_workflow_designer_repairs_common_llm_action_aliases(monkeypatch):
+    from app.services import workflow_designer
+
+    workflow = _coding_lifecycle_workflow()
+    workflow["actions"] = {
+        "code_ready": {"to": "ready_to_apply"},
+        "apply_succeeded": {"to": "applied"},
+        "verification_failed": {"to": "implement"},
+        "workflow_done": {"to": "done"},
+        "fail": {"to": "failed"},
+        "abandon": {"to": "abandoned"},
+        "retry": {"to": "implement"},
+    }
+
+    monkeypatch.setattr(
+        workflow_designer,
+        "_ask_llm",
+        lambda **kwargs: {
+            "reply": "Coding workflow revised.",
+            "workflow": workflow,
+            "agents": {},
+        },
+    )
+
+    result = workflow_designer.design_project_workflow(
+        project_id="coding-aliases",
+        messages=[{"role": "user", "content": "Create a coding workflow."}],
+    )
+
+    assert result["workflow"]["actions"]["abandon"]["to"] == "failed"
+    assert result["debug"]["normalization_notes"]
+    assert any("abandoned" in note for note in result["debug"]["normalization_notes"])
+
+
+def test_workflow_designer_records_effective_llm_debug(monkeypatch):
+    from app.services import workflow_designer
+
+    captured = {}
+
+    class FakeClient:
+        def chat_json(self, messages):
+            captured["messages"] = messages
+            return {"reply": "ok", "workflow": _writing_workflow(), "agents": {"writer": {"model_route": "default"}}}
+
+    monkeypatch.setattr(workflow_designer, "get_llm_client", lambda agent: FakeClient())
+
+    result = workflow_designer.design_project_workflow(
+        project_id="debug-flow",
+        messages=[{"role": "user", "content": "Design a writing workflow."}],
+    )
+
+    assert result["debug"]["llm_input"] == captured["messages"]
+    assert result["debug"]["llm_output"]["reply"] == "ok"
+    assert result["debug"]["validated_workflow"]["name"] == "writing-workflow"
+
+
+def test_workflow_designer_endpoint_records_debug_and_failure_events(monkeypatch, tmp_path):
+    kanban_service = _configure(monkeypatch, tmp_path)
+    import app.routes.kanban as kanban_routes
+    import app.services.workflow_designer as workflow_designer
+
+    kanban_service.upsert_project(project_id="designer-debug", name="Designer Debug")
+    monkeypatch.setattr(
+        workflow_designer,
+        "_ask_llm",
+        lambda **kwargs: {
+            "reply": "ok",
+            "workflow": _writing_workflow(),
+            "agents": {"writer": {"model_route": "default"}},
+        },
+    )
+
+    response = kanban_routes.kanban_design_project_workflow(
+        "designer-debug",
+        kanban_routes.WorkflowDesignRequest(
+            messages=[{"role": "user", "content": "Use writing workflow."}],
+            save=True,
+        ),
+    )
+    assert response["saved"] is True
+
+    events = kanban_service.list_events(project_id="designer-debug", limit=20)["events"]
+    assert any(event["event_type"] == "project_workflow_design_debug" for event in events)
+
+    monkeypatch.setattr(
+        workflow_designer,
+        "_ask_llm",
+        lambda **kwargs: {
+            "reply": "bad",
+            "workflow": {
+                "name": "bad",
+                "columns": [{"status_key": "working", "title": "Working", "position": 10, "transition_to": []}],
+                "actions": {},
+            },
+            "agents": {},
+        },
+    )
+
+    try:
+        kanban_routes.kanban_design_project_workflow(
+            "designer-debug",
+            kanban_routes.WorkflowDesignRequest(messages=[{"role": "user", "content": "Bad workflow."}], save=True),
+        )
+    except Exception:
+        pass
+    else:
+        raise AssertionError("invalid workflow should fail")
+
+    events = kanban_service.list_events(project_id="designer-debug", limit=20)["events"]
+    failed = [event for event in events if event["event_type"] == "project_workflow_design_failed"]
+    assert failed
+    assert "explicit success action" in failed[0]["payload"]["error"]
+
+
+def test_project_conversation_designs_pipeline_for_mini_program_request(monkeypatch, tmp_path):
+    kanban_service = _configure(monkeypatch, tmp_path)
+    import app.routes.kanban as kanban_routes
+    import app.services.workflow_designer as workflow_designer
+
+    project_id = "mini-program-pipeline"
+    kanban_service.upsert_project(project_id=project_id, name="Mini Program Pipeline")
+
+    def fake_project_agent(**kwargs):
+        return {
+            "action": "save_design",
+            "reply": "I will design the workflow before starting implementation.",
+            "save": True,
+        }
+
+    workflow = _coding_lifecycle_workflow()
+    workflow["actions"]["abandon"] = {"to": "abandoned"}
+
+    monkeypatch.setattr(kanban_routes, "_ask_project_conversation_agent", fake_project_agent)
+    monkeypatch.setattr(
+        workflow_designer,
+        "_ask_llm",
+        lambda **kwargs: {
+            "reply": "已为 uniapp + Java 小程序骨架创建 coding workflow。",
+            "workflow": workflow,
+            "agents": {
+                "project-default-agent": {"enabled": True, "model_route": "default"},
+                "skeleton-builder": {"enabled": True, "model_route": "default", "tools": ["workspace.write"]},
+            },
+        },
+    )
+
+    response = kanban_routes.kanban_project_conversation_message(
+        project_id,
+        kanban_routes.ProjectConversationRequest(
+            action="message",
+            message=(
+                "有一个小程序需求，使用uniapp开发前端，java开发后端。"
+                "请在D:/workspace规划前后端两个工程，做线下活动和积分商城骨架。"
+            ),
+        ),
+    )
+
+    assert response["ok"] is True
+    assert response["kind"] == "workflow_design"
+    saved_workflow = kanban_service.get_project_workflow(project_id)["workflow"]
+    assert saved_workflow["actions"]["abandon"]["to"] == "failed"
+    assert saved_workflow["actions"]["workflow_done"]["to"] == "done"
+    assert kanban_service.list_columns(project_id)
+    events = kanban_service.list_events(project_id=project_id, limit=20)["events"]
+    debug_events = [event for event in events if event["event_type"] == "project_workflow_design_debug"]
+    assert debug_events
+    assert "llm_output" in debug_events[0]["payload"]["debug"]
+
+
 def test_workflow_designer_uses_project_agent_for_default_llm(monkeypatch):
     from app.services import workflow_designer
 
@@ -367,6 +536,30 @@ def test_workflow_designer_endpoint_can_save_project_override(monkeypatch, tmp_p
         kanban_service.get_project_settings("designer-save")["settings"]["agents"]["publication-agent"]["model_route"]
         == "default"
     )
+
+
+def test_project_delete_api_removes_local_project_records(monkeypatch, tmp_path):
+    kanban_service = _configure(monkeypatch, tmp_path)
+    import app.routes.kanban as kanban_routes
+
+    project_id = "delete-me"
+    kanban_service.upsert_project(project_id=project_id, name="Delete Me")
+    kanban_service.update_project_workflow(project_id, _writing_workflow())
+    task = kanban_service.create_task(project_id=project_id, title="Temporary", description="Delete with project")
+    kanban_service.add_event(task["task"]["id"], "temporary_event", {"ok": True})
+
+    response = kanban_routes.kanban_delete_project(project_id)
+
+    assert response["deleted"] is True
+    project_ids = {project["id"] for project in kanban_service.list_projects()}
+    assert project_id not in project_ids
+
+    try:
+        kanban_routes.kanban_delete_project("default")
+    except Exception as exc:
+        assert getattr(exc, "status_code", None) == 400
+    else:
+        raise AssertionError("default project must not be deleted")
 
 
 def test_backend_web_ui_is_split_into_template_css_and_script():

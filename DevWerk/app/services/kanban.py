@@ -267,6 +267,29 @@ def get_project(project_id: str | None) -> dict[str, Any]:
     return {"ok": True, "project": project}
 
 
+def delete_project(project_id: str | None) -> dict[str, Any]:
+    pid = _project_id(project_id)
+    if pid == DEFAULT_PROJECT_ID:
+        raise ValueError("default project cannot be deleted")
+    init_kanban_db()
+    with _conn() as conn:
+        row = conn.execute("SELECT id FROM kb_projects WHERE id = ?", (pid,)).fetchone()
+        if row is None:
+            raise KeyError(f"project not found: {pid}")
+        conn.execute("DELETE FROM kb_revisions WHERE project_id = ?", (pid,))
+        conn.execute("DELETE FROM kb_column_runs WHERE project_id = ?", (pid,))
+        conn.execute("DELETE FROM kb_messages WHERE project_id = ?", (pid,))
+        conn.execute("DELETE FROM kb_conversations WHERE project_id = ?", (pid,))
+        conn.execute("DELETE FROM kb_artifacts WHERE project_id = ?", (pid,))
+        conn.execute("DELETE FROM kb_events WHERE project_id = ?", (pid,))
+        conn.execute("DELETE FROM kb_tasks WHERE project_id = ?", (pid,))
+        conn.execute("DELETE FROM kb_columns WHERE project_id = ?", (pid,))
+        conn.execute("DELETE FROM kb_project_settings WHERE project_id = ?", (pid,))
+        conn.execute("DELETE FROM kb_projects WHERE id = ?", (pid,))
+    _log.debug("kanban project deleted project_id=%s", pid)
+    return {"ok": True, "project_id": pid, "deleted": True}
+
+
 def upsert_project(
     *,
     project_id: str | None,

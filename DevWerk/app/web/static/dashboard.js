@@ -139,8 +139,7 @@ function renderOverviewPage() {
 function renderProjectsPage() {
   $("page").innerHTML = `
     <div class="projects-page">
-      <div class="page-head"><div class="title-block"><span class="folder-icon"></span><div><h1 class="h2">Projects</h1><div class="muted">Manage and configure your development assistant projects.</div></div></div><div class="toolbar"><label class="search-box" style="margin:0;width:230px"><span></span><input placeholder="Search projects..." /></label><select class="select-pill"><option>All Environments</option></select><select class="select-pill"><option>All Statuses</option></select><button id="newProjectMain" class="button primary">+ New Project</button></div></div>
-      <div class="project-cards">${state.projects.length ? state.projects.map(projectCard).join("") : `<div class="card card-pad muted">No projects returned by backend.</div>`}</div>
+      <div class="page-head"><div class="title-block"><span class="folder-icon"></span><div><h1 class="h2">${esc(currentProject().name || state.projectId)}</h1><div class="muted">Project conversation, workflow configuration, and runtime state.</div></div></div><div class="toolbar"><button id="deleteProjectMain" class="button danger">Delete Project</button><button id="newProjectMain" class="button primary">+ New Project</button></div></div>
       <div class="project-workbench-grid">
         ${conversationCard()}
         <aside class="side-stack">${liveLogCard()}${recentTasksCard()}${recentEventsCard()}</aside>
@@ -153,6 +152,7 @@ function renderProjectsPage() {
       </section>
     </div>`;
   $("newProjectMain").onclick = createProjectFromPrompt;
+  $("deleteProjectMain").onclick = deleteCurrentProject;
   wireConversation();
   document.querySelectorAll("[data-project-tab]").forEach(button => {
     button.onclick = () => {
@@ -315,7 +315,15 @@ function conversationHtml() {
 }
 function conversationTabs(){ return [{key:"conversation", label:"Conversation"}, {key:"workflow_log", label:"Workflow Log"}, {key:"artifacts", label:"Artifacts"}]; }
 function conversationTabContent(){ if(state.conversationTab === "workflow_log") return workflowLogHtml(state.events); if(state.conversationTab === "artifacts") return artifactsOverviewHtml(allArtifacts()); return conversationHtml(); }
-function workflowLogHtml(events){ return `<div class="summary-card wide exec-log" style="border:0;padding:0"><div class="log-head"><div class="h3">Workflow Log</div><span class="muted">${events.length} events</span></div><div class="log-lines" style="margin-top:12px">${events.length ? events.map(e=>`${dateTime(e.created_at)}  ${esc(eventTitle(e))} ${esc(e.task_id || "")} ${e.to_status ? "-> " + esc(e.to_status) : ""}`).join("<br/>") : "No workflow events returned by backend."}</div></div>`; }
+function workflowLogHtml(events){
+  return `<div class="summary-card wide exec-log" style="border:0;padding:0"><div class="log-head"><div class="h3">Workflow Log</div><span class="muted">${events.length} events</span></div><div class="workflow-event-list">${events.length ? events.map(workflowEventDetail).join("") : "No workflow events returned by backend."}</div></div>`;
+}
+function workflowEventDetail(event){
+  const payload = event.payload || {};
+  const detail = JSON.stringify({from_status:event.from_status,to_status:event.to_status,task_id:event.task_id,payload}, null, 2);
+  const summary = `${dateTime(event.created_at)}  ${eventTitle(event)} ${event.task_id || ""}${event.to_status ? " -> " + event.to_status : ""}`;
+  return `<details class="workflow-event-detail"><summary>${esc(summary)}</summary><pre class="json-panel">${esc(detail)}</pre></details>`;
+}
 function artifactsOverviewHtml(artifacts){ return `<div class="section-stack">${artifacts.length ? artifacts.map(a=>`<div class="summary-card"><div class="h3">${esc(a.artifact_type || a.type || a.name || "artifact")}</div><pre class="json-panel">${esc(JSON.stringify(a.payload || a, null, 2))}</pre></div>`).join("") : `<div class="muted">No artifacts returned by backend.</div>`}</div>`; }
 function wireConversation() {
   const send = $("send"); const prompt = $("prompt");
@@ -546,6 +554,16 @@ function looksLikeJson(value) {
 function defaultAgents(){ return {"dev-assistant":{name:"DevWerk Assistant",role:"primary",description:"General purpose development assistant",model_route:"default",tools:["code","search","file_editor","terminal"]}}; }
 function defaultParameters(){ return {model:modelRoutes()[0] || "default",temperature:0.2,max_tokens:8192,top_p:1,stream:true,thinking_mode:"balanced",retry:{attempts:3,backoff_ms:500}}; }
 async function createProjectFromPrompt(){ openTextDialog({title:"New Project", label:"Project name", defaultValue:"Untitled Project", submitText:"Create Project", onSubmit: async name => { const id=`project-${new Date().toISOString().replace(/[-:TZ.]/g,"").slice(0,17)}`; await api(`${API}/kanban/projects`,{method:"POST",body:JSON.stringify({project_id:id,name})}); state.projectId=id; await refreshAll(); location.href=`/workbench?project_id=${encodeURIComponent(id)}&new=1&project_name=${encodeURIComponent(name)}`; }}); }
+async function deleteCurrentProject(){
+  if (!state.projectId || state.projectId === "default") { notify("The default project cannot be deleted.", "error"); return; }
+  if (!confirm(`Delete project ${state.projectId}? This removes its tasks, events, and settings from the local backend database.`)) return;
+  await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}`, {method:"DELETE"});
+  state.projectId = "default";
+  await refreshAll();
+  history.replaceState(null, "", `/dashboard?project_id=${encodeURIComponent(state.projectId)}`);
+  renderShell();
+  notify("Project deleted.");
+}
 async function createTaskFromPrompt(){ openTextDialog({title:"New Task", label:"Task title", defaultValue:"New workflow task", submitText:"Create Task", onSubmit: async title => { await api(`${API}/kanban/tasks`,{method:"POST",body:JSON.stringify({project_id:state.projectId,title,description:"Created from DevWerk Web UI."})}); await Promise.allSettled([loadBoard(),loadEvents()]); renderShell(); notify("Task created."); }}); }
 function notify(message, type="info") {
   document.querySelectorAll(".toast").forEach(node => node.remove());
@@ -565,14 +583,21 @@ function openTextDialog({title, label, defaultValue, submitText, onSubmit}) {
   input.focus();
   input.select();
   wrap.querySelector("[data-dialog-close]").onclick = () => wrap.remove();
+  let submitting = false;
   wrap.querySelector("form").onsubmit = async event => {
     event.preventDefault();
+    if (submitting) return;
     const value = (input.value || "").trim();
     if (!value) return;
+    submitting = true;
+    const submitButton = wrap.querySelector('button[type="submit"]');
+    if (submitButton) submitButton.disabled = true;
     try {
       await onSubmit(value);
       wrap.remove();
     } catch (error) {
+      submitting = false;
+      if (submitButton) submitButton.disabled = false;
       notify(error.message || String(error), "error");
     }
   };
