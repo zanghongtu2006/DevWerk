@@ -34,11 +34,14 @@ const state = {
   projectTab: "configuration",
   conversationTab: "conversation",
   taskTab: "summary",
-  busy: false
+  busy: false,
+  pendingAttachments: [],
+  sendMode: localStorage.getItem("devwerk.sendMode") || "alt_enter"
 };
 const $ = (id) => document.getElementById(id);
 async function api(path, options = {}) {
-  const headers = {"Content-Type": "application/json", ...(options.headers || {})};
+  const isForm = typeof FormData !== "undefined" && options.body instanceof FormData;
+  const headers = isForm ? (options.headers || {}) : {"Content-Type": "application/json", ...(options.headers || {})};
   const response = await fetch(path, {...options, headers});
   if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
   const text = await response.text();
@@ -297,7 +300,7 @@ function pipelineHtml() {
 function healthCard(){ const failed=(currentProject().stats || {}).failed_tasks || 0; const active=activeStage(); const stages=columns().map(c=>c.status_key); return `<div class="card card-pad"><div style="display:flex;gap:10px;align-items:center"><span class="ok">${failed ? "!" : "OK"}</span><div><div class="h3">${failed ? "Attention" : "No failed tasks"}</div><div class="muted" style="font-size:12px">Derived from backend Kanban state.</div></div></div><div style="margin-top:18px" class="muted">Active Stage</div><div style="margin-top:8px"><span class="badge blue">${esc(active ? stageTitle(active) : "-")}</span></div><div class="muted" style="font-size:12px;margin-top:6px">${active ? statusCount(active) : 0} tasks in active stage</div><div class="progress"><span style="width:${active && stages.length ? Math.max(3, Math.round(((stages.indexOf(active) + 1) / stages.length) * 100)) : 0}%"></span></div></div>`; }
 function usageCard(u, title="Token Usage", rows=null){ return `<div class="card card-pad"><div style="display:flex;justify-content:space-between;gap:10px"><div class="h3">${esc(title)}</div><span class="muted" style="font-size:12px">Backend usage DB</span></div><div style="font-size:20px;font-weight:850;margin-top:12px">${compact(u.total)} total tokens</div><div class="progress"><span style="width:${u.total ? 100 : 0}%"></span></div><div class="metric-lines"><div class="metric-line"><span>Input Tokens</span><b>${compact(u.input)}</b></div><div class="metric-line"><span>Output Tokens</span><b>${compact(u.output)}</b></div><div class="metric-line"><span>LLM Calls</span><b>${compact(u.calls)}</b></div><div class="metric-line"><span>Requests</span><b>${compact(u.request_count)}</b></div></div>${usageBars(rows || state.usage.by_task || state.usage.projects || [])}</div>`; }
 function routingCard(){ return `<div class="card card-pad"><div class="h3">Agent Route</div><div class="muted" style="font-size:12px;margin-top:4px">Routes map agent responsibilities to model configs; they are not model names.</div><div class="metric-lines" style="margin-top:12px"><div><div class="muted">Project Default</div><b>${esc(modelRoutes()[0] || "default")}</b></div><div><div class="muted">Project Routes</div><b>${esc(modelRoutes().join(", ") || "default")}</b></div><div><div class="muted">Thinking Mode</div><b>${esc((state.settings.parameters || {}).thinking_mode || "Balanced")}</b></div></div></div>`; }
-function conversationCard(){ return `<section class="card chat-card"><div class="tabs">${conversationTabs().map(tab=>`<button class="tab tab-button ${state.conversationTab===tab.key?"active":""}" data-chat-tab="${tab.key}">${tab.label}</button>`).join("")}</div><div id="chatBody" class="chat-body">${conversationTabContent()}</div><div class="composer"><div class="composer-box"><textarea id="prompt" class="composer-input" placeholder="Message DevWerk, or use slash commands..."></textarea>${slashHintHtml()}<div class="composer-actions"><div class="tool-row"><span class="tool">A</span><span class="tool">F</span><span class="tool">&lt;/&gt;</span><span class="tool">B</span></div><div style="display:flex;gap:10px"><select class="select-pill">${modelRoutes().map(m=>`<option>${esc(m)}</option>`).join("") || "<option>default</option>"}</select><button id="send" class="send-button">></button></div></div></div></div></section>`; }
+function conversationCard(){ return `<section class="card chat-card"><div class="tabs">${conversationTabs().map(tab=>`<button class="tab tab-button ${state.conversationTab===tab.key?"active":""}" data-chat-tab="${tab.key}">${tab.label}</button>`).join("")}</div><div id="chatBody" class="chat-body">${conversationTabContent()}</div><div class="composer"><div class="composer-box"><textarea id="prompt" class="composer-input" placeholder="Message DevWerk, or use slash commands..."></textarea><div id="slashPreview" class="slash-preview"></div><div id="slashSuggestions" class="slash-suggestions"></div>${attachmentListHtml()}<div class="composer-actions"><div class="tool-row"><input id="attachmentInput" type="file" multiple hidden /><button id="attachFiles" class="small-button" type="button">Attach</button><select id="sendMode" class="select-pill"><option value="alt_enter" ${state.sendMode==="alt_enter"?"selected":""}>Alt+Enter sends</option><option value="enter" ${state.sendMode==="enter"?"selected":""}>Enter sends</option></select></div><div style="display:flex;gap:10px"><select class="select-pill" title="Conversation route">${modelRoutes().map(m=>`<option>${esc(routeDisplayName(m))}</option>`).join("") || "<option>default-task</option>"}</select><button id="send" class="send-button" title="Send">></button></div></div></div></div></section>`; }
 function slashHintHtml(){
   const commands = state.slashCommands && state.slashCommands.length ? state.slashCommands : [
     {command:"/goal", argument_hint:"project objective", source:"builtin"},
@@ -305,6 +308,9 @@ function slashHintHtml(){
     {command:"/distill", argument_hint:"compact this project context", source:"builtin"}
   ];
   return `<div class="slash-hint"><b>Slash commands</b>${commands.slice(0,8).map(item => `<span data-slash-command="${escAttr(item.command)}" title="${escAttr(item.summary || "")}">${esc(item.command)}${item.argument_hint ? " " + esc(item.argument_hint) : ""}${item.source === "plugin" ? " · plugin" : ""}</span>`).join("")}</div>`;
+}
+function attachmentListHtml(){
+  return state.pendingAttachments.length ? `<div class="attachment-list">${state.pendingAttachments.map(file=>`<span class="attachment-chip">${esc(file.filename || file.name || "attachment")} <button type="button" data-remove-attachment="${escAttr(file.id || file.filename || file.name)}">x</button></span>`).join("")}</div>` : "";
 }
 function conversationHtml() {
   const msgs = state.conversation.length ? state.conversation : [{role:"assistant", content:"I will help you break this down into actionable tasks and move them through the workflow. Tell me what you want DevWerk to build, review, research, or organize."}];
@@ -329,13 +335,28 @@ function wireConversation() {
   const send = $("send"); const prompt = $("prompt");
   if (!send || !prompt) return;
   send.onclick = sendProjectMessage;
-  prompt.addEventListener("keydown", event => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) { event.preventDefault(); sendProjectMessage(); }});
+  prompt.addEventListener("input", updateSlashAutocomplete);
+  prompt.addEventListener("keydown", event => {
+    const wantsEnter = state.sendMode === "enter" && event.key === "Enter" && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey;
+    const wantsAltEnter = state.sendMode !== "enter" && event.key === "Enter" && event.altKey;
+    if (wantsEnter || wantsAltEnter || (event.key === "Enter" && (event.ctrlKey || event.metaKey))) {
+      event.preventDefault();
+      sendProjectMessage();
+    }
+  });
+  const sendMode = $("sendMode");
+  if (sendMode) sendMode.onchange = () => { state.sendMode = sendMode.value || "alt_enter"; localStorage.setItem("devwerk.sendMode", state.sendMode); };
+  const attachmentInput = $("attachmentInput");
+  const attachFiles = $("attachFiles");
+  if (attachFiles && attachmentInput) attachFiles.onclick = () => attachmentInput.click();
+  if (attachmentInput) attachmentInput.onchange = uploadSelectedAttachments;
   document.querySelectorAll("[data-chat-tab]").forEach(button => {
     button.onclick = () => {
       state.conversationTab = button.dataset.chatTab || "conversation";
       renderProjectsPage();
     };
   });
+  updateSlashAutocomplete();
   scrollConversationToLatest();
 }
 function scrollConversationToLatest() {
@@ -346,12 +367,14 @@ async function sendProjectMessage() {
   const prompt = $("prompt"); const content = (prompt.value || "").trim();
   if (!content || state.busy) return;
   const slash = parseSlashCommand(content);
+  const attachments = state.pendingAttachments.slice();
   state.busy = true; prompt.disabled = true; $("send").disabled = true;
   state.conversation.push({role:"user", content});
   renderProjectsPage();
   try {
-    const result = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/conversation`, {method:"POST", body: JSON.stringify({action:slash?.action || "message", message:slash?.argument || content, messages:state.conversation, metadata:{active_task_id: state.activeTask?.id || state.activeTask?.task_id || null, slash_command: slash?.command || null}})});
+    const result = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/conversation`, {method:"POST", body: JSON.stringify({action:slash?.action || "message", message:slash?.argument || content, messages:state.conversation, metadata:{active_task_id: state.activeTask?.id || state.activeTask?.task_id || null, slash_command: slash?.command || null, attachments}})});
     if (result && result.task_id) state.activeTask = {id: result.task_id, status_key: result.status_key || "queued"};
+    state.pendingAttachments = [];
     await Promise.allSettled([loadConversation(), loadBoard(), loadEvents()]);
     renderProjectsPage();
   } catch (error) {
@@ -363,6 +386,33 @@ async function sendProjectMessage() {
     if (currentPrompt) currentPrompt.disabled = false;
     if (currentSend) currentSend.disabled = false;
   }
+}
+async function uploadSelectedAttachments(event) {
+  const files = Array.from(event.target.files || []);
+  if (!files.length) return;
+  for (const file of files) {
+    const data = new FormData();
+    data.append("file", file);
+    data.append("project_id", state.projectId);
+    const uploaded = await api(`${API}/ide/attachments`, {method:"POST", body:data});
+    state.pendingAttachments.push(uploaded);
+  }
+  event.target.value = "";
+  renderProjectsPage();
+}
+function updateSlashAutocomplete() {
+  const prompt = $("prompt");
+  const box = $("slashSuggestions");
+  const preview = $("slashPreview");
+  if (!prompt || !box || !preview) return;
+  const text = String(prompt.value || "");
+  const head = text.trimStart().split(/\s+/, 1)[0];
+  const commands = state.slashCommands && state.slashCommands.length ? state.slashCommands : [];
+  const selected = commands.find(item => item.command === head);
+  preview.innerHTML = selected ? `<span class="slash-token">${esc(selected.command)}</span><span class="muted">${esc(selected.summary || selected.argument_hint || "")}</span>` : "";
+  if (!head.startsWith("/")) { box.innerHTML = ""; return; }
+  const matches = commands.filter(item => item.command.toLowerCase().startsWith(head.toLowerCase())).slice(0, 8);
+  box.innerHTML = matches.length ? matches.map(item => `<button type="button" data-slash-command="${escAttr(item.command)}"><b>${esc(item.command)}</b><span>${esc(item.summary || item.argument_hint || "")}</span></button>`).join("") : `<div class="muted">No slash command matches.</div>`;
 }
 function parseSlashCommand(content){
   const text = String(content || "").trim();
@@ -812,6 +862,7 @@ function activeStage(){ if(state.activeTask && state.activeTask.status_key) retu
 function statusCount(stage){ return columns().find(column => column.status_key === stage)?.tasks?.length || 0; }
 function activeBoardTask(){ const requested = new URLSearchParams(location.search).get("task_id"); const tasks = allTasks(); return tasks.find(t => t.id === requested) || tasks.find(t => t.status_key === activeStage()) || tasks[0]; }
 function modelRoutes(){ const agents = state.settings.agents || {}; const routes = new Set(); Object.values(agents).forEach(agent => { if(agent && agent.model_route) routes.add(agent.model_route); if(agent && agent.model) routes.add(agent.model); }); const params = state.settings.parameters || {}; if(params.model) routes.add(params.model); if(params.model_route) routes.add(params.model_route); return Array.from(routes); }
+function routeDisplayName(route){ return route === "default" ? "default-task" : route; }
 function usageTotals(source=state.usage){ const totals=source.totals || {}; if(Object.keys(totals).length) return {request_count: source.request_count || totals.request_count || 0,calls: totals.calls || 0,input: totals.input_tokens || 0,output: totals.output_tokens || 0,total: totals.total_tokens || 0,duration: totals.duration_ms || 0}; const rows = source.projects || []; return rows.reduce((a,r)=>{ a.calls += r.calls || 0; a.input += r.input_tokens || 0; a.output += r.output_tokens || 0; a.total += r.total_tokens || 0; a.duration += r.duration_ms || 0; return a; }, {request_count: source.request_count || 0,calls:0,input:0,output:0,total:0,duration:0}); }
 function projectTotal(key){ return state.projects.reduce((sum, project) => sum + Number((project.stats || {})[key] || 0), 0); }
 function routeKeyLabel(key){ const labels={default:"Default route", compression:"Compression route"}; return labels[key] || key; }
@@ -846,6 +897,13 @@ document.addEventListener("click", async event => {
   const slashChip = event.target.closest("[data-slash-command]");
   if (slashChip) {
     setPrompt(`${slashChip.dataset.slashCommand || ""} `);
+    return;
+  }
+  const removeAttachment = event.target.closest("[data-remove-attachment]");
+  if (removeAttachment) {
+    const id = removeAttachment.dataset.removeAttachment || "";
+    state.pendingAttachments = state.pendingAttachments.filter(item => String(item.id || item.filename || item.name) !== id);
+    renderProjectsPage();
     return;
   }
   const sectionLink = event.target.closest("a[data-nav]");

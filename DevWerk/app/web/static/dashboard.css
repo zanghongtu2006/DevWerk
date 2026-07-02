@@ -132,6 +132,13 @@ button, input, textarea, select { font: inherit; }
 .composer-input { width: 100%; min-height: 58px; resize: vertical; border: 0; outline: 0; color: var(--text); }
 .slash-hint { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; color: var(--muted); font-size: 12px; margin: 4px 0 10px; }
 .slash-hint span { border: 1px solid var(--border); border-radius: 999px; padding: 3px 8px; background: var(--panel); color: var(--muted); }
+.slash-preview { display: flex; gap: 8px; align-items: center; min-height: 0; margin-top: 6px; font-size: 12px; }
+.slash-token, .attachment-chip { display: inline-flex; gap: 6px; align-items: center; border: 1px solid #bfdbfe; background: #eff6ff; color: #1d4ed8; border-radius: 999px; padding: 3px 8px; font-size: 12px; font-weight: 750; }
+.slash-suggestions { display: grid; gap: 6px; margin-top: 6px; }
+.slash-suggestions button { border: 1px solid var(--border); border-radius: 8px; background: #fff; padding: 7px 9px; display: flex; justify-content: space-between; gap: 10px; cursor: pointer; text-align: left; color: var(--text); }
+.slash-suggestions button:hover { border-color: var(--blue); background: #eff6ff; }
+.attachment-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.attachment-chip button { border: 0; background: transparent; color: #1d4ed8; cursor: pointer; font-weight: 900; padding: 0; }
 .workflow-event-list { display: grid; gap: 8px; margin-top: 12px; }
 .workflow-event-detail { border: 1px solid var(--border); border-radius: 8px; background: var(--panel); padding: 8px 10px; }
 .workflow-event-detail summary { cursor: pointer; font-size: 12px; color: var(--text); }
