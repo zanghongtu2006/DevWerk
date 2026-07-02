@@ -323,6 +323,52 @@ def test_plugin_validation_and_import_reject_invalid_semver(monkeypatch, tmp_pat
         raise AssertionError("invalid semver plugin import should fail")
 
 
+def test_plugin_validation_requires_manifest_name(monkeypatch, tmp_path):
+    _patch_roots(monkeypatch, tmp_path)
+    broken = tmp_path / "missing-name"
+    (broken / ".claude-plugin").mkdir(parents=True)
+    (broken / ".claude-plugin" / "plugin.json").write_text(
+        '{"version":"0.1.0","description":"Missing required name"}',
+        encoding="utf-8",
+    )
+
+    from app.services.plugin_manager import import_global_plugin, validate_plugin_source
+
+    validation = validate_plugin_source(str(broken))
+
+    assert validation["ok"] is False
+    assert any("plugin manifest requires name" in issue for issue in validation["issues"])
+    try:
+        import_global_plugin(str(broken))
+    except ValueError as exc:
+        assert "plugin manifest requires name" in str(exc)
+    else:
+        raise AssertionError("missing manifest name plugin import should fail")
+
+
+def test_plugin_validation_warns_for_unknown_manifest_fields(monkeypatch, tmp_path):
+    _patch_roots(monkeypatch, tmp_path)
+    source = _write_plugin(tmp_path / "source", "unknown-fields")
+    (source / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "unknown-fields",
+                "version": "0.1.0",
+                "description": "Has extra fields",
+                "mysteryFeature": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    from app.services.plugin_manager import validate_plugin_source
+
+    validation = validate_plugin_source(str(source))
+
+    assert validation["ok"] is True
+    assert any("unknown manifest field: mysteryFeature" in warning for warning in validation["warnings"])
+
+
 def test_plugin_validation_rejects_duplicate_component_ids(monkeypatch, tmp_path):
     _patch_roots(monkeypatch, tmp_path)
     source = _write_plugin(tmp_path / "source", "duplicate-components")

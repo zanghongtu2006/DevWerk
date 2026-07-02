@@ -11,6 +11,20 @@ MANIFEST_PATH = ".claude-plugin/plugin.json"
 STATE_PATH = ".devwerk-plugin.json"
 SETTINGS_PATH = ".devwerk-plugin-settings.md"
 SKILL_ENTRYPOINT = "SKILL.md"
+MANIFEST_ALLOWED_FIELDS = {
+    "name",
+    "version",
+    "description",
+    "author",
+    "license",
+    "homepage",
+    "repository",
+    "keywords",
+    "commands",
+    "agents",
+    "hooks",
+    "mcpServers",
+}
 
 
 def list_global_plugins() -> list[dict[str, Any]]:
@@ -160,6 +174,11 @@ def validate_plugin_source(source_path: str) -> dict[str, Any]:
         issues.append(f"plugin manifest is required at {MANIFEST_PATH}")
     elif not manifest:
         issues.append(f"plugin manifest is invalid JSON or not an object: {MANIFEST_PATH}")
+
+    if manifest_path.is_file() and "name" not in manifest:
+        issues.append("plugin manifest requires name")
+    for field in sorted(set(manifest) - MANIFEST_ALLOWED_FIELDS):
+        warnings.append(f"unknown manifest field: {field}")
 
     raw_name = str(manifest.get("name") or source.name)
     try:
