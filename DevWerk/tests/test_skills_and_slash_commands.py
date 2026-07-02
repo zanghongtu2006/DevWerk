@@ -138,6 +138,21 @@ def test_browser_and_network_capabilities_are_first_class_tool_requests():
     assert response["tool_requests"][0]["tool"] == "browser.playwright"
 
 
+def test_builtin_browser_toolkit_plugin_exposes_mcp_servers():
+    from app.services.plugin_manager import get_global_plugin, list_enabled_plugin_mcp_servers
+
+    plugin = get_global_plugin("browser-toolkit")
+    servers = {server["id"]: server for server in plugin["mcp_servers"]}
+    runtime = {server["server_ref"]: server for server in list_enabled_plugin_mcp_servers()}
+
+    assert servers["playwright"]["config"]["command"] == "npx"
+    assert "@playwright/mcp@latest" in servers["playwright"]["config"]["args"]
+    assert servers["chrome-devtools"]["config"]["command"] == "npx"
+    assert "chrome-devtools-mcp@latest" in servers["chrome-devtools"]["config"]["args"]
+    assert runtime["browser-toolkit:playwright"]["resolved_config"]["command"] == "npx"
+    assert runtime["browser-toolkit:chrome-devtools"]["resolved_config"]["command"] == "npx"
+
+
 def test_project_conversation_slash_commands_update_project_md_and_memory(monkeypatch, tmp_path):
     _configure(monkeypatch, tmp_path)
     import app.main as main_module
