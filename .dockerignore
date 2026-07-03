@@ -1,0 +1,15 @@
+.git
+.devwerk
+backend
+dist
+idea-plugin
+**/.env
+**/.env.*
+**/config/llm.json
+**/data
+**/.venv
+**/venv
+**/__pycache__
+**/.pytest_cache
+**/tests
+**/node_modules
