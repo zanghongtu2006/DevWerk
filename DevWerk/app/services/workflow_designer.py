@@ -312,7 +312,73 @@ def _normalize_actions(
     if fail_target and "abandon" not in normalized:
         normalized["abandon"] = {"to": fail_target}
         _note(debug, f"action 'abandon' aligned to explicit fail target {fail_target!r}")
+    if coding:
+        _ensure_coding_lifecycle_actions(normalized, columns, known, debug=debug)
     return normalized
+
+
+def _ensure_coding_lifecycle_actions(
+    actions: dict[str, dict[str, Any]],
+    columns: list[dict[str, Any]],
+    known: set[str],
+    *,
+    debug: dict[str, Any] | None,
+) -> None:
+    """Repair common LLM omissions without inventing project columns.
+
+    The workflow designer may emit project-specific columns correctly but omit
+    the semantic action map required by the deterministic engine. Only infer
+    actions whose target columns already exist in the LLM-provided workflow.
+    """
+
+    if "ready_to_apply" in known and "code_ready" not in actions:
+        actions["code_ready"] = {"to": "ready_to_apply"}
+        _note(debug, "coding lifecycle action 'code_ready' inferred from explicit ready_to_apply column")
+    if "done" in known and "workflow_done" not in actions:
+        actions["workflow_done"] = {"to": "done"}
+        _note(debug, "coding lifecycle action 'workflow_done' inferred from explicit done column")
+    if "failed" in known:
+        if "fail" not in actions:
+            actions["fail"] = {"to": "failed"}
+            _note(debug, "coding lifecycle action 'fail' inferred from explicit failed column")
+        if str((actions.get("abandon") or {}).get("to") or "") != "failed":
+            previous = str((actions.get("abandon") or {}).get("to") or "")
+            actions["abandon"] = {"to": "failed"}
+            if previous:
+                _note(debug, f"coding lifecycle action 'abandon' target {previous!r} aligned to 'failed'")
+            else:
+                _note(debug, "coding lifecycle action 'abandon' inferred from explicit failed column")
+        if "verification_failed" not in actions:
+            actions["verification_failed"] = {"to": "failed"}
+            _note(debug, "coding lifecycle action 'verification_failed' inferred from explicit failed column")
+    if "apply_succeeded" not in actions:
+        apply_target = _first_existing_status(("applied", "apply_succeeded", "verified", "done"), known)
+        if apply_target:
+            actions["apply_succeeded"] = {"to": apply_target}
+            _note(debug, f"coding lifecycle action 'apply_succeeded' inferred to {apply_target!r}")
+    retry_target = str((actions.get("retry") or {}).get("to") or "")
+    terminal_targets = {
+        str((actions.get(action) or {}).get("to") or "")
+        for action in ("workflow_done", "complete", "completed", "fail", "abandon")
+    }
+    terminal_targets.discard("")
+    if not retry_target or retry_target in terminal_targets:
+        inferred = _first_retry_status(columns, terminal_targets)
+        if inferred:
+            actions["retry"] = {"to": inferred}
+            _note(debug, f"coding lifecycle action 'retry' inferred to {inferred!r}")
+
+
+def _first_existing_status(candidates: tuple[str, ...], known: set[str]) -> str:
+    return next((candidate for candidate in candidates if candidate in known), "")
+
+
+def _first_retry_status(columns: list[dict[str, Any]], terminal_targets: set[str]) -> str:
+    for column in sorted(columns, key=lambda item: int(item.get("position") or 0)):
+        status = str(column.get("status_key") or "")
+        if status and status not in terminal_targets and status not in {"ready_to_apply"}:
+            return status
+    return ""
 
 
 def _repair_action_target(action: str, target: str, known: set[str], *, coding: bool = False) -> str:

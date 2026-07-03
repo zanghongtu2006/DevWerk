@@ -150,3 +150,50 @@ def test_workflow_designer_aligns_coding_abandon_to_failed(monkeypatch):
 
     assert result["workflow"]["actions"]["abandon"]["to"] == "failed"
     assert "action 'abandon' target 'abandoned' normalized to 'failed'" in result["debug"]["normalization_notes"]
+
+
+def test_workflow_designer_repairs_real_minimax_coding_lifecycle_shape(monkeypatch):
+    workflow_designer = _patch_designer(
+        monkeypatch,
+        {
+            "name": "offline-points-full-lifecycle",
+            "version": 2,
+            "workflow_type": "coding",
+            "requires_apply": True,
+            "columns": [
+                {"status_key": "backlog", "title": "Backlog", "position": 1, "job_template": "captured_requirement", "output_artifact": "requirement_card", "success_action": "code_ready"},
+                {"status_key": "designing", "title": "Designing", "position": 2, "job_template": "design_task", "output_artifact": "design_doc", "success_action": "code_ready"},
+                {"status_key": "developing", "title": "Developing", "position": 3, "job_template": "code_task", "output_artifact": "code_changes", "success_action": "code_ready"},
+                {"status_key": "ready_to_apply", "title": "Ready To Apply", "position": 4, "job_template": "apply_ready_task", "output_artifact": "apply_package", "success_action": "code_ready"},
+                {"status_key": "applying", "title": "Applying", "position": 5, "job_template": "apply_task", "output_artifact": "apply_result", "success_action": "apply_succeeded"},
+                {"status_key": "apply_succeeded", "title": "Apply Succeeded", "position": 6, "job_template": "verify_task", "output_artifact": "verification_report", "success_action": "code_ready"},
+                {"status_key": "done", "title": "Done", "position": 90, "job_template": "delivery_task", "output_artifact": "delivery_report", "success_action": "workflow_done"},
+                {"status_key": "failed", "title": "Failed", "position": 98, "job_template": "fail_terminal", "output_artifact": "failure_report", "success_action": "fail"},
+                {"status_key": "abandoned", "title": "Abandoned", "position": 99, "job_template": "abandon_terminal", "output_artifact": "abandon_record", "success_action": "abandon"},
+                {"status_key": "retry_pending", "title": "Retry Pending", "position": 100, "job_template": "retry_task", "output_artifact": "retry_intent", "success_action": "retry"},
+            ],
+            "actions": {
+                "workflow_done": {"target": "done"},
+                "fail": {"target": "failed"},
+                "abandon": {"target": "abandoned"},
+                "retry": {"target": "retry_pending"},
+            },
+        },
+    )
+
+    result = workflow_designer.design_project_workflow(
+        project_id="offline-points",
+        messages=[{"role": "user", "content": "coding+review, start the project."}],
+    )
+
+    actions = result["workflow"]["actions"]
+    notes = result["debug"]["normalization_notes"]
+    assert actions["code_ready"]["to"] == "ready_to_apply"
+    assert actions["apply_succeeded"]["to"] == "apply_succeeded"
+    assert actions["verification_failed"]["to"] == "failed"
+    assert actions["workflow_done"]["to"] == "done"
+    assert actions["fail"]["to"] == "failed"
+    assert actions["abandon"]["to"] == "failed"
+    assert actions["retry"]["to"] == "retry_pending"
+    assert "coding lifecycle action 'code_ready' inferred from explicit ready_to_apply column" in notes
+    assert "action 'abandon' target 'abandoned' normalized to 'failed'" in notes
