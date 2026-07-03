@@ -260,6 +260,10 @@ def continue_workflow_payload(task_id: str, incoming: dict) -> dict:
             )
     if isinstance(incoming.get("client_capabilities"), dict):
         body["client_capabilities"] = incoming["client_capabilities"]
+    if "backend_local" in incoming:
+        body["backend_local"] = incoming.get("backend_local")
+    if "local_backend" in incoming:
+        body["local_backend"] = incoming.get("local_backend")
     cursor = _latest_artifact_created_at(task, "workflow_result")
     update_conversation(task_id, state="queued", waiting_for=None)
     _kanban_event(task_id, "workflow_resume_queued", {"action": body["resume_action"], "result_after": cursor})
@@ -769,6 +773,9 @@ def _workflow_request_body_artifact(body: dict) -> dict:
         "mode": body.get("mode", "agent"),
         "interaction_mode": body.get("interaction_mode", "auto"),
         "project_root": body.get("project_root"),
+        "backend_local": body.get("backend_local"),
+        "local_backend": body.get("local_backend"),
+        "metadata": body.get("metadata") if isinstance(body.get("metadata"), dict) else {},
         "messages": body.get("messages") if isinstance(body.get("messages"), list) else [],
         "workspace": body.get("workspace") if isinstance(body.get("workspace"), dict) else None,
         "client_capabilities": body.get("client_capabilities") if isinstance(body.get("client_capabilities"), dict) else {},

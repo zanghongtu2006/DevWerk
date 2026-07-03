@@ -32,6 +32,11 @@ from app.services.session_store import read_project_memory
 from app.services.skill_manager import resolve_agent_skills
 from app.services.job_scheduler import JobScheduler
 from app.services.llm_factory import get_llm_client
+from app.services.local_capability_provider import (
+    apply_file_changes,
+    execute_tool_requests,
+    local_backend_enabled,
+)
 from app.services.memory_system import build_context_pack, create_agent_run, handle_agent_writeback
 from app.services.plugin_manager import get_plugin_agent
 from app.services.provider_errors import is_retryable_llm_error
@@ -275,6 +280,48 @@ class WorkflowEngine:
                     include_current=True,
                 )
             if next_column is None:
+                if result.action == "apply_result" and _is_success_terminal(definition, target_status):
+                    response = _generic_done_response(task_id, project_id, target_status, state)
+                    append_conversation_message(
+                        task_id,
+                        role="assistant",
+                        content=response.reply or "Workflow completed after backend-local apply.",
+                        message_type="workflow_result",
+                        metadata={"status_key": target_status, "apply_provider": "devwerk-backend"},
+                    )
+                    update_conversation(task_id, state="done", waiting_for=None, active_column=target_status)
+                    _event(
+                        task_id,
+                        "workflow_finished",
+                        {
+                            "ok": True,
+                            "phase": current.status_key,
+                            "status_key": response.status_key,
+                            "round": round_no,
+                            "apply_provider": "devwerk-backend",
+                        },
+                    )
+                    add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
+                    return
+
+                if result.action == "apply_result" and target_status in _failure_statuses(definition):
+                    response = _failure_response(
+                        task_id,
+                        "BACKEND_LOCAL_APPLY_FAILED",
+                        "Backend-local apply or verification failed.",
+                        status_key=target_status or _failure_status(definition) or "failed",
+                    )
+                    _notify_project_conversation_failure(
+                        task_id,
+                        project_id,
+                        phase=current.status_key,
+                        reason=response.error_message or "",
+                        status_key=response.status_key,
+                    )
+                    _event(task_id, "workflow_finished", {"ok": False, "phase": current.status_key, "status_key": response.status_key})
+                    add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
+                    return
+
                 if _is_success_terminal(definition, target_status) and state.execute_response is None and result.decision == "approve":
                     response = _generic_done_response(task_id, project_id, target_status, state)
                     append_conversation_message(
@@ -575,6 +622,47 @@ class WorkflowEngine:
         )
         decision = _generic_decision(raw.get("decision"), raw.get("next_action"), has_tool_requests=bool(tool_requests))
         if decision == "need_client_tool" and tool_requests:
+            if local_backend_enabled(body):
+                root = _effective_project_root(body, raw=raw)
+                if root:
+                    tool_round = _positive_int(body.get("_backend_tool_round"), 0)
+                    max_tool_rounds = _positive_int(body.get("backend_tool_max_rounds"), 64)
+                    if tool_round >= max_tool_rounds:
+                        raise RuntimeError(f"backend local tool loop exceeded {max_tool_rounds} rounds")
+                    results = execute_tool_requests(tool_requests, project_root=root)
+                    result_payload = {
+                        "phase": column.status_key,
+                        "agent": agent,
+                        "provider": "devwerk-backend",
+                        "project_root": root,
+                        "requests": [request.model_dump() for request in tool_requests],
+                        "results": [result.model_dump(exclude_none=True) for result in results],
+                        "round": tool_round + 1,
+                    }
+                    add_artifact(task_id, artifact_type="backend_tool_result", payload=result_payload)
+                    add_artifact(
+                        task_id,
+                        artifact_type="client_tool_result",
+                        payload={"waiting_for": "backend_local_tool", "results": result_payload["results"]},
+                    )
+                    _event(
+                        task_id,
+                        "backend_local_tool_result_recorded",
+                        {
+                            "phase": column.status_key,
+                            "agent": agent,
+                            "project_root": root,
+                            "result_count": len(results),
+                            "all_ok": all(result.ok for result in results),
+                            "round": tool_round + 1,
+                        },
+                    )
+                    next_body = dict(body)
+                    next_body["_backend_tool_round"] = tool_round + 1
+                    existing_results = next_body.get("tool_results") if isinstance(next_body.get("tool_results"), list) else []
+                    next_body["tool_results"] = [*existing_results, *result_payload["results"]]
+                    return await self._run_generic_column(task_id, next_body, definition, workflow_summary, column, state)
+
             request_payload = {
                 "phase": column.status_key,
                 "agent": agent,
@@ -700,6 +788,42 @@ class WorkflowEngine:
                     "requires_apply": True,
                     "requires_verification": _requires_post_apply_verification(project_id),
                 }
+                if local_backend_enabled(body):
+                    root = _effective_project_root(body, raw=raw, response=code_response)
+                    if root:
+                        apply_payload = apply_file_changes(
+                            ops=code_response.ops,
+                            patch_ops=code_response.patch_ops,
+                            project_root=root,
+                        )
+                        add_artifact(task_id, artifact_type="backend_local_apply_result", payload=apply_payload)
+                        applied = apply_workflow_action(
+                            task_id,
+                            "apply_result",
+                            {
+                                **apply_payload,
+                                "phase": "apply",
+                                "revision_id": revision["id"],
+                                "_engine_internal": True,
+                            },
+                        )
+                        _event(
+                            task_id,
+                            "backend_local_apply_completed",
+                            {
+                                "phase": column.status_key,
+                                "project_root": root,
+                                "ok": bool(apply_payload.get("ok")),
+                                "changed_paths": apply_payload.get("changed_paths") or [],
+                                "error_message": apply_payload.get("error_message"),
+                                "status_key": (applied.get("task") or {}).get("status_key"),
+                            },
+                        )
+                        return ColumnResult(
+                            action="apply_result",
+                            target_status=(applied.get("task") or {}).get("status_key"),
+                            decision=decision,
+                        )
                 append_conversation_message(
                     task_id,
                     role="assistant",
@@ -1180,7 +1304,7 @@ def _generic_code_response(
     code_tree = raw.get("code_tree") or raw_outputs.get("code_tree")
     if not ops and not patch_ops and not tool_requests and code_tree is None:
         return None
-    return IdeChatResponse(
+    response = IdeChatResponse(
         ok=bool(raw.get("ok", True)),
         reply=str(raw.get("reply") or summary or ""),
         task_id=task_id,
@@ -1191,6 +1315,22 @@ def _generic_code_response(
         tool_requests=tool_requests,
         done=bool(raw.get("done", True)),
     )
+    target_root = _code_patch_target_root(raw, raw_outputs)
+    if target_root:
+        response.planning = {"target_root": target_root}
+    return response
+
+
+def _code_patch_target_root(raw: dict[str, Any], raw_outputs: dict[str, Any] | None = None) -> str:
+    outputs = raw_outputs if isinstance(raw_outputs, dict) else raw.get("outputs") if isinstance(raw.get("outputs"), dict) else {}
+    for candidate in (outputs.get("code_patch"), raw.get("code_patch"), outputs, raw):
+        if not isinstance(candidate, dict):
+            continue
+        for key in ("target_root", "project_root", "root", "base_dir", "base_path"):
+            text = str(candidate.get(key) or "").strip()
+            if text:
+                return text
+    return ""
 
 
 def _code_patch_file_ops(raw: dict[str, Any], raw_outputs: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1397,6 +1537,7 @@ def _build_agent_context(
         "plugin_agent": plugin_agent,
         "skills": resolve_agent_skills(project_id, skill_ids),
         "capabilities": _capability_context(body),
+        "tool_results": _compact_tool_results(body.get("tool_results")),
         "workspace": _workspace_summary(body.get("workspace")),
     }
 
@@ -1526,6 +1667,38 @@ def _latest_task_artifact_payload(task_id: str, artifact_type: str) -> dict[str,
             payload = artifact.get("payload")
             return payload if isinstance(payload, dict) else None
     return None
+
+
+def _effective_project_root(
+    body: dict[str, Any],
+    *,
+    raw: dict[str, Any] | None = None,
+    response: IdeChatResponse | None = None,
+) -> str:
+    project_id = str(body.get("project_id") or "default")
+    settings_payload = get_project_settings(project_id)
+    project_settings = settings_payload.get("settings") if isinstance(settings_payload, dict) else {}
+    parameters = project_settings.get("parameters") if isinstance(project_settings, dict) else {}
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    workspace = body.get("workspace") if isinstance(body.get("workspace"), dict) else {}
+    source_map = workspace.get("source_map") if isinstance(workspace.get("source_map"), dict) else {}
+
+    candidates = [
+        body.get("project_root"),
+        metadata.get("project_root"),
+        metadata.get("workspace_root"),
+        metadata.get("local_project_root"),
+        parameters.get("project_root") if isinstance(parameters, dict) else None,
+        parameters.get("workspace_root") if isinstance(parameters, dict) else None,
+        (response.planning or {}).get("target_root") if response and isinstance(response.planning, dict) else None,
+        _code_patch_target_root(raw or {}) if isinstance(raw, dict) else None,
+        source_map.get("root") if isinstance(source_map, dict) else None,
+    ]
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return ""
 
 
 def _ready_response(task_id: str, project_id: str, status_key: str, execute_response: IdeChatResponse) -> IdeChatResponse:
@@ -1701,6 +1874,24 @@ def _compact_task_memory(task: dict[str, Any], conversation_context: dict[str, A
             if isinstance(item, dict)
         ],
     }
+
+
+def _compact_tool_results(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in value[-20:]:
+        if not isinstance(item, dict):
+            continue
+        out.append(
+            {
+                "id": item.get("id"),
+                "ok": item.get("ok"),
+                "content": str(item.get("content") or "")[:12000],
+                "error": str(item.get("error") or "")[:4000] or None,
+            }
+        )
+    return out
 
 
 def _context_log_summary(context: dict[str, Any]) -> dict[str, Any]:

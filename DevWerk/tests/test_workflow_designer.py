@@ -978,7 +978,7 @@ def test_project_conversation_agent_normalizes_raw_json_reply(monkeypatch, tmp_p
     assert captured["metadata"]["project_agent_decision"]["action"] == "start_task"
     conversation = kanban_routes.kanban_project_conversation("json-project")["messages"]
     assistant_messages = [message for message in conversation if message["role"] == "assistant"]
-    assert assistant_messages[-1]["content"] == "Task started: task-json-123"
+    assert assistant_messages[-1]["content"] == "Start the writing intake.\n\nTask started: task-json-123"
     assert '"action"' not in assistant_messages[-1]["content"]
 
 

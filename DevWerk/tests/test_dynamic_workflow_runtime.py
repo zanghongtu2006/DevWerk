@@ -425,3 +425,85 @@ async def test_column_agent_tool_request_aliases_are_normalized(monkeypatch, tmp
     assert result["waiting_for"] == "client_tool"
     assert result["tool_requests"][0]["tool"] == "source.diagnostics"
     assert result["tool_requests"][0]["args"]["paths"] == ["src/main/java"]
+
+
+@pytest.mark.asyncio
+async def test_backend_local_tool_request_is_executed_and_reinjected(monkeypatch, tmp_path):
+    kanban = _configure(monkeypatch, tmp_path)
+    project_id = "backend-local-tool-loop"
+    project_root = tmp_path / "workspace"
+    project_root.mkdir()
+    (project_root / "README.md").write_text("# Existing\n", encoding="utf-8")
+    workflow = {
+        "name": "tool-loop-flow",
+        "version": 1,
+        "columns": [
+            {
+                "status_key": "inspect",
+                "title": "Inspect",
+                "position": 10,
+                "transition_to": ["done", "failed"],
+                "job_template": "inspect_project",
+                "output_artifact": "inspection_bundle",
+                "success_action": "workflow_done",
+                "failure_actions": ["fail"],
+            },
+            {"status_key": "done", "title": "Done", "position": 90, "transition_to": []},
+            {"status_key": "failed", "title": "Failed", "position": 99, "transition_to": ["inspect"]},
+        ],
+        "actions": {
+            "workflow_done": {"to": "done"},
+            "fail": {"to": "failed"},
+            "abandon": {"to": "failed"},
+            "retry": {"to": "inspect"},
+        },
+    }
+    kanban.update_project_workflow(project_id, workflow)
+    task = kanban.create_task(project_id=project_id, title="Inspect project")["task"]
+
+    import app.services.workflow_engine as workflow_engine_service
+    from app.services.local_capability_provider import merge_backend_capabilities
+
+    calls: list[dict] = []
+
+    class FakeToolClient:
+        def chat_json(self, messages: list[dict]) -> dict:
+            payload = json.loads(messages[-1]["content"])
+            calls.append(payload)
+            if len(calls) == 1:
+                return {
+                    "phase": payload["phase"],
+                    "summary": "Need to list the workspace first.",
+                    "decision": "need_client_tool",
+                    "tool_requests": [{"tool": "workspace.list", "args": {"path": "", "max_depth": 1}}],
+                }
+            tool_results = payload["agent_context"].get("tool_results") or []
+            assert tool_results
+            assert "README.md" in tool_results[-1]["content"]
+            return {
+                "phase": payload["phase"],
+                "summary": "Workspace was inspected through backend-local tools.",
+                "outputs": {"observed": "README.md"},
+                "decision": "approve",
+                "next_action": "workflow_done",
+            }
+
+    monkeypatch.setattr(workflow_engine_service, "get_llm_client", lambda route: FakeToolClient())
+
+    await workflow_engine_service.WorkflowEngine().run(
+        task["id"],
+        {
+            "project_id": project_id,
+            "backend_local": True,
+            "project_root": str(project_root),
+            "client_capabilities": merge_backend_capabilities({}),
+            "messages": [{"role": "user", "content": "Inspect files"}],
+        },
+    )
+
+    detail = kanban.get_task(task["id"])["task"]
+    assert detail["status_key"] == "done"
+    assert len(calls) == 2
+    artifact_types = [item["artifact_type"] for item in detail["artifacts"]]
+    assert "backend_tool_result" in artifact_types
+    assert "client_tool_result" in artifact_types

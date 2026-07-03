@@ -12,6 +12,7 @@ from urllib.parse import quote
 
 from app.routes.web_ui import render_web_ui
 from app.services.llm_factory import get_llm_client
+from app.services.local_capability_provider import merge_backend_capabilities
 from app.services.kanban import (
     add_artifact,
     add_event,
@@ -1249,6 +1250,8 @@ def _is_project_explanation_request(text: str) -> bool:
     lower = str(text or "").strip().lower()
     if not lower:
         return False
+    if _is_actionable_project_request(lower):
+        return False
     markers = (
         "?",
         "？",
@@ -1274,6 +1277,33 @@ def _is_project_explanation_request(text: str) -> bool:
         "explain",
         "how does",
         "what is",
+    )
+    return any(marker in lower for marker in markers)
+
+
+def _is_actionable_project_request(lower: str) -> bool:
+    markers = (
+        "排查",
+        "修复",
+        "解决",
+        "执行",
+        "测试",
+        "重新",
+        "继续",
+        "创建",
+        "生成",
+        "落盘",
+        "写入",
+        "搭建",
+        "实现",
+        "run",
+        "fix",
+        "repair",
+        "execute",
+        "test",
+        "create",
+        "build",
+        "implement",
     )
     return any(marker in lower for marker in markers)
 
@@ -1554,16 +1584,22 @@ def _handle_project_task_dispatch(
         "workspace": workspace
         or {"root_id": project_id, "changed_files": [], "open_files": [], "tree_preview": "", "source_map": None},
         "metadata": {"source": "project_conversation", **metadata},
+        "backend_local": True,
+        "client_capabilities": merge_backend_capabilities(metadata.get("client_capabilities")),
     }
     from app.routes import workflows as workflow_routes
 
     result = workflow_routes.start_workflow_payload(body)
     started = bool(result.get("ok", True))
+    decision = metadata.get("project_agent_decision") if isinstance(metadata.get("project_agent_decision"), dict) else {}
+    decision_reply = str(decision.get("reply") or "").strip()
     content = (
         f"Task started: {result.get('task_id') or 'unknown'}"
         if started
         else f"Task dispatch failed: {result.get('error_message') or result.get('error_code') or 'unknown error'}"
     )
+    if decision_reply:
+        content = f"{decision_reply}\n\n{content}"
     add_project_event(
         project_id,
         "project_conversation_message",
@@ -1630,16 +1666,22 @@ def _handle_project_task_continue(
         "action": "message",
         "message": task_message,
         "metadata": {"source": "project_conversation", **metadata},
+        "backend_local": True,
+        "client_capabilities": merge_backend_capabilities(metadata.get("client_capabilities")),
     }
     if workspace is not None:
         incoming["workspace"] = workspace
     result = workflow_routes.continue_workflow_payload(task_id, incoming)
     ok = bool(result.get("ok", True))
+    decision = metadata.get("project_agent_decision") if isinstance(metadata.get("project_agent_decision"), dict) else {}
+    decision_reply = str(decision.get("reply") or "").strip()
     content = (
         f"Task continued: {task_id}"
         if ok
         else f"Task continuation failed: {result.get('error_message') or result.get('error_code') or 'unknown error'}"
     )
+    if decision_reply:
+        content = f"{decision_reply}\n\n{content}"
     add_project_event(
         project_id,
         "project_conversation_message",

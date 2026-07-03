@@ -359,6 +359,61 @@ def test_context_pack_loads_latest_failure_bundle_for_rework(monkeypatch, tmp_pa
     assert pack["task"]["latest_failure_bundle"]["reason"] == "compile failed"
 
 
+@pytest.mark.asyncio
+async def test_backend_local_code_ops_are_applied_and_complete_workflow(monkeypatch, tmp_path):
+    kanban, _memory = configure(monkeypatch, tmp_path)
+    project_id = "backend-local-apply"
+    project_root = tmp_path / "generated-project"
+    kanban.update_project_workflow(project_id, coding_workflow())
+    task = kanban.create_task(project_id=project_id, title="Generate scaffold")["task"]
+
+    import app.services.workflow_engine as workflow_engine_service
+
+    class FakeCodeClient:
+        def chat_json(self, messages: list[dict]) -> dict:
+            payload = json.loads(messages[-1]["content"])
+            assert payload["phase"] == "implement"
+            return {
+                "phase": "implement",
+                "summary": "Generated a backend-local scaffold.",
+                "outputs": {
+                    "code_patch": {
+                        "target_root": str(project_root),
+                        "files": [
+                            {"path": "README.md", "content": "# Generated\n"},
+                            {"path": "src/App.java", "content": "class App {}\n"},
+                        ],
+                    }
+                },
+                "decision": "approve",
+                "next_action": "code_ready",
+            }
+
+    monkeypatch.setattr(workflow_engine_service, "get_llm_client", lambda route: FakeCodeClient())
+
+    await workflow_engine_service.WorkflowEngine().run(
+        task["id"],
+        {
+            "project_id": project_id,
+            "backend_local": True,
+            "messages": [{"role": "user", "content": "Create a tiny scaffold"}],
+        },
+    )
+
+    detail = kanban.get_task(task["id"])["task"]
+    result = [artifact for artifact in detail["artifacts"] if artifact["artifact_type"] == "workflow_result"][-1]["payload"]
+    apply_result = [artifact for artifact in detail["artifacts"] if artifact["artifact_type"] == "backend_local_apply_result"][-1]["payload"]
+
+    assert (project_root / "README.md").read_text(encoding="utf-8") == "# Generated\n"
+    assert (project_root / "src" / "App.java").read_text(encoding="utf-8") == "class App {}\n"
+    assert detail["status_key"] == "done"
+    assert result["ok"] is True
+    assert result["done"] is True
+    assert result["status_key"] == "done"
+    assert apply_result["ok"] is True
+    assert sorted(apply_result["changed_paths"]) == ["README.md", "src/App.java"]
+
+
 def test_coding_workflow_validator_requires_lifecycle_contract(monkeypatch, tmp_path):
     kanban, _memory = configure(monkeypatch, tmp_path)
 
