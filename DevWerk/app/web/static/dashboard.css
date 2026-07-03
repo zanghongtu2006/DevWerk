@@ -108,7 +108,7 @@ button, input, textarea, select { font: inherit; }
 .stage-label { font-size: 12px; font-weight: 750; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .chat-card { padding: 0; overflow: hidden; min-height: 520px; display: grid; grid-template-rows: auto minmax(260px, 1fr) auto; }
 .project-workbench-grid { display: grid; grid-template-columns: minmax(520px, 1fr) 320px; gap: 14px; align-items: stretch; }
-.project-workbench-grid .chat-card { height: 560px; min-height: 560px; }
+.project-workbench-grid .chat-card { height: 100%; min-height: clamp(680px, calc(100vh - 140px), 860px); }
 .tabs { display: flex; gap: 24px; border-bottom: 1px solid var(--border); padding: 0 16px; min-height: 48px; align-items: end; }
 .tab { padding: 14px 0 11px; color: #334155; font-weight: 750; font-size: 13px; border-bottom: 2px solid transparent; }
 .tab.active { color: var(--blue); border-color: var(--blue); }
