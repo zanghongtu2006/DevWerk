@@ -1351,11 +1351,16 @@ def _handle_project_task_dispatch(
     metadata: dict[str, Any],
     event_kind: str,
 ) -> dict[str, Any]:
+    workflow_messages = _project_task_workflow_messages(
+        project_id,
+        task_message=task_message,
+        metadata=metadata,
+    )
     body = {
         "project_id": project_id,
         "mode": "agent",
         "interaction_mode": "auto",
-        "messages": [{"role": "user", "content": task_message}],
+        "messages": workflow_messages,
         "workspace": workspace
         or {"root_id": project_id, "changed_files": [], "open_files": [], "tree_preview": "", "source_map": None},
         "metadata": {"source": "project_conversation", **metadata},
@@ -1382,6 +1387,42 @@ def _handle_project_task_dispatch(
         },
     )
     return {"ok": started, "project_id": project_id, "kind": "task_started", **result}
+
+
+def _project_task_workflow_messages(
+    project_id: str,
+    *,
+    task_message: str,
+    metadata: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Build a workflow conversation that preserves project-level design context.
+
+    A project task often starts after several project-conversation turns. If the
+    workflow receives only the short task title, column agents lose the stack,
+    directory, scope, and acceptance criteria that the project agent already
+    discussed with the user. Keep the newest project turns, then append the
+    concrete task request as the final user message so task title extraction
+    remains stable.
+    """
+
+    messages: list[dict[str, str]] = []
+    for item in list_project_conversation_messages(project_id, limit=16).get("messages", []):
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        content = str(item.get("content") or "").strip()
+        if role not in {"user", "assistant", "system"} or not content:
+            continue
+        messages.append({"role": role, "content": content})
+
+    project_md = str(metadata.get("project_md") or "").strip()
+    if project_md:
+        messages.append({"role": "system", "content": f"Project.MD context:\n{project_md[:6000]}"})
+
+    task_text = str(task_message or "").strip()
+    if task_text and (not messages or messages[-1].get("content") != task_text):
+        messages.append({"role": "user", "content": task_text})
+    return messages or [{"role": "user", "content": task_text or "Start project task."}]
 
 
 def _handle_project_task_continue(

@@ -32,7 +32,8 @@ def test_project_conversation_starts_task_when_workflow_exists_and_no_active_tas
 
     assert response["kind"] == "task_started"
     assert captured["body"]["project_id"] == project_id
-    assert captured["body"]["messages"][0]["content"] == "Write the first article."
+    assert captured["body"]["messages"][-1]["content"] == "Write the first article."
+    assert any(message["content"] for message in captured["body"]["messages"][:-1])
 
 
 def test_project_conversation_continues_active_non_terminal_task(monkeypatch, tmp_path):
@@ -107,4 +108,3 @@ def test_terminal_task_followup_can_start_new_task(monkeypatch, tmp_path):
 
     assert response["kind"] == "task_started"
     assert response["task_id"] == "next-task"
-

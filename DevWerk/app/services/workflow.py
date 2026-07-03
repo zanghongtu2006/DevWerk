@@ -138,7 +138,7 @@ def apply_workflow_action(task_id: str, action: str, payload: dict[str, Any] | N
             task_detail["ignored_action"] = ACTION_WORKFLOW_DONE
             return task_detail
 
-    if action_key == ACTION_RETRY:
+    if action_key == ACTION_RETRY and not data.get("_engine_internal"):
         task_detail = get_task(task_id)
         current_status = str((task_detail.get("task") or {}).get("status_key") or "")
         if current_status not in _failure_statuses(_definition_for_task(task_id)):

@@ -17,6 +17,7 @@ from app.services.conversation_context import context_debug_payload, prepare_con
 from app.services.kanban import (
     add_artifact,
     add_event,
+    add_project_event,
     append_conversation_message,
     create_revision,
     finish_column_run,
@@ -94,6 +95,13 @@ class WorkflowEngine:
                 status_key=_failure_status(definition) or _current_status(task_id),
             )
             _safe_fail(task_id, {"phase": "workflow", "reason": response.error_message})
+            _notify_project_conversation_failure(
+                task_id,
+                project_id,
+                phase="workflow",
+                reason=response.error_message,
+                status_key=response.status_key,
+            )
             _event(task_id, "workflow_finished", {"ok": False, "phase": "workflow", "status_key": response.status_key})
             add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
             return
@@ -144,6 +152,13 @@ class WorkflowEngine:
                     status_key=_failure_status(definition) or current.status_key,
                 )
                 _safe_fail(task_id, {"phase": current.status_key, "reason": response.error_message})
+                _notify_project_conversation_failure(
+                    task_id,
+                    project_id,
+                    phase=current.status_key,
+                    reason=response.error_message,
+                    status_key=response.status_key,
+                )
                 _event(task_id, "workflow_finished", {"ok": False, "phase": current.status_key, "status_key": response.status_key})
                 add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
                 return
@@ -176,6 +191,14 @@ class WorkflowEngine:
                 else:
                     boundary_payload["terminal"] = bool(result.response.done or result.response.status_key in _terminal_statuses(definition))
                     _event(task_id, "workflow_finished", boundary_payload)
+                if not result.response.ok and not result.response.waiting_for:
+                    _notify_project_conversation_failure(
+                        task_id,
+                        project_id,
+                        phase=current.status_key,
+                        reason=result.response.error_message or result.response.reply or "Workflow failed before producing a result.",
+                        status_key=result.response.status_key,
+                    )
                 add_artifact(task_id, artifact_type="workflow_result", payload=result.response.model_dump())
                 return
 
@@ -232,11 +255,25 @@ class WorkflowEngine:
                     status_key=failure_status,
                 )
                 apply_workflow_action(task_id, "fail", {"phase": current.status_key, "reason": response.error_message})
+                _notify_project_conversation_failure(
+                    task_id,
+                    project_id,
+                    phase=current.status_key,
+                    reason=response.error_message,
+                    status_key=response.status_key,
+                )
                 _event(task_id, "workflow_finished", {"ok": False, "phase": current.status_key, "status_key": response.status_key})
                 add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
                 return
 
             next_column = _next_executable_after_transition(definition, target_status, current)
+            if result.decision in {"request_replan", "request_rework"} or result.action == "retry":
+                next_column = _next_executable_after_transition(
+                    definition,
+                    target_status,
+                    current,
+                    include_current=True,
+                )
             if next_column is None:
                 if _is_success_terminal(definition, target_status) and state.execute_response is None and result.decision == "approve":
                     response = _generic_done_response(task_id, project_id, target_status, state)
@@ -296,6 +333,13 @@ class WorkflowEngine:
                 )
                 if not _failure_status(definition) or target_status not in _failure_statuses(definition):
                     apply_workflow_action(task_id, "fail", {"phase": current.status_key, "reason": response.error_message})
+                _notify_project_conversation_failure(
+                    task_id,
+                    project_id,
+                    phase=current.status_key,
+                    reason=response.error_message,
+                    status_key=response.status_key,
+                )
                 _event(task_id, "workflow_finished", {"ok": False, "phase": current.status_key, "status_key": response.status_key})
                 add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
                 return
@@ -309,6 +353,13 @@ class WorkflowEngine:
             status_key=_failure_status(definition) or "failed",
         )
         _safe_fail(task_id, {"phase": "workflow", "reason": response.error_message})
+        _notify_project_conversation_failure(
+            task_id,
+            project_id,
+            phase="workflow",
+            reason=response.error_message,
+            status_key=response.status_key,
+        )
         _event(task_id, "workflow_finished", {"ok": False, "phase": "workflow", "status_key": response.status_key})
         add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
 
@@ -631,6 +682,7 @@ class WorkflowEngine:
                         "changed_paths": changed_paths,
                         "ops_count": len(code_response.ops),
                         "patch_ops_count": len(code_response.patch_ops),
+                        "_engine_internal": True,
                     },
                 )
                 _event(
@@ -709,6 +761,7 @@ class WorkflowEngine:
                 "session_id": output["session_id"],
                 "reason": summary,
                 "output_artifact": output_artifact,
+                "_engine_internal": True,
             },
         )
         _event(
@@ -766,7 +819,11 @@ class WorkflowEngine:
         )
         _event(task_id, "agent_output_recorded", {"phase": column.status_key, "agent": agent, "artifact": column.output_artifact or "context_bundle"})
         action = column.success_action or column.status_key
-        moved = apply_workflow_action(task_id, action, {"phase": column.status_key, "session_id": output["session_id"]})
+        moved = apply_workflow_action(
+            task_id,
+            action,
+            {"phase": column.status_key, "session_id": output["session_id"], "_engine_internal": True},
+        )
         _event(task_id, "workflow_column_completed", {"status_key": column.status_key, "agent": agent, "decision": "approve"})
         return ColumnResult(action=action, target_status=(moved.get("task") or {}).get("status_key"), decision="approve")
 
@@ -1185,6 +1242,38 @@ def _safe_fail(task_id: str, payload: dict[str, Any]) -> None:
         _log.debug("workflow safe fail skipped task_id=%s error=%s", task_id, exc)
 
 
+def _notify_project_conversation_failure(
+    task_id: str,
+    project_id: str,
+    *,
+    phase: str,
+    reason: str,
+    status_key: str,
+) -> None:
+    content = (
+        f"Task failed at `{phase}`.\n\n"
+        f"Reason: {reason or 'Workflow failed before producing a result.'}\n\n"
+        "The task is now in the failure state. You can inspect the task events/artifacts, "
+        "send more guidance, or use Re-run to retry from the workflow retry target."
+    )
+    try:
+        add_project_event(
+            project_id,
+            "project_conversation_message",
+            {
+                "role": "assistant",
+                "content": content,
+                "kind": "workflow_failed",
+                "task_id": task_id,
+                "status_key": status_key,
+                "phase": phase,
+                "retryable": True,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("workflow failure project conversation notification skipped task_id=%s error=%s", task_id, exc)
+
+
 def record_agent_message(
     task_id: str,
     *,
@@ -1601,13 +1690,15 @@ def _next_executable_after_transition(
     definition: WorkflowDefinition,
     status_key: str,
     current: WorkflowColumn,
+    *,
+    include_current: bool = False,
 ) -> WorkflowColumn | None:
     status = str(status_key or "").strip().lower()
     columns = sorted(definition.columns, key=lambda col: col.position)
     anchor = next((col for col in columns if col.status_key == status), None)
     if anchor is None:
         return None
-    minimum = anchor.position + 1 if anchor.status_key == current.status_key else anchor.position
+    minimum = anchor.position if include_current else (anchor.position + 1 if anchor.status_key == current.status_key else anchor.position)
     return next((col for col in columns if col.executable and col.position >= minimum), None)
 
 

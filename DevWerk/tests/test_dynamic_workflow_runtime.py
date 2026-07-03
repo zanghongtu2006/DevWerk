@@ -218,6 +218,150 @@ async def test_column_agent_target_status_is_mapped_to_workflow_action(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_workflow_failure_is_reported_to_project_conversation(monkeypatch, tmp_path):
+    kanban = _configure(monkeypatch, tmp_path)
+    project_id = "failure-conversation"
+    workflow = {
+        "name": "failure-flow",
+        "version": 1,
+        "columns": [
+            {
+                "status_key": "implement",
+                "title": "Implement",
+                "position": 10,
+                "transition_to": ["done", "failed"],
+                "job_template": "implement_task",
+                "output_artifact": "implementation_bundle",
+                "success_action": "workflow_done",
+                "failure_actions": ["fail"],
+            },
+            {"status_key": "done", "title": "Done", "position": 90, "transition_to": []},
+            {"status_key": "failed", "title": "Failed", "position": 99, "transition_to": ["implement"]},
+        ],
+        "actions": {
+            "workflow_done": {"to": "done"},
+            "fail": {"to": "failed"},
+            "abandon": {"to": "failed"},
+            "retry": {"to": "implement"},
+        },
+    }
+    kanban.update_project_workflow(project_id, workflow)
+    task = kanban.create_task(project_id=project_id, title="Build scaffold")["task"]
+
+    import app.services.workflow_engine as workflow_engine_service
+
+    class FakeColumnClient:
+        def chat_json(self, messages: list[dict]) -> dict:
+            payload = json.loads(messages[-1]["content"])
+            return {
+                "phase": payload["phase"],
+                "summary": "Cannot produce scaffold from current evidence.",
+                "outputs": {},
+                "decision": "fail",
+                "next_action": "fail",
+            }
+
+    monkeypatch.setattr(workflow_engine_service, "get_llm_client", lambda route: FakeColumnClient())
+
+    await workflow_engine_service.WorkflowEngine().run(
+        task["id"],
+        {
+            "project_id": project_id,
+            "messages": [{"role": "user", "content": "Build the project scaffold"}],
+            "workspace": {"root_id": project_id, "source_map": None, "tree_preview": ""},
+        },
+    )
+
+    messages = kanban.list_project_conversation_messages(project_id, limit=10)["messages"]
+    assert messages[-1]["kind"] == "workflow_failed"
+    assert messages[-1]["task_id"] == task["id"]
+    assert "Task failed at `implement`" in messages[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_internal_retry_reenters_retry_target_instead_of_advancing_downstream(monkeypatch, tmp_path):
+    kanban = _configure(monkeypatch, tmp_path)
+    project_id = "internal-retry-target"
+    workflow = {
+        "name": "retry-flow",
+        "version": 1,
+        "columns": [
+            {
+                "status_key": "implement",
+                "title": "Implement",
+                "position": 10,
+                "transition_to": ["apply", "failed"],
+                "job_template": "implement_task",
+                "output_artifact": "implementation_bundle",
+                "success_action": "implementation_ready",
+                "failure_actions": ["retry", "fail"],
+            },
+            {
+                "status_key": "apply",
+                "title": "Apply",
+                "position": 20,
+                "transition_to": ["done", "failed"],
+                "job_template": "apply_task",
+                "output_artifact": "apply_bundle",
+                "success_action": "workflow_done",
+                "failure_actions": ["retry", "fail"],
+            },
+            {"status_key": "done", "title": "Done", "position": 90, "transition_to": []},
+            {"status_key": "failed", "title": "Failed", "position": 99, "transition_to": ["implement"]},
+        ],
+        "actions": {
+            "implementation_ready": {"to": "apply"},
+            "workflow_done": {"to": "done"},
+            "fail": {"to": "failed"},
+            "abandon": {"to": "failed"},
+            "retry": {"to": "implement"},
+        },
+    }
+    kanban.update_project_workflow(project_id, workflow)
+    task = kanban.create_task(project_id=project_id, title="Build scaffold")["task"]
+
+    import app.services.workflow_engine as workflow_engine_service
+
+    calls: list[str] = []
+
+    class FakeColumnClient:
+        def chat_json(self, messages: list[dict]) -> dict:
+            payload = json.loads(messages[-1]["content"])
+            phase = payload["phase"]
+            calls.append(phase)
+            if calls == ["implement"]:
+                return {
+                    "phase": phase,
+                    "summary": "Need another implementation pass.",
+                    "outputs": {},
+                    "decision": "request_replan",
+                    "next_action": "retry",
+                }
+            return {
+                "phase": phase,
+                "summary": f"{phase} complete.",
+                "outputs": {"ok": True},
+                "decision": "approve",
+                "next_action": "implementation_ready" if phase == "implement" else "workflow_done",
+            }
+
+    monkeypatch.setattr(workflow_engine_service, "get_llm_client", lambda route: FakeColumnClient())
+
+    await workflow_engine_service.WorkflowEngine().run(
+        task["id"],
+        {
+            "project_id": project_id,
+            "messages": [{"role": "user", "content": "Build the project scaffold"}],
+            "workspace": {"root_id": project_id, "source_map": None, "tree_preview": ""},
+        },
+    )
+
+    assert calls[:2] == ["implement", "implement"]
+    assert calls == ["implement", "implement", "apply"]
+    assert kanban.get_task(task["id"])["task"]["status_key"] == "done"
+
+
+@pytest.mark.asyncio
 async def test_column_agent_tool_request_aliases_are_normalized(monkeypatch, tmp_path):
     kanban = _configure(monkeypatch, tmp_path)
     project_id = "tool-alias-workflow"

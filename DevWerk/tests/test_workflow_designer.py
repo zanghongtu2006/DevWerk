@@ -886,7 +886,7 @@ def test_project_conversation_start_task_uses_workflow_entrypoint(monkeypatch, t
     assert response["task_id"] == "task-123"
     assert captured["project_id"] == "writing-project"
     assert captured["interaction_mode"] == "auto"
-    assert captured["messages"] == [{"role": "user", "content": "Write a short release note using the project writing flow."}]
+    assert captured["messages"][-1] == {"role": "user", "content": "Write a short release note using the project writing flow."}
     assert captured["workspace"]["root_id"] == "writing-project"
     conversation = kanban_routes.kanban_project_conversation("writing-project")["messages"]
     assert conversation[-1]["task_id"] == "task-123"
@@ -930,7 +930,8 @@ def test_project_conversation_agent_can_dispatch_task_to_workflow_engine(monkeyp
     assert response["ok"] is True
     assert response["kind"] == "task_started"
     assert response["task_id"] == "task-agent-456"
-    assert captured["messages"] == [{"role": "user", "content": "Write the release note using the writing workflow."}]
+    assert captured["messages"][-1] == {"role": "user", "content": "Write the release note using the writing workflow."}
+    assert any(message["content"] == "Please write a release note now." for message in captured["messages"][:-1])
     assert captured["metadata"]["source"] == "project_conversation"
     assert captured["metadata"]["project_agent_decision"]["action"] == "start_task"
 
@@ -972,7 +973,8 @@ def test_project_conversation_agent_normalizes_raw_json_reply(monkeypatch, tmp_p
 
     assert response["ok"] is True
     assert response["kind"] == "task_started"
-    assert captured["messages"] == [{"role": "user", "content": "Run the writing intake workflow."}]
+    assert captured["messages"][-1] == {"role": "user", "content": "Run the writing intake workflow."}
+    assert len(captured["messages"]) >= 2
     assert captured["metadata"]["project_agent_decision"]["action"] == "start_task"
     conversation = kanban_routes.kanban_project_conversation("json-project")["messages"]
     assistant_messages = [message for message in conversation if message["role"] == "assistant"]
