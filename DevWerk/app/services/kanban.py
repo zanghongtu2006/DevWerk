@@ -80,6 +80,9 @@ def init_kanban_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_kb_columns_project_position
                 ON kb_columns(project_id, position);
 
+            CREATE INDEX IF NOT EXISTS idx_kb_projects_updated_name
+                ON kb_projects(updated_at DESC, name ASC);
+
             CREATE TABLE IF NOT EXISTS kb_tasks (
                 id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL,
@@ -96,6 +99,9 @@ def init_kanban_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_kb_tasks_project_status
                 ON kb_tasks(project_id, status_key, archived);
 
+            CREATE INDEX IF NOT EXISTS idx_kb_tasks_project_archived_updated
+                ON kb_tasks(project_id, archived, updated_at DESC);
+
             CREATE TABLE IF NOT EXISTS kb_events (
                 id TEXT PRIMARY KEY,
                 task_id TEXT NOT NULL,
@@ -104,6 +110,7 @@ def init_kanban_db() -> None:
                 from_status TEXT,
                 to_status TEXT,
                 payload_json TEXT NOT NULL DEFAULT '{}',
+                payload_summary_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL
             );
 
@@ -112,6 +119,12 @@ def init_kanban_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_kb_events_project_time
                 ON kb_events(project_id, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_kb_events_project_type_time
+                ON kb_events(project_id, event_type, created_at DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_kb_events_task_type_time
+                ON kb_events(task_id, event_type, created_at DESC);
 
             CREATE TABLE IF NOT EXISTS kb_artifacts (
                 id TEXT PRIMARY KEY,
@@ -125,6 +138,9 @@ def init_kanban_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_kb_artifacts_task
                 ON kb_artifacts(task_id);
+
+            CREATE INDEX IF NOT EXISTS idx_kb_artifacts_task_type_time
+                ON kb_artifacts(task_id, artifact_type, created_at DESC);
 
             CREATE TABLE IF NOT EXISTS kb_conversations (
                 id TEXT PRIMARY KEY,
@@ -202,6 +218,7 @@ def init_kanban_db() -> None:
             """
         )
         _ensure_column(conn, T_PROJECT_SETTINGS, "workflow_json", "TEXT NOT NULL DEFAULT '{}'")
+        _ensure_column(conn, T_EVENTS, "payload_summary_json", "TEXT NOT NULL DEFAULT '{}'")
     _initialized = True
     _log.debug("kanban db initialized path=%s", path)
 
@@ -250,8 +267,9 @@ def list_projects() -> list[dict[str, Any]]:
             """
         ).fetchall()
         projects = [_project_dict(row) for row in rows]
+        stats_by_project = _project_stats_many(conn, [project["id"] for project in projects])
         for project in projects:
-            project["stats"] = _project_stats(conn, project["id"])
+            project["stats"] = stats_by_project.get(project["id"], _empty_project_stats())
         return projects
 
 
@@ -875,6 +893,7 @@ def list_events(
     project_id: str | None = None,
     task_id: str | None = None,
     limit: int = 200,
+    payload_mode: str = "full",
 ) -> dict[str, Any]:
     pid = _project_id(project_id)
     max_rows = max(1, min(int(limit or 200), 1000))
@@ -884,11 +903,14 @@ def list_events(
         where.append("e.task_id = ?")
         params.append(task_id)
     params.append(max_rows)
+    payload_select = "e.payload_summary_json AS payload_json" if payload_mode == "summary" else "e.payload_json AS payload_json"
     with _conn() as conn:
         rows = conn.execute(
             f"""
             SELECT
-                e.*,
+                e.id, e.task_id, e.project_id, e.event_type, e.from_status, e.to_status,
+                {payload_select},
+                e.created_at,
                 t.title AS task_title,
                 t.status_key AS task_status_key
               FROM kb_events e
@@ -903,8 +925,41 @@ def list_events(
         "ok": True,
         "project_id": pid,
         "task_id": task_id,
-        "events": [_event_dict(row) for row in rows],
+        "events": [_event_dict(row, payload_mode=payload_mode) for row in rows],
     }
+
+
+def list_project_conversation_messages(project_id: str | None = None, *, limit: int = 80) -> dict[str, Any]:
+    """Return project conversation messages without parsing unrelated event payloads."""
+    pid = _project_id(project_id)
+    max_rows = max(1, min(int(limit or 80), 500))
+    with _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, task_id, project_id, event_type, payload_json, created_at
+              FROM kb_events
+             WHERE project_id = ?
+               AND event_type = 'project_conversation_message'
+             ORDER BY created_at DESC
+             LIMIT ?
+            """,
+            (pid, max_rows),
+        ).fetchall()
+    messages = []
+    for row in reversed(rows):
+        payload = _loads(row["payload_json"], {})
+        if not isinstance(payload, dict):
+            payload = {}
+        messages.append(
+            {
+                "role": payload.get("role") or "assistant",
+                "content": payload.get("content") or "",
+                "kind": payload.get("kind") or "message",
+                "created_at": row["created_at"],
+                "task_id": payload.get("task_id"),
+            }
+        )
+    return {"ok": True, "project_id": pid, "messages": messages}
 
 
 def add_artifact(
@@ -1037,8 +1092,8 @@ def _insert_event(
         """
         INSERT INTO kb_events (
             id, task_id, project_id, event_type, from_status, to_status,
-            payload_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                payload_json, payload_summary_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             str(uuid.uuid4()),
@@ -1048,6 +1103,7 @@ def _insert_event(
             from_status,
             to_status,
             _json(event_payload),
+            _json(_payload_summary(event_payload)),
             _now(),
         ),
     )
@@ -1161,6 +1217,100 @@ def _project_stats(conn: sqlite3.Connection, project_id: str) -> dict[str, Any]:
     }
 
 
+def _empty_project_stats() -> dict[str, Any]:
+    return {
+        "tasks": 0,
+        "archived_tasks": 0,
+        "active_tasks": 0,
+        "done_tasks": 0,
+        "failed_tasks": 0,
+        "request_count": 0,
+        "llm_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cached_input_tokens": 0,
+        "duration_ms": 0,
+    }
+
+
+def _project_stats_many(conn: sqlite3.Connection, project_ids: list[str]) -> dict[str, dict[str, Any]]:
+    stats = {project_id: _empty_project_stats() for project_id in project_ids}
+    if not project_ids:
+        return stats
+
+    terminal_by_project = {
+        project_id: _workflow_terminal_statuses_from_db(conn, project_id)
+        for project_id in project_ids
+    }
+    placeholders = ",".join("?" for _ in project_ids)
+    task_rows = conn.execute(
+        f"""
+        SELECT project_id, status_key, archived, COUNT(*) AS count
+          FROM kb_tasks
+         WHERE project_id IN ({placeholders})
+         GROUP BY project_id, status_key, archived
+        """,
+        project_ids,
+    ).fetchall()
+    for row in task_rows:
+        project_id = row["project_id"]
+        count = int(row["count"] or 0)
+        archived = bool(row["archived"])
+        status_key = str(row["status_key"] or "")
+        success_statuses, failure_statuses = terminal_by_project.get(project_id, (set(), set()))
+        terminal_statuses = success_statuses | failure_statuses
+        item = stats.setdefault(project_id, _empty_project_stats())
+        item["tasks"] += count
+        if archived:
+            item["archived_tasks"] += count
+            continue
+        if status_key not in terminal_statuses:
+            item["active_tasks"] += count
+        if status_key in success_statuses:
+            item["done_tasks"] += count
+        if status_key in failure_statuses:
+            item["failed_tasks"] += count
+
+    if _table_exists(conn, "api_requests"):
+        for row in conn.execute(
+            f"""
+            SELECT project_id, COUNT(*) AS count
+              FROM api_requests
+             WHERE project_id IN ({placeholders})
+             GROUP BY project_id
+            """,
+            project_ids,
+        ).fetchall():
+            stats.setdefault(row["project_id"], _empty_project_stats())["request_count"] = int(row["count"] or 0)
+
+    if _table_exists(conn, "llm_usage"):
+        for row in conn.execute(
+            f"""
+            SELECT
+                project_id,
+                COUNT(*) AS calls,
+                SUM(COALESCE(input_tokens, 0)) AS input_tokens,
+                SUM(COALESCE(output_tokens, 0)) AS output_tokens,
+                SUM(COALESCE(total_tokens, 0)) AS total_tokens,
+                SUM(COALESCE(cached_input_tokens, 0)) AS cached_input_tokens,
+                SUM(COALESCE(duration_ms, 0)) AS duration_ms
+              FROM llm_usage
+             WHERE project_id IN ({placeholders})
+             GROUP BY project_id
+            """,
+            project_ids,
+        ).fetchall():
+            item = stats.setdefault(row["project_id"], _empty_project_stats())
+            item["llm_calls"] = row["calls"] or 0
+            item["input_tokens"] = row["input_tokens"] or 0
+            item["output_tokens"] = row["output_tokens"] or 0
+            item["total_tokens"] = row["total_tokens"] or 0
+            item["cached_input_tokens"] = row["cached_input_tokens"] or 0
+            item["duration_ms"] = row["duration_ms"] or 0
+    return stats
+
+
 def _workflow_terminal_statuses_from_db(conn: sqlite3.Connection, project_id: str) -> tuple[set[str], set[str]]:
     row = conn.execute("SELECT workflow_json FROM kb_project_settings WHERE project_id = ?", (project_id,)).fetchone()
     workflow = _loads(row["workflow_json"], {}) if row is not None else {}
@@ -1227,7 +1377,8 @@ def _task_record_response(task_id: str) -> dict[str, Any]:
     return {"ok": True, "task": _task_dict(row)}
 
 
-def _event_dict(row: sqlite3.Row) -> dict[str, Any]:
+def _event_dict(row: sqlite3.Row, *, payload_mode: str = "full") -> dict[str, Any]:
+    keys = set(row.keys())
     event = {
         "id": row["id"],
         "task_id": row["task_id"],
@@ -1235,15 +1386,60 @@ def _event_dict(row: sqlite3.Row) -> dict[str, Any]:
         "event_type": row["event_type"],
         "from_status": row["from_status"],
         "to_status": row["to_status"],
-        "payload": _loads(row["payload_json"], {}),
+        "payload": _event_payload(
+            row["payload_json"],
+            payload_mode=payload_mode,
+            payload_size=row["payload_size"] if "payload_size" in keys else None,
+        ),
         "created_at": row["created_at"],
     }
-    keys = set(row.keys())
     if "task_title" in keys:
         event["task_title"] = row["task_title"]
     if "task_status_key" in keys:
         event["task_status_key"] = row["task_status_key"]
     return event
+
+
+def _event_payload(payload_json: str | None, *, payload_mode: str = "full", payload_size: int | None = None) -> Any:
+    text = payload_json or ""
+    if payload_mode != "summary":
+        return _loads(text, {})
+    size = payload_size if payload_size is not None else len(text)
+    if size > len(text):
+        return {
+            "_summary": True,
+            "_truncated": True,
+            "_bytes": size,
+            "preview": text,
+        }
+    if len(text) > 8000:
+        return {"_summary": True, "_truncated": True, "_bytes": len(text), "preview": text[:2000]}
+    return _loads(text, {})
+
+
+def _payload_summary(value: Any, *, max_string: int = 500, max_items: int = 12, depth: int = 0) -> Any:
+    if depth > 3:
+        return _short_scalar(value, max_string=max_string)
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= max_items:
+                out["_truncated_keys"] = max(0, len(value) - max_items)
+                break
+            out[str(key)] = _payload_summary(item, max_string=max_string, max_items=max_items, depth=depth + 1)
+        return out
+    if isinstance(value, list):
+        out = [_payload_summary(item, max_string=max_string, max_items=max_items, depth=depth + 1) for item in value[:max_items]]
+        if len(value) > max_items:
+            out.append({"_truncated_items": len(value) - max_items})
+        return out
+    return _short_scalar(value, max_string=max_string)
+
+
+def _short_scalar(value: Any, *, max_string: int) -> Any:
+    if isinstance(value, str) and len(value) > max_string:
+        return {"_summary": True, "_truncated": True, "_chars": len(value), "preview": value[:max_string]}
+    return value
 
 
 def _artifact_dict(row: sqlite3.Row) -> dict[str, Any]:

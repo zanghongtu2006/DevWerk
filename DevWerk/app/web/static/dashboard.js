@@ -36,7 +36,8 @@ const state = {
   taskTab: "summary",
   busy: false,
   pendingAttachments: [],
-  sendMode: localStorage.getItem("devwerk.sendMode") || "alt_enter"
+  sendMode: localStorage.getItem("devwerk.sendMode") || "alt_enter",
+  globalLoaded: false
 };
 const $ = (id) => document.getElementById(id);
 async function api(path, options = {}) {
@@ -49,7 +50,13 @@ async function api(path, options = {}) {
 }
 async function refreshAll() {
   await loadProjects();
-  await Promise.allSettled([loadBoard(), loadEvents(), loadConversation(), loadSettings(), loadGlobalSettings(), loadWorkflow(), loadMemory(), loadUsage(), loadProjectMd(), loadGlobalSkills(), loadGlobalPlugins(), loadPluginCommands(), loadPluginAgents(), loadPluginHooks(), loadPluginMcpServers(), loadCapabilities(), loadPluginSettings(), loadProjectSkills(), loadSlashCommands()]);
+  const projectLoads = [loadBoard(), loadEvents(), loadConversation(), loadSettings(), loadWorkflow(), loadMemory(), loadUsage(), loadProjectMd(), loadProjectSkills(), loadSlashCommands()];
+  const globalLoads = state.globalLoaded ? [] : [loadGlobalSettings(), loadGlobalSkills(), loadGlobalPlugins(), loadPluginCommands(), loadPluginAgents(), loadPluginHooks(), loadPluginMcpServers(), loadCapabilities()];
+  await Promise.allSettled([...projectLoads, ...globalLoads]);
+  if (!state.globalLoaded) {
+    await loadPluginSettings();
+    state.globalLoaded = true;
+  }
   renderShell();
   connectProjectStream();
 }
@@ -59,7 +66,7 @@ async function loadProjects() {
   if (!state.projects.some(p => p.id === state.projectId) && state.projects[0]) state.projectId = state.projects[0].id;
 }
 async function loadBoard() { state.board = await api(`${API}/kanban/board?project_id=${encodeURIComponent(state.projectId)}`); }
-async function loadEvents() { const data = await api(`${API}/kanban/events?project_id=${encodeURIComponent(state.projectId)}&limit=80`); state.events = data.events || []; }
+async function loadEvents() { const data = await api(`${API}/kanban/events?project_id=${encodeURIComponent(state.projectId)}&limit=80&payload_mode=summary`); state.events = data.events || []; }
 async function loadConversation() {
   const data = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/conversation`);
   state.conversation = normalizeMessages(data.messages || []);

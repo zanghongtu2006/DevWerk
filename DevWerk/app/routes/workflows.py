@@ -617,7 +617,7 @@ async def _workflow_event_stream(task_id: str, *, result_after: str | None = Non
             sent_state_status = status_key
 
         try:
-            event_payload = list_events(project_id=project_id, task_id=task_id, limit=500)
+            event_payload = list_events(project_id=project_id, task_id=task_id, limit=500, payload_mode="summary")
             events = event_payload.get("events") if isinstance(event_payload, dict) else []
             if isinstance(events, list):
                 for event in reversed(events):

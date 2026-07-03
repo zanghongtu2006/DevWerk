@@ -27,6 +27,7 @@ from app.services.kanban import (
     list_events,
     list_columns,
     list_projects,
+    list_project_conversation_messages,
     replace_columns,
     update_project_workflow,
     update_project_settings,
@@ -152,8 +153,8 @@ def kanban_projects():
 
 
 @router.get("/events")
-def kanban_events(project_id: str | None = None, task_id: str | None = None, limit: int = 200):
-    return list_events(project_id=project_id, task_id=task_id, limit=limit)
+def kanban_events(project_id: str | None = None, task_id: str | None = None, limit: int = 200, payload_mode: str = "full"):
+    return list_events(project_id=project_id, task_id=task_id, limit=limit, payload_mode=payload_mode)
 
 
 @router.websocket("/projects/{project_id}/stream")
@@ -161,7 +162,7 @@ async def kanban_project_stream(websocket: WebSocket, project_id: str):
     await websocket.accept()
     seen: set[str] = set()
     try:
-        initial_events = list_events(project_id=project_id, limit=80).get("events", [])
+        initial_events = list_events(project_id=project_id, limit=80, payload_mode="summary").get("events", [])
         seen.update(str(event.get("id") or "") for event in initial_events if event.get("id"))
         await websocket.send_json(
             {
@@ -172,7 +173,7 @@ async def kanban_project_stream(websocket: WebSocket, project_id: str):
             }
         )
         while True:
-            events = list_events(project_id=project_id, limit=80).get("events", [])
+            events = list_events(project_id=project_id, limit=80, payload_mode="summary").get("events", [])
             unseen = [event for event in reversed(events) if str(event.get("id") or "") not in seen]
             if unseen:
                 seen.update(str(event.get("id") or "") for event in events if event.get("id"))
@@ -331,21 +332,7 @@ def kanban_design_project_workflow(project_id: str, req: WorkflowDesignRequest):
 
 @router.get("/projects/{project_id}/conversation")
 def kanban_project_conversation(project_id: str, limit: int = 80):
-    events = list_events(project_id=project_id, limit=limit).get("events", [])
-    messages = []
-    for event in reversed(events):
-        if event.get("event_type") != "project_conversation_message":
-            continue
-        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-        messages.append(
-            {
-                "role": payload.get("role") or "assistant",
-                "content": payload.get("content") or "",
-                "kind": payload.get("kind") or "message",
-                "created_at": event.get("created_at"),
-                "task_id": payload.get("task_id"),
-            }
-        )
+    messages = list_project_conversation_messages(project_id, limit=limit).get("messages", [])
     return {"ok": True, "project_id": project_id, "messages": messages, "active_task": _active_project_task(project_id)}
 
 
@@ -1150,10 +1137,9 @@ def _active_project_task(project_id: str, preferred_task_id: object = None) -> d
     candidates: list[str] = []
     if preferred:
         candidates.append(preferred)
-    events = list_events(project_id=project_id, limit=200).get("events", [])
-    for event in events:
-        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-        task_id = str(payload.get("task_id") or payload.get("active_task_id") or "").strip()
+    messages = list_project_conversation_messages(project_id, limit=200).get("messages", [])
+    for message in reversed(messages):
+        task_id = str(message.get("task_id") or "").strip()
         if task_id and task_id not in candidates:
             candidates.append(task_id)
     for task_id in candidates:
