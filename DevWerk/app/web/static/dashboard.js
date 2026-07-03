@@ -373,9 +373,16 @@ async function sendProjectMessage() {
   renderProjectsPage();
   try {
     const result = await api(`${API}/kanban/projects/${encodeURIComponent(state.projectId)}/conversation`, {method:"POST", body: JSON.stringify({action:slash?.action || "message", message:slash?.argument || content, messages:state.conversation, metadata:{active_task_id: state.activeTask?.id || state.activeTask?.task_id || null, slash_command: slash?.command || null, attachments}})});
+    if (result && result.reply && !state.conversation.some(message => message.role === "assistant" && displayMessageContent(message) === result.reply)) {
+      state.conversation.push({role:"assistant", content:result.reply, kind:result.kind || "reply"});
+    }
+    if (result && result.workflow) state.workflow = result.workflow;
     if (result && result.task_id) state.activeTask = {id: result.task_id, status_key: result.status_key || "queued"};
     state.pendingAttachments = [];
-    await Promise.allSettled([loadConversation(), loadBoard(), loadEvents()]);
+    await Promise.allSettled([loadConversation(), loadBoard(), loadEvents(), loadWorkflow(), loadSettings(), loadProjectMd()]);
+    if (result && result.reply && !state.conversation.some(message => message.role === "assistant" && displayMessageContent(message) === result.reply)) {
+      state.conversation.push({role:"assistant", content:result.reply, kind:result.kind || "reply"});
+    }
     renderProjectsPage();
   } catch (error) {
     alert(error.message || String(error));

@@ -449,7 +449,7 @@ def kanban_project_conversation_message(project_id: str, req: ProjectConversatio
                 messages=messages,
                 current_workflow=current_workflow,
                 current_agents=current_agents,
-                save=bool(decision.get("save")) or decision_action == "save_design",
+                save=True,
                 event_kind=decision_action,
             )
         if decision_action in {"continue_task", "resume_task", "message_task"}:
@@ -1269,17 +1269,79 @@ def _handle_project_workflow_design(
             "error_message": str(exc.detail),
             "debug_event_recorded": True,
         }
+    result["reply"] = _workflow_design_reply(result)
     add_project_event(
         project_id,
         "project_conversation_message",
         {
             "role": "assistant",
-            "content": result.get("reply") or "Workflow draft updated.",
+            "content": result["reply"],
             "kind": event_kind,
             "saved": result.get("saved", False),
+            "summary": result.get("summary") or {},
+            "workflow": result.get("workflow") or {},
+            "agents": result.get("agents") or {},
         },
     )
+    if result.get("saved"):
+        _store_project_md(project_id, _project_md_with_workflow_design(project_id, result), summary="Workflow design saved")
     return {"ok": True, "project_id": project_id, "kind": "workflow_design", **result}
+
+
+def _workflow_design_reply(result: dict[str, Any]) -> str:
+    reply = str(result.get("reply") or "").strip()
+    workflow = result.get("workflow") if isinstance(result.get("workflow"), dict) else {}
+    columns = workflow.get("columns") if isinstance(workflow.get("columns"), list) else []
+    agents = result.get("agents") if isinstance(result.get("agents"), dict) else {}
+    if not result.get("saved"):
+        return reply or "Workflow draft updated."
+    column_names = ", ".join(
+        str(item.get("title") or item.get("status_key"))
+        for item in columns[:12]
+        if isinstance(item, dict)
+    )
+    suffix = (
+        "\n\nKanban workflow has been saved for this project. "
+        f"Columns: {column_names or 'configured'}. "
+        f"Agent overrides: {', '.join(sorted(agents.keys())) if agents else 'none'}."
+    )
+    return (reply + suffix).strip() if reply else suffix.strip()
+
+
+def _project_md_with_workflow_design(project_id: str, result: dict[str, Any]) -> str:
+    current = _project_md(project_id)
+    workflow = result.get("workflow") if isinstance(result.get("workflow"), dict) else {}
+    agents = result.get("agents") if isinstance(result.get("agents"), dict) else {}
+    columns = workflow.get("columns") if isinstance(workflow.get("columns"), list) else []
+    actions = workflow.get("actions") if isinstance(workflow.get("actions"), dict) else {}
+    section = "\n".join(
+        [
+            f"Workflow name: {workflow.get('name') or 'project-workflow'}",
+            f"Workflow type: {workflow.get('workflow_type') or 'general'}",
+            f"Requires apply: {bool(workflow.get('requires_apply'))}",
+            "",
+            "Columns:",
+            *[
+                f"- {item.get('status_key')}: {item.get('title') or item.get('status_key')}"
+                for item in columns
+                if isinstance(item, dict)
+            ],
+            "",
+            "Semantic actions:",
+            *[
+                f"- {name} -> {rule.get('to') if isinstance(rule, dict) else rule}"
+                for name, rule in sorted(actions.items())
+            ],
+            "",
+            "Agent overrides:",
+            *[
+                f"- {name}: model_route={config.get('model_route') or config.get('model') or 'default'}"
+                for name, config in sorted(agents.items())
+                if isinstance(config, dict)
+            ],
+        ]
+    ).strip()
+    return _replace_markdown_section(current, "Workflow Design", section)
 
 
 def _workflow_design_error_code(message: str) -> str:

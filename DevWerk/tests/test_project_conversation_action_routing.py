@@ -113,3 +113,41 @@ def test_project_conversation_workflow_design_failure_returns_chat_response(monk
     assert response["debug_event_recorded"] is True
     events = kanban_service.list_events(project_id=project_id, limit=20)["events"]
     assert any(event["event_type"] == "project_workflow_design_failed" for event in events)
+
+
+def test_project_conversation_design_auto_saves_and_returns_visible_reply(monkeypatch, tmp_path):
+    kanban_service = configure_kanban(monkeypatch, tmp_path)
+    import app.routes.kanban as kanban_routes
+    import app.services.workflow_designer as workflow_designer
+
+    project_id = "conversation-design-auto-save"
+    kanban_service.upsert_project(project_id=project_id, name="Conversation Design Auto Save")
+    monkeypatch.setattr(
+        kanban_routes,
+        "_ask_project_conversation_agent",
+        lambda **kwargs: {"action": "design", "reply": "Designing the requested coding workflow."},
+    )
+    monkeypatch.setattr(
+        workflow_designer,
+        "_ask_llm",
+        lambda **kwargs: {
+            "reply": "Coding workflow with review is ready.",
+            "workflow": noncoding_workflow(domain="coding"),
+            "agents": {"review-agent": {"model_route": "default"}},
+        },
+    )
+
+    response = kanban_routes.kanban_project_conversation_message(
+        project_id,
+        kanban_routes.ProjectConversationRequest(action="message", message="coding+review, please build the workflow."),
+    )
+
+    assert response["ok"] is True
+    assert response["kind"] == "workflow_design"
+    assert response["saved"] is True
+    assert "Kanban workflow has been saved" in response["reply"]
+    assert kanban_service.get_project_workflow(project_id)["workflow"]["columns"]
+    conversation = kanban_routes.kanban_project_conversation(project_id)["messages"]
+    assert conversation[-1]["role"] == "assistant"
+    assert "Kanban workflow has been saved" in conversation[-1]["content"]
+    assert kanban_service.get_project_settings(project_id)["settings"]["agents"]["review-agent"]["model_route"] == "default"

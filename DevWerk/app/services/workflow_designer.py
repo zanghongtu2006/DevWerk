@@ -176,7 +176,12 @@ def _normalize_workflow(
     workflow["requires_apply"] = bool(workflow.get("requires_apply", False))
     workflow["parameters"] = workflow.get("parameters") if isinstance(workflow.get("parameters"), dict) else {}
     workflow["columns"] = _normalize_columns(workflow.get("columns"), base_workflow=base_workflow)
-    workflow["actions"] = _normalize_actions(workflow.get("actions"), workflow["columns"], debug=debug)
+    workflow["actions"] = _normalize_actions(
+        workflow.get("actions"),
+        workflow["columns"],
+        debug=debug,
+        coding=workflow["requires_apply"] or workflow["workflow_type"] == "coding",
+    )
     if debug is not None:
         debug["normalized_workflow"] = workflow
     return workflow
@@ -264,6 +269,7 @@ def _normalize_actions(
     columns: list[dict[str, Any]],
     *,
     debug: dict[str, Any] | None = None,
+    coding: bool = False,
 ) -> dict[str, dict[str, Any]]:
     known = {str(col.get("status_key") or "") for col in columns}
     actions = dict(value) if isinstance(value, dict) else {}
@@ -271,13 +277,26 @@ def _normalize_actions(
     for key, raw in actions.items():
         if not isinstance(raw, dict):
             continue
-        target = _status_key(raw.get("to"))
-        repaired = _repair_action_target(_status_key(key), target, known)
+        action_key = _status_key(key)
+        if raw.get("to") in (None, "") and any(
+            raw.get(alias) not in (None, "")
+            for alias in ("target", "target_column", "target_status", "status", "column")
+        ):
+            _note(debug, f"action {action_key!r} target normalized from alternate action target field")
+        target = _status_key(
+            raw.get("to")
+            or raw.get("target")
+            or raw.get("target_column")
+            or raw.get("target_status")
+            or raw.get("status")
+            or raw.get("column")
+        )
+        repaired = _repair_action_target(action_key, target, known, coding=coding)
         if repaired != target:
-            _note(debug, f"action {_status_key(key)!r} target {target!r} normalized to {repaired!r}")
+            _note(debug, f"action {action_key!r} target {target!r} normalized to {repaired!r}")
             target = repaired
         if target in known:
-            normalized[_status_key(key)] = {"to": target}
+            normalized[action_key] = {"to": target}
     for column in columns:
         if not isinstance(column, dict):
             continue
@@ -296,10 +315,12 @@ def _normalize_actions(
     return normalized
 
 
-def _repair_action_target(action: str, target: str, known: set[str]) -> str:
+def _repair_action_target(action: str, target: str, known: set[str], *, coding: bool = False) -> str:
+    failure_aliases = {"abandoned", "abandon", "blocked", "failure", "error", "cancelled", "canceled"}
+    if coding and action in {"fail", "abandon"} and target in failure_aliases and "failed" in known:
+        return "failed"
     if target in known:
         return target
-    failure_aliases = {"abandoned", "abandon", "blocked", "failure", "error", "cancelled", "canceled"}
     success_aliases = {"complete", "completed", "success", "successful"}
     if action in {"fail", "abandon"} and target in failure_aliases and "failed" in known:
         return "failed"
