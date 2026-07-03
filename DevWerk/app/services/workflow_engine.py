@@ -1174,7 +1174,8 @@ def _generic_code_response(
     tool_requests: list[ToolRequest],
 ) -> IdeChatResponse | None:
     raw_outputs = raw.get("outputs") if isinstance(raw.get("outputs"), dict) else {}
-    ops = _model_list(FileOp, raw.get("ops") or raw_outputs.get("ops"))
+    normalized_ops = raw.get("ops") or raw_outputs.get("ops") or _code_patch_file_ops(raw, raw_outputs)
+    ops = _model_list(FileOp, normalized_ops)
     patch_ops = _model_list(PatchOp, raw.get("patch_ops") or raw_outputs.get("patch_ops"))
     code_tree = raw.get("code_tree") or raw_outputs.get("code_tree")
     if not ops and not patch_ops and not tool_requests and code_tree is None:
@@ -1190,6 +1191,71 @@ def _generic_code_response(
         tool_requests=tool_requests,
         done=bool(raw.get("done", True)),
     )
+
+
+def _code_patch_file_ops(raw: dict[str, Any], raw_outputs: dict[str, Any]) -> list[dict[str, Any]]:
+    """Convert common LLM file-bundle payloads into DevWerk file ops.
+
+    Some models produce an artifact-shaped code bundle such as
+    outputs.code_patch.files instead of the IDE protocol's ops array. If the
+    bundle contains concrete path/content pairs, it is already an actionable
+    code result and should enter the snapshot/apply lifecycle instead of
+    falling through to a generic phase artifact.
+    """
+
+    candidates = [
+        raw_outputs.get("code_patch"),
+        raw.get("code_patch"),
+        raw_outputs,
+    ]
+    files: object = None
+    for candidate in candidates:
+        if isinstance(candidate, dict) and isinstance(candidate.get("files"), list):
+            files = candidate.get("files")
+            break
+    if not isinstance(files, list):
+        return []
+
+    ops: list[dict[str, Any]] = []
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or item.get("file") or item.get("name") or "").strip().replace("\\", "/")
+        content = item.get("content")
+        if not path or content is None:
+            continue
+        operation = str(item.get("op") or item.get("operation") or "create_file").strip() or "create_file"
+        op: dict[str, Any] = {
+            "op": operation,
+            "path": path,
+            "content": str(content),
+        }
+        language = item.get("language") or _language_from_path(path)
+        if language:
+            op["language"] = str(language)
+        ops.append(op)
+    return ops
+
+
+def _language_from_path(path: str) -> str | None:
+    suffix = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    return {
+        "java": "java",
+        "kt": "kotlin",
+        "kts": "kotlin",
+        "js": "javascript",
+        "ts": "typescript",
+        "vue": "vue",
+        "json": "json",
+        "yml": "yaml",
+        "yaml": "yaml",
+        "xml": "xml",
+        "md": "markdown",
+        "sql": "sql",
+        "py": "python",
+        "html": "html",
+        "css": "css",
+    }.get(suffix)
 
 
 def _model_list(model: type[FileOp] | type[PatchOp], value: object) -> list[FileOp] | list[PatchOp]:

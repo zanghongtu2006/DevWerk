@@ -129,6 +129,61 @@ async def test_code_output_is_forced_to_ready_to_apply_even_when_llm_requests_do
     assert "code_ready" in [event["event_type"] for event in detail["events"]]
 
 
+@pytest.mark.asyncio
+async def test_code_patch_file_bundle_is_treated_as_applyable_code_result(monkeypatch, tmp_path):
+    kanban, _memory = configure(monkeypatch, tmp_path)
+    project_id = "code-patch-file-bundle"
+    kanban.update_project_workflow(project_id, coding_workflow())
+    task = kanban.create_task(project_id=project_id, title="Generate a scaffold")["task"]
+
+    import app.services.workflow_engine as workflow_engine_service
+
+    class FakeCodePatchClient:
+        def chat_json(self, messages: list[dict]) -> dict:
+            payload = json.loads(messages[-1]["content"])
+            assert payload["phase"] == "implement"
+            return {
+                "phase": "implement",
+                "summary": "Generated a file bundle, but cannot write it locally in this phase.",
+                "outputs": {
+                    "code_patch": {
+                        "format": "file-bundle",
+                        "files": [
+                            {
+                                "path": "backend-java/pom.xml",
+                                "content": "<project></project>\n",
+                            },
+                            {
+                                "path": "README.md",
+                                "content": "# Scaffold\n",
+                            },
+                        ],
+                    }
+                },
+                "decision": "fail",
+                "next_action": "fail",
+            }
+
+    monkeypatch.setattr(workflow_engine_service, "get_llm_client", lambda route: FakeCodePatchClient())
+
+    await workflow_engine_service.WorkflowEngine().run(
+        task["id"],
+        {"project_id": project_id, "messages": [{"role": "user", "content": "Create the scaffold"}]},
+    )
+
+    detail = kanban.get_task(task["id"])["task"]
+    result = [artifact for artifact in detail["artifacts"] if artifact["artifact_type"] == "workflow_result"][-1]["payload"]
+    ready_bundle = [artifact for artifact in detail["artifacts"] if artifact["artifact_type"] == "code_ready_bundle"][-1]["payload"]
+
+    assert detail["status_key"] == "ready_to_apply"
+    assert result["ok"] is True
+    assert result["waiting_for"] == "apply_result"
+    assert [op["path"] for op in result["ops"]] == ["backend-java/pom.xml", "README.md"]
+    assert result["ops"][0]["op"] == "create_file"
+    assert ready_bundle["ops_count"] == 2
+    assert "fail" not in [event["event_type"] for event in detail["events"]]
+
+
 def test_coding_workflow_rejects_done_without_apply_result(monkeypatch, tmp_path):
     kanban, _memory = configure(monkeypatch, tmp_path)
     project_id = "done-guard"
