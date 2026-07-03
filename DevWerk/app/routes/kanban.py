@@ -1029,6 +1029,10 @@ def _ask_project_conversation_agent(
                 "must be executed or continued as a workflow task, not bypassed. Decide one action: reply, "
                 "design, save_design, start_task, or continue_task. Use design/save_design when the user asks to "
                 "create or change project workflow, columns, state machine, agents, or capabilities. "
+                "Do not choose design/save_design just because the user describes a project goal. "
+                "Use design/save_design only when the user explicitly asks to create or change workflow, "
+                "columns, Kanban stages, state machine, agents, or capabilities. If the project is new "
+                "and the user intent is broad, ask a short clarification or reply with suggested next steps. "
                 "Use continue_task when the user's message belongs to the active non-terminal task, "
                 "for example extra guidance, compile feedback, rework, or follow-up details. Use start_task "
                 "when the user begins a distinct work item or the active task is terminal/unrelated. "
@@ -1237,7 +1241,34 @@ def _handle_project_workflow_design(
         current_agents=current_agents,
         save=save,
     )
-    result = kanban_design_project_workflow(project_id, design_req)
+    try:
+        result = kanban_design_project_workflow(project_id, design_req)
+    except HTTPException as exc:
+        if exc.status_code != 400:
+            raise
+        reply = (
+            "我理解你的项目目标，但还需要确认这是 coding、writing、research 还是 review 流程，"
+            "才能创建有效的工作流。你可以补充希望的阶段、完成标准和失败处理方式。"
+        )
+        add_project_event(
+            project_id,
+            "project_conversation_message",
+            {
+                "role": "assistant",
+                "content": reply,
+                "kind": "workflow_design_failed",
+                "error": exc.detail,
+            },
+        )
+        return {
+            "ok": False,
+            "project_id": project_id,
+            "kind": "workflow_design_failed",
+            "reply": reply,
+            "error_code": _workflow_design_error_code(str(exc.detail)),
+            "error_message": str(exc.detail),
+            "debug_event_recorded": True,
+        }
     add_project_event(
         project_id,
         "project_conversation_message",
@@ -1249,6 +1280,19 @@ def _handle_project_workflow_design(
         },
     )
     return {"ok": True, "project_id": project_id, "kind": "workflow_design", **result}
+
+
+def _workflow_design_error_code(message: str) -> str:
+    text = str(message or "").lower()
+    if "workflow must define project-specific columns" in text:
+        return "WORKFLOW_EMPTY_COLUMNS"
+    if "workflow.columns must be a list" in text:
+        return "WORKFLOW_COLUMNS_INVALID"
+    if "coding workflow missing lifecycle" in text:
+        return "WORKFLOW_CODING_LIFECYCLE_INVALID"
+    if "explicit success action" in text:
+        return "WORKFLOW_TERMINAL_ACTIONS_INVALID"
+    return "WORKFLOW_DESIGN_FAILED"
 
 
 def _handle_project_task_dispatch(

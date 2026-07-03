@@ -55,11 +55,15 @@ def design_project_workflow(
         raise WorkflowDesignError(f"project LLM agent failed: {llm_error}", debug=debug) from exc
     debug.setdefault("llm_output", raw_reply)
 
-    workflow = _normalize_workflow(
-        raw_reply.get("workflow") or base_workflow,
-        base_workflow=base_workflow,
-        debug=debug,
-    )
+    try:
+        workflow = _normalize_workflow(
+            raw_reply.get("workflow") or base_workflow,
+            base_workflow=base_workflow,
+            debug=debug,
+        )
+    except ValueError as exc:
+        debug["normalization_error"] = str(exc)
+        raise WorkflowDesignError(str(exc), debug=debug) from exc
     agent_overrides = _normalize_agents(raw_reply.get("agents") or agents)
     reply = str(raw_reply.get("reply") or "Workflow draft updated.")
 
@@ -103,6 +107,12 @@ def _ask_llm(
                 "The runtime requires explicit semantic actions workflow_done, fail, "
                 "abandon, and retry, but their target column names are project-specific. "
                 "Never rely on a no-transition column as an implicit terminal state. "
+                "If you return a workflow, workflow.columns MUST be a non-empty array. "
+                "Each column MUST include status_key and title. Every workflow MUST include "
+                "explicit actions workflow_done, fail, abandon, and retry. "
+                "If the user intent is insufficient to design a workflow, do not return an "
+                "empty workflow; instead return a reply asking for clarification. "
+                "Never return workflow: {}. Never return columns under a nested workflow.workflow object. "
                 "For code-producing workflows, set workflow_type='coding' or requires_apply=true, "
                 "include ready_to_apply/done/failed lifecycle columns, define code_ready, "
                 "apply_succeeded, verification_failed, workflow_done, fail, abandon, and retry. "
@@ -159,7 +169,7 @@ def _normalize_workflow(
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("workflow designer LLM did not return a workflow object")
-    workflow = dict(value)
+    workflow = _repair_workflow_object(value, debug=debug)
     workflow["name"] = str(workflow.get("name") or "project-workflow")
     workflow["version"] = int(workflow.get("version") or 1)
     workflow["workflow_type"] = str(workflow.get("workflow_type") or "").strip().lower()
@@ -169,6 +179,22 @@ def _normalize_workflow(
     workflow["actions"] = _normalize_actions(workflow.get("actions"), workflow["columns"], debug=debug)
     if debug is not None:
         debug["normalized_workflow"] = workflow
+    return workflow
+
+
+def _repair_workflow_object(value: dict[str, Any], *, debug: dict[str, Any] | None = None) -> dict[str, Any]:
+    workflow = dict(value)
+    nested = workflow.get("workflow")
+    if isinstance(nested, dict) and nested.get("columns"):
+        _note(debug, "workflow.workflow.columns unwrapped to workflow.columns")
+        workflow = {**nested, **{key: val for key, val in workflow.items() if key not in {"workflow", "columns", "actions"}}}
+    kanban = workflow.get("kanban")
+    if not workflow.get("columns") and isinstance(kanban, dict) and kanban.get("columns"):
+        workflow["columns"] = kanban.get("columns")
+        _note(debug, "kanban.columns normalized to workflow.columns")
+    if not workflow.get("columns") and workflow.get("states"):
+        workflow["columns"] = _states_to_columns(workflow.get("states"))
+        _note(debug, "states normalized to workflow.columns")
     return workflow
 
 
@@ -185,15 +211,20 @@ def _normalize_columns(value: object, *, base_workflow: dict[str, Any] | None = 
     for index, raw in enumerate(value):
         if not isinstance(raw, dict):
             continue
-        key = _status_key(raw.get("status_key"))
+        key = _status_key(raw.get("status_key") or raw.get("key") or raw.get("id") or raw.get("state"))
         if not key or key in seen:
             continue
         seen.add(key)
+        transitions = raw.get("transition_to")
+        if transitions is None:
+            transitions = raw.get("transitions") or raw.get("next") or raw.get("next_states") or raw.get("to")
+        if isinstance(transitions, str):
+            transitions = [transitions]
         col = {
             "status_key": key,
-            "title": str(raw.get("title") or key.replace("_", " ").title()),
+            "title": str(raw.get("title") or raw.get("name") or key.replace("_", " ").title()),
             "position": int(raw.get("position") or (index + 1) * 10),
-            "transition_to": [_status_key(item) for item in raw.get("transition_to") or [] if _status_key(item)],
+            "transition_to": [_status_key(item) for item in transitions or [] if _status_key(item)],
         }
         base_col = base_columns.get(key) if isinstance(base_columns.get(key), dict) else {}
         for optional in (
@@ -212,6 +243,20 @@ def _normalize_columns(value: object, *, base_workflow: dict[str, Any] | None = 
     if not out:
         raise ValueError("workflow must define project-specific columns")
     return sorted(out, key=lambda item: int(item.get("position") or 0))
+
+
+def _states_to_columns(value: object) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        states = []
+        for index, (key, raw) in enumerate(value.items()):
+            item = dict(raw) if isinstance(raw, dict) else {}
+            item.setdefault("status_key", key)
+            item.setdefault("position", (index + 1) * 10)
+            states.append(item)
+        return states
+    if isinstance(value, list):
+        return [dict(item) for item in value if isinstance(item, dict)]
+    return []
 
 
 def _normalize_actions(
