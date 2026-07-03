@@ -128,3 +128,156 @@ async def test_workflow_spawns_column_agents_without_fixed_stage_names(monkeypat
     assert result["payload"]["ok"] is True
     assert result["payload"]["done"] is True
     assert result["payload"]["status_key"] == "shipped"
+
+
+@pytest.mark.asyncio
+async def test_column_agent_target_status_is_mapped_to_workflow_action(monkeypatch, tmp_path):
+    kanban = _configure(monkeypatch, tmp_path)
+    project_id = "target-status-workflow"
+    workflow = {
+        "name": "target-status-flow",
+        "version": 1,
+        "columns": [
+            {
+                "status_key": "intake",
+                "title": "Intake",
+                "position": 10,
+                "transition_to": ["compose", "blocked"],
+                "job_template": "clarify_goal",
+                "output_artifact": "intake_bundle",
+                "success_action": "intake_ready",
+                "failure_actions": ["fail"],
+            },
+            {
+                "status_key": "compose",
+                "title": "Compose",
+                "position": 20,
+                "transition_to": ["shipped", "blocked"],
+                "job_template": "write_output",
+                "input_artifacts": ["intake_bundle"],
+                "output_artifact": "draft_bundle",
+                "success_action": "workflow_done",
+                "failure_actions": ["fail"],
+            },
+            {"status_key": "shipped", "title": "Shipped", "position": 90, "transition_to": []},
+            {"status_key": "blocked", "title": "Blocked", "position": 99, "transition_to": ["intake"]},
+        ],
+        "actions": {
+            "intake_ready": {"to": "compose"},
+            "workflow_done": {"to": "shipped"},
+            "fail": {"to": "blocked"},
+            "abandon": {"to": "blocked"},
+            "retry": {"to": "intake"},
+        },
+    }
+    kanban.update_project_workflow(project_id, workflow)
+    task = kanban.create_task(project_id=project_id, title="Publish note")["task"]
+
+    import app.services.workflow_engine as workflow_engine_service
+
+    class FakeColumnClient:
+        def chat_json(self, messages: list[dict]) -> dict:
+            payload = json.loads(messages[-1]["content"])
+            phase = payload["phase"]
+            if phase == "intake":
+                return {
+                    "phase": phase,
+                    "summary": "Intake done.",
+                    "outputs": {"ok": True},
+                    "decision": "success",
+                    "target": "compose",
+                }
+            return {
+                "phase": phase,
+                "summary": "Draft shipped.",
+                "outputs": {"ok": True},
+                "decision": "approve",
+                "next_action": "shipped",
+            }
+
+    monkeypatch.setattr(workflow_engine_service, "get_llm_client", lambda route: FakeColumnClient())
+
+    await workflow_engine_service.WorkflowEngine().run(
+        task["id"],
+        {
+            "project_id": project_id,
+            "messages": [{"role": "user", "content": "Publish a short note"}],
+            "workspace": {"root_id": project_id, "source_map": None, "tree_preview": ""},
+        },
+    )
+
+    detail = kanban.get_task(task["id"])["task"]
+    assert detail["status_key"] == "shipped"
+    event_payloads = [
+        event["payload"]
+        for event in detail["events"]
+        if event["event_type"] == "agent_output_normalized"
+    ]
+    assert any("target status 'compose' mapped to action 'intake_ready'" in payload["notes"] for payload in event_payloads)
+    assert any("next_action looked like target status 'shipped'" in payload["notes"] for payload in event_payloads)
+
+
+@pytest.mark.asyncio
+async def test_column_agent_tool_request_aliases_are_normalized(monkeypatch, tmp_path):
+    kanban = _configure(monkeypatch, tmp_path)
+    project_id = "tool-alias-workflow"
+    workflow = {
+        "name": "tool-alias-flow",
+        "version": 1,
+        "columns": [
+            {
+                "status_key": "inspect",
+                "title": "Inspect",
+                "position": 10,
+                "transition_to": ["done", "blocked"],
+                "job_template": "inspect_with_client_tool",
+                "output_artifact": "inspection_bundle",
+                "success_action": "workflow_done",
+                "failure_actions": ["fail"],
+            },
+            {"status_key": "done", "title": "Done", "position": 90, "transition_to": []},
+            {"status_key": "blocked", "title": "Blocked", "position": 99, "transition_to": ["inspect"]},
+        ],
+        "actions": {
+            "workflow_done": {"to": "done"},
+            "fail": {"to": "blocked"},
+            "abandon": {"to": "blocked"},
+            "retry": {"to": "inspect"},
+        },
+    }
+    kanban.update_project_workflow(project_id, workflow)
+    task = kanban.create_task(project_id=project_id, title="Inspect project")["task"]
+
+    import app.services.workflow_engine as workflow_engine_service
+
+    class FakeColumnClient:
+        def chat_json(self, messages: list[dict]) -> dict:
+            payload = json.loads(messages[-1]["content"])
+            return {
+                "phase": payload["phase"],
+                "summary": "Need source diagnostics before continuing.",
+                "decision": "need_tool",
+                "tool_requests": [
+                    {
+                        "name": "source.diagnostics",
+                        "arguments": {"path": "src/main/java", "max_errors": 20},
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(workflow_engine_service, "get_llm_client", lambda route: FakeColumnClient())
+
+    await workflow_engine_service.WorkflowEngine().run(
+        task["id"],
+        {
+            "project_id": project_id,
+            "messages": [{"role": "user", "content": "Inspect diagnostics"}],
+            "client_capabilities": {"capabilities": [{"capability": "source.diagnostics"}]},
+        },
+    )
+
+    detail = kanban.get_task(task["id"])["task"]
+    result = [item for item in detail["artifacts"] if item["artifact_type"] == "workflow_result"][-1]["payload"]
+    assert result["waiting_for"] == "client_tool"
+    assert result["tool_requests"][0]["tool"] == "source.diagnostics"
+    assert result["tool_requests"][0]["args"]["paths"] == ["src/main/java"]

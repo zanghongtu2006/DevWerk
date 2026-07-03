@@ -34,6 +34,7 @@ from app.services.llm_factory import get_llm_client
 from app.services.memory_system import build_context_pack, create_agent_run, handle_agent_writeback
 from app.services.plugin_manager import get_plugin_agent
 from app.services.provider_errors import is_retryable_llm_error
+from app.services.tool_protocol import normalize_tool_request
 from app.services.verification_policy import configured_post_apply_tool_requests, verification_feedback_summary
 from app.services.workflow import apply_workflow_action, record_phase_output
 from app.services.workflow_definition import WorkflowColumn, WorkflowDefinition, workflow_from_dict
@@ -480,6 +481,18 @@ class WorkflowEngine:
         raw = await _chat_json_with_retry(model_route, prompt)
         if not isinstance(raw, dict):
             raise ValueError("generic column agent returned a non-object JSON response")
+        raw, normalization_notes = _normalize_generic_agent_output(raw, definition, column)
+        if normalization_notes:
+            _event(
+                task_id,
+                "agent_output_normalized",
+                {
+                    "phase": column.status_key,
+                    "agent": agent,
+                    "notes": normalization_notes,
+                    "keys": sorted(str(key) for key in raw.keys()),
+                },
+            )
 
         warnings = [str(item) for item in (raw.get("warnings") or []) if str(item).strip()]
         summary = str(raw.get("summary") or raw.get("reply") or f"{column.title} completed.").strip()
@@ -875,6 +888,133 @@ def _generic_decision(decision: object, next_action: object, *, has_tool_request
     return "approve"
 
 
+def _normalize_generic_agent_output(
+    raw: dict[str, Any],
+    definition: WorkflowDefinition,
+    column: WorkflowColumn,
+) -> tuple[dict[str, Any], list[str]]:
+    """Align common LLM output shapes to the workflow action protocol.
+
+    Column agents must emit semantic actions, but models often return target
+    statuses or provider raw_text fallbacks. This function does not invent new
+    workflow states; it only maps model output to actions already defined by
+    the active workflow.
+    """
+
+    normalized = dict(raw)
+    notes: list[str] = []
+    for key in ("raw_text", "reply", "content"):
+        parsed = _extract_json_object(str(normalized.get(key) or ""))
+        if parsed is not None:
+            normalized = {**normalized, **parsed}
+            notes.append(f"embedded JSON parsed from {key}")
+            break
+
+    requested = _action_key(
+        normalized.get("next_action")
+        or normalized.get("action")
+        or normalized.get("semantic_action")
+        or normalized.get("command")
+    )
+    target = _status_key(
+        normalized.get("target")
+        or normalized.get("target_status")
+        or normalized.get("target_column")
+        or normalized.get("status")
+        or normalized.get("to")
+    )
+    if not target and requested and definition.column(requested) is not None:
+        target = requested
+        requested = ""
+        notes.append(f"next_action looked like target status {target!r}")
+
+    if target:
+        mapped = _action_for_target(definition, column, target, preferred=requested)
+        if mapped:
+            if requested != mapped:
+                notes.append(f"target status {target!r} mapped to action {mapped!r}")
+            normalized["next_action"] = mapped
+        elif requested:
+            normalized["next_action"] = requested
+    elif requested:
+        alias_action = _action_alias(requested, definition, column)
+        if alias_action != requested:
+            notes.append(f"action alias {requested!r} normalized to {alias_action!r}")
+        normalized["next_action"] = alias_action
+
+    return normalized, notes
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    if not text or "{" not in text:
+        return None
+    decoder = json.JSONDecoder()
+    start = 0
+    while True:
+        index = text.find("{", start)
+        if index < 0:
+            return None
+        try:
+            parsed, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            start = index + 1
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+        start = index + 1
+
+
+def _action_key(value: object) -> str:
+    return str(value or "").strip().lower().replace("-", "_")
+
+
+def _status_key(value: object) -> str:
+    return str(value or "").strip().lower().replace("-", "_")
+
+
+def _action_alias(action: str, definition: WorkflowDefinition, column: WorkflowColumn) -> str:
+    if _is_valid_column_action(definition, column, action):
+        return action
+    if action in {"approve", "approved", "success", "succeeded", "done", "complete", "completed"}:
+        return _preferred_success_action(definition, column) or action
+    if action in {"fail", "failed", "failure", "error", "blocked"}:
+        return _failure_action(column)
+    if action in {"rework", "rewrite"}:
+        return "request_rework"
+    if action in {"replan"}:
+        return "request_replan"
+    return action
+
+
+def _action_for_target(
+    definition: WorkflowDefinition,
+    column: WorkflowColumn,
+    target: str,
+    *,
+    preferred: str = "",
+) -> str | None:
+    if preferred and _is_valid_column_action(definition, column, preferred) and _action_target(definition, preferred) == target:
+        return preferred
+    candidates = [
+        column.success_action or "",
+        *(column.failure_actions or []),
+        "workflow_done",
+        "complete",
+        "completed",
+        "code_ready",
+        "apply_succeeded",
+        "verification_failed",
+        "fail",
+        "abandon",
+        "retry",
+    ]
+    candidates.extend(action for action in definition.actions if action not in candidates)
+    for action in candidates:
+        if action and _is_valid_column_action(definition, column, action) and _action_target(definition, action) == target:
+            return action
+    return None
+
+
 def _generic_column_action(
     definition: WorkflowDefinition,
     column: WorkflowColumn,
@@ -1163,11 +1303,18 @@ def _allowed_client_tool_requests(
         return []
     requests: list[ToolRequest] = []
     seen_ids: set[str] = set()
-    for item in value:
-        if not isinstance(item, dict) or str(item.get("tool") or "").strip() not in allowed:
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
             continue
         try:
-            request = ToolRequest.model_validate(item)
+            normalized_item = normalize_tool_request(item, index)
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("client tool request ignored during normalization item=%s error=%s", item, exc)
+            continue
+        if str(normalized_item.get("tool") or "").strip() not in allowed:
+            continue
+        try:
+            request = ToolRequest.model_validate(normalized_item)
         except Exception:  # noqa: BLE001
             continue
         offer = broker.resolve(capabilities, request.tool)
