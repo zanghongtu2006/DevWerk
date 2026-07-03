@@ -430,6 +430,23 @@ def kanban_project_conversation_message(project_id: str, req: ProjectConversatio
             active_task=active_task,
         )
         decision_action = str(decision.get("action") or "reply").strip().lower().replace("-", "_")
+        if _is_project_explanation_request(user_text) and decision_action in {
+            "continue_task",
+            "resume_task",
+            "message_task",
+            "start_task",
+            "run_task",
+            "dispatch_task",
+        }:
+            task_id = str(decision.get("task_id") or (active_task or {}).get("id") or req.metadata.get("active_task_id") or "").strip()
+            reply = _project_explanation_reply(project_id, user_text=user_text, task_id=task_id, decision=decision)
+            return _record_project_conversation_reply(
+                project_id,
+                reply=reply,
+                kind="reply",
+                decision={**decision, "action_overridden": decision_action, "override_reason": "explanation_request"},
+                task_id=task_id or None,
+            )
         if decision_action in {"design", "save_design", "revise_workflow", "configure_project"}:
             return _handle_project_workflow_design(
                 project_id,
@@ -444,6 +461,15 @@ def kanban_project_conversation_message(project_id: str, req: ProjectConversatio
             if not task_id:
                 raise HTTPException(status_code=409, detail="project agent chose continue_task but no active task is available")
             task_message = str(decision.get("task_request") or decision.get("message") or user_text).strip()
+            if _task_is_terminal(project_id, task_id):
+                reply = _terminal_task_continue_reply(project_id, task_id, task_message)
+                return _record_project_conversation_reply(
+                    project_id,
+                    reply=reply,
+                    kind="reply",
+                    decision={**decision, "action_overridden": decision_action, "override_reason": "terminal_task"},
+                    task_id=task_id,
+                )
             return _handle_project_task_continue(
                 project_id,
                 task_id=task_id,
@@ -496,6 +522,15 @@ def kanban_project_conversation_message(project_id: str, req: ProjectConversatio
             raise HTTPException(status_code=400, detail="active task is required to continue a task")
         if not user_text:
             raise HTTPException(status_code=400, detail="message is required to continue a task")
+        if _task_is_terminal(project_id, task_id):
+            reply = _terminal_task_continue_reply(project_id, task_id, user_text)
+            return _record_project_conversation_reply(
+                project_id,
+                reply=reply,
+                kind="reply",
+                decision={"action_overridden": action, "override_reason": "terminal_task"},
+                task_id=task_id,
+            )
         return _handle_project_task_continue(
             project_id,
             task_id=task_id,
@@ -1020,9 +1055,14 @@ def _ask_project_conversation_agent(
                 "Use design/save_design only when the user explicitly asks to create or change workflow, "
                 "columns, Kanban stages, state machine, agents, or capabilities. If the project is new "
                 "and the user intent is broad, ask a short clarification or reply with suggested next steps. "
+                "Use reply, not start_task or continue_task, when the user asks for explanation, policy, "
+                "status, failure cause, retry reason, or design discussion. Do not invent retry limits, "
+                "failure causes, build tools, paths, or environment facts; quote current project/workflow "
+                "settings when available, otherwise say they are not configured. "
                 "Use continue_task when the user's message belongs to the active non-terminal task, "
                 "for example extra guidance, compile feedback, rework, or follow-up details. Use start_task "
                 "when the user begins a distinct work item or the active task is terminal/unrelated. "
+                "Never choose continue_task for a terminal task; terminal retry requires an explicit retry/re-run. "
                 "Support coding and non-coding projects such as writing, research, review, and revision. "
                 "The chat also supports deterministic slash commands: /goal records a project goal, "
                 "/learn records reusable project knowledge, and /distill compacts the conversation into Project.MD. "
@@ -1174,6 +1214,156 @@ def _project_terminal_statuses(project_id: str) -> set[str]:
             if target:
                 terminals.add(target)
     return terminals
+
+
+def _record_project_conversation_reply(
+    project_id: str,
+    *,
+    reply: str,
+    kind: str,
+    decision: dict[str, Any] | None = None,
+    task_id: str | None = None,
+) -> dict[str, Any]:
+    add_project_event(
+        project_id,
+        "project_conversation_message",
+        {
+            "role": "assistant",
+            "content": reply,
+            "kind": kind,
+            "decision": decision or {},
+            "task_id": task_id,
+        },
+    )
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "kind": "reply",
+        "reply": reply,
+        "decision": decision or {},
+        "task_id": task_id,
+    }
+
+
+def _is_project_explanation_request(text: str) -> bool:
+    lower = str(text or "").strip().lower()
+    if not lower:
+        return False
+    markers = (
+        "?",
+        "？",
+        "为什么",
+        "为何",
+        "怎么回事",
+        "解释",
+        "说明",
+        "原因",
+        "是否",
+        "是不是",
+        "我不知道",
+        "不理解",
+        "需要讨论",
+        "分析任务失败",
+        "失败原因",
+        "retry max",
+        "retry 最多",
+        "重试上限",
+        "最多 2",
+        "最多2",
+        "why",
+        "explain",
+        "how does",
+        "what is",
+    )
+    return any(marker in lower for marker in markers)
+
+
+def _task_for_project(project_id: str, task_id: str) -> dict[str, Any] | None:
+    if not task_id:
+        return None
+    try:
+        task = get_task(task_id).get("task") or {}
+    except KeyError:
+        return None
+    if str(task.get("project_id") or "") != str(project_id):
+        return None
+    return task
+
+
+def _task_is_terminal(project_id: str, task_id: str) -> bool:
+    task = _task_for_project(project_id, task_id)
+    if not task:
+        return False
+    return str(task.get("status_key") or "") in _project_terminal_statuses(project_id)
+
+
+def _project_retry_policy(project_id: str) -> dict[str, Any]:
+    settings_payload = get_project_settings(project_id)
+    settings = settings_payload.get("settings") if isinstance(settings_payload, dict) else {}
+    settings_params = settings.get("parameters") if isinstance(settings, dict) and isinstance(settings.get("parameters"), dict) else {}
+    workflow = get_project_workflow(project_id).get("workflow") or {}
+    workflow_params = workflow.get("parameters") if isinstance(workflow.get("parameters"), dict) else {}
+    return {
+        "workflow_max_rework_runs": workflow_params.get("workflow_max_rework_runs", settings_params.get("workflow_max_rework_runs", 128)),
+        "workflow_max_total_runs": workflow_params.get("workflow_max_total_runs", settings_params.get("workflow_max_total_runs", 512)),
+        "source": "workflow.parameters" if "workflow_max_rework_runs" in workflow_params else "project.settings.parameters",
+    }
+
+
+def _project_explanation_reply(
+    project_id: str,
+    *,
+    user_text: str,
+    task_id: str,
+    decision: dict[str, Any],
+) -> str:
+    policy = _project_retry_policy(project_id)
+    task = _task_for_project(project_id, task_id) if task_id else None
+    status = str((task or {}).get("status_key") or "unknown")
+    terminal = bool(task_id and _task_is_terminal(project_id, task_id))
+    failure = _latest_artifact_payload(task_id, "failure_bundle") if task_id else None
+    workflow_result = _latest_artifact_payload(task_id, "workflow_result") if task_id else None
+    failure_reason = ""
+    if isinstance(failure, dict):
+        failure_reason = str(failure.get("reason") or failure.get("error_message") or "").strip()
+    if not failure_reason and isinstance(workflow_result, dict):
+        failure_reason = str(workflow_result.get("error_message") or workflow_result.get("reply") or "").strip()
+
+    lines = [
+        "我先回答这个问题，不会把这条消息当成任务继续执行。",
+        "",
+        f"- 当前 DevWerk 引擎的重试上限来自 `{policy['source']}`：`workflow_max_rework_runs={policy['workflow_max_rework_runs']}`，`workflow_max_total_runs={policy['workflow_max_total_runs']}`。",
+        "- 你看到的 `retry 最多 2 次` 不是 DevWerk workflow engine 的固定规则；它来自上一次 LLM 生成的 `failure_handling` 任务说明/phase output。",
+        "- LLM 在那段内容里把失败原因写成了“编译/JDK 环境/Maven 仓库”等假设；这只能算模型推测，不是工具诊断证据，也不应该被当成事实。",
+    ]
+    if task_id:
+        lines.append(f"- 当前关联 task 是 `{task_id}`，状态是 `{status}`。")
+    if terminal:
+        lines.append("- 这个 task 已经处于终态，普通 `continue_task` 不应继续写入；需要用显式 Re-run/Retry 创建受控重试，或者新建任务。")
+    if failure_reason:
+        lines.append(f"- 最近一次后端记录的失败摘要：{failure_reason[:800]}")
+    lines.extend(
+        [
+            "",
+            "这次问题的根因是 project conversation agent 把你的“为什么/解释”类消息误判成了 `continue_task`。后端现在会对这类消息做硬保护：解释类输入只能回复说明，terminal task 也不会被继续执行。",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _terminal_task_continue_reply(project_id: str, task_id: str, task_message: str) -> str:
+    task = _task_for_project(project_id, task_id) or {}
+    status = str(task.get("status_key") or "unknown")
+    failure = _latest_artifact_payload(task_id, "failure_bundle")
+    reason = ""
+    if isinstance(failure, dict):
+        reason = str(failure.get("reason") or failure.get("error_message") or "").strip()
+    suffix = f"\n\n最近失败摘要：{reason[:800]}" if reason else ""
+    return (
+        f"这个任务 `{task_id}` 已经是终态 `{status}`，不能用普通继续消息推进。\n\n"
+        "如果要重新执行，请使用显式 Re-run/Retry；如果只是讨论失败原因或策略，我会保持在项目对话里解释，不会启动 workflow。"
+        f"{suffix}"
+    )
 
 
 def _project_md(project_id: str) -> str:
