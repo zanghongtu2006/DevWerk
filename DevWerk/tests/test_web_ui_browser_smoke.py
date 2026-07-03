@@ -169,6 +169,38 @@ const chrome = process.env.DEVWERK_BROWSER_CHROME || 'C:/Program Files/Google/Ch
   await page.waitForSelector('button[data-project-tab="configuration"]');
   await page.waitForSelector('.live-log-card');
   await page.waitForSelector('#prompt');
+  const chatLayout = await page.evaluate(() => {{
+    const grid = document.querySelector('.project-workbench-grid');
+    const card = document.querySelector('.chat-card');
+    const body = document.querySelector('#chatBody');
+    if (!grid || !card || !body) return {{ missing: true }};
+    const before = card.getBoundingClientRect();
+    for (let i = 0; i < 80; i += 1) {{
+      const bubble = document.createElement('div');
+      bubble.className = i % 2 ? 'user-bubble' : 'message-content';
+      bubble.textContent = `Synthetic long conversation row ${{i}} `.repeat(8);
+      body.appendChild(bubble);
+    }}
+    const after = card.getBoundingClientRect();
+    const bodyStyle = getComputedStyle(body);
+    return {{
+      missing: false,
+      viewportHeight: window.innerHeight,
+      gridHeight: Math.round(grid.getBoundingClientRect().height),
+      cardBeforeHeight: Math.round(before.height),
+      cardAfterHeight: Math.round(after.height),
+      bodyClientHeight: body.clientHeight,
+      bodyScrollHeight: body.scrollHeight,
+      bodyOverflowY: bodyStyle.overflowY,
+      pageScrollHeight: document.querySelector('.page')?.scrollHeight || 0,
+      pageClientHeight: document.querySelector('.page')?.clientHeight || 0
+    }};
+  }});
+  if (chatLayout.missing) throw new Error('chat layout elements are missing');
+  if (chatLayout.cardBeforeHeight < 640 || chatLayout.cardBeforeHeight > 900) throw new Error(`chat card height outside designed range: ${{JSON.stringify(chatLayout)}}`);
+  if (Math.abs(chatLayout.cardAfterHeight - chatLayout.cardBeforeHeight) > 2) throw new Error(`chat card was expanded by long conversation content: ${{JSON.stringify(chatLayout)}}`);
+  if (!['auto', 'scroll'].includes(chatLayout.bodyOverflowY)) throw new Error(`chat body is not independently scrollable: ${{JSON.stringify(chatLayout)}}`);
+  if (chatLayout.bodyScrollHeight <= chatLayout.bodyClientHeight) throw new Error(`long conversation did not create internal chat scroll: ${{JSON.stringify(chatLayout)}}`);
   await (await one('#newProjectMain', 'new project button')).click();
   await page.waitForSelector('.modal');
   if (!await page.locator('.modal h2:has-text("New Project")').count()) throw new Error('new project modal did not open');
