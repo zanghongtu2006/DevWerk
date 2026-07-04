@@ -13,6 +13,11 @@ def _patch_designer(monkeypatch, payload: dict):
         "_ask_llm",
         lambda **kwargs: payload,
     )
+    monkeypatch.setattr(
+        workflow_designer,
+        "_ask_llm_repair",
+        lambda **kwargs: (_ for _ in ()).throw(ValueError("repair disabled in invalid-output test")),
+    )
     return workflow_designer
 
 
@@ -43,7 +48,7 @@ def _patch_designer(monkeypatch, payload: dict):
                     "actions": {"workflow_done": {"to": "done"}, "fail": {"to": "failed"}, "abandon": {"to": "failed"}, "retry": {"to": "implement"}},
                 },
             },
-            "coding workflow missing lifecycle columns",
+            "coding workflow missing lifecycle action: code_ready",
         ),
         (
             "WD-006-code-column-uses-workflow-done",

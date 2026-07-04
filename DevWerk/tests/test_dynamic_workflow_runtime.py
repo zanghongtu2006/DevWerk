@@ -218,6 +218,63 @@ async def test_column_agent_target_status_is_mapped_to_workflow_action(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_column_agent_status_field_does_not_drive_transition(monkeypatch, tmp_path):
+    kanban = _configure(monkeypatch, tmp_path)
+    project_id = "status-field-workflow"
+    workflow = {
+        "name": "status-field-flow",
+        "version": 1,
+        "columns": [
+            {
+                "status_key": "intake",
+                "title": "Intake",
+                "position": 10,
+                "transition_to": ["done", "failed"],
+                "job_template": "intake",
+                "success_action": "workflow_done",
+                "failure_actions": ["fail"],
+            },
+            {"status_key": "done", "title": "Done", "position": 90, "transition_to": []},
+            {"status_key": "failed", "title": "Failed", "position": 99, "transition_to": ["intake"]},
+        ],
+        "actions": {
+            "workflow_done": {"to": "done"},
+            "fail": {"to": "failed"},
+            "abandon": {"to": "failed"},
+            "retry": {"to": "intake"},
+        },
+    }
+    kanban.update_project_workflow(project_id, workflow)
+    task = kanban.create_task(project_id=project_id, title="Status field should be descriptive")["task"]
+
+    import app.services.workflow_engine as workflow_engine_service
+
+    class FakeColumnClient:
+        def chat_json(self, messages: list[dict]) -> dict:
+            return {
+                "phase": "intake",
+                "status": "failed",
+                "summary": "The work is actually ready; status is just a descriptive model field.",
+                "outputs": {"ok": True},
+                "decision": "success",
+            }
+
+    monkeypatch.setattr(workflow_engine_service, "get_llm_client", lambda route: FakeColumnClient())
+
+    await workflow_engine_service.WorkflowEngine().run(
+        task["id"],
+        {
+            "project_id": project_id,
+            "messages": [{"role": "user", "content": "Complete it"}],
+            "workspace": {"root_id": project_id, "source_map": None, "tree_preview": ""},
+        },
+    )
+
+    detail = kanban.get_task(task["id"])["task"]
+    assert detail["status_key"] == "done"
+
+
+@pytest.mark.asyncio
 async def test_workflow_failure_is_reported_to_project_conversation(monkeypatch, tmp_path):
     kanban = _configure(monkeypatch, tmp_path)
     project_id = "failure-conversation"
@@ -507,3 +564,85 @@ async def test_backend_local_tool_request_is_executed_and_reinjected(monkeypatch
     artifact_types = [item["artifact_type"] for item in detail["artifacts"]]
     assert "backend_tool_result" in artifact_types
     assert "client_tool_result" in artifact_types
+
+
+@pytest.mark.asyncio
+async def test_backend_local_workspace_write_tool_is_available(monkeypatch, tmp_path):
+    kanban = _configure(monkeypatch, tmp_path)
+    project_id = "backend-local-write-tool"
+    project_root = tmp_path / "workspace"
+    project_root.mkdir()
+    workflow = {
+        "name": "write-tool-flow",
+        "version": 1,
+        "columns": [
+            {
+                "status_key": "write",
+                "title": "Write",
+                "position": 10,
+                "transition_to": ["done", "failed"],
+                "job_template": "write_project_file",
+                "output_artifact": "write_bundle",
+                "success_action": "workflow_done",
+                "failure_actions": ["fail"],
+            },
+            {"status_key": "done", "title": "Done", "position": 90, "transition_to": []},
+            {"status_key": "failed", "title": "Failed", "position": 99, "transition_to": ["write"]},
+        ],
+        "actions": {
+            "workflow_done": {"to": "done"},
+            "fail": {"to": "failed"},
+            "abandon": {"to": "failed"},
+            "retry": {"to": "write"},
+        },
+    }
+    kanban.update_project_workflow(project_id, workflow)
+    task = kanban.create_task(project_id=project_id, title="Write note")["task"]
+
+    import app.services.workflow_engine as workflow_engine_service
+    from app.services.local_capability_provider import merge_backend_capabilities
+
+    calls = 0
+
+    class FakeWriteClient:
+        def chat_json(self, messages: list[dict]) -> dict:
+            nonlocal calls
+            payload = json.loads(messages[-1]["content"])
+            calls += 1
+            if calls == 1:
+                offers = payload["agent_context"]["capabilities"]["client_offers"]
+                assert any(offer["capability"] == "workspace.write" for offer in offers)
+                return {
+                    "phase": payload["phase"],
+                    "summary": "Need to write a project note.",
+                    "decision": "need_client_tool",
+                    "tool_requests": [
+                        {
+                            "tool": "workspace.write",
+                            "args": {"path": "notes/summary.md", "content": "# Summary\n", "op": "write_file"},
+                        }
+                    ],
+                }
+            return {
+                "phase": payload["phase"],
+                "summary": "Project note written.",
+                "outputs": {"path": "notes/summary.md"},
+                "decision": "approve",
+                "next_action": "workflow_done",
+            }
+
+    monkeypatch.setattr(workflow_engine_service, "get_llm_client", lambda route: FakeWriteClient())
+
+    await workflow_engine_service.WorkflowEngine().run(
+        task["id"],
+        {
+            "project_id": project_id,
+            "backend_local": True,
+            "project_root": str(project_root),
+            "client_capabilities": merge_backend_capabilities({}),
+            "messages": [{"role": "user", "content": "Write project note"}],
+        },
+    )
+
+    assert (project_root / "notes" / "summary.md").read_text(encoding="utf-8") == "# Summary\n"
+    assert kanban.get_task(task["id"])["task"]["status_key"] == "done"

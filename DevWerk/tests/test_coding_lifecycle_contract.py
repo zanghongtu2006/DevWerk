@@ -184,6 +184,54 @@ async def test_code_patch_file_bundle_is_treated_as_applyable_code_result(monkey
     assert "fail" not in [event["event_type"] for event in detail["events"]]
 
 
+@pytest.mark.asyncio
+async def test_summary_embedded_staged_patch_is_treated_as_applyable_code_result(monkeypatch, tmp_path):
+    kanban, _memory = configure(monkeypatch, tmp_path)
+    project_id = "summary-staged-patch"
+    kanban.update_project_workflow(project_id, coding_workflow())
+    task = kanban.create_task(project_id=project_id, title="Generate a scaffold")["task"]
+
+    import app.services.workflow_engine as workflow_engine_service
+
+    class FakeSummaryPatchClient:
+        def chat_json(self, messages: list[dict]) -> dict:
+            payload = json.loads(messages[-1]["content"])
+            assert payload["phase"] == "implement"
+            return {
+                "summary": json.dumps(
+                    {
+                        "phase": "implement",
+                        "summary": "Generated a staged patch.",
+                        "outputs": {
+                            "staged_patch": {
+                                "files": [
+                                    {"path": "README.md", "content": "# Scaffold\n"},
+                                    {"path": "src/App.java", "content": "class App {}\n"},
+                                ]
+                            }
+                        },
+                        "next_action": "code_ready",
+                    }
+                ),
+                "decision": "approve",
+            }
+
+    monkeypatch.setattr(workflow_engine_service, "get_llm_client", lambda route: FakeSummaryPatchClient())
+
+    await workflow_engine_service.WorkflowEngine().run(
+        task["id"],
+        {"project_id": project_id, "messages": [{"role": "user", "content": "Create the scaffold"}]},
+    )
+
+    detail = kanban.get_task(task["id"])["task"]
+    result = [artifact for artifact in detail["artifacts"] if artifact["artifact_type"] == "workflow_result"][-1]["payload"]
+    assert detail["status_key"] == "ready_to_apply"
+    assert result["ok"] is True
+    assert result["waiting_for"] == "apply_result"
+    assert [op["path"] for op in result["ops"]] == ["README.md", "src/App.java"]
+    assert "fail" not in [event["event_type"] for event in detail["events"]]
+
+
 def test_coding_workflow_rejects_done_without_apply_result(monkeypatch, tmp_path):
     kanban, _memory = configure(monkeypatch, tmp_path)
     project_id = "done-guard"
@@ -274,6 +322,99 @@ def test_explicit_verification_skip_records_artifact_and_allows_done(monkeypatch
     assert "workflow_done_guard_passed" in event_types
     assert "apply_succeeded" in event_types
     assert "verification_passed" in event_types
+
+
+def test_post_apply_verification_column_can_complete_workflow(monkeypatch, tmp_path):
+    kanban, _memory = configure(monkeypatch, tmp_path)
+    project_id = "post-apply-verification"
+    workflow = coding_workflow()
+    workflow["columns"][2]["transition_to"] = ["verifying", "failed"]
+    workflow["columns"].insert(
+        3,
+        {
+            "status_key": "verifying",
+            "title": "Verifying",
+            "position": 50,
+            "transition_to": ["done", "failed"],
+            "job_template": "verify.scaffold",
+            "input_artifacts": ["apply_result"],
+            "output_artifact": "verification_report",
+            "success_action": "workflow_done",
+            "failure_actions": ["verification_failed", "fail"],
+        },
+    )
+    kanban.update_project_workflow(project_id, workflow)
+    task = kanban.create_task(project_id=project_id, title="Apply then verify", status_key="ready_to_apply")["task"]
+
+    import app.services.workflow as workflow_service
+
+    applied = workflow_service.apply_workflow_action(
+        task["id"],
+        "apply_result",
+        {"ok": True, "snapshot_id": "snap-verify", "changed_paths": ["README.md"], "verification": {}},
+    )
+    assert applied["task"]["status_key"] == "applied"
+
+    kanban.move_task(task["id"], "verifying", force=True)
+    done = workflow_service.apply_workflow_action(
+        task["id"],
+        "workflow_done",
+        {"phase": "verifying", "reason": "verification column passed"},
+    )
+
+    detail = kanban.get_task(task["id"])["task"]
+    assert done["task"]["status_key"] == "done"
+    assert detail["status_key"] == "done"
+    event_types = [event["event_type"] for event in detail["events"]]
+    assert "workflow_done_guard_blocked" not in event_types
+    assert "workflow_transition_decided" in event_types
+    assert any(
+        event["event_type"] == "workflow_transition_decided"
+        and (event.get("payload") or {}).get("action") == "workflow_done"
+        and (event.get("payload") or {}).get("to_status") == "done"
+        for event in detail["events"]
+    )
+
+
+def test_post_apply_verification_accepts_backend_local_apply_result(monkeypatch, tmp_path):
+    kanban, _memory = configure(monkeypatch, tmp_path)
+    project_id = "post-apply-verification-backend-local"
+    workflow = coding_workflow()
+    workflow["columns"][2]["transition_to"] = ["verifying", "failed"]
+    workflow["columns"].insert(
+        3,
+        {
+            "status_key": "verifying",
+            "title": "Verifying",
+            "position": 50,
+            "transition_to": ["done", "failed"],
+            "job_template": "verify.scaffold",
+            "input_artifacts": ["backend_local_apply_result"],
+            "output_artifact": "verification_report",
+            "success_action": "workflow_done",
+            "failure_actions": ["verification_failed", "fail"],
+        },
+    )
+    kanban.update_project_workflow(project_id, workflow)
+    task = kanban.create_task(project_id=project_id, title="Apply then verify", status_key="verifying")["task"]
+    kanban.add_artifact(
+        task["id"],
+        artifact_type="backend_local_apply_result",
+        payload={"ok": True, "changed_paths": ["README.md"], "verification": {}},
+    )
+
+    import app.services.workflow as workflow_service
+
+    done = workflow_service.apply_workflow_action(
+        task["id"],
+        "workflow_done",
+        {"phase": "verifying", "reason": "backend-local verification column passed"},
+    )
+
+    detail = kanban.get_task(task["id"])["task"]
+    assert done["task"]["status_key"] == "done"
+    assert detail["status_key"] == "done"
+    assert "workflow_done_guard_blocked" not in [event["event_type"] for event in detail["events"]]
 
 
 def test_apply_failure_creates_failure_bundle_and_task_memory(monkeypatch, tmp_path):
@@ -422,10 +563,81 @@ def test_coding_workflow_validator_requires_lifecycle_contract(monkeypatch, tmp_
 
     workflow = coding_workflow()
     workflow["actions"]["workflow_done"] = {"to": "ready_to_apply"}
-    with pytest.raises(ValueError, match="workflow_done"):
+    with pytest.raises(ValueError, match="code_ready"):
         kanban.update_project_workflow("bad-done-target", workflow)
 
     workflow = coding_workflow()
     workflow["columns"][0]["success_action"] = "workflow_done"
     with pytest.raises(ValueError, match="must use success_action='code_ready'"):
         kanban.update_project_workflow("bad-code-success-action", workflow)
+
+
+def test_coding_workflow_accepts_project_specific_terminal_columns(monkeypatch, tmp_path):
+    kanban, _memory = configure(monkeypatch, tmp_path)
+    workflow = coding_workflow()
+    for column in workflow["columns"]:
+        if column["status_key"] == "done":
+            column["status_key"] = "workflow_complete"
+            column["title"] = "Workflow Complete"
+        elif column["status_key"] == "failed":
+            column["status_key"] = "workflow_failed"
+            column["title"] = "Workflow Failed"
+        column["transition_to"] = [
+            "workflow_complete" if item == "done" else "workflow_failed" if item == "failed" else item
+            for item in column.get("transition_to", [])
+        ]
+    workflow["actions"]["workflow_done"] = {"to": "workflow_complete"}
+    workflow["actions"]["verification_passed"] = {"to": "workflow_complete"}
+    workflow["actions"]["fail"] = {"to": "workflow_failed"}
+    workflow["actions"]["abandon"] = {"to": "workflow_failed"}
+    workflow["actions"]["verification_failed"] = {"to": "workflow_failed"}
+
+    kanban.update_project_workflow("custom-terminal-coding", workflow)
+
+    saved = kanban.get_project_workflow("custom-terminal-coding")
+    assert saved["workflow"]["actions"]["workflow_done"]["to"] == "workflow_complete"
+    assert saved["workflow"]["actions"]["fail"]["to"] == "workflow_failed"
+
+
+def test_ready_to_apply_packaging_column_is_not_treated_as_code_producer(monkeypatch, tmp_path):
+    kanban, _memory = configure(monkeypatch, tmp_path)
+    workflow = coding_workflow()
+    for column in workflow["columns"]:
+        if column["status_key"] == "ready_to_apply":
+            column["job_template"] = "code.package"
+            column["output_artifact"] = "apply_package.json"
+            column["success_action"] = "apply_succeeded"
+
+    kanban.update_project_workflow("ready-package-coding", workflow)
+
+    saved = kanban.get_project_workflow("ready-package-coding")
+    ready = next(item for item in saved["workflow"]["columns"] if item["status_key"] == "ready_to_apply")
+    assert ready["success_action"] == "apply_succeeded"
+
+
+def test_implementation_plan_column_is_not_treated_as_code_producer(monkeypatch, tmp_path):
+    kanban, _memory = configure(monkeypatch, tmp_path)
+    workflow = coding_workflow()
+    workflow["name"] = "implementation-plan-column"
+    workflow["columns"].insert(
+        1,
+        {
+            "status_key": "ready_to_implement",
+            "title": "Ready To Implement",
+            "position": 15,
+            "transition_to": ["implement", "failed"],
+            "job_template": "implementation_plan",
+            "input_artifacts": ["analysis_bundle"],
+            "output_artifact": "implementation_plan",
+            "success_action": "implementation_planned",
+            "failure_actions": ["fail"],
+        },
+    )
+    workflow["columns"][0]["transition_to"] = ["ready_to_implement", "failed"]
+    workflow["actions"]["implementation_planned"] = {"to": "implement"}
+
+    kanban.update_project_workflow("implementation-plan-column", workflow)
+
+    saved = kanban.get_project_workflow("implementation-plan-column")
+    plan_col = next(item for item in saved["workflow"]["columns"] if item["status_key"] == "ready_to_implement")
+    assert plan_col["success_action"] == "implementation_planned"

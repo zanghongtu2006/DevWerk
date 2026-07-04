@@ -999,6 +999,13 @@ def _generic_column_prompt(
                 "project memory, and workflow definition. Do not move Kanban columns yourself; choose "
                 "a semantic next_action from the supplied actions. If the phase succeeds, prefer the "
                 "column success_action. If it cannot succeed, use a configured failure action. "
+                "When the current column is code-producing or has a code_change/output_contract, the "
+                "result MUST include concrete file changes as either top-level ops or "
+                "outputs.code_patch.files. Each file entry must include path and content, and code_patch "
+                "may include target_root/project_root. Do not put generated files only in a prose summary "
+                "or a generic outputs artifact; the workflow engine can only apply concrete file ops. "
+                "Use workspace.write only for explicit tool-driven file writes, not as a substitute for "
+                "returning the final code patch bundle in code-producing phases. "
                 "If external evidence is required and available tools are described in context, return "
                 "decision='need_client_tool' with tool_requests. Persist durable learning through an "
                 "optional writeback object instead of repeating raw conversation. writeback may contain "
@@ -1084,7 +1091,7 @@ def _normalize_generic_agent_output(
 
     normalized = dict(raw)
     notes: list[str] = []
-    for key in ("raw_text", "reply", "content"):
+    for key in ("raw_text", "reply", "summary", "content"):
         parsed = _extract_json_object(str(normalized.get(key) or ""))
         if parsed is not None:
             normalized = {**normalized, **parsed}
@@ -1101,7 +1108,6 @@ def _normalize_generic_agent_output(
         normalized.get("target")
         or normalized.get("target_status")
         or normalized.get("target_column")
-        or normalized.get("status")
         or normalized.get("to")
     )
     if not target and requested and definition.column(requested) is not None:
@@ -1323,7 +1329,7 @@ def _generic_code_response(
 
 def _code_patch_target_root(raw: dict[str, Any], raw_outputs: dict[str, Any] | None = None) -> str:
     outputs = raw_outputs if isinstance(raw_outputs, dict) else raw.get("outputs") if isinstance(raw.get("outputs"), dict) else {}
-    for candidate in (outputs.get("code_patch"), raw.get("code_patch"), outputs, raw):
+    for candidate in _file_bundle_candidates(raw, outputs):
         if not isinstance(candidate, dict):
             continue
         for key in ("target_root", "project_root", "root", "base_dir", "base_path"):
@@ -1343,11 +1349,7 @@ def _code_patch_file_ops(raw: dict[str, Any], raw_outputs: dict[str, Any]) -> li
     falling through to a generic phase artifact.
     """
 
-    candidates = [
-        raw_outputs.get("code_patch"),
-        raw.get("code_patch"),
-        raw_outputs,
-    ]
+    candidates = _file_bundle_candidates(raw, raw_outputs)
     files: object = None
     for candidate in candidates:
         if isinstance(candidate, dict) and isinstance(candidate.get("files"), list):
@@ -1375,6 +1377,34 @@ def _code_patch_file_ops(raw: dict[str, Any], raw_outputs: dict[str, Any]) -> li
             op["language"] = str(language)
         ops.append(op)
     return ops
+
+
+def _file_bundle_candidates(raw: dict[str, Any], raw_outputs: dict[str, Any]) -> list[object]:
+    """Return likely file-bundle containers without coupling to column names.
+
+    Dynamic workflows name artifacts freely, so the protocol should care about
+    the shape (a dict with files containing path/content), not a hard-coded
+    column or artifact label. The common labels are checked first, followed by
+    all nested dict values in outputs.
+    """
+
+    labels = (
+        "code_patch",
+        "staged_patch",
+        "source_bundle",
+        "code_change",
+        "code_change_bundle",
+        "patch",
+        "file_bundle",
+        "files_bundle",
+    )
+    candidates: list[object] = []
+    for label in labels:
+        candidates.append(raw_outputs.get(label))
+        candidates.append(raw.get(label))
+    candidates.extend([raw_outputs, raw])
+    candidates.extend(value for value in raw_outputs.values() if isinstance(value, dict))
+    return candidates
 
 
 def _language_from_path(path: str) -> str | None:

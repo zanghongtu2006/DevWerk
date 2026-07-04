@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 
-LOCAL_CAPABILITIES = {"workspace.list", "workspace.read", "workspace.search"}
+LOCAL_CAPABILITIES = {"workspace.list", "workspace.read", "workspace.search", "workspace.write"}
 BROWSER_CAPABILITIES = {"browser.cdp", "browser.playwright"}
 NETWORK_CAPABILITIES = {"network.http", "network.web"}
 REMOTE_CAPABILITIES = {
@@ -58,6 +58,14 @@ def normalize_tool_request(raw: dict[str, Any], index: int = 0) -> dict[str, Any
         if not isinstance(args.get("paths"), list):
             args["paths"] = []
         args.setdefault("max_results", 50)
+    elif tool == "workspace.write":
+        _require_path(args, index)
+        op = str(args.get("op") or args.get("operation") or "write_file").strip()
+        args["op"] = op or "write_file"
+        if args["op"] not in {"create_file", "update_file", "replace_file", "write_file", "create_dir", "mkdir", "delete_file", "delete_path", "remove"}:
+            raise ToolProtocolError(f"tool_requests[{index}].args.op invalid")
+        if args["op"] not in {"create_dir", "mkdir", "delete_file", "delete_path", "remove"} and "content" not in args:
+            raise ToolProtocolError(f"tool_requests[{index}].args.content missing")
     elif tool == "process.run":
         command = args.get("command")
         if not isinstance(command, (list, str)) or not command:

@@ -123,7 +123,7 @@ def apply_workflow_action(task_id: str, action: str, payload: dict[str, Any] | N
 
     if action_key == ACTION_WORKFLOW_DONE:
         definition = _definition_for_task(task_id)
-        if definition.is_coding and not _coding_done_guard_satisfied(task_id):
+        if definition.is_coding and not _coding_done_guard_satisfied(task_id, definition=definition, payload=data):
             task_detail = get_task(task_id)
             add_event(
                 task_id,
@@ -284,7 +284,9 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     verification = payload.get("verification")
     has_verification_policy = verification_has_policy(verification)
     allow_skip_verification = (not definition.is_coding) or _allow_done_without_verification(definition)
-    passed = not verification_failed(verification) if has_verification_policy else allow_skip_verification
+    apply_success_target = _action_target(definition, ACTION_APPLY_SUCCEEDED) or current_status
+    has_post_apply_step = _has_post_apply_executable(definition, apply_success_target)
+    passed = not verification_failed(verification) if has_verification_policy else (allow_skip_verification or has_post_apply_step)
     status_key = (
         _first_action_target(definition, [ACTION_WORKFLOW_DONE, ACTION_VERIFICATION_PASSED, ACTION_APPLY_SUCCEEDED])
         if passed
@@ -308,6 +310,22 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
 
     latest = _apply_configured_action(task_id, definition, ACTION_APPLY_SUCCEEDED, {"phase": "apply", **payload})
     if passed:
+        current_after_apply = str(((latest.get("task") or {}).get("status_key")) or "")
+        if (
+            current_after_apply
+            and current_after_apply not in _success_statuses(definition)
+            and _has_post_apply_executable(definition, current_after_apply)
+        ):
+            add_event(
+                task_id,
+                "workflow_apply_succeeded_waiting_next_column",
+                {
+                    "phase": "apply",
+                    "status_key": current_after_apply,
+                    "reason": "Apply succeeded; workflow defines additional post-apply columns before success terminal.",
+                },
+            )
+            return latest
         if not has_verification_policy:
             skip_payload = {
                 "reason": "Project policy explicitly allows done without verification.",
@@ -369,6 +387,21 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     if failed is not None:
         return failed
     return _apply_configured_action(task_id, definition, ACTION_FAIL, {"phase": "verify", "reason": reason, **payload})
+
+
+def _has_post_apply_executable(definition: WorkflowDefinition, status_key: str) -> bool:
+    anchor = definition.column(status_key)
+    if anchor is None:
+        return False
+    success_targets = _success_statuses(definition)
+    for column in sorted(definition.columns, key=lambda item: item.position):
+        if column.position < anchor.position:
+            continue
+        if column.status_key in success_targets:
+            return False
+        if column.executable:
+            return True
+    return False
 
 
 def current_workflow_state(task_id: str) -> dict[str, Any]:
@@ -498,18 +531,26 @@ def _allow_done_without_verification(definition: WorkflowDefinition) -> bool:
     return bool(isinstance(lifecycle, dict) and lifecycle.get("allow_done_without_verification") is True)
 
 
-def _coding_done_guard_satisfied(task_id: str) -> bool:
+def _coding_done_guard_satisfied(
+    task_id: str,
+    *,
+    definition: WorkflowDefinition | None = None,
+    payload: dict[str, Any] | None = None,
+) -> bool:
     task = (get_task(task_id).get("task") or {})
     artifacts = task.get("artifacts") if isinstance(task.get("artifacts"), list) else []
     latest_apply = None
     has_verification_skipped = False
+    workflow_done_payload = payload or {}
     for artifact in artifacts:
         if not isinstance(artifact, dict):
             continue
         artifact_type = artifact.get("artifact_type")
-        payload = artifact.get("payload") if isinstance(artifact.get("payload"), dict) else {}
+        artifact_payload = artifact.get("payload") if isinstance(artifact.get("payload"), dict) else {}
         if artifact_type == "apply_result":
-            latest_apply = payload
+            latest_apply = artifact_payload
+        elif artifact_type == "backend_local_apply_result":
+            latest_apply = artifact_payload
         elif artifact_type == "verification_skipped":
             has_verification_skipped = True
     if not isinstance(latest_apply, dict) or latest_apply.get("ok") is not True:
@@ -517,7 +558,32 @@ def _coding_done_guard_satisfied(task_id: str) -> bool:
     verification = latest_apply.get("verification")
     if verification_has_policy(verification):
         return not verification_failed(verification)
-    return has_verification_skipped
+    if has_verification_skipped:
+        return True
+    return _explicit_post_apply_verification_completed(task, definition=definition, payload=workflow_done_payload)
+
+
+def _explicit_post_apply_verification_completed(
+    task: dict[str, Any],
+    *,
+    definition: WorkflowDefinition | None,
+    payload: dict[str, Any] | None,
+) -> bool:
+    if definition is None:
+        return False
+    current_status = str(task.get("status_key") or "").strip().lower()
+    current_column = definition.column(current_status)
+    if current_column is None or current_column.success_action != ACTION_WORKFLOW_DONE:
+        return False
+    apply_target = _action_target(definition, ACTION_APPLY_SUCCEEDED)
+    apply_column = definition.column(apply_target or "") if apply_target else None
+    if apply_column is not None and current_column.position < apply_column.position:
+        return False
+    phase = str((payload or {}).get("phase") or "").strip().lower()
+    verification_markers = ("verify", "verifying", "verification", "review", "checked")
+    return any(marker in current_status for marker in verification_markers) or any(
+        marker in phase for marker in verification_markers
+    )
 
 
 def _failure_stage_from_action(action: str, payload: dict[str, Any]) -> str:

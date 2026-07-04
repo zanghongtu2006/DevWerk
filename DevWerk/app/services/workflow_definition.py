@@ -168,32 +168,30 @@ def _none_if_blank(value: object) -> str | None:
 
 
 def _validate_coding_lifecycle(definition: WorkflowDefinition, known: set[str]) -> None:
-    required_columns = {"ready_to_apply", "done", "failed"}
-    missing_columns = sorted(required_columns - known)
-    if missing_columns:
-        raise ValueError(f"coding workflow missing lifecycle columns: {missing_columns}")
-
-    required_actions = {
-        "code_ready": "ready_to_apply",
-        "apply_succeeded": None,
-        "verification_failed": None,
-        "workflow_done": "done",
-        "fail": "failed",
-        "abandon": "failed",
-        "retry": None,
-    }
-    for action, required_target in required_actions.items():
+    required_actions = (
+        "code_ready",
+        "apply_succeeded",
+        "verification_failed",
+        "workflow_done",
+        "fail",
+        "abandon",
+        "retry",
+    )
+    targets: dict[str, str] = {}
+    for action in required_actions:
         rule = definition.action(action)
         target = str((rule or {}).get("to") or "").strip().lower()
         if rule is None or not target:
             raise ValueError(f"coding workflow missing lifecycle action: {action}")
         if target not in known:
             raise ValueError(f"coding workflow action {action!r} references unknown target {target!r}")
-        if required_target is not None and target != required_target:
-            raise ValueError(f"coding workflow action {action!r} must target {required_target!r}, got {target!r}")
+        targets[action] = target
 
-    retry_target = str((definition.action("retry") or {}).get("to") or "").strip().lower()
-    if retry_target in {"done", "failed"}:
+    if targets["code_ready"] in {targets["workflow_done"], targets["fail"], targets["abandon"]}:
+        raise ValueError("coding workflow action 'code_ready' must target a non-terminal apply gate column")
+
+    retry_target = targets["retry"]
+    if retry_target in {targets["workflow_done"], targets["fail"], targets["abandon"]}:
         raise ValueError("coding workflow action 'retry' must not target terminal lifecycle columns")
 
     for column in definition.columns:
@@ -206,19 +204,24 @@ def _validate_coding_lifecycle(definition: WorkflowDefinition, known: set[str]) 
                     "must use success_action='code_ready'"
                 )
             success_target = str((definition.action(column.success_action or "") or {}).get("to") or "").strip().lower()
-            if success_target != "ready_to_apply":
+            if success_target != targets["code_ready"]:
                 raise ValueError(
                     f"coding workflow code-producing column {column.status_key!r} "
-                    "must transition to ready_to_apply via code_ready"
+                    f"must transition to {targets['code_ready']!r} via code_ready"
                 )
 
 
 def _column_can_produce_code(column: WorkflowColumn) -> bool:
     policy = column.context_policy if isinstance(column.context_policy, dict) else {}
+    status = str(column.status_key or "").lower()
+    if policy.get("output_contract") != "code_change" and any(
+        token in status for token in ("ready_to_apply", "apply", "verify", "done", "fail", "abandon", "retry")
+    ):
+        return False
     output = str(column.output_artifact or "").lower()
     template = str(column.job_template or "").lower()
     if policy.get("requires_apply") is True or policy.get("output_contract") == "code_change":
         return True
-    return any(token in template for token in ("implement", "code", "patch", "repair", "change")) or any(
-        token in output for token in ("code", "patch", "repair", "implementation")
+    return any(token in template for token in ("code", "patch", "repair", "change")) or any(
+        token in output for token in ("code", "patch", "repair")
     )

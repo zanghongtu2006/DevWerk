@@ -17,6 +17,7 @@ BACKEND_CAPABILITIES = {
     "workspace.list",
     "workspace.read",
     "workspace.search",
+    "workspace.write",
     "process.run",
     "project.compile",
     "source.diagnostics",
@@ -144,6 +145,8 @@ def _execute_one(request: ToolRequest, root: Path) -> str:
         return _workspace_read(root, args)
     if tool == "workspace.search":
         return _json(_workspace_search(root, args))
+    if tool == "workspace.write":
+        return _json(_workspace_write(root, args))
     if tool == "process.run":
         return _json(_process_run(root, args))
     if tool == "project.compile":
@@ -213,6 +216,16 @@ def _workspace_search(root: Path, args: dict[str, Any]) -> dict[str, Any]:
             except OSError:
                 continue
     return {"query": query, "matches": matches}
+
+
+def _workspace_write(root: Path, args: dict[str, Any]) -> dict[str, Any]:
+    op = FileOp(
+        op=str(args.get("op") or "write_file"),
+        path=str(args.get("path") or ""),
+        content=str(args.get("content") or "") if "content" in args else None,
+    )
+    changed = _apply_file_op(root, op)
+    return {"ok": True, "path": changed, "op": op.op}
 
 
 def _process_run(root: Path, args: dict[str, Any]) -> dict[str, Any]:

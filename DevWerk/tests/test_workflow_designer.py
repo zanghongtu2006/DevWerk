@@ -407,6 +407,11 @@ def test_workflow_designer_endpoint_records_debug_and_failure_events(monkeypatch
             "agents": {},
         },
     )
+    monkeypatch.setattr(
+        workflow_designer,
+        "_ask_llm_repair",
+        lambda **kwargs: (_ for _ in ()).throw(ValueError("repair disabled in debug failure test")),
+    )
 
     try:
         kanban_routes.kanban_design_project_workflow(

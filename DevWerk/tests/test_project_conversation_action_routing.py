@@ -101,6 +101,11 @@ def test_project_conversation_workflow_design_failure_returns_chat_response(monk
         "_ask_llm",
         lambda **kwargs: {"reply": "ok", "workflow": {"columns": []}, "agents": {}},
     )
+    monkeypatch.setattr(
+        workflow_designer,
+        "_ask_llm_repair",
+        lambda **kwargs: (_ for _ in ()).throw(ValueError("repair disabled in failure test")),
+    )
 
     response = kanban_routes.kanban_project_conversation_message(
         project_id,

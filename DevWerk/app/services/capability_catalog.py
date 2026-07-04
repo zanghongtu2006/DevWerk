@@ -19,6 +19,10 @@ CAPABILITY_METADATA: dict[str, dict[str, str]] = {
         "category": "workspace",
         "summary": "Search project files through a connected workspace provider.",
     },
+    "workspace.write": {
+        "category": "workspace",
+        "summary": "Write project-root relative files through a connected workspace provider.",
+    },
     "process.run": {
         "category": "runtime",
         "summary": "Run a command in a connected local, IDE, CI, or sandbox provider.",

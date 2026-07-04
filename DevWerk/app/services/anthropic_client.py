@@ -179,19 +179,96 @@ class AnthropicClient:
         try:
             return _normalize_top_level_json(json.loads(cleaned), cleaned)
         except json.JSONDecodeError as first_exc:
-            start = cleaned.find("{")
-            end = cleaned.rfind("}")
-            if start >= 0 and end > start:
-                try:
-                    return _normalize_top_level_json(json.loads(cleaned[start:end + 1]), cleaned)
-                except json.JSONDecodeError:
-                    pass
+            decoded = _decode_first_json_value(cleaned)
+            if decoded is not None:
+                value, trailing = decoded
+                if trailing:
+                    _log.debug(
+                        "Anthropic-compatible API returned JSON with trailing text; parsed first object trailing_chars=%s",
+                        len(trailing),
+                    )
+                return _normalize_top_level_json(value, cleaned)
+            repaired = _decode_json_with_missing_closers(cleaned)
+            if repaired is not None:
+                _log.debug("Anthropic-compatible API returned JSON with missing trailing closers; repaired first value")
+                return _normalize_top_level_json(repaired, cleaned)
             _log.debug(
                 "Anthropic-compatible API returned non-JSON text; using raw_text fallback. error=%s snippet=%r",
                 first_exc,
                 cleaned[:500],
             )
             return {"raw_text": cleaned, "reply": cleaned}
+
+
+def _decode_first_json_value(text: str) -> tuple[Any, str] | None:
+    """Decode the first complete JSON value embedded in provider text.
+
+    Some Anthropic-compatible providers occasionally append prose or repeat the
+    same JSON object after the first valid object. A first-brace/last-brace
+    slice turns that into invalid JSON, so use JSONDecoder.raw_decode to consume
+    exactly one JSON value and preserve the extra text for diagnostics.
+    """
+
+    start_candidates = [index for index in (text.find("{"), text.find("[")) if index >= 0]
+    if not start_candidates:
+        return None
+    start = min(start_candidates)
+    decoder = json.JSONDecoder()
+    try:
+        value, end = decoder.raw_decode(text[start:])
+    except json.JSONDecodeError:
+        return None
+    trailing = text[start + end :].strip()
+    return value, trailing
+
+
+def _decode_json_with_missing_closers(text: str) -> Any | None:
+    """Repair provider JSON only when it is missing trailing ]/} closers.
+
+    The repair is deliberately narrow: it does not alter interior content,
+    commas, quotes, or keys. It only appends the closers required by the
+    observed stack when the JSON-looking value reaches end-of-text while still
+    structurally open.
+    """
+
+    start_candidates = [index for index in (text.find("{"), text.find("[")) if index >= 0]
+    if not start_candidates:
+        return None
+    start = min(start_candidates)
+    segment = text[start:].strip()
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for index, char in enumerate(segment):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append("}" if char == "{" else "]")
+        elif char in "}]":
+            if not stack or stack[-1] != char:
+                if stack and not segment[index + 1 :].strip():
+                    expected = stack.pop()
+                    candidate = segment[:index] + expected + "".join(reversed(stack))
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        return None
+                return None
+            stack.pop()
+    if in_string or not stack or len(stack) > 8:
+        return None
+    try:
+        return json.loads(segment + "".join(reversed(stack)))
+    except json.JSONDecodeError:
+        return None
 
 
 def _normalize_top_level_json(value: Any, raw_text: str) -> dict[str, Any]:
