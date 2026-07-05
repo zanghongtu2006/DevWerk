@@ -5,8 +5,10 @@ import logging
 import uuid
 import asyncio
 import re
+import os
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from app.models.protocol import FileOp, IdeChatResponse, PatchOp, ToolRequest
@@ -281,6 +283,59 @@ class WorkflowEngine:
                 add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
                 return
 
+            if _is_success_terminal(definition, target_status):
+                response = _generic_done_response(task_id, project_id, target_status, state)
+                append_conversation_message(
+                    task_id,
+                    role="assistant",
+                    content=response.reply or "Workflow completed.",
+                    message_type="workflow_result",
+                    metadata={"status_key": target_status, "terminal_action": result.action},
+                )
+                update_conversation(task_id, state="done", waiting_for=None, active_column=target_status)
+                _event(
+                    task_id,
+                    "workflow_finished",
+                    {
+                        "ok": True,
+                        "phase": current.status_key,
+                        "status_key": response.status_key,
+                        "action": result.action,
+                        "round": round_no,
+                        "generic_phase_outputs": len(state.phase_outputs),
+                    },
+                )
+                add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
+                return
+
+            if target_status in _failure_statuses(definition):
+                response = _failure_response(
+                    task_id,
+                    "WORKFLOW_FAILED",
+                    f"Workflow moved to failure status {target_status!r}.",
+                    status_key=target_status or _failure_status(definition) or "failed",
+                )
+                _notify_project_conversation_failure(
+                    task_id,
+                    project_id,
+                    phase=current.status_key,
+                    reason=response.error_message or "",
+                    status_key=response.status_key,
+                )
+                _event(
+                    task_id,
+                    "workflow_finished",
+                    {
+                        "ok": False,
+                        "phase": current.status_key,
+                        "status_key": response.status_key,
+                        "action": result.action,
+                        "round": round_no,
+                    },
+                )
+                add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
+                return
+
             next_column = _next_executable_after_transition(definition, target_status, current)
             if result.decision in {"request_replan", "request_rework"} or result.action == "retry":
                 next_column = _next_executable_after_transition(
@@ -481,7 +536,9 @@ class WorkflowEngine:
         )
         _event(task_id, "column_run_started", {"column_run_id": run["id"], "run_no": run["run_no"], "status_key": column.status_key, "job_id": job.id, "agent": job.agent.id})
         try:
-            if handler is None:
+            if _should_run_runtime_apply_column(column, job.template.id):
+                outcome = self._run_runtime_apply_column(task_id, job_body, definition, workflow_summary, column, state)
+            elif handler is None:
                 outcome = await self._run_generic_column(task_id, job_body, definition, workflow_summary, column, state)
             else:
                 result = handler(task_id, job_body, workflow_summary, column, state)
@@ -492,6 +549,149 @@ class WorkflowEngine:
         except Exception as exc:
             finish_column_run(run["id"], state="failed", checkpoint={"error": f"{type(exc).__name__}: {exc}"})
             raise
+
+    def _run_runtime_apply_column(
+        self,
+        task_id: str,
+        body: dict[str, Any],
+        definition: WorkflowDefinition,
+        workflow_summary: dict[str, Any],
+        column: WorkflowColumn,
+        state: WorkflowRunState,
+    ) -> ColumnResult:
+        agent = _active_agent(body)
+        if _current_status(task_id) != column.status_key:
+            enter_action = _entry_action_for_status(definition, column.status_key)
+            if enter_action:
+                apply_workflow_action(task_id, enter_action, {"phase": column.status_key, "reason": "enter runtime apply column"})
+            else:
+                move_task(
+                    task_id,
+                    column.status_key,
+                    force=True,
+                    payload={"phase": column.status_key, "reason": "enter runtime apply column", "action": "workflow_column_entered"},
+                )
+            _event(task_id, "workflow_column_entered", {"status_key": column.status_key, "agent": agent, "runtime": "backend_apply"})
+
+        _event(
+            task_id,
+            "workflow_column_started",
+            {
+                "status_key": column.status_key,
+                "agent": agent,
+                "job_template": column.job_template,
+                "runtime": "backend_apply",
+            },
+        )
+
+        revision = _latest_revision(task_id)
+        if not revision:
+            return self._runtime_apply_failed(
+                task_id,
+                definition,
+                column,
+                reason="Runtime apply column requires a prior revision with concrete file operations.",
+            )
+
+        ops = _model_list(FileOp, revision.get("ops"))
+        patch_ops = _model_list(PatchOp, revision.get("patch_ops"))
+        if not ops and not patch_ops:
+            return self._runtime_apply_failed(
+                task_id,
+                definition,
+                column,
+                reason="Runtime apply column found a revision, but it contains no concrete file operations.",
+            )
+
+        code_ready = _latest_task_artifact_payload(task_id, "code_ready_bundle") or {}
+        root = (
+            str(code_ready.get("target_root") or code_ready.get("project_root") or "").strip()
+            or _effective_project_root(body)
+            or _absolute_root_from_ops(ops)
+        )
+        if not root:
+            return self._runtime_apply_failed(
+                task_id,
+                definition,
+                column,
+                reason="Runtime apply column could not resolve project_root/target_root for concrete file operations.",
+            )
+
+        apply_payload = apply_file_changes(ops=ops, patch_ops=patch_ops, project_root=root)
+        apply_payload.update(
+            {
+                "phase": column.status_key,
+                "revision_id": revision.get("id"),
+                "provider": apply_payload.get("provider") or "devwerk-backend",
+                "_engine_internal": True,
+            }
+        )
+        add_artifact(task_id, artifact_type="backend_local_apply_result", payload=apply_payload)
+        _event(
+            task_id,
+            "backend_local_apply_completed",
+            {
+                "phase": column.status_key,
+                "project_root": root,
+                "revision_id": revision.get("id"),
+                "ok": bool(apply_payload.get("ok")),
+                "changed_paths": apply_payload.get("changed_paths") or [],
+                "error_message": apply_payload.get("error_message"),
+            },
+        )
+
+        moved = apply_workflow_action(task_id, WorkflowAction.APPLY_RESULT, apply_payload)
+        target_status = (moved.get("task") or {}).get("status_key")
+        summary = (
+            f"Runtime apply wrote {len(apply_payload.get('changed_paths') or [])} file(s) under {root}."
+            if apply_payload.get("ok")
+            else str(apply_payload.get("error_message") or "Runtime apply failed.")
+        )
+        output = record_phase_output(
+            task_id,
+            phase=column.status_key,
+            agent=agent,
+            status_key=target_status or column.status_key,
+            summary=summary,
+            inputs=_build_agent_context(task_id, column.status_key, agent, body, workflow_summary, column.input_artifacts or []),
+            outputs={"apply_result": apply_payload},
+            warnings=[] if apply_payload.get("ok") else [summary],
+            decision="approve" if apply_payload.get("ok") else "fail",
+            next_action=WorkflowAction.APPLY_RESULT,
+        )
+        state.phase_outputs.append(output)
+        _event(
+            task_id,
+            "workflow_column_completed",
+            {
+                "status_key": column.status_key,
+                "agent": agent,
+                "decision": output["decision"],
+                "action": WorkflowAction.APPLY_RESULT,
+                "runtime": "backend_apply",
+            },
+        )
+        return ColumnResult(
+            action=WorkflowAction.APPLY_RESULT,
+            target_status=target_status,
+            decision="approve" if apply_payload.get("ok") else "fail",
+        )
+
+    def _runtime_apply_failed(
+        self,
+        task_id: str,
+        definition: WorkflowDefinition,
+        column: WorkflowColumn,
+        *,
+        reason: str,
+    ) -> ColumnResult:
+        _event(task_id, "backend_local_apply_blocked", {"phase": column.status_key, "reason": reason})
+        failed = apply_workflow_action(
+            task_id,
+            WorkflowAction.FAIL,
+            {"phase": column.status_key, "reason": reason, "_engine_internal": True},
+        )
+        return ColumnResult(action=WorkflowAction.FAIL, target_status=(failed.get("task") or {}).get("status_key"), decision="fail")
 
     async def _run_generic_column(
         self,
@@ -735,6 +935,9 @@ class WorkflowEngine:
                 "tool_requests": len(code_response.tool_requests),
                 "changed_paths": changed_paths,
             }
+            target_root = ""
+            if isinstance(code_response.planning, dict):
+                target_root = str(code_response.planning.get("target_root") or code_response.planning.get("project_root") or "").strip()
             add_artifact(
                 task_id,
                 artifact_type="code_ready_bundle",
@@ -742,6 +945,7 @@ class WorkflowEngine:
                     "revision_id": revision["id"],
                     "phase": column.status_key,
                     "agent": agent,
+                    "target_root": target_root,
                     "changed_paths": changed_paths,
                     "ops_count": len(code_response.ops),
                     "patch_ops_count": len(code_response.patch_ops),
@@ -1605,6 +1809,41 @@ def _is_success_terminal(definition: WorkflowDefinition, status_key: str | None)
 
 def _terminal_statuses(definition: WorkflowDefinition) -> set[str]:
     return _success_statuses(definition) | _failure_statuses(definition)
+
+
+def _should_run_runtime_apply_column(column: WorkflowColumn, job_template: str | None) -> bool:
+    policy = column.context_policy if isinstance(column.context_policy, dict) else {}
+    if policy.get("runtime") == "backend_apply" or policy.get("runtime_apply") is True:
+        return True
+    template = canonical_workflow_key(job_template or column.job_template or "")
+    output = canonical_workflow_key(column.output_artifact or "")
+    status = canonical_workflow_key(column.status_key)
+    if template in {"apply", "backend_apply", "apply_runtime"}:
+        return True
+    if output in {"apply_result", "backend_local_apply_result"} and "apply" in status:
+        return True
+    return False
+
+
+def _latest_revision(task_id: str) -> dict[str, Any] | None:
+    task = (get_task(task_id).get("task") or {})
+    revisions = task.get("revisions") if isinstance(task.get("revisions"), list) else []
+    for revision in reversed(revisions):
+        if isinstance(revision, dict):
+            return revision
+    return None
+
+
+def _absolute_root_from_ops(ops: list[FileOp]) -> str:
+    paths = [str(op.path or "").strip() for op in ops if str(op.path or "").strip()]
+    absolute = [Path(path) for path in paths if Path(path).is_absolute()]
+    if not absolute:
+        return ""
+    try:
+        common = Path(os.path.commonpath([str(path) for path in absolute]))
+    except ValueError:
+        return ""
+    return str(common.parent if common.suffix else common)
 
 
 def _safe_fail(task_id: str, payload: dict[str, Any]) -> None:

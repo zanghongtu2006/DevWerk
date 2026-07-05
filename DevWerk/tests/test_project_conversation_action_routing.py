@@ -31,21 +31,34 @@ def test_project_agent_prompt_prevents_premature_save_design(monkeypatch):
     assert "Do not choose design/save_design just because the user describes a project goal" in captured["system"]
 
 
-def test_project_agent_reads_explicit_local_file_before_llm(monkeypatch, tmp_path):
+def test_project_conversation_agent_can_request_local_file_tool(monkeypatch, tmp_path):
     kanban_service = configure_kanban(monkeypatch, tmp_path)
     import app.routes.kanban as kanban_routes
 
-    project_id = "conversation-file-evidence"
-    kanban_service.upsert_project(project_id=project_id, name="Conversation File Evidence")
+    project_id = "conversation-agent-tools"
+    kanban_service.upsert_project(project_id=project_id, name="Conversation Agent Tools")
     log_path = tmp_path / "devwerk-smoke.log"
     log_path.write_text("alpha\nROOT_CAUSE_MARKER: status stopped at ready_to_apply\n", encoding="utf-8")
-    captured = {}
+    captured = {"calls": 0}
 
     class FakeClient:
         def chat_json(self, messages):
+            captured["calls"] += 1
+            if captured["calls"] == 1:
+                return {
+                    "action": "reply",
+                    "reply": "I will inspect the log first.",
+                    "tool_requests": [
+                        {
+                            "id": "read-log",
+                            "tool": "workspace.read",
+                            "args": {"path": str(log_path), "start_line": 1, "end_line": 20},
+                        }
+                    ],
+                }
             payload = json.loads(messages[-1]["content"])
-            captured["local_file_evidence"] = payload["local_file_evidence"]
-            return {"action": "reply", "reply": "The log says status stopped at ready_to_apply."}
+            captured["tool_results"] = payload["tool_results"]
+            return {"action": "reply", "reply": f"The log contains ROOT_CAUSE_MARKER and tool id {payload['tool_results'][0]['id']}."}
 
     monkeypatch.setattr(kanban_routes, "get_llm_client", lambda agent: FakeClient())
 
@@ -58,9 +71,11 @@ def test_project_agent_reads_explicit_local_file_before_llm(monkeypatch, tmp_pat
     )
 
     assert decision["action"] == "reply"
-    assert "ROOT_CAUSE_MARKER" in captured["local_file_evidence"][0]["content"]
+    assert captured["calls"] == 2
+    assert "ROOT_CAUSE_MARKER" in captured["tool_results"][0]["content"]
     events = kanban_service.list_events(project_id=project_id, limit=20)["events"]
-    assert any(event["event_type"] == "project_conversation_file_read" for event in events)
+    assert any(event["event_type"] == "project_conversation_tool_requested" for event in events)
+    assert any(event["event_type"] == "project_conversation_tool_executed" for event in events)
 
 
 @pytest.mark.parametrize(

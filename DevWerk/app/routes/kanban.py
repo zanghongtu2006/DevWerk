@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -12,9 +13,11 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from urllib.parse import quote
 
+from app.models.protocol import ToolRequest
 from app.routes.web_ui import render_web_ui
 from app.services.llm_factory import get_llm_client
-from app.services.local_capability_provider import merge_backend_capabilities
+from app.services.local_capability_provider import execute_tool_requests, merge_backend_capabilities
+from app.services.provider_errors import is_retryable_llm_error
 from app.services.kanban import (
     add_artifact,
     add_event,
@@ -47,6 +50,7 @@ from app.services.skill_manager import (
     upsert_project_skill,
 )
 from app.services.plugin_manager import get_plugin_command, list_enabled_plugin_commands
+from app.services.tool_protocol import ToolProtocolError, normalize_tool_requests
 from app.services.verification_policy import verification_failed, verification_has_policy
 from app.services.workflow import apply_workflow_action, current_workflow_state
 from app.services.workflow_designer import design_project_workflow
@@ -441,6 +445,8 @@ def kanban_project_conversation_message(project_id: str, req: ProjectConversatio
             current_workflow=current_workflow,
             current_agents=current_agents,
             active_task=active_task,
+            workspace=req.workspace,
+            metadata=req.metadata,
         )
         decision_action = str(decision.get("action") or "reply").strip().lower().replace("-", "_")
         if _is_project_explanation_request(user_text) and decision_action in {
@@ -1053,13 +1059,16 @@ def _ask_project_conversation_agent(
     current_workflow: dict[str, Any] | None,
     current_agents: dict[str, Any] | None,
     active_task: dict[str, Any] | None,
+    workspace: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    local_file_evidence = _collect_project_conversation_file_evidence(project_id, messages)
+    max_rounds = _positive_agent_rounds((metadata or {}).get("project_agent_max_rounds"), default=8, maximum=32)
     prompt = [
         {
             "role": "system",
             "content": (
                 "You are DevWerk's project conversation agent. Return one JSON object only. "
+                "You are a real agent with backend local tools, not a passive router. "
                 "You help users create and maintain projects, Kanban workflows, state machines, "
                 "agent definitions, and task dispatch. DevWerk is Kanban-driven: executable work "
                 "must be executed or continued as a workflow task, not bypassed. Decide one action: reply, "
@@ -1081,9 +1090,13 @@ def _ask_project_conversation_agent(
                 "The chat also supports deterministic slash commands: /goal records a project goal, "
                 "/learn records reusable project knowledge, and /distill compacts the conversation into Project.MD. "
                 "Skill management is based on SKILL.md entries at global and project scope. "
-                "When the user names a local file path, DevWerk reads the file before this call and provides "
-                "local_file_evidence. Use that evidence directly; do not claim you cannot read local files. "
-                "JSON shape: {action, reply, save, task_id, task_request, notes}."
+                "You may request backend tools when you need evidence or local OS work. Available tools: "
+                "workspace.list, workspace.read, workspace.search, workspace.write, process.run, "
+                "project.compile, source.diagnostics. If you need a tool, return tool_requests as an array "
+                "and keep action=reply until the tool results come back. Use absolute paths when the user "
+                "gives absolute paths. After tool_results are provided, continue reasoning and return a final "
+                "action. Do not claim you cannot read or write local files when a backend tool can do it. "
+                "JSON shape: {action, reply, save, task_id, task_request, notes, tool_requests}."
             ),
         },
         {
@@ -1094,98 +1107,253 @@ def _ask_project_conversation_agent(
                     "current_workflow": current_workflow or {},
                     "current_agents": current_agents or {},
                     "active_task": active_task or None,
-                    "local_file_evidence": local_file_evidence,
+                    "workspace": workspace or {},
+                    "metadata": metadata or {},
+                    "tool_protocol": {
+                        "request_shape": {"id": "short-id", "tool": "workspace.read", "args": {"path": "absolute-or-project-relative-path"}},
+                        "final_response": {"action": "reply|design|save_design|start_task|continue_task", "reply": "visible user message"},
+                    },
                     "conversation": messages[-16:],
                 },
                 ensure_ascii=False,
             ),
         },
     ]
+    runtime_messages = list(prompt)
     try:
-        decision = get_llm_client("project").chat_json(prompt)
+        for round_no in range(1, max_rounds + 1):
+            decision = _project_conversation_chat_json_with_retry(project_id, runtime_messages)
+            if not isinstance(decision, dict):
+                raise HTTPException(status_code=502, detail="project LLM agent returned a non-object response")
+            tool_requests = _project_agent_tool_requests(decision)
+            add_project_event(
+                project_id,
+                "project_conversation_agent_round",
+                {
+                    "round": round_no,
+                    "action": decision.get("action"),
+                    "reply_preview": str(decision.get("reply") or "")[:1000],
+                    "tool_requests": [request.model_dump() for request in tool_requests],
+                },
+            )
+            if not tool_requests:
+                return _normalize_project_agent_decision(decision)
+            tool_results = _execute_project_conversation_tools(
+                project_id=project_id,
+                requests=tool_requests,
+                messages=messages,
+                workspace=workspace,
+                metadata=metadata or {},
+            )
+            runtime_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
+            runtime_messages.append(
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "tool_results": tool_results,
+                            "instruction": "Use these tool results to continue. Request another tool only if still necessary; otherwise return the final JSON action.",
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            )
     except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, HTTPException):
+            raise
         raise HTTPException(status_code=503, detail=f"project LLM agent failed: {type(exc).__name__}: {exc}") from exc
-    if not isinstance(decision, dict):
-        raise HTTPException(status_code=502, detail="project LLM agent returned a non-object response")
-    return _normalize_project_agent_decision(decision)
+    raise HTTPException(status_code=504, detail=f"project conversation agent exceeded {max_rounds} tool rounds")
 
 
-_QUOTED_LOCAL_PATH_RE = re.compile(r"[\"“”'](?P<path>[A-Za-z]:[\\/][^\"“”']+)[\"“”']")
-_BARE_LOCAL_PATH_RE = re.compile(r"(?P<path>[A-Za-z]:[\\/][^\s，。；;、<>|]+)")
+def _project_conversation_chat_json_with_retry(project_id: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    attempts = 3
+    last_exc: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return get_llm_client("project").chat_json(messages)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt >= attempts or not is_retryable_llm_error(exc):
+                raise
+            delay = min(8.0, 1.5 * attempt)
+            add_project_event(
+                project_id,
+                "project_conversation_llm_retry",
+                {
+                    "attempt": attempt,
+                    "max_attempts": attempts,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "delay_seconds": delay,
+                },
+            )
+            time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
 
 
-def _collect_project_conversation_file_evidence(project_id: str, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    paths = _extract_local_paths_from_messages(messages)
-    evidence: list[dict[str, Any]] = []
-    for raw_path in paths[:4]:
-        item = _read_local_file_evidence(raw_path)
-        evidence.append(item)
+def _project_agent_tool_requests(decision: dict[str, Any]) -> list[ToolRequest]:
+    raw_requests = decision.get("tool_requests")
+    if not raw_requests:
+        return []
+    if not isinstance(raw_requests, list):
+        raise HTTPException(status_code=502, detail="project conversation agent returned non-array tool_requests")
+    try:
+        normalized = normalize_tool_requests(raw_requests)
+    except ToolProtocolError as exc:
+        raise HTTPException(status_code=502, detail=f"project conversation agent emitted invalid tool request: {exc}") from exc
+    return [ToolRequest(**item) for item in normalized]
+
+
+def _execute_project_conversation_tools(
+    *,
+    project_id: str,
+    requests: list[ToolRequest],
+    messages: list[dict[str, Any]],
+    workspace: dict[str, Any] | None,
+    metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    default_root = _project_agent_default_root(messages=messages, workspace=workspace, metadata=metadata)
+    for request in requests:
+        root = _project_agent_tool_root(request, default_root)
         add_project_event(
             project_id,
-            "project_conversation_file_read",
+            "project_conversation_tool_requested",
             {
-                "path": item["path"],
-                "exists": item["exists"],
-                "is_file": item.get("is_file"),
-                "size_bytes": item.get("size_bytes"),
-                "chars": len(str(item.get("content") or "")),
-                "truncated": item.get("truncated"),
-                "error": item.get("error"),
+                "id": request.id,
+                "tool": request.tool,
+                "args": request.args,
+                "project_root": str(root) if root else None,
             },
         )
-    return evidence
+        if root is None:
+            result = {
+                "id": request.id,
+                "ok": False,
+                "error": "project_root is required for relative backend local tool requests; use an absolute path or provide metadata.project_root",
+            }
+        else:
+            result = execute_tool_requests([request], project_root=root)[0].model_dump()
+        add_project_event(
+            project_id,
+            "project_conversation_tool_executed",
+            {
+                "id": result.get("id"),
+                "tool": request.tool,
+                "ok": result.get("ok"),
+                "project_root": str(root) if root else None,
+                "content_preview": str(result.get("content") or "")[:4000],
+                "error": result.get("error"),
+            },
+        )
+        results.append(result)
+    return results
 
 
-def _extract_local_paths_from_messages(messages: list[dict[str, Any]]) -> list[str]:
+def _project_agent_default_root(
+    *,
+    messages: list[dict[str, Any]],
+    workspace: dict[str, Any] | None,
+    metadata: dict[str, Any],
+) -> Path | None:
+    candidates: list[object] = [
+        metadata.get("project_root"),
+        metadata.get("workspace_root"),
+        metadata.get("root"),
+    ]
+    if isinstance(workspace, dict):
+        source_map = workspace.get("source_map") if isinstance(workspace.get("source_map"), dict) else {}
+        candidates.extend(
+            [
+                workspace.get("project_root"),
+                workspace.get("workspace_root"),
+                workspace.get("root"),
+                source_map.get("root"),
+            ]
+        )
+    candidates.extend(_extract_absolute_paths_from_messages(messages))
+    for candidate in candidates:
+        path = _as_existing_root(candidate)
+        if path is not None:
+            return path
+    return None
+
+
+def _project_agent_tool_root(request: ToolRequest, default_root: Path | None) -> Path | None:
+    absolute = _first_absolute_path_from_tool(request)
+    if absolute is not None:
+        return _filesystem_anchor_root(absolute)
+    return default_root
+
+
+def _first_absolute_path_from_tool(request: ToolRequest) -> Path | None:
+    args = request.args or {}
+    candidates: list[object] = [args.get("path"), args.get("cwd")]
+    paths = args.get("paths")
+    if isinstance(paths, list):
+        candidates.extend(paths)
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if not text:
+            continue
+        path = Path(text).expanduser()
+        if path.is_absolute():
+            return path.resolve()
+    return None
+
+
+_ABSOLUTE_PATH_RE = re.compile(r"(?P<path>(?:[A-Za-z]:[\\/]|/)[^\s\"'<>|]+)")
+
+
+def _extract_absolute_paths_from_messages(messages: list[dict[str, Any]]) -> list[Path]:
     text = "\n".join(
         str(item.get("content") or "")
         for item in (messages or [])[-8:]
         if isinstance(item, dict) and str(item.get("role") or "").lower() in {"user", "system"}
     )
-    found: list[str] = []
-    for match in _QUOTED_LOCAL_PATH_RE.finditer(text):
-        found.append(_clean_local_path(match.group("path")))
-    for match in _BARE_LOCAL_PATH_RE.finditer(text):
-        found.append(_clean_local_path(match.group("path")))
-    out: list[str] = []
-    seen: set[str] = set()
-    for path in found:
-        key = path.lower()
-        if path and key not in seen:
-            seen.add(key)
-            out.append(path)
-    return out
+    paths: list[Path] = []
+    for match in _ABSOLUTE_PATH_RE.finditer(text):
+        cleaned = str(match.group("path") or "").strip().strip(".,;:，。；：)]}）】")
+        try:
+            path = Path(cleaned).expanduser()
+            if path.is_absolute():
+                paths.append(path.resolve())
+        except OSError:
+            continue
+    return paths
 
 
-def _clean_local_path(path: str) -> str:
-    return str(path or "").strip().strip(" \t\r\n\"'`，。；;:：、)]}）】")
-
-
-def _read_local_file_evidence(path: str) -> dict[str, Any]:
-    clean = _clean_local_path(path)
-    result: dict[str, Any] = {"path": clean, "exists": False, "content": ""}
+def _as_existing_root(value: object) -> Path | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
     try:
-        file_path = Path(clean).expanduser()
-        result["exists"] = file_path.exists()
-        result["is_file"] = file_path.is_file()
-        if not file_path.exists() or not file_path.is_file():
-            return result
-        size = file_path.stat().st_size
-        result["size_bytes"] = size
-        max_bytes = 48000
-        data = file_path.read_bytes()
-        truncated = len(data) > max_bytes
-        if truncated:
-            if file_path.suffix.lower() in {".log", ".txt", ".jsonl", ".out", ".err"}:
-                data = b"...[truncated: showing tail]\n" + data[-max_bytes:]
-            else:
-                data = data[:max_bytes] + b"\n...[truncated]"
-        result["truncated"] = truncated
-        result["content"] = data.decode("utf-8-sig", errors="replace")
-        return result
-    except Exception as exc:  # noqa: BLE001
-        result["error"] = f"{type(exc).__name__}: {exc}"
-        return result
+        path = Path(text).expanduser().resolve()
+    except OSError:
+        return None
+    if path.is_file():
+        return _filesystem_anchor_root(path)
+    if path.is_dir():
+        return path
+    parent = path.parent
+    if parent.exists() and parent.is_dir():
+        return parent
+    return None
+
+
+def _filesystem_anchor_root(path: Path) -> Path:
+    anchor = path.anchor or "/"
+    return Path(anchor).resolve()
+
+
+def _positive_agent_rounds(value: object, *, default: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    if parsed <= 0:
+        parsed = default
+    return min(parsed, maximum)
 
 
 def _normalize_project_agent_decision(decision: dict[str, Any]) -> dict[str, Any]:

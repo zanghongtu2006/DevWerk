@@ -544,8 +544,6 @@ def _rule_target(rule: dict[str, Any]) -> str | None:
 
 def _can_apply_result_from(definition: WorkflowDefinition, column: Any) -> bool:
     target = _action_target(definition, ACTION_APPLY_SUCCEEDED)
-    if definition.is_coding and canonical_workflow_key(getattr(column, "status_key", "")) != "ready_to_apply":
-        return False
     return bool(target and _target_allowed(column, target))
 
 

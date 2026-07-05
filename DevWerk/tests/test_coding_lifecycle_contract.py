@@ -784,25 +784,34 @@ async def test_backend_local_apply_column_uses_its_own_success_action(monkeypatc
         status_key="apply_scaffold",
         metadata={"source": "project_conversation", "backend_local": True},
     )["task"]
+    revision = kanban.create_revision(
+        task["id"],
+        summary="Prepared concrete scaffold file ops.",
+        ops=[{"op": "create_file", "path": "README.md", "content": "# Applied\n", "language": "markdown"}],
+        patch_ops=[],
+        changed_paths=["README.md"],
+    )
+    kanban.add_artifact(
+        task["id"],
+        artifact_type="code_ready_bundle",
+        payload={
+            "revision_id": revision["id"],
+            "target_root": str(project_root),
+            "changed_paths": ["README.md"],
+            "ops_count": 1,
+            "patch_ops_count": 0,
+        },
+    )
 
     import app.services.workflow_engine as workflow_engine_service
 
     class FakeApplyThenVerifyClient:
+        calls: list[str] = []
+
         def chat_json(self, messages: list[dict]) -> dict:
             payload = json.loads(messages[-1]["content"])
-            if payload["phase"] == "apply_scaffold":
-                return {
-                    "phase": "apply_scaffold",
-                    "summary": "Writing scaffold files.",
-                    "outputs": {
-                        "code_patch": {
-                            "target_root": str(project_root),
-                            "files": [{"path": "README.md", "content": "# Applied\n"}],
-                        }
-                    },
-                    "decision": "approve",
-                    "next_action": "apply_succeeded",
-                }
+            self.calls.append(payload["phase"])
+            assert payload["phase"] != "apply_scaffold"
             assert payload["phase"] == "verifying"
             return {
                 "phase": "verifying",
@@ -831,6 +840,85 @@ async def test_backend_local_apply_column_uses_its_own_success_action(monkeypatc
     assert "code_ready" not in event_types
     assert "apply_succeeded" in event_types
     assert "backend_local_apply_completed" in event_types
+    assert "apply_scaffold" not in FakeApplyThenVerifyClient.calls
+
+
+@pytest.mark.asyncio
+async def test_workflow_stops_at_terminal_before_later_retry_column(monkeypatch, tmp_path):
+    kanban, _memory = configure(monkeypatch, tmp_path)
+    project_id = "terminal-before-retry"
+    workflow = {
+        "name": "terminal-before-retry",
+        "version": 1,
+        "workflow_type": "managed",
+        "requires_apply": False,
+        "columns": [
+            {
+                "status_key": "verifying",
+                "title": "Verifying",
+                "position": 10,
+                "transition_to": ["done", "failed"],
+                "job_template": "verify_generated_files",
+                "output_artifact": "verification_result",
+                "success_action": "workflow_done",
+                "failure_actions": ["fail", "retry"],
+            },
+            {"status_key": "done", "title": "Done", "position": 20, "transition_to": []},
+            {
+                "status_key": "retrying",
+                "title": "Retrying",
+                "position": 30,
+                "transition_to": ["verifying"],
+                "job_template": "retry",
+                "output_artifact": "retry_bundle",
+                "success_action": "retry_complete",
+                "failure_actions": ["fail"],
+            },
+            {"status_key": "failed", "title": "Failed", "position": 40, "transition_to": ["retrying"]},
+        ],
+        "actions": {
+            "workflow_done": {"to": "done"},
+            "fail": {"to": "failed"},
+            "abandon": {"to": "failed"},
+            "retry": {"to": "retrying"},
+            "retry_complete": {"to": "verifying"},
+        },
+    }
+    kanban.update_project_workflow(project_id, workflow)
+    task = kanban.create_task(project_id=project_id, title="Verify terminal", status_key="verifying")["task"]
+
+    import app.services.workflow_engine as workflow_engine_service
+
+    seen_phases: list[str] = []
+
+    class FakeVerifyClient:
+        def chat_json(self, messages: list[dict]) -> dict:
+            payload = json.loads(messages[-1]["content"])
+            seen_phases.append(payload["phase"])
+            assert payload["phase"] == "verifying"
+            return {
+                "phase": "verifying",
+                "summary": "Verification passed.",
+                "outputs": {"checks": [{"name": "ok", "ok": True}]},
+                "decision": "approve",
+                "next_action": "workflow_done",
+            }
+
+    monkeypatch.setattr(workflow_engine_service, "get_llm_client", lambda route: FakeVerifyClient())
+
+    await workflow_engine_service.WorkflowEngine().run(
+        task["id"],
+        {"project_id": project_id, "messages": [{"role": "user", "content": "Verify and finish."}]},
+    )
+
+    detail = kanban.get_task(task["id"])["task"]
+
+    assert detail["status_key"] == "done"
+    assert seen_phases == ["verifying"]
+    assert not any(
+        event["event_type"] == "workflow_round_started" and (event.get("payload") or {}).get("status_key") == "retrying"
+        for event in detail["events"]
+    )
 
 
 def test_ready_to_apply_packaging_column_is_not_treated_as_code_producer(monkeypatch, tmp_path):
