@@ -599,6 +599,240 @@ def test_coding_workflow_accepts_project_specific_terminal_columns(monkeypatch, 
     assert saved["workflow"]["actions"]["fail"]["to"] == "workflow_failed"
 
 
+def test_coding_workflow_normalizes_apply_gate_aliases(monkeypatch, tmp_path):
+    kanban, _memory = configure(monkeypatch, tmp_path)
+    workflow = coding_workflow()
+    for column in workflow["columns"]:
+        if column["status_key"] == "ready_to_apply":
+            column["status_key"] = "ReadyToApply"
+            column["transition_to"] = ["Applied", "Failed"]
+        else:
+            column["transition_to"] = [
+                "readytoapply" if item == "ready_to_apply" else item
+                for item in column.get("transition_to", [])
+            ]
+    workflow["actions"]["code_ready"] = {"target": "readytoapply"}
+    workflow["actions"]["applySucceeded"] = {"to": "Applied"}
+
+    kanban.update_project_workflow("alias-apply-gate", workflow)
+
+    saved = kanban.get_project_workflow("alias-apply-gate")["workflow"]
+    columns = {column["status_key"]: column for column in saved["columns"]}
+    assert "ready_to_apply" in columns
+    assert "ReadyToApply" not in columns
+    assert saved["actions"]["code_ready"]["to"] == "ready_to_apply"
+    assert saved["actions"]["apply_succeeded"]["to"] == "applied"
+
+
+@pytest.mark.asyncio
+async def test_backend_local_code_patch_wins_over_need_client_tool(monkeypatch, tmp_path):
+    kanban, _memory = configure(monkeypatch, tmp_path)
+    project_id = "backend-local-code-before-tools"
+    project_root = tmp_path / "web-project"
+    kanban.update_project_workflow(project_id, coding_workflow())
+    task = kanban.create_task(
+        project_id=project_id,
+        title="Create scaffold",
+        metadata={"source": "project_conversation", "backend_local": True},
+    )["task"]
+
+    import app.services.workflow_engine as workflow_engine_service
+
+    class FakeToolAndPatchClient:
+        def chat_json(self, messages: list[dict]) -> dict:
+            return {
+                "phase": "implement",
+                "summary": "Patch is ready; tool evidence can be collected after apply.",
+                "outputs": {
+                    "code_patch": {
+                        "target_root": str(project_root),
+                        "files": [
+                            {"path": "README.md", "content": "# Generated\n"},
+                        ],
+                    }
+                },
+                "decision": "need_client_tool",
+                "next_action": "retry",
+                "tool_requests": [
+                    {
+                        "id": "mkdirs",
+                        "capability": "workspace.mkdir",
+                        "params": {"paths": [str(project_root / "src")]},
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(workflow_engine_service, "get_llm_client", lambda route: FakeToolAndPatchClient())
+
+    await workflow_engine_service.WorkflowEngine().run(
+        task["id"],
+        {
+            "project_id": project_id,
+            "messages": [{"role": "user", "content": f"Create a project at target_root={project_root.as_posix()}"}],
+            "metadata": {"source": "project_conversation"},
+        },
+    )
+
+    detail = kanban.get_task(task["id"])["task"]
+    assert detail["status_key"] == "done"
+    assert (project_root / "README.md").read_text(encoding="utf-8") == "# Generated\n"
+    event_types = [event["event_type"] for event in detail["events"]]
+    assert "backend_local_apply_completed" in event_types
+    assert "workflow_client_tool_requested" not in event_types
+
+
+@pytest.mark.asyncio
+async def test_backend_local_missing_root_fails_instead_of_waiting_at_apply_gate(monkeypatch, tmp_path):
+    kanban, _memory = configure(monkeypatch, tmp_path)
+    project_id = "backend-local-missing-root"
+    kanban.update_project_workflow(project_id, coding_workflow())
+    task = kanban.create_task(
+        project_id=project_id,
+        title="Create scaffold without root",
+        metadata={"source": "project_conversation", "backend_local": True},
+    )["task"]
+
+    import app.services.workflow_engine as workflow_engine_service
+
+    class FakePatchNoRootClient:
+        def chat_json(self, messages: list[dict]) -> dict:
+            return {
+                "phase": "implement",
+                "summary": "Generated relative files without a target root.",
+                "outputs": {"code_patch": {"files": [{"path": "README.md", "content": "# Missing root\n"}]}},
+                "decision": "approve",
+                "next_action": "code_ready",
+            }
+
+    monkeypatch.setattr(workflow_engine_service, "get_llm_client", lambda route: FakePatchNoRootClient())
+
+    await workflow_engine_service.WorkflowEngine().run(
+        task["id"],
+        {
+            "project_id": project_id,
+            "messages": [{"role": "user", "content": "Create a project but no root path was supplied"}],
+            "metadata": {"source": "project_conversation"},
+        },
+    )
+
+    detail = kanban.get_task(task["id"])["task"]
+    result = [artifact for artifact in detail["artifacts"] if artifact["artifact_type"] == "workflow_result"][-1]["payload"]
+    event_types = [event["event_type"] for event in detail["events"]]
+
+    assert detail["status_key"] == "failed"
+    assert result["ok"] is False
+    assert result["status_key"] == "failed"
+    assert "backend_local_apply_blocked" in event_types
+    assert "workflow_waiting_apply_result" not in event_types
+
+
+@pytest.mark.asyncio
+async def test_backend_local_apply_column_uses_its_own_success_action(monkeypatch, tmp_path):
+    kanban, _memory = configure(monkeypatch, tmp_path)
+    project_id = "backend-local-apply-column"
+    project_root = tmp_path / "generated"
+    workflow = {
+        "name": "dynamic-coding-flow",
+        "version": 1,
+        "workflow_type": "coding",
+        "requires_apply": True,
+        "columns": [
+            {
+                "status_key": "ready_to_apply",
+                "title": "Ready To Apply",
+                "position": 10,
+                "transition_to": ["apply_scaffold", "failed"],
+            },
+            {
+                "status_key": "apply_scaffold",
+                "title": "Apply Scaffold",
+                "position": 20,
+                "transition_to": ["verifying", "failed"],
+                "job_template": "backend_apply",
+                "output_artifact": "apply_result",
+                "success_action": "apply_succeeded",
+                "failure_actions": ["fail"],
+            },
+            {
+                "status_key": "verifying",
+                "title": "Verifying",
+                "position": 30,
+                "transition_to": ["done", "failed"],
+                "job_template": "verify_generated_files",
+                "output_artifact": "verification_result",
+                "success_action": "workflow_done",
+                "failure_actions": ["fail"],
+            },
+            {"status_key": "done", "title": "Done", "position": 90, "transition_to": []},
+            {"status_key": "failed", "title": "Failed", "position": 99, "transition_to": ["ready_to_apply"]},
+        ],
+        "actions": {
+            "code_ready": {"to": "ready_to_apply"},
+            "apply_succeeded": {"to": "verifying"},
+            "verification_passed": {"to": "done"},
+            "verification_failed": {"to": "failed"},
+            "workflow_done": {"to": "done"},
+            "fail": {"to": "failed"},
+            "abandon": {"to": "failed"},
+            "retry": {"to": "ready_to_apply"},
+        },
+    }
+    kanban.update_project_workflow(project_id, workflow)
+    task = kanban.create_task(
+        project_id=project_id,
+        title="Apply a scaffold",
+        status_key="apply_scaffold",
+        metadata={"source": "project_conversation", "backend_local": True},
+    )["task"]
+
+    import app.services.workflow_engine as workflow_engine_service
+
+    class FakeApplyThenVerifyClient:
+        def chat_json(self, messages: list[dict]) -> dict:
+            payload = json.loads(messages[-1]["content"])
+            if payload["phase"] == "apply_scaffold":
+                return {
+                    "phase": "apply_scaffold",
+                    "summary": "Writing scaffold files.",
+                    "outputs": {
+                        "code_patch": {
+                            "target_root": str(project_root),
+                            "files": [{"path": "README.md", "content": "# Applied\n"}],
+                        }
+                    },
+                    "decision": "approve",
+                    "next_action": "apply_succeeded",
+                }
+            assert payload["phase"] == "verifying"
+            return {
+                "phase": "verifying",
+                "summary": "Generated files exist.",
+                "outputs": {"checks": [{"name": "file_exists", "ok": True}]},
+                "decision": "approve",
+                "next_action": "workflow_done",
+            }
+
+    monkeypatch.setattr(workflow_engine_service, "get_llm_client", lambda route: FakeApplyThenVerifyClient())
+
+    await workflow_engine_service.WorkflowEngine().run(
+        task["id"],
+        {
+            "project_id": project_id,
+            "messages": [{"role": "user", "content": f"Apply files at target_root={project_root.as_posix()}"}],
+            "metadata": {"source": "project_conversation"},
+        },
+    )
+
+    detail = kanban.get_task(task["id"])["task"]
+    event_types = [event["event_type"] for event in detail["events"]]
+
+    assert detail["status_key"] == "done"
+    assert (project_root / "README.md").read_text(encoding="utf-8") == "# Applied\n"
+    assert "code_ready" not in event_types
+    assert "apply_succeeded" in event_types
+    assert "backend_local_apply_completed" in event_types
+
+
 def test_ready_to_apply_packaging_column_is_not_treated_as_code_producer(monkeypatch, tmp_path):
     kanban, _memory = configure(monkeypatch, tmp_path)
     workflow = coding_workflow()
@@ -612,7 +846,28 @@ def test_ready_to_apply_packaging_column_is_not_treated_as_code_producer(monkeyp
 
     saved = kanban.get_project_workflow("ready-package-coding")
     ready = next(item for item in saved["workflow"]["columns"] if item["status_key"] == "ready_to_apply")
-    assert ready["success_action"] == "apply_succeeded"
+    assert ready.get("job_template") is None
+    assert ready.get("success_action") is None
+
+
+def test_runtime_skips_code_ready_apply_gate_even_if_it_has_execution_fields(monkeypatch, tmp_path):
+    kanban, _memory = configure(monkeypatch, tmp_path)
+    workflow = coding_workflow()
+    for column in workflow["columns"]:
+        if column["status_key"] == "ready_to_apply":
+            column["job_template"] = "validate_apply_gate"
+            column["success_action"] = "apply_succeeded"
+            column["transition_to"] = ["applied", "failed"]
+    kanban.update_project_workflow("runtime-apply-gate-skip", workflow)
+
+    import app.services.workflow_engine as workflow_engine_service
+    from app.services.workflow_definition import workflow_from_dict
+
+    definition = workflow_from_dict(kanban.get_project_workflow("runtime-apply-gate-skip")["workflow"])
+    executable_statuses = [column.status_key for column in workflow_engine_service._executable_columns(definition)]
+
+    assert "ready_to_apply" not in executable_statuses
+    assert "implement" in executable_statuses
 
 
 def test_implementation_plan_column_is_not_treated_as_code_producer(monkeypatch, tmp_path):

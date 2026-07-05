@@ -801,7 +801,14 @@ def _ensure_workflow_task(body: dict) -> str:
             title=title or "DevWerk workflow task",
             description=user_text,
             status_key=initial_status,
-            metadata={"entrypoint": "/v1/workflows", "mode": body.get("mode", "agent")},
+            metadata={
+                "entrypoint": "/v1/workflows",
+                "mode": body.get("mode", "agent"),
+                "source": (body.get("metadata") or {}).get("source") if isinstance(body.get("metadata"), dict) else None,
+                "backend_local": body.get("backend_local"),
+                "local_backend": body.get("local_backend"),
+                "project_root": body.get("project_root"),
+            },
         )
         task_id = result["task"]["id"]
         _log.debug("workflow: created kanban task_id=%s project_id=%s", task_id, body.get("project_id"))

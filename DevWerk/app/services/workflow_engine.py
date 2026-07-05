@@ -4,6 +4,7 @@ import json
 import logging
 import uuid
 import asyncio
+import re
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from typing import Any
@@ -43,7 +44,15 @@ from app.services.provider_errors import is_retryable_llm_error
 from app.services.tool_protocol import normalize_tool_request
 from app.services.verification_policy import configured_post_apply_tool_requests, verification_feedback_summary
 from app.services.workflow import apply_workflow_action, record_phase_output
-from app.services.workflow_definition import WorkflowColumn, WorkflowDefinition, workflow_from_dict
+from app.services.workflow_definition import (
+    WorkflowAction,
+    WorkflowColumn,
+    WorkflowDefinition,
+    WorkflowStatus,
+    canonical_workflow_key,
+    workflow_column_can_produce_code,
+    workflow_from_dict,
+)
 
 _log = logging.getLogger("devwerk.workflow_engine")
 
@@ -111,11 +120,12 @@ class WorkflowEngine:
             add_artifact(task_id, artifact_type="workflow_result", payload=response.model_dump())
             return
 
+        body = _restore_persistent_runtime_options(task_id, body)
         state = WorkflowRunState()
-        resume_action = str(body.get("resume_action") or "").strip().lower()
-        resume_status = str(body.get("resume_status") or "").strip().lower()
+        resume_action = canonical_workflow_key(body.get("resume_action"))
+        resume_status = canonical_workflow_key(body.get("resume_status"))
         resume_column = definition.column(resume_status) if resume_status else None
-        current = resume_column if resume_column is not None and resume_column.executable else executable[0]
+        current = resume_column if resume_column is not None and _is_runtime_executable_column(definition, resume_column) else executable[0]
         if resume_action:
             update_conversation(task_id, state="running", waiting_for=None, active_column=current.status_key)
             _event(
@@ -620,8 +630,15 @@ class WorkflowEngine:
             body.get("client_capabilities"),
             project_root=body.get("project_root"),
         )
+        code_response = _generic_code_response(
+            task_id=task_id,
+            status_key=column.status_key,
+            raw=raw,
+            summary=summary,
+            tool_requests=tool_requests,
+        )
         decision = _generic_decision(raw.get("decision"), raw.get("next_action"), has_tool_requests=bool(tool_requests))
-        if decision == "need_client_tool" and tool_requests:
+        if decision == "need_client_tool" and tool_requests and not _should_handle_code_response_before_tools(body, code_response):
             if local_backend_enabled(body):
                 root = _effective_project_root(body, raw=raw)
                 if root:
@@ -701,13 +718,6 @@ class WorkflowEngine:
             _event(task_id, "workflow_column_waiting", {**request_payload, "waiting_for": "client_tool"})
             return ColumnResult(action="need_client_tool", target_status=response.status_key, decision="wait", response=response)
 
-        code_response = _generic_code_response(
-            task_id=task_id,
-            status_key=column.status_key,
-            raw=raw,
-            summary=summary,
-            tool_requests=tool_requests,
-        )
         if code_response is not None:
             state.execute_response = code_response
             changed_paths = [op.path for op in code_response.ops] + _patch_paths(code_response)
@@ -824,6 +834,33 @@ class WorkflowEngine:
                             target_status=(applied.get("task") or {}).get("status_key"),
                             decision=decision,
                         )
+                    reason = "Backend-local apply is enabled, but no project_root or target_root could be resolved for concrete code changes."
+                    _event(
+                        task_id,
+                        "backend_local_apply_blocked",
+                        {
+                            "phase": column.status_key,
+                            "revision_id": revision["id"],
+                            "changed_paths": changed_paths,
+                            "reason": reason,
+                        },
+                    )
+                    failed = apply_workflow_action(
+                        task_id,
+                        "fail",
+                        {
+                            "phase": "apply",
+                            "reason": reason,
+                            "revision_id": revision["id"],
+                            "changed_paths": changed_paths,
+                            "_engine_internal": True,
+                        },
+                    )
+                    return ColumnResult(
+                        action="fail",
+                        target_status=(failed.get("task") or {}).get("status_key"),
+                        decision="fail",
+                    )
                 append_conversation_message(
                     task_id,
                     role="assistant",
@@ -844,6 +881,95 @@ class WorkflowEngine:
                     },
                 )
                 return ColumnResult(action=action, target_status=response.status_key, decision=decision, response=response)
+
+            action = _generic_column_action(definition, column, raw, decision)
+            add_artifact(task_id, artifact_type=output_artifact, payload=phase_bundle)
+            output = record_phase_output(
+                task_id,
+                phase=column.status_key,
+                agent=agent,
+                status_key=_action_target(definition, action) or column.status_key,
+                summary=summary,
+                inputs=context,
+                outputs=phase_bundle,
+                warnings=warnings,
+                decision=decision,
+                next_action=action,
+            )
+            state.phase_outputs.append(output)
+            if writeback and memory_run.get("run_id"):
+                writeback_result = handle_agent_writeback(str(memory_run["run_id"]), writeback)
+                add_artifact(task_id, artifact_type="memory_writeback", payload=writeback_result)
+            action_payload = {
+                "phase": column.status_key,
+                "session_id": output["session_id"],
+                "reason": summary,
+                "output_artifact": output_artifact,
+                "revision_id": revision["id"],
+                "changed_paths": changed_paths,
+                "ops_count": len(code_response.ops),
+                "patch_ops_count": len(code_response.patch_ops),
+                "_engine_internal": True,
+            }
+            if local_backend_enabled(body) and (code_response.ops or code_response.patch_ops):
+                root = _effective_project_root(body, raw=raw, response=code_response)
+                if root:
+                    apply_payload = apply_file_changes(
+                        ops=code_response.ops,
+                        patch_ops=code_response.patch_ops,
+                        project_root=root,
+                    )
+                    add_artifact(task_id, artifact_type="backend_local_apply_result", payload=apply_payload)
+                    action_payload.update(apply_payload)
+                    if apply_payload.get("ok") is not True:
+                        action = WorkflowAction.FAIL
+                        action_payload["reason"] = str(apply_payload.get("error_message") or "Backend-local apply failed.")
+                    _event(
+                        task_id,
+                        "backend_local_apply_completed",
+                        {
+                            "phase": column.status_key,
+                            "project_root": root,
+                            "ok": bool(apply_payload.get("ok")),
+                            "changed_paths": apply_payload.get("changed_paths") or [],
+                            "error_message": apply_payload.get("error_message"),
+                        },
+                    )
+                else:
+                    reason = "Backend-local apply is enabled, but no project_root or target_root could be resolved for concrete code changes."
+                    _event(
+                        task_id,
+                        "backend_local_apply_blocked",
+                        {
+                            "phase": column.status_key,
+                            "revision_id": revision["id"],
+                            "changed_paths": changed_paths,
+                            "reason": reason,
+                        },
+                    )
+                    failed = apply_workflow_action(
+                        task_id,
+                        WorkflowAction.FAIL,
+                        {
+                            "phase": column.status_key,
+                            "reason": reason,
+                            "revision_id": revision["id"],
+                            "changed_paths": changed_paths,
+                            "_engine_internal": True,
+                        },
+                    )
+                    return ColumnResult(
+                        action=WorkflowAction.FAIL,
+                        target_status=(failed.get("task") or {}).get("status_key"),
+                        decision="fail",
+                    )
+            moved = apply_workflow_action(task_id, action, action_payload)
+            _event(
+                task_id,
+                "workflow_column_completed",
+                {"status_key": column.status_key, "agent": agent, "decision": decision, "action": action},
+            )
+            return ColumnResult(action=action, target_status=(moved.get("task") or {}).get("status_key"), decision=decision)
 
         add_artifact(task_id, artifact_type=output_artifact, payload=phase_bundle)
         action = _generic_column_action(definition, column, raw, decision)
@@ -1059,8 +1185,8 @@ async def _chat_json_with_retry(model_route: str, messages: list[dict[str, str]]
 
 
 def _generic_decision(decision: object, next_action: object, *, has_tool_requests: bool) -> str:
-    value = str(decision or "").strip().lower().replace("-", "_")
-    action = str(next_action or "").strip().lower().replace("-", "_")
+    value = canonical_workflow_key(decision)
+    action = canonical_workflow_key(next_action)
     if has_tool_requests and value in {"need_client_tool", "tool", "tools", "need_tool"}:
         return "need_client_tool"
     if value in {"approve", "approved", "success", "succeeded", "done", "complete", "completed"}:
@@ -1152,11 +1278,11 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
 
 
 def _action_key(value: object) -> str:
-    return str(value or "").strip().lower().replace("-", "_")
+    return canonical_workflow_key(value)
 
 
 def _status_key(value: object) -> str:
-    return str(value or "").strip().lower().replace("-", "_")
+    return canonical_workflow_key(value)
 
 
 def _action_alias(action: str, definition: WorkflowDefinition, column: WorkflowColumn) -> str:
@@ -1208,7 +1334,7 @@ def _generic_column_action(
     raw: dict[str, Any],
     decision: str,
 ) -> str:
-    requested = str(raw.get("next_action") or raw.get("action") or "").strip().lower().replace("-", "_")
+    requested = canonical_workflow_key(raw.get("next_action") or raw.get("action"))
     if requested and _is_valid_column_action(definition, column, requested):
         return requested
     if decision == "fail":
@@ -1229,7 +1355,7 @@ def _preferred_success_action(definition: WorkflowDefinition, column: WorkflowCo
         return column.success_action
     preferred_targets = [target for target in column.transition_to if target != "failed"]
     for action, rule in definition.actions.items():
-        target = str(rule.get("to") or "").strip().lower() if isinstance(rule, dict) else ""
+        target = canonical_workflow_key(rule.get("to")) if isinstance(rule, dict) else ""
         if target in preferred_targets:
             return action
     done_target = _action_target(definition, "workflow_done")
@@ -1248,14 +1374,16 @@ def _is_valid_column_action(definition: WorkflowDefinition, column: WorkflowColu
 
 
 def _should_force_code_ready(definition: WorkflowDefinition, column: WorkflowColumn) -> bool:
-    if definition.action("code_ready") is None:
+    if definition.action(WorkflowAction.CODE_READY) is None:
         return False
-    if definition.is_coding:
-        return True
+    if not workflow_column_can_produce_code(column):
+        return False
     policy = column.context_policy if isinstance(column.context_policy, dict) else {}
+    if definition.is_coding and column.success_action == WorkflowAction.CODE_READY:
+        return True
     if policy.get("requires_apply") is True:
         return True
-    return _action_target(definition, "code_ready") in set(column.transition_to or [])
+    return _action_target(definition, WorkflowAction.CODE_READY) in set(column.transition_to or [])
 
 
 def _generic_done_response(
@@ -1325,6 +1453,14 @@ def _generic_code_response(
     if target_root:
         response.planning = {"target_root": target_root}
     return response
+
+
+def _should_handle_code_response_before_tools(body: dict[str, Any], response: IdeChatResponse | None) -> bool:
+    if response is None:
+        return False
+    if not local_backend_enabled(body):
+        return False
+    return bool(response.ops or response.patch_ops or response.code_tree)
 
 
 def _code_patch_target_root(raw: dict[str, Any], raw_outputs: dict[str, Any] | None = None) -> str:
@@ -1464,7 +1600,7 @@ def _failure_status(definition: WorkflowDefinition) -> str | None:
 
 
 def _is_success_terminal(definition: WorkflowDefinition, status_key: str | None) -> bool:
-    return str(status_key or "").strip().lower() in _success_statuses(definition)
+    return canonical_workflow_key(status_key) in _success_statuses(definition)
 
 
 def _terminal_statuses(definition: WorkflowDefinition) -> set[str]:
@@ -1699,6 +1835,34 @@ def _latest_task_artifact_payload(task_id: str, artifact_type: str) -> dict[str,
     return None
 
 
+def _restore_persistent_runtime_options(task_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Keep task runtime capabilities stable across retries/resumes."""
+
+    restored = dict(body)
+    previous = _latest_task_artifact_payload(task_id, "workflow_request_body") or {}
+    task_metadata: dict[str, Any] = {}
+    try:
+        task_record = get_task(task_id).get("task") or {}
+        task_metadata = task_record.get("metadata") if isinstance(task_record.get("metadata"), dict) else {}
+    except Exception:  # noqa: BLE001
+        task_metadata = {}
+    for key in ("backend_local", "local_backend", "project_root"):
+        if restored.get(key) in (None, "") and previous.get(key) not in (None, ""):
+            restored[key] = previous.get(key)
+        if restored.get(key) in (None, "") and task_metadata.get(key) not in (None, ""):
+            restored[key] = task_metadata.get(key)
+    if not isinstance(restored.get("client_capabilities"), dict) and isinstance(previous.get("client_capabilities"), dict):
+        restored["client_capabilities"] = previous.get("client_capabilities")
+    if not isinstance(restored.get("metadata"), dict) and isinstance(previous.get("metadata"), dict):
+        restored["metadata"] = previous.get("metadata")
+    elif isinstance(restored.get("metadata"), dict) and isinstance(previous.get("metadata"), dict):
+        restored["metadata"] = {**previous["metadata"], **restored["metadata"]}
+    metadata = restored.get("metadata") if isinstance(restored.get("metadata"), dict) else {}
+    if restored.get("backend_local") is None and (metadata.get("source") == "project_conversation" or task_metadata.get("source") == "project_conversation"):
+        restored["backend_local"] = True
+    return restored
+
+
 def _effective_project_root(
     body: dict[str, Any],
     *,
@@ -1723,12 +1887,35 @@ def _effective_project_root(
         (response.planning or {}).get("target_root") if response and isinstance(response.planning, dict) else None,
         _code_patch_target_root(raw or {}) if isinstance(raw, dict) else None,
         source_map.get("root") if isinstance(source_map, dict) else None,
+        _project_root_from_messages(body.get("messages")),
     ]
     for candidate in candidates:
         text = str(candidate or "").strip()
         if text:
             return text
     return ""
+
+
+def _project_root_from_messages(messages: object) -> str:
+    if not isinstance(messages, list):
+        return ""
+    text = "\n".join(str(item.get("content") or "") for item in messages if isinstance(item, dict))
+    if not text:
+        return ""
+    explicit = re.findall(
+        r"(?:target_root|project_root|workspace_root)\s*[:=]\s*[`'\"]?([A-Za-z]:[\\/][^\s`'\",，。；;]+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if explicit:
+        return explicit[-1].rstrip("`'\".,;，。；")
+    paths = re.findall(r"\b[A-Za-z]:[\\/](?:[^\s`'\"，。；;]+)", text)
+    usable = [
+        item.rstrip("`'\".,;，。；")
+        for item in paths
+        if not any(part in item.replace("\\", "/").lower().split("/") for part in {"target", "build", ".devwerk"})
+    ]
+    return usable[-1] if usable else ""
 
 
 def _ready_response(task_id: str, project_id: str, status_key: str, execute_response: IdeChatResponse) -> IdeChatResponse:
@@ -1961,16 +2148,19 @@ def _first_user_text(messages: list[Any]) -> str:
 
 
 def _executable_columns(definition: WorkflowDefinition) -> list[WorkflowColumn]:
-    return sorted([column for column in definition.columns if column.executable], key=lambda col: col.position)
+    return sorted(
+        [column for column in definition.columns if _is_runtime_executable_column(definition, column)],
+        key=lambda col: col.position,
+    )
 
 
 def _first_executable_at_or_after(definition: WorkflowDefinition, status_key: str) -> WorkflowColumn | None:
-    status = str(status_key or "").strip().lower()
+    status = canonical_workflow_key(status_key)
     columns = sorted(definition.columns, key=lambda col: col.position)
     anchor = next((col for col in columns if col.status_key == status), None)
     if anchor is None:
         return None
-    return next((col for col in columns if col.executable and col.position >= anchor.position), None)
+    return next((col for col in columns if _is_runtime_executable_column(definition, col) and col.position >= anchor.position), None)
 
 
 def _next_executable_after_transition(
@@ -1980,13 +2170,24 @@ def _next_executable_after_transition(
     *,
     include_current: bool = False,
 ) -> WorkflowColumn | None:
-    status = str(status_key or "").strip().lower()
+    status = canonical_workflow_key(status_key)
     columns = sorted(definition.columns, key=lambda col: col.position)
     anchor = next((col for col in columns if col.status_key == status), None)
     if anchor is None:
         return None
     minimum = anchor.position if include_current else (anchor.position + 1 if anchor.status_key == current.status_key else anchor.position)
-    return next((col for col in columns if col.executable and col.position >= minimum), None)
+    return next((col for col in columns if _is_runtime_executable_column(definition, col) and col.position >= minimum), None)
+
+
+def _is_runtime_executable_column(definition: WorkflowDefinition, column: WorkflowColumn) -> bool:
+    if not column.executable:
+        return False
+    status = canonical_workflow_key(column.status_key)
+    if status in _terminal_statuses(definition):
+        return False
+    if definition.is_coding and status == _action_target(definition, WorkflowAction.CODE_READY):
+        return False
+    return True
 
 
 def _positive_int(value: Any, default: int) -> int:
@@ -2001,15 +2202,15 @@ def _action_target(definition: WorkflowDefinition, action: str) -> str | None:
     rule = definition.action(action)
     if not isinstance(rule, dict):
         return None
-    target = str(rule.get("to") or "").strip().lower()
+    target = canonical_workflow_key(rule.get("to"))
     return target or None
 
 
 def _entry_action_for_status(definition: WorkflowDefinition, status_key: str) -> str | None:
-    status = str(status_key or "").strip().lower()
+    status = canonical_workflow_key(status_key)
     candidates = []
     for action, rule in definition.actions.items():
-        if str(rule.get("to") or "").strip().lower() == status:
+        if canonical_workflow_key(rule.get("to")) == status:
             candidates.append(action)
     preferred = [f"{status}_started", f"start_{status}", status]
     for name in preferred:

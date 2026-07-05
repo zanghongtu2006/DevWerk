@@ -24,7 +24,7 @@ def normalize_tool_request(raw: dict[str, Any], index: int = 0) -> dict[str, Any
     if not isinstance(raw, dict):
         raise ToolProtocolError(f"tool_requests[{index}] must be object")
 
-    tool = str(raw.get("tool") or raw.get("name") or "").strip()
+    tool = str(raw.get("tool") or raw.get("name") or raw.get("capability") or "").strip()
     if not tool:
         raise ToolProtocolError(f"tool_requests[{index}].tool invalid")
 
@@ -33,7 +33,24 @@ def normalize_tool_request(raw: dict[str, Any], index: int = 0) -> dict[str, Any
         raise ToolProtocolError(f"tool_requests[{index}].id invalid")
 
     args_obj = raw.get("args") if isinstance(raw.get("args"), dict) else raw.get("arguments")
+    if not isinstance(args_obj, dict):
+        args_obj = raw.get("params") if isinstance(raw.get("params"), dict) else None
     args = dict(args_obj) if isinstance(args_obj, dict) else {}
+
+    if tool in {"workspace.mkdir", "workspace.makedirs"}:
+        tool = "workspace.write"
+        args["op"] = "create_dir"
+        paths = args.get("paths") if isinstance(args.get("paths"), list) else []
+        if paths:
+            args["path"] = str(paths[0] or "")
+    elif tool == "workspace.write" and isinstance(args.get("files"), list):
+        first = next((item for item in args["files"] if isinstance(item, dict)), None)
+        if first is not None:
+            args = {
+                "op": first.get("op") or first.get("operation") or "write_file",
+                "path": first.get("path") or first.get("file") or first.get("name"),
+                "content": first.get("content"),
+            }
 
     if tool == "workspace.read":
         _copy_alias(args, "file_path", "path")

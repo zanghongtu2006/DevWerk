@@ -12,24 +12,29 @@ from app.services.verification_policy import (
     verification_has_policy,
     verification_feedback_summary,
 )
-from app.services.workflow_definition import WorkflowDefinition, workflow_from_dict
+from app.services.workflow_definition import (
+    WorkflowAction,
+    WorkflowDefinition,
+    canonical_workflow_key,
+    workflow_from_dict,
+)
 
 _log = logging.getLogger("devwerk.workflow")
 
 
-ACTION_REQUEST_REPLAN = "request_replan"
-ACTION_REQUEST_REWORK = "request_rework"
-ACTION_APPROVE = "approve"
-ACTION_FAIL = "fail"
-ACTION_NEED_CLIENT_TOOL = "need_client_tool"
-ACTION_APPLY_RESULT = "apply_result"
-ACTION_RETRY = "retry"
-ACTION_ABANDON = "abandon"
-ACTION_APPLY_SUCCEEDED = "apply_succeeded"
-ACTION_VERIFICATION_PASSED = "verification_passed"
-ACTION_VERIFICATION_FAILED = "verification_failed"
-ACTION_WORKFLOW_DONE = "workflow_done"
-ACTION_CODE_READY = "code_ready"
+ACTION_REQUEST_REPLAN = WorkflowAction.REQUEST_REPLAN
+ACTION_REQUEST_REWORK = WorkflowAction.REQUEST_REWORK
+ACTION_APPROVE = WorkflowAction.APPROVE
+ACTION_FAIL = WorkflowAction.FAIL
+ACTION_NEED_CLIENT_TOOL = WorkflowAction.NEED_CLIENT_TOOL
+ACTION_APPLY_RESULT = WorkflowAction.APPLY_RESULT
+ACTION_RETRY = WorkflowAction.RETRY
+ACTION_ABANDON = WorkflowAction.ABANDON
+ACTION_APPLY_SUCCEEDED = WorkflowAction.APPLY_SUCCEEDED
+ACTION_VERIFICATION_PASSED = WorkflowAction.VERIFICATION_PASSED
+ACTION_VERIFICATION_FAILED = WorkflowAction.VERIFICATION_FAILED
+ACTION_WORKFLOW_DONE = WorkflowAction.WORKFLOW_DONE
+ACTION_CODE_READY = WorkflowAction.CODE_READY
 
 CLIENT_VISIBLE_ACTIONS = {ACTION_RETRY, ACTION_ABANDON}
 LIFECYCLE_ACTIONS = {ACTION_FAIL, ACTION_RETRY, ACTION_ABANDON}
@@ -114,7 +119,7 @@ def apply_workflow_action(task_id: str, action: str, payload: dict[str, Any] | N
     This function is the backend-owned state machine boundary: future workflow
     changes should update this mapping while keeping the action protocol stable.
     """
-    action_key = str(action or "").strip().lower().replace("-", "_")
+    action_key = canonical_workflow_key(action)
     data = dict(payload or {})
     _log.debug("workflow action task_id=%s action=%s payload=%s", task_id, action_key, data)
 
@@ -140,7 +145,7 @@ def apply_workflow_action(task_id: str, action: str, payload: dict[str, Any] | N
 
     if action_key == ACTION_RETRY and not data.get("_engine_internal"):
         task_detail = get_task(task_id)
-        current_status = str((task_detail.get("task") or {}).get("status_key") or "")
+        current_status = canonical_workflow_key((task_detail.get("task") or {}).get("status_key"))
         if current_status not in _failure_statuses(_definition_for_task(task_id)):
             add_event(
                 task_id,
@@ -164,13 +169,13 @@ def _workflow_has_action(task_id: str, action: str) -> bool:
 def _transition_by_definition(task_id: str, action: str, payload: dict[str, Any]) -> dict[str, Any]:
     task_detail = get_task(task_id)
     task = task_detail.get("task") or {}
-    current_status = str(task.get("status_key") or "")
+    current_status = canonical_workflow_key(task.get("status_key"))
     definition = _definition_from_task_record(task)
     action_rule = definition.action(action)
     if action_rule is None:
         raise ValueError(f"unknown workflow action for project workflow: {action}")
 
-    to_status = str(action_rule.get("to") or "").strip().lower()
+    to_status = canonical_workflow_key(action_rule.get("to"))
     if not to_status:
         raise ValueError(f"workflow action {action!r} has no target status")
     current_column = definition.column(current_status)
@@ -245,7 +250,7 @@ def _apply_result(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     definition = _definition_for_task(task_id)
     task_detail = get_task(task_id)
     task = task_detail.get("task") or {}
-    current_status = str(task.get("status_key") or "")
+    current_status = canonical_workflow_key(task.get("status_key"))
     current_column = definition.column(current_status)
     if current_column is None or not _can_apply_result_from(definition, current_column):
         add_artifact(task_id, artifact_type="stale_apply_result", payload=payload)
@@ -439,7 +444,7 @@ def current_workflow_state(task_id: str) -> dict[str, Any]:
 
 def available_actions_for_status(status_key: str, definition: WorkflowDefinition | None = None) -> list[str]:
     definition = definition or workflow_from_dict({})
-    status = str(status_key or "").strip().lower()
+    status = canonical_workflow_key(status_key)
     column = definition.column(status)
     if column is None:
         return []
@@ -533,13 +538,13 @@ def _apply_optional_action(
 
 
 def _rule_target(rule: dict[str, Any]) -> str | None:
-    target = str(rule.get("to") or "").strip().lower()
+    target = canonical_workflow_key(rule.get("to"))
     return target or None
 
 
 def _can_apply_result_from(definition: WorkflowDefinition, column: Any) -> bool:
     target = _action_target(definition, ACTION_APPLY_SUCCEEDED)
-    if definition.is_coding and str(getattr(column, "status_key", "") or "") != "ready_to_apply":
+    if definition.is_coding and canonical_workflow_key(getattr(column, "status_key", "")) != "ready_to_apply":
         return False
     return bool(target and _target_allowed(column, target))
 
@@ -590,7 +595,7 @@ def _explicit_post_apply_verification_completed(
 ) -> bool:
     if definition is None:
         return False
-    current_status = str(task.get("status_key") or "").strip().lower()
+    current_status = canonical_workflow_key(task.get("status_key"))
     current_column = definition.column(current_status)
     if current_column is None or current_column.success_action != ACTION_WORKFLOW_DONE:
         return False
@@ -750,16 +755,17 @@ def _is_client_visible_action(action: str, rule: dict[str, Any]) -> bool:
 def _target_allowed(column: Any, target: str, *, action: str | None = None) -> bool:
     if action in LIFECYCLE_ACTIONS:
         return True
-    allowed = set(column.transition_to or [])
-    return target == column.status_key or target in allowed
+    target_key = canonical_workflow_key(target)
+    allowed = {canonical_workflow_key(item) for item in (column.transition_to or [])}
+    return target_key == canonical_workflow_key(getattr(column, "status_key", "")) or target_key in allowed
 
 
 def _action_declared_by_column(column: Any, action: str | None) -> bool:
-    action_key = str(action or "").strip().lower().replace("-", "_")
+    action_key = canonical_workflow_key(action)
     if not action_key:
         return False
-    declared = {str(getattr(column, "success_action", "") or "").strip().lower().replace("-", "_")}
-    declared.update(str(item or "").strip().lower().replace("-", "_") for item in (getattr(column, "failure_actions", None) or []))
+    declared = {canonical_workflow_key(getattr(column, "success_action", ""))}
+    declared.update(canonical_workflow_key(item) for item in (getattr(column, "failure_actions", None) or []))
     return action_key in declared
 
 

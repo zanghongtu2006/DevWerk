@@ -8,8 +8,11 @@ from typing import Any
 
 from app.services.llm_factory import get_llm_client
 from app.services.workflow_definition import (
+    WorkflowColumn,
     WorkflowDefinition,
+    canonical_workflow_key,
     validate_managed_workflow_definition,
+    workflow_column_can_produce_code,
     workflow_from_dict,
 )
 
@@ -333,7 +336,7 @@ def _normalize_workflow(
     workflow = _repair_workflow_object(value, debug=debug)
     workflow["name"] = str(workflow.get("name") or "project-workflow")
     workflow["version"] = int(workflow.get("version") or 1)
-    workflow["workflow_type"] = str(workflow.get("workflow_type") or "").strip().lower()
+    workflow["workflow_type"] = canonical_workflow_key(workflow.get("workflow_type"))
     workflow["requires_apply"] = bool(workflow.get("requires_apply", False))
     workflow["parameters"] = workflow.get("parameters") if isinstance(workflow.get("parameters"), dict) else {}
     workflow["columns"] = _normalize_columns(workflow.get("columns"), base_workflow=base_workflow)
@@ -348,6 +351,7 @@ def _normalize_workflow(
     if workflow["requires_apply"] or workflow["workflow_type"] == "coding":
         _align_reserved_success_actions(workflow["columns"], workflow["actions"], debug=debug)
         _align_verification_success_actions(workflow["columns"], workflow["actions"], debug=debug)
+        _sanitize_coding_lifecycle_boundaries(workflow["columns"], workflow["actions"], debug=debug)
     _align_column_transitions_with_actions(workflow["columns"], workflow["actions"], debug=debug)
     _sanitize_terminal_columns(workflow["columns"], workflow["actions"], debug=debug)
     if debug is not None:
@@ -702,17 +706,43 @@ def _align_verification_success_actions(
         _note(debug, f"verification column {status!r} success_action {previous!r} aligned to 'workflow_done'")
 
 
+def _sanitize_coding_lifecycle_boundaries(
+    columns: list[dict[str, Any]],
+    actions: dict[str, dict[str, Any]],
+    *,
+    debug: dict[str, Any] | None,
+) -> None:
+    apply_gate = _status_key((actions.get("code_ready") or {}).get("to"))
+    if not apply_gate:
+        return
+    for column in columns:
+        if not isinstance(column, dict) or _status_key(column.get("status_key")) != apply_gate:
+            continue
+        removed = []
+        for key in ("job_template", "success_action", "failure_actions", "input_artifacts", "output_artifact"):
+            if column.get(key):
+                removed.append(key)
+                column.pop(key, None)
+        if removed:
+            _note(
+                debug,
+                f"coding apply gate column {apply_gate!r} execution fields removed: {', '.join(removed)}",
+            )
+
+
 def _dict_column_can_produce_code(column: dict[str, Any]) -> bool:
     policy = column.get("context_policy") if isinstance(column.get("context_policy"), dict) else {}
-    status = _status_key(column.get("status_key"))
-    output = _status_key(column.get("output_artifact"))
-    template = _status_key(column.get("job_template"))
-    if policy.get("requires_apply") is True or policy.get("output_contract") == "code_change":
-        return True
-    if any(token in status for token in ("ready_to_apply", "apply", "verify", "done", "fail", "abandon", "retry")):
-        return False
-    return any(token in template for token in ("code", "patch", "repair", "change", "scaffold", "generate")) or any(
-        token in output for token in ("code", "patch", "repair", "scaffold")
+    return workflow_column_can_produce_code(
+        WorkflowColumn(
+            status_key=_status_key(column.get("status_key")),
+            title=str(column.get("title") or column.get("status_key") or ""),
+            position=int(column.get("position") or 0),
+            transition_to=[_status_key(item) for item in column.get("transition_to") or [] if _status_key(item)],
+            job_template=str(column.get("job_template") or "") or None,
+            output_artifact=str(column.get("output_artifact") or "") or None,
+            success_action=_status_key(column.get("success_action")) or None,
+            context_policy=policy,
+        )
     )
 
 
@@ -849,7 +879,7 @@ def _latest_user_text(messages: list[dict[str, Any]]) -> str:
 
 
 def _status_key(value: object) -> str:
-    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return canonical_workflow_key(value)
 
 
 def _workflow_summary(definition: WorkflowDefinition, agents: dict[str, Any]) -> dict[str, Any]:

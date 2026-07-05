@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from tests.workflow_test_utils import configure_kanban, noncoding_workflow
@@ -27,6 +29,38 @@ def test_project_agent_prompt_prevents_premature_save_design(monkeypatch):
 
     assert decision["action"] == "reply"
     assert "Do not choose design/save_design just because the user describes a project goal" in captured["system"]
+
+
+def test_project_agent_reads_explicit_local_file_before_llm(monkeypatch, tmp_path):
+    kanban_service = configure_kanban(monkeypatch, tmp_path)
+    import app.routes.kanban as kanban_routes
+
+    project_id = "conversation-file-evidence"
+    kanban_service.upsert_project(project_id=project_id, name="Conversation File Evidence")
+    log_path = tmp_path / "devwerk-smoke.log"
+    log_path.write_text("alpha\nROOT_CAUSE_MARKER: status stopped at ready_to_apply\n", encoding="utf-8")
+    captured = {}
+
+    class FakeClient:
+        def chat_json(self, messages):
+            payload = json.loads(messages[-1]["content"])
+            captured["local_file_evidence"] = payload["local_file_evidence"]
+            return {"action": "reply", "reply": "The log says status stopped at ready_to_apply."}
+
+    monkeypatch.setattr(kanban_routes, "get_llm_client", lambda agent: FakeClient())
+
+    decision = kanban_routes._ask_project_conversation_agent(
+        project_id=project_id,
+        messages=[{"role": "user", "content": f"请阅读这个日志文件并分析：{log_path}"}],
+        current_workflow={},
+        current_agents={},
+        active_task=None,
+    )
+
+    assert decision["action"] == "reply"
+    assert "ROOT_CAUSE_MARKER" in captured["local_file_evidence"][0]["content"]
+    events = kanban_service.list_events(project_id=project_id, limit=20)["events"]
+    assert any(event["event_type"] == "project_conversation_file_read" for event in events)
 
 
 @pytest.mark.parametrize(

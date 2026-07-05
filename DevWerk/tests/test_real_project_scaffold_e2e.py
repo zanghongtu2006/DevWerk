@@ -276,6 +276,35 @@ def test_real_http_project_conversation_creates_scaffold_on_disk(tmp_path):
         assert (retry_root / "README.md").is_file()
         assert (retry_root / "backend-java" / "pom.xml").is_file()
         assert (retry_root / "backend-java" / "src" / "main" / "java" / "com" / "devwerk" / "points" / "RetryApplication.java").is_file()
+
+        marker = f"DEVWERK_FILE_READ_SMOKE_{uuid.uuid4().hex[:8]}"
+        log_path = tmp_path / "project-conversation-read.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    "workflow stopped at ready_to_apply before the canonical action fix",
+                    f"marker={marker}",
+                    "expected analysis: the project conversation agent must read this file before replying",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        read_response = _request(
+            "POST",
+            f"{base_url}/v1/kanban/projects/{project_id}/conversation",
+            {
+                "action": "message",
+                "message": (
+                    f"Read this local log file and explain what happened: {log_path}. "
+                    f"Include the exact marker {marker} in your reply."
+                ),
+            },
+            timeout=120,
+        )
+        assert read_response["ok"] is True, read_response
+        assert read_response["kind"] == "reply", read_response
+        assert marker in read_response["reply"], read_response
     finally:
         process.terminate()
         try:
