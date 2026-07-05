@@ -30,10 +30,10 @@ Coverage:
   fetched from backend APIs.
 - Usage summary supports global, project, task, and agent breakdowns.
 
-Expected result:
+Expected result as of 2026-07-04:
 
 ```text
-45 passed, 2 skipped
+192 passed, 6 skipped
 ```
 
 Skipped tests are opt-in real-browser and real-LLM tests.
@@ -90,6 +90,31 @@ $env:DEVWERK_RUN_REAL_LLM_SMOKE='1'
 ```
 
 Use this only after `config/llm.json` has a valid `routing.default` and API key.
+
+### Real Project Scaffold Smoke
+
+The live project scaffold smoke exercises the full current product path:
+
+1. starts DevWerk on a temporary port
+2. creates an isolated project
+3. asks the project conversation agent to save a workflow
+4. starts a task for a mini-program points-mall scaffold
+5. lets the workflow engine spawn dynamic column agents
+6. uses backend-local apply into a temporary `project_root`
+7. verifies the workflow reaches the configured success terminal
+8. checks required files exist on disk
+
+Run:
+
+```powershell
+cd DevWerk
+$env:DEVWERK_RUN_REAL_PROJECT_SCAFFOLD_SMOKE='1'
+.\.venv\Scripts\python.exe -m pytest tests\test_real_project_scaffold_e2e.py -q -s
+```
+
+This test is the guard against the failure mode where LLM output exists but is
+not normalized into file operations, or backend-local apply succeeds but the
+done guard fails to recognize the result.
 
 ## Plugin Kotlin Smoke
 

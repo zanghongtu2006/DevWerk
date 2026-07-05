@@ -423,6 +423,16 @@ def kanban_project_conversation_message(project_id: str, req: ProjectConversatio
     if action in {"message", "send"}:
         if not user_text:
             raise HTTPException(status_code=400, detail="message is required")
+        if _is_explicit_project_retry_request(user_text) and not _is_project_explanation_request(user_text):
+            retry_task = _project_retry_task_candidate(project_id, req.metadata)
+            if retry_task is not None:
+                return _handle_project_task_retry(
+                    project_id,
+                    task_id=str(retry_task.get("id") or ""),
+                    user_text=user_text,
+                    metadata=req.metadata,
+                    event_kind="retry",
+                )
         decision = _ask_project_conversation_agent(
             project_id=project_id,
             messages=messages,
@@ -1281,6 +1291,30 @@ def _is_project_explanation_request(text: str) -> bool:
     return any(marker in lower for marker in markers)
 
 
+def _is_explicit_project_retry_request(text: str) -> bool:
+    lower = str(text or "").strip().lower()
+    if not lower:
+        return False
+    markers = (
+        "retry",
+        "re-run",
+        "rerun",
+        "restart task",
+        "restart workflow",
+        "run again",
+        "try again",
+        "retry task",
+        "重试",
+        "重跑",
+        "重启任务",
+        "重新执行",
+        "重新跑",
+        "再试一次",
+        "再跑一次",
+    )
+    return any(marker in lower for marker in markers)
+
+
 def _is_actionable_project_request(lower: str) -> bool:
     markers = (
         "排查",
@@ -1308,6 +1342,49 @@ def _is_actionable_project_request(lower: str) -> bool:
     return any(marker in lower for marker in markers)
 
 
+def _project_retry_task_candidate(project_id: str, metadata: dict[str, Any]) -> dict[str, Any] | None:
+    candidates: list[str] = []
+    for key in ("task_id", "active_task_id"):
+        value = str((metadata or {}).get(key) or "").strip()
+        if value and value not in candidates:
+            candidates.append(value)
+
+    for message in reversed(list_project_conversation_messages(project_id, limit=120).get("messages", [])):
+        task_id = str(message.get("task_id") or "").strip()
+        if task_id and task_id not in candidates:
+            candidates.append(task_id)
+
+    failure_statuses = _project_failure_statuses(project_id)
+    for task_id in candidates:
+        task = _task_for_project(project_id, task_id)
+        if task and str(task.get("status_key") or "") in failure_statuses:
+            return task
+
+    board = get_board(project_id)
+    tasks: list[dict[str, Any]] = []
+    for column in board.get("columns") or []:
+        if not isinstance(column, dict):
+            continue
+        for task in column.get("tasks") or []:
+            if isinstance(task, dict) and str(task.get("status_key") or "") in failure_statuses:
+                tasks.append(task)
+    tasks.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+    return tasks[0] if tasks else None
+
+
+def _project_failure_statuses(project_id: str) -> set[str]:
+    workflow = get_project_workflow(project_id).get("workflow") or {}
+    actions = workflow.get("actions") if isinstance(workflow.get("actions"), dict) else {}
+    failures: set[str] = set()
+    for action in ("fail", "abandon"):
+        rule = actions.get(action) if isinstance(actions, dict) else None
+        if isinstance(rule, dict):
+            target = str(rule.get("to") or "").strip().lower()
+            if target:
+                failures.add(target)
+    return failures or {"failed"}
+
+
 def _task_for_project(project_id: str, task_id: str) -> dict[str, Any] | None:
     if not task_id:
         return None
@@ -1325,6 +1402,64 @@ def _task_is_terminal(project_id: str, task_id: str) -> bool:
     if not task:
         return False
     return str(task.get("status_key") or "") in _project_terminal_statuses(project_id)
+
+
+def _handle_project_task_retry(
+    project_id: str,
+    *,
+    task_id: str,
+    user_text: str,
+    metadata: dict[str, Any],
+    event_kind: str,
+) -> dict[str, Any]:
+    if not task_id:
+        raise HTTPException(status_code=409, detail="retry requested but no failed project task is available")
+    if _task_for_project(project_id, task_id) is None:
+        raise HTTPException(status_code=404, detail=f"task {task_id!r} does not belong to project {project_id!r}")
+    result_cursor = _latest_artifact_created_at(task_id, "workflow_result")
+    result = apply_workflow_action(
+        task_id,
+        "retry",
+        {
+            "phase": "project_conversation",
+            "reason": user_text or "project conversation requested retry",
+            "metadata": metadata or {},
+        },
+    )
+    resume = None if result.get("action_ignored") else _maybe_resume_after_retry(task_id, "retry", result_cursor)
+    if resume:
+        result["workflow_resume"] = resume
+    ok = bool(result.get("ok", True)) and not bool(result.get("action_ignored"))
+    status_key = str((result.get("task") or {}).get("status_key") or "")
+    content = (
+        f"Retry queued for task: {task_id}"
+        if ok
+        else f"Retry was not queued for task {task_id}: {result.get('ignored_action') or 'workflow action ignored'}"
+    )
+    add_project_event(
+        project_id,
+        "project_conversation_message",
+        {
+            "role": "assistant",
+            "content": content,
+            "kind": event_kind,
+            "task_id": task_id,
+            "status_key": status_key,
+            "poll_url": (resume or {}).get("poll_url"),
+            "events_url": (resume or {}).get("events_url"),
+            "result": result,
+        },
+    )
+    return {
+        "ok": ok,
+        "project_id": project_id,
+        "kind": "task_retried",
+        "reply": content,
+        "task_id": task_id,
+        "status_key": status_key,
+        "workflow_resume": resume,
+        "result": result,
+    }
 
 
 def _project_retry_policy(project_id: str) -> dict[str, Any]:

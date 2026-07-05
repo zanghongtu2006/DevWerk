@@ -1,182 +1,150 @@
 # DevWerk
 
-DevWerk is a Kanban-centered AI engineering loop. It is moving from an IDE
-plugin plus backend into a product-shaped workflow engine: the DevWerk service
-owns durable tasks, workflow state, agents, model routing, memory, events, and
-tool contracts; clients provide capabilities such as source-map collection,
-file apply, diagnostics, compile, command execution, or MCP tools.
+DevWerk is a Kanban-centered AI workflow engine. The product core is the
+`DevWerk/` FastAPI service: it owns projects, workflow definitions, task state,
+dynamic column agents, memory, usage accounting, events, artifacts, MCP, and
+the Web UI. Clients such as the IntelliJ plugin, future VS Code providers, CI,
+GitHub, or MCP clients provide capabilities and workspace evidence.
 
 The IntelliJ plugin remains the first capability provider and keeps the most
-important safety rule: every source write is protected by a before/after
-snapshot. The service does not directly mutate the user's repository.
+important code-safety rule: every source write through the plugin is protected
+by before/after snapshots. The service itself is framework-neutral and must not
+depend on IntelliJ, Java, Maven, Gradle, VS Code, or a fixed directory layout.
 
 ## Layout
 
 ```text
 DevWerk/
-  app/          FastAPI service, workflow engine, agents, Kanban, MCP
-  config/       default agents, workflow, LLM config templates
-  tests/        service and workflow tests
+  app/          FastAPI service, workflow engine, Kanban, memory, MCP, Web UI
+  config/       LLM config templates and runtime workflow examples
+  tests/        service, workflow, UI, and real-LLM smoke tests
   startup.bat   Windows service launcher
 
 idea-plugin/
-  IntelliJ capability provider
+  IntelliJ-family capability provider
   source-map collection
   attachments
-  IDE diagnostics/compile tools
+  IDE diagnostics/compile/process tools
   snapshot-protected apply
 
 docs/
-  smoke tests, MCP notes, workflow runtime notes
+  architecture, workflow runtime, MCP, smoke tests, memory notes
+
+scripts/
+packaging/
+  packaging helpers for service/plugin distributions
 ```
 
 The former `backend/` directory has been renamed to `DevWerk/` so the service
 can stand on its own as the product core.
 
-## Architecture
+## Current Architecture
 
 ```text
-Capability Provider
-  IntelliJ plugin, future VS Code provider, CI, GitHub, MCP client
-  - projectId
-  - source map and selected context
-  - attachments
-  - client tool execution
-  - guarded file apply
+User / Web Workbench / IDE / MCP client
         |
         v
-DevWerk Service
-  - /v1/workflows
-  - /v1/kanban/*
-  - /dashboard
-  - /workbench
-  - /mcp
-  - durable conversations and compression
-  - Kanban workflow state machine
-  - per-column agent runs
-  - workflow designer
-  - project memory and audit events
-  - token and request accounting
+DevWerk service
+  project conversation agent
+  workflow designer and validator
+  Kanban state machine
+  workflow engine
+  context compiler and memory writer
+  usage/event/artifact persistence
         |
         v
-LLM Catalog
-  provider/model refs, routing, parameters, cost-aware role mapping
+Dynamic workflow column
+  column definition -> job_template -> temporary column agent
+  context pack -> LLM/tool loop -> phase output
+  semantic action -> next column
+        |
+        v
+Capability provider
+  source map, file read/search, diagnostics, compile, process.run,
+  guarded apply, workspace.write, browser/CDP/Playwright, MCP tools
 ```
 
-Service code must not depend on IntelliJ, VS Code, Java, Maven, or a fixed
-directory layout. It should request named capabilities such as
-`project.compile`, `source.diagnostics`, `workspace.read`, or `process.run`.
-Each client maps those names to its own implementation.
+DevWerk asks for semantic capabilities such as `workspace.read`,
+`workspace.write`, `project.compile`, `source.diagnostics`, `process.run`, or
+browser tools. A provider decides how to implement those names.
 
-## Workflow
+## Workflow Model
 
-The default workflow is:
+Projects do not receive hard-coded Kanban columns. A new project starts
+unconfigured. The project conversation agent talks with the user, proposes and
+saves:
 
-```text
-Draft -> Context Indexed -> Planned -> Coding -> Reviewed -> Ready To Apply
-      -> Applied -> Verified -> Done
-                         \-> Failed
-```
+- project operating guide (`Project.MD` style content)
+- workflow columns
+- semantic actions and transition targets
+- node-agent settings and capability requirements
+- task policy, retry policy, and failure handling
 
-Columns are states. Agents are derived at runtime:
+There are no fixed planner/coder/reviewer Python agents in the runtime. If a
+project needs planning, coding, review, verification, writing, research, or
+editing, those are workflow columns. When a task reaches an executable column,
+DevWerk spawns a temporary column agent from that column definition and destroys
+it after the phase output is recorded.
 
-```text
-column -> job_template -> scheduler -> enabled agent -> model route -> capabilities
-```
+Completion is explicit:
 
-The default agent catalog lives in `DevWerk/config/agents/default.json`.
-The default workflow lives in `DevWerk/config/workflows/default.json`.
-Project-specific workflow overrides are stored in the Kanban DB and can be
-created from the Web Workbench.
+- Success requires a configured action such as `workflow_done`, `complete`, or
+  `completed`.
+- Failure requires configured actions such as `fail` and `abandon`.
+- Retry must target a non-terminal recovery column.
+- A column with no outgoing transition is not treated as a hidden success
+  terminal.
 
-Important runtime rules:
+This is deliberate: Kanban is the task driver, and the state machine must make
+task completion auditable instead of guessing.
 
-- Kanban is the source of task truth.
-- Clients do not move columns directly; they report semantic actions.
-- The state machine drives tasks to `done` or `failed`.
-- Waiting for a client tool is explicit and bounded by supervisor timeouts.
-- Retry is idempotent and resumes from the persisted workflow request.
-- Every column run records events, artifacts, and phase outputs.
-
-## Web UIs
+## Web UI
 
 Start the service, then open:
 
 ```text
-http://localhost:8000/dashboard
 http://localhost:8000/workbench
+http://localhost:8000/dashboard
 http://localhost:8000/docs
+http://localhost:8000/mcp
 ```
 
-`/dashboard` shows statistics, projects, Kanban, task details, events, project
-memory, and global model routing.
+`/workbench` is the product entry. It provides a project list and a large
+project conversation surface. The conversation is used to create projects,
+design workflows, revise agents, start tasks, continue active tasks, and
+inspect runtime feedback.
 
-`/workbench` is the product setup entry. It can:
+`/dashboard`, `/kanban`, `/tasks`, `/events`, `/memory`, `/analytics`, and
+`/settings` share the same backend Web shell. Operational data must come from
+backend APIs, not frontend mock data.
 
-- create a project
-- show projects in a left rail and a large project chat on the right
-- discuss project workflow, agent behavior, state-machine changes, and tasks
-- let the project conversation agent decide whether to reply, save workflow
-  design, start a new task, or continue the active task
-- keep workflow JSON, agent overrides, memory, and events in dashboard views
-  instead of the main conversation surface
+Web assets are split normally:
 
-The workbench is not limited to coding. It is the standalone product entry for
-LLM-driven Kanban projects, including writing, research, review, revision, and
-coding workflows.
+```text
+DevWerk/app/web/templates/dashboard.html
+DevWerk/app/web/static/dashboard.css
+DevWerk/app/web/static/dashboard.js
+```
 
 ## Main APIs
 
-### `POST /v1/workflows`
+- `POST /v1/workflows`
+- `GET /v1/workflows/{task_id}`
+- `GET /v1/workflows/{task_id}/events`
+- `GET /v1/workflows/{task_id}/result`
+- `POST /v1/workflows/{task_id}/messages`
+- `GET /v1/usage/summary?project_id=&task_id=`
+- `GET /v1/kanban/projects`
+- `POST /v1/kanban/projects`
+- `GET/PUT /v1/kanban/projects/{project_id}/workflow`
+- `POST /v1/kanban/projects/{project_id}/workflow/design`
+- `POST /v1/kanban/tasks/{task_id}/actions`
+- `GET/PUT /v1/settings`
 
-Starts or resumes a coding workflow. The service creates or reuses a Kanban task,
-returns `task_id`, `poll_url`, `events_url`, and `result_url`, then runs the
-workflow in the background.
+Legacy `/v1/plan` and `/v1/execute` APIs have been removed. IDE and Web clients
+use `/v1/workflows`, workflow messages, and semantic actions.
 
-Clients should consume:
-
-```text
-GET /v1/workflows/{task_id}/events
-GET /v1/workflows/{task_id}
-GET /v1/workflows/{task_id}/result
-POST /v1/workflows/{task_id}/messages
-```
-
-The event stream is the primary progress channel. Polling is only a fallback.
-
-### `POST /v1/kanban/tasks/{task_id}/actions`
-
-Reports semantic actions such as:
-
-- `apply_result`
-- `retry`
-- `abandon`
-
-Internal agents use the same state-machine boundary with actions such as
-`approve`, `request_recoding`, `request_replan`, and `fail`.
-
-### `POST /v1/kanban/projects/{project_id}/workflow/design`
-
-Generates or revises a project workflow draft from conversation messages:
-
-```json
-{
-  "messages": [{"role": "user", "content": "Add design, coding, review and verify gates"}],
-  "current_workflow": {},
-  "current_agents": {},
-  "save": false
-}
-```
-
-Response includes `workflow`, `agents`, `summary`, `reply`, and validation
-warnings. With `save: true`, the service stores the workflow and project agent
-overrides.
-
-### `GET/PUT /v1/settings`
-
-Reads and writes the LLM catalog in `DevWerk/config/llm.json`.
-
-## Configuration
+## LLM Configuration
 
 `.env` should stay small:
 
@@ -184,30 +152,26 @@ Reads and writes the LLM catalog in `DevWerk/config/llm.json`.
 DEVWERK_LLM_CONFIG_PATH=./config/llm.json
 LOG_LEVEL=debug
 LOG_FILE_ENABLED=true
+LOG_DIR=./data/logs
 ```
 
-Structured model config is kept in JSON:
-
-```text
-DevWerk/config/llm.example.json   committed template
-DevWerk/config/llm.json           local ignored runtime config
-```
-
-Example shape:
+Structured model settings live in `DevWerk/config/llm.json`, which is ignored
+by git. `routing.default` is required. Other route keys are aliases that
+projects and dynamic workflow columns may reference.
 
 ```json
 {
   "routing": {
     "default": "minimax/m3",
-    "planner": "minimax/m3",
-    "executor": "minimax/m3",
-    "reviewer": "minimax/m3"
+    "project": "minimax/m3",
+    "context-indexer": "minimax/m3"
   },
   "llms": {
     "minimax": {
       "api": "anthropic",
       "base_url": "https://api.minimaxi.com/anthropic",
       "api_key": "API_TOKEN",
+      "trust_env_proxy": false,
       "models": {
         "m3": {
           "model": "M3",
@@ -221,9 +185,14 @@ Example shape:
 }
 ```
 
+The Anthropic-compatible client includes tolerant JSON extraction because some
+providers return JSON inside text fields or with repeated/trailing text. The
+workflow engine then normalizes valid embedded JSON before applying the state
+machine protocol.
+
 ## Runtime Data
 
-Default local data paths:
+Default local paths:
 
 ```text
 DevWerk/data/devwerk.db
@@ -233,10 +202,10 @@ DevWerk/data/sessions/{projectId}/project_memory.json
 DevWerk/data/sessions/{projectId}/project_memory.jsonl
 ```
 
-SQLite is the source of truth for tasks, events, artifacts, conversations,
-column runs, and candidate revisions. Task memory is built from the active
-task's conversation, events, artifacts, and phase outputs. Project memory is a
-compact reusable summary carried into every task, not a raw prompt store.
+SQLite is the runtime source of truth for projects, settings, tasks,
+conversations, events, artifacts, column runs, revisions, and usage records.
+Filesystem JSONL is an audit mirror. Project memory is compact reusable
+knowledge carried into tasks; raw prompts are not promoted directly.
 
 ## Running Locally
 
@@ -258,19 +227,32 @@ cd idea-plugin
 
 ## Tests
 
-Service checks:
+Backend checks:
 
 ```powershell
 cd DevWerk
 .\.venv\Scripts\python.exe -m compileall app tests
-.\.venv\Scripts\python.exe -m pytest tests
+.\.venv\Scripts\python.exe -m pytest tests -q
 ```
+
+Real LLM scaffold smoke is opt-in because it spends provider quota:
+
+```powershell
+cd DevWerk
+$env:DEVWERK_RUN_REAL_PROJECT_SCAFFOLD_SMOKE='1'
+.\.venv\Scripts\python.exe -m pytest tests\test_real_project_scaffold_e2e.py -q -s
+```
+
+This live smoke starts DevWerk on a temporary port, uses the configured
+`routing.default` LLM, creates a project, designs a workflow, starts a task,
+uses backend-local file apply, and verifies that a mini-program points-mall
+scaffold is written to disk.
 
 Plugin checks:
 
 ```powershell
 cd idea-plugin
-.\gradlew.bat test verifyPlugin --no-daemon
+.\gradlew.bat compileKotlin
 ```
 
 ## Packaging
@@ -300,18 +282,17 @@ dist/devwerk-release.zip              DevWerk service package
 dist/idea-plugin/DevWerk-*.zip        IntelliJ Platform plugin install package
 ```
 
-The service package includes `install` and `start` scripts for Windows and
-Unix-like systems. Local secrets and runtime data are excluded, including
-`DevWerk/config/llm.json`, `.env*`, `data/`, tests, and bytecode caches.
-
 ## Design Principles
 
 - Kanban first: AI work is workflow, not a hidden chat turn.
-- Workflow is configurable; columns and agents stay independent.
+- Workflow is project-defined; columns and agents stay independent.
+- Completion is explicit; DevWerk does not infer terminal success.
 - The service asks for capabilities, not IDE-specific APIs.
-- Source maps and project memory reduce token cost and improve consistency.
-- Frontend applies through snapshots; service produces guarded operations.
-- Events and artifacts must make fast AI task movement auditable.
+- Source maps, diagnostics, project memory, and task memory reduce token cost
+  and improve consistency.
+- Code writes are guarded through snapshots or backend-local isolated apply.
+- Events, artifacts, phase outputs, and logs must make AI task movement
+  inspectable.
 
 ## License
 

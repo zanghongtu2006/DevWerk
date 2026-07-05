@@ -4,10 +4,10 @@ DevWerk is the product core: a FastAPI service that owns projects, Kanban
 workflow definitions, dynamic workflow-node agents, durable task state, project
 memory, usage accounting, MCP, and the Web UI.
 
-The service does not write source files directly. Capability providers such as
-the IntelliJ plugin, a future VS Code client, CI, GitHub, or an MCP client supply
-workspace evidence and execute granted capabilities. Source writes still go
-through the provider's guarded apply and snapshot path.
+In IDE mode, source writes go through the provider's guarded apply and snapshot
+path. In backend-local mode, the service can write into an explicitly supplied
+isolated project root using the same workflow artifact and apply-result
+protocol. Both paths must produce durable events and artifacts.
 
 ## Setup
 
@@ -71,6 +71,18 @@ projects or dynamically spawned workflow-node agents may reference.
 }
 ```
 
+The Anthropic-compatible client and workflow engine tolerate common provider
+format drift:
+
+- JSON embedded inside `raw_text`, `reply`, `summary`, or `content`
+- repeated/trailing text around the first JSON object
+- file bundles shaped as `code_patch.files`, `staged_patch.files`,
+  `source_bundle.files`, or another dict containing `files` with `path` and
+  `content`
+
+The state machine still requires semantic actions from the active workflow; the
+normalizer only maps provider output into the configured protocol.
+
 ## Workflow Model
 
 DevWerk no longer creates default Kanban columns. A project starts as
@@ -98,6 +110,12 @@ unknown `job_template`, DevWerk derives a temporary `{column}-agent` from the
 project agent defaults or a project override. The agent is disposed after the
 column run; durable state is kept as artifacts, events, revisions, task memory,
 and project memory.
+
+Completion is explicit. A workflow must define success and failure actions such
+as `workflow_done`, `fail`, and `abandon`; DevWerk does not treat a no-transition
+column as a hidden success terminal. Coding workflows also require a concrete
+code result before completion. A code result may come from plugin apply evidence
+or from backend-local apply evidence.
 
 ## Web UI
 
@@ -155,6 +173,10 @@ cd DevWerk
 $env:LOG_FILE_ENABLED='false'
 .\.venv\Scripts\python.exe -m compileall app tests
 .\.venv\Scripts\python.exe -m pytest tests -q
+
+# optional live LLM scaffold smoke; requires config/llm.json routing.default
+$env:DEVWERK_RUN_REAL_PROJECT_SCAFFOLD_SMOKE='1'
+.\.venv\Scripts\python.exe -m pytest tests\test_real_project_scaffold_e2e.py -q -s
 
 cd ..\idea-plugin
 .\gradlew.bat compileKotlin

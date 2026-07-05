@@ -154,6 +154,60 @@ def test_project_conversation_explanation_request_does_not_continue_task(monkeyp
     assert response["decision"]["override_reason"] == "explanation_request"
 
 
+def test_project_conversation_explicit_retry_uses_workflow_retry_action(monkeypatch, tmp_path):
+    kanban_service = configure_kanban(monkeypatch, tmp_path)
+    import app.routes.kanban as kanban_routes
+    from app.routes import workflows as workflow_routes
+
+    project_id = "dispatch-retry"
+    kanban_service.upsert_project(project_id=project_id, name="Dispatch Retry")
+    kanban_service.update_project_workflow(project_id, noncoding_workflow(domain="writing"))
+    task = kanban_service.create_task(project_id=project_id, title="Failed draft", description="Failed")
+    task_id = task["task"]["id"]
+    kanban_service.add_artifact(
+        task_id,
+        artifact_type="workflow_request_body",
+        payload={
+            "project_id": project_id,
+            "messages": [{"role": "user", "content": "Write the article."}],
+            "workspace": {"root_id": project_id},
+        },
+    )
+    kanban_service.move_task(task_id, "failed", force=True)
+
+    def _unexpected_project_llm(*args, **kwargs):
+        raise AssertionError("explicit retry should not ask the project LLM to guess routing")
+
+    resumed = {}
+
+    monkeypatch.setattr(kanban_routes, "_ask_project_conversation_agent", _unexpected_project_llm)
+    monkeypatch.setattr(
+        workflow_routes,
+        "_start_workflow_thread",
+        lambda task_id_arg, body: resumed.setdefault("payload", {"task_id": task_id_arg, "body": body}),
+    )
+
+    response = kanban_routes.kanban_project_conversation_message(
+        project_id,
+        kanban_routes.ProjectConversationRequest(
+            action="message",
+            message="retry task",
+            metadata={"active_task_id": task_id},
+        ),
+    )
+
+    detail = kanban_service.get_task(task_id)["task"]
+    event_types = [event["event_type"] for event in detail["events"]]
+    assert response["kind"] == "task_retried"
+    assert response["task_id"] == task_id
+    assert response["workflow_resume"]["reason"] == "retry"
+    assert detail["status_key"] == "intake"
+    assert resumed["payload"]["task_id"] == task_id
+    assert resumed["payload"]["body"]["retry_nonce"]
+    assert "workflow_retry_queued" in event_types
+    assert "manual_retry_requested" in event_types
+
+
 def test_explicit_continue_terminal_task_returns_reply(monkeypatch, tmp_path):
     kanban_service = configure_kanban(monkeypatch, tmp_path)
     import app.routes.kanban as kanban_routes

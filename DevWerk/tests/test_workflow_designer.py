@@ -296,6 +296,11 @@ def test_workflow_designer_does_not_infer_terminal_actions(monkeypatch):
             "agents": {},
         },
     )
+    monkeypatch.setattr(
+        workflow_designer,
+        "_ask_llm_repair",
+        lambda **kwargs: (_ for _ in ()).throw(ValueError("repair disabled for terminal-action guard test")),
+    )
 
     try:
         workflow_designer.design_project_workflow(

@@ -59,7 +59,7 @@ When the workflow reaches that column:
    summary, required artifacts, task events, task memory, project memory, source
    map summary, diagnostics, and client capabilities.
 5. The column agent returns JSON with `summary`, `outputs`, `decision`,
-   `next_action`, optional `tool_requests`, and optional `ops/patch_ops`.
+   `next_action`, optional `tool_requests`, and optional file changes.
 6. DevWerk records phase output, artifacts, events, and revisions.
 7. The state machine applies `next_action` using the project workflow
    definition.
@@ -80,6 +80,15 @@ column as an implicit terminal state.
 If a project workflow omits the explicit success or failure actions, DevWerk
 rejects the workflow definition instead of guessing.
 
+Coding workflows also require concrete apply evidence before completion:
+
+- plugin mode records `apply_result` after snapshot-protected client apply.
+- backend-local mode records `backend_local_apply_result` after writing to an
+  explicitly supplied isolated `project_root`.
+- post-apply verification/review columns may then emit `workflow_done`.
+- if the apply/verification guard is not satisfied, `workflow_done` is ignored
+  and an audit event records the reason.
+
 ## Prompt Management
 
 Prompt construction is centralized in the workflow engine:
@@ -94,6 +103,21 @@ Prompt construction is centralized in the workflow engine:
 There are no fixed planner/coder/reviewer Python agents in the runtime. If a
 project wants planning, coding, reviewing, testing, writing, editing, or
 research phases, those are workflow columns that spawn dynamic agents.
+
+## Provider Output Normalization
+
+The engine normalizes common LLM/provider drift before applying the state
+machine:
+
+- JSON embedded in `raw_text`, `reply`, `summary`, or `content`.
+- first valid JSON object inside repeated/trailing provider text.
+- target-column style responses mapped back to configured semantic actions.
+- file bundles with `files` entries containing `path` and `content`.
+
+Accepted file-bundle shapes include `code_patch.files`, `staged_patch.files`,
+`source_bundle.files`, and other shape-compatible dicts. This is intentionally
+shape-based rather than column-name-based so dynamic workflows can use their own
+artifact names.
 
 ## Client Capability Direction
 
