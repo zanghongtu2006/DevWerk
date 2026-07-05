@@ -178,8 +178,12 @@ def _workspace_list(root: Path, args: dict[str, Any]) -> dict[str, Any]:
 
 def _workspace_read(root: Path, args: dict[str, Any]) -> str:
     path = _safe_path(root, args.get("path") or "", create_parent=False)
-    if not path.exists() or not path.is_file():
+    if not path.exists():
         raise LocalCapabilityError(f"file not found: {_rel(root, path)}")
+    if path.is_dir():
+        return _json(_workspace_list(root, {**args, "path": _rel(root, path)}))
+    if not path.is_file():
+        raise LocalCapabilityError(f"not a regular file: {_rel(root, path)}")
     start = _positive_int(args.get("start_line"), 1, maximum=1_000_000)
     end = _positive_int(args.get("end_line"), start + 220, maximum=1_000_000)
     if end < start:

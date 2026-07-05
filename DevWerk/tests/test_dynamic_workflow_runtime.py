@@ -646,3 +646,24 @@ async def test_backend_local_workspace_write_tool_is_available(monkeypatch, tmp_
 
     assert (project_root / "notes" / "summary.md").read_text(encoding="utf-8") == "# Summary\n"
     assert kanban.get_task(task["id"])["task"]["status_key"] == "done"
+
+
+def test_backend_local_workspace_read_directory_returns_listing(tmp_path):
+    from app.models.protocol import ToolRequest
+    from app.services.local_capability_provider import execute_tool_requests
+
+    project_root = tmp_path / "workspace"
+    (project_root / "logs").mkdir(parents=True)
+    (project_root / "logs" / "devwerk.log").write_text("ready_to_apply\n", encoding="utf-8")
+
+    results = execute_tool_requests(
+        [ToolRequest(id="read-logs-dir", tool="workspace.read", args={"path": "logs", "max_depth": 1})],
+        project_root=project_root,
+    )
+
+    assert len(results) == 1
+    assert results[0].ok is True
+    payload = json.loads(results[0].content or "{}")
+    assert payload["path"] == "logs"
+    assert payload["exists"] is True
+    assert [item["path"] for item in payload["items"]] == ["logs/devwerk.log"]

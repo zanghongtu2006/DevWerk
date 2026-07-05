@@ -95,7 +95,7 @@ class AgentCatalog:
                     capabilities=_strings(raw.get("capabilities")),
                     skills=_strings(raw.get("skills")),
                     memory_policy=str(raw.get("memory_policy") or "task_and_project").strip(),
-                    context_policy=dict(raw.get("context_policy") or {}),
+                    context_policy=_dict(raw.get("context_policy")),
                     enabled=bool(raw.get("enabled", True)),
                 )
             )
@@ -125,7 +125,7 @@ def agent_catalog_from_dict(value: dict[str, Any]) -> AgentCatalog:
                 capabilities=_strings(raw.get("capabilities")),
                 skills=_strings(raw.get("skills")),
                 memory_policy=str(raw.get("memory_policy") or "task_and_project").strip(),
-                context_policy=dict(raw.get("context_policy") or {}),
+                context_policy=_dict(raw.get("context_policy")),
                 enabled=bool(raw.get("enabled", True)),
             )
         )
@@ -157,6 +157,10 @@ def _strings(value: object) -> tuple[str, ...]:
     if not isinstance(value, list):
         return ()
     return tuple(str(item).strip() for item in value if str(item).strip())
+
+
+def _dict(value: object) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
 
 
 def _optional_text(value: object) -> str | None:

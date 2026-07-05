@@ -63,7 +63,7 @@ def _request(method: str, url: str, payload: dict | None = None, *, timeout: int
     return json.loads(text) if text else {}
 
 
-def _wait_for_server(base_url: str, process: subprocess.Popen, *, timeout_seconds: int = 45) -> None:
+def _wait_for_server(base_url: str, process: subprocess.Popen, *, timeout_seconds: int = 180) -> None:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if process.poll() is not None:

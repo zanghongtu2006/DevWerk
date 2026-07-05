@@ -280,6 +280,8 @@ def _validate_coding_lifecycle(definition: WorkflowDefinition, known: set[str]) 
 def workflow_column_can_produce_code(column: WorkflowColumn) -> bool:
     policy = column.context_policy if isinstance(column.context_policy, dict) else {}
     status = str(column.status_key or "").lower()
+    if status == "code_ready":
+        return False
     if policy.get("output_contract") != "code_change" and status.startswith("ready_to_"):
         return False
     if policy.get("output_contract") != "code_change" and any(

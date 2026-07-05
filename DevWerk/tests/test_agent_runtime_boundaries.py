@@ -77,3 +77,41 @@ def test_capability_broker_maps_semantic_name_to_provider_implementation():
     assert offer is not None
     assert offer.provider == "ci-runner"
     assert offer.implementation == "pipeline.execute_compile_job"
+
+
+def test_agent_catalog_ignores_invalid_context_policy_shapes():
+    catalog = agent_catalog_from_dict(
+        {
+            "agents": [
+                {
+                    "id": "devwerk-general",
+                    "roles": ["general"],
+                    "runtime": "tool_loop",
+                    "model_route": "default",
+                    "context_policy": ["not", "a", "mapping"],
+                }
+            ],
+            "job_templates": [
+                {
+                    "id": "general_task",
+                    "role": "general",
+                    "output_contract": "task_result",
+                }
+            ],
+        }
+    )
+
+    assert catalog.agents[0].context_policy == {}
+
+    overridden = catalog.with_project_overrides(
+        {
+            "project-agent": {
+                "roles": ["general"],
+                "model_route": "default",
+                "context_policy": "invalid",
+            }
+        }
+    )
+
+    assert overridden.agents[-1].id == "project-agent"
+    assert overridden.agents[-1].context_policy == {}

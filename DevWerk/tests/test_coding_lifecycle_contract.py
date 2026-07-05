@@ -232,6 +232,49 @@ async def test_summary_embedded_staged_patch_is_treated_as_applyable_code_result
     assert "fail" not in [event["event_type"] for event in detail["events"]]
 
 
+@pytest.mark.asyncio
+async def test_truncated_raw_text_file_bundle_still_creates_revision(monkeypatch, tmp_path):
+    kanban, _memory = configure(monkeypatch, tmp_path)
+    project_id = "truncated-raw-file-bundle"
+    kanban.update_project_workflow(project_id, coding_workflow())
+    task = kanban.create_task(project_id=project_id, title="Generate a scaffold")["task"]
+
+    import app.services.workflow_engine as workflow_engine_service
+
+    class FakeTruncatedRawPatchClient:
+        def chat_json(self, messages: list[dict]) -> dict:
+            return {
+                "raw_text": (
+                    '{"phase":"implement","summary":"Generated files","outputs":{"code_patch":{"target_root":"'
+                    + tmp_path.as_posix()
+                    + '","files":['
+                    + json.dumps({"path": "README.md", "content": "# Scaffold\n"})
+                    + ","
+                    + json.dumps({"path": "src/App.java", "content": "class App {}\n"})
+                    + ',{"path":"unfinished.java","content":"class Unfinished {'
+                ),
+                "reply": "truncated provider text",
+            }
+
+    monkeypatch.setattr(workflow_engine_service, "get_llm_client", lambda route: FakeTruncatedRawPatchClient())
+
+    await workflow_engine_service.WorkflowEngine().run(
+        task["id"],
+        {"project_id": project_id, "messages": [{"role": "user", "content": "Create the scaffold"}]},
+    )
+
+    detail = kanban.get_task(task["id"])["task"]
+    result = [artifact for artifact in detail["artifacts"] if artifact["artifact_type"] == "workflow_result"][-1]["payload"]
+    ready_bundle = [artifact for artifact in detail["artifacts"] if artifact["artifact_type"] == "code_ready_bundle"][-1]["payload"]
+
+    assert detail["status_key"] == "ready_to_apply"
+    assert result["ok"] is True
+    assert [op["path"] for op in result["ops"]] == ["README.md", "src/App.java"]
+    assert ready_bundle["ops_count"] == 2
+    assert detail["revisions"][-1]["changed_paths"] == ["README.md", "src/App.java"]
+    assert "fail" not in [event["event_type"] for event in detail["events"]]
+
+
 def test_coding_workflow_rejects_done_without_apply_result(monkeypatch, tmp_path):
     kanban, _memory = configure(monkeypatch, tmp_path)
     project_id = "done-guard"
@@ -251,6 +294,74 @@ def test_coding_workflow_rejects_done_without_apply_result(monkeypatch, tmp_path
     assert detail["status_key"] == "ready_to_apply"
     event_types = [event["event_type"] for event in detail["events"]]
     assert "workflow_done_guard_blocked" in event_types
+
+
+def test_verification_success_action_loop_is_normalized_to_workflow_done():
+    import app.services.workflow_engine as workflow_engine_service
+    from app.services.workflow_definition import workflow_from_dict
+
+    definition = workflow_from_dict(
+        {
+            "name": "verification-loop-guard",
+            "version": 1,
+            "workflow_type": "coding",
+            "requires_apply": True,
+            "columns": [
+                {
+                    "status_key": "implementation",
+                    "title": "Implementation",
+                    "position": 10,
+                    "transition_to": ["ready_to_apply"],
+                    "job_template": "implement_code",
+                    "output_artifact": "code_patch",
+                    "success_action": "code_ready",
+                    "context_policy": {"output_contract": "code_change"},
+                },
+                {"status_key": "ready_to_apply", "title": "Ready To Apply", "position": 20, "transition_to": ["backend_apply"]},
+                {
+                    "status_key": "backend_apply",
+                    "title": "Backend Apply",
+                    "position": 30,
+                    "transition_to": ["verification"],
+                    "job_template": "apply.backend_write",
+                    "output_artifact": "apply_result",
+                    "success_action": "apply_succeeded",
+                },
+                {
+                    "status_key": "verification",
+                    "title": "Verification",
+                    "position": 40,
+                    "transition_to": ["implementation", "done", "failed"],
+                    "job_template": "verify.points_mall",
+                    "output_artifact": "verification_report",
+                    "success_action": "advance",
+                },
+                {"status_key": "done", "title": "Done", "position": 90},
+                {"status_key": "failed", "title": "Failed", "position": 99},
+            ],
+            "actions": {
+                "code_ready": {"to": "ready_to_apply"},
+                "apply_succeeded": {"to": "verification"},
+                "verification_failed": {"to": "failed"},
+                "advance": {"to": "implementation"},
+                "workflow_done": {"to": "done"},
+                "fail": {"to": "failed"},
+                "abandon": {"to": "failed"},
+                "retry": {"to": "implementation"},
+            },
+        }
+    )
+    column = definition.column("verification")
+    assert column is not None
+
+    normalized, notes = workflow_engine_service._normalize_generic_agent_output(
+        {"summary": "Verification PASSED.", "next_action": "advance"},
+        definition,
+        column,
+    )
+
+    assert normalized["next_action"] == "workflow_done"
+    assert "verification success action 'advance' targeting 'implementation' normalized to 'workflow_done'" in notes
 
 
 def test_coding_workflow_rejects_forged_done_guard_without_apply_artifact(monkeypatch, tmp_path):
@@ -841,6 +952,205 @@ async def test_backend_local_apply_column_uses_its_own_success_action(monkeypatc
     assert "apply_succeeded" in event_types
     assert "backend_local_apply_completed" in event_types
     assert "apply_scaffold" not in FakeApplyThenVerifyClient.calls
+
+
+@pytest.mark.asyncio
+async def test_backend_local_coding_flow_follows_transition_graph_to_runtime_apply(monkeypatch, tmp_path):
+    kanban, _memory = configure(monkeypatch, tmp_path)
+    project_id = "graph-runtime-apply"
+    project_root = tmp_path / "mini-program-offline-points"
+    workflow = {
+        "name": "nonlinear-coding-flow",
+        "version": 1,
+        "workflow_type": "coding",
+        "requires_apply": True,
+        "columns": [
+            {
+                "status_key": "todo",
+                "title": "Todo",
+                "position": 1,
+                "transition_to": [],
+            },
+            {
+                "status_key": "in_progress",
+                "title": "InProgress",
+                "position": 2,
+                "transition_to": [],
+                "job_template": "project_agent_dev",
+                "output_artifact": "code_patch",
+                "success_action": "code_ready",
+                "failure_actions": ["retry", "fail"],
+                "context_policy": {"output_contract": "code_change"},
+            },
+            {
+                "status_key": "code_ready",
+                "title": "CodeReady",
+                "position": 3,
+                "transition_to": ["applying"],
+            },
+            {
+                "status_key": "applying",
+                "title": "Applying",
+                "position": 4,
+                "transition_to": [],
+                "job_template": "runtime_apply",
+                "input_artifacts": ["code_patch"],
+                "output_artifact": "apply_result",
+                "success_action": "apply_succeeded",
+                "failure_actions": ["verification_failed"],
+            },
+            {
+                "status_key": "apply_succeeded",
+                "title": "ApplyOK",
+                "position": 5,
+                "transition_to": ["verifying"],
+            },
+            {
+                "status_key": "ready_to_apply",
+                "title": "ReadyToApply",
+                "position": 6,
+                "transition_to": ["applying"],
+            },
+            {
+                "status_key": "verifying",
+                "title": "Verifying",
+                "position": 7,
+                "transition_to": [],
+                "job_template": "project_agent_verify",
+                "input_artifacts": ["apply_result"],
+                "output_artifact": "verification_report",
+                "success_action": "workflow_done",
+                "failure_actions": ["verification_failed", "retry"],
+            },
+            {"status_key": "done", "title": "Done", "position": 9, "transition_to": []},
+            {"status_key": "failed", "title": "Failed", "position": 11, "transition_to": []},
+        ],
+        "actions": {
+            "workflow_done": {"to": "done"},
+            "fail": {"to": "failed"},
+            "abandon": {"to": "failed"},
+            "retry": {"to": "in_progress"},
+            "code_ready": {"to": "ready_to_apply"},
+            "verification_failed": {"to": "failed"},
+            "apply_succeeded": {"to": "apply_succeeded"},
+        },
+    }
+    kanban.update_project_workflow(project_id, workflow)
+    task = kanban.create_task(
+        project_id=project_id,
+        title="Create scaffold",
+        status_key="in_progress",
+        metadata={"source": "project_conversation", "backend_local": True},
+    )["task"]
+
+    import app.services.workflow_engine as workflow_engine_service
+
+    phases: list[str] = []
+
+    class FakeCodeThenVerifyClient:
+        def chat_json(self, messages: list[dict]) -> dict:
+            payload = json.loads(messages[-1]["content"])
+            phases.append(payload["phase"])
+            if payload["phase"] == "in_progress":
+                return {
+                    "phase": "in_progress",
+                    "summary": "Generated minimal scaffold.",
+                    "outputs": {
+                        "code_patch": {
+                            "target_root": str(project_root),
+                            "files": [
+                                {"path": "pom.xml", "content": "<project></project>\n", "language": "xml"},
+                                {"path": "src/main/java/com/points/app/PointsApplication.java", "content": "package com.points.app;\nclass PointsApplication {}\n", "language": "java"},
+                            ],
+                        }
+                    },
+                    "decision": "approve",
+                    "next_action": "code_ready",
+                }
+            assert payload["phase"] == "verifying"
+            return {
+                "phase": "verifying",
+                "summary": "Files were applied and verified.",
+                "outputs": {"checks": [{"name": "files_exist", "ok": True}]},
+                "decision": "approve",
+                "next_action": "workflow_done",
+            }
+
+    monkeypatch.setattr(workflow_engine_service, "get_llm_client", lambda route: FakeCodeThenVerifyClient())
+
+    await workflow_engine_service.WorkflowEngine().run(
+        task["id"],
+        {
+            "project_id": project_id,
+            "backend_local": True,
+            "messages": [{"role": "user", "content": f"Create scaffold at project_root={project_root.as_posix()}"}],
+            "metadata": {"source": "project_conversation"},
+        },
+    )
+
+    detail = kanban.get_task(task["id"])["task"]
+    event_types = [event["event_type"] for event in detail["events"]]
+
+    assert detail["status_key"] == "done"
+    assert phases == ["in_progress", "verifying"]
+    assert (project_root / "pom.xml").read_text(encoding="utf-8") == "<project></project>\n"
+    assert (project_root / "src/main/java/com/points/app/PointsApplication.java").exists()
+    assert "backend_local_apply_deferred_to_runtime_column" in event_types
+    assert "backend_local_apply_completed" in event_types
+    assert "workflow_waiting_apply_result" not in event_types
+
+
+def test_transition_graph_executes_target_column_when_target_is_executable():
+    from app.services.workflow_definition import workflow_from_dict
+    from app.services.workflow_engine import _next_executable_after_transition
+
+    definition = workflow_from_dict(
+        {
+            "name": "target-executable",
+            "version": 1,
+            "workflow_type": "coding",
+            "requires_apply": True,
+            "columns": [
+                {
+                    "status_key": "apply_pending",
+                    "title": "Apply",
+                    "position": 3,
+                    "transition_to": ["verify"],
+                    "job_template": "runtime_apply",
+                    "output_artifact": "apply_result",
+                    "success_action": "apply_succeeded",
+                },
+                {
+                    "status_key": "verify",
+                    "title": "Verify",
+                    "position": 4,
+                    "transition_to": ["done", "failed", "ready_to_apply"],
+                    "job_template": "verify",
+                    "output_artifact": "verification_report",
+                    "success_action": "workflow_done",
+                },
+                {"status_key": "ready_to_apply", "title": "Ready", "position": 5, "transition_to": ["apply_pending"]},
+                {"status_key": "done", "title": "Done", "position": 6, "transition_to": []},
+                {"status_key": "failed", "title": "Failed", "position": 7, "transition_to": []},
+            ],
+            "actions": {
+                "code_ready": {"to": "ready_to_apply"},
+                "apply_succeeded": {"to": "verify"},
+                "verification_failed": {"to": "failed"},
+                "workflow_done": {"to": "done"},
+                "fail": {"to": "failed"},
+                "abandon": {"to": "failed"},
+                "retry": {"to": "ready_to_apply"},
+            },
+        }
+    )
+    current = definition.column("apply_pending")
+    assert current is not None
+
+    next_column = _next_executable_after_transition(definition, "verify", current)
+
+    assert next_column is not None
+    assert next_column.status_key == "verify"
 
 
 @pytest.mark.asyncio

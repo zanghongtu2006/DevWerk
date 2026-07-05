@@ -352,6 +352,7 @@ def _normalize_workflow(
         _align_reserved_success_actions(workflow["columns"], workflow["actions"], debug=debug)
         _align_verification_success_actions(workflow["columns"], workflow["actions"], debug=debug)
         _sanitize_coding_lifecycle_boundaries(workflow["columns"], workflow["actions"], debug=debug)
+        _ensure_coding_producer_column(workflow["columns"], workflow["actions"], debug=debug)
     _align_column_transitions_with_actions(workflow["columns"], workflow["actions"], debug=debug)
     _sanitize_terminal_columns(workflow["columns"], workflow["actions"], debug=debug)
     if debug is not None:
@@ -691,7 +692,7 @@ def _align_verification_success_actions(
             continue
         success_action = _status_key(column.get("success_action"))
         success_target = _status_key((actions.get(success_action) or {}).get("to"))
-        if success_target and success_target not in failure_targets:
+        if success_target == done_target:
             continue
         previous = success_action or "<none>"
         column["success_action"] = "workflow_done"
@@ -728,6 +729,66 @@ def _sanitize_coding_lifecycle_boundaries(
                 debug,
                 f"coding apply gate column {apply_gate!r} execution fields removed: {', '.join(removed)}",
             )
+
+
+def _ensure_coding_producer_column(
+    columns: list[dict[str, Any]],
+    actions: dict[str, dict[str, Any]],
+    *,
+    debug: dict[str, Any] | None,
+) -> None:
+    if any(isinstance(column, dict) and _dict_column_can_produce_code(column) for column in columns):
+        return
+    apply_gate = _status_key((actions.get("code_ready") or {}).get("to"))
+    if not apply_gate:
+        return
+    terminal_targets = {
+        _status_key((actions.get(action) or {}).get("to"))
+        for action in ("workflow_done", "complete", "completed", "fail", "abandon")
+    }
+    terminal_targets.discard("")
+    candidates: list[dict[str, Any]] = []
+    apply_gate_position = next(
+        (int(column.get("position") or 0) for column in columns if isinstance(column, dict) and _status_key(column.get("status_key")) == apply_gate),
+        0,
+    )
+    for column in columns:
+        if not isinstance(column, dict):
+            continue
+        status = _status_key(column.get("status_key"))
+        if not status or status in terminal_targets or status == apply_gate:
+            continue
+        if status == "code_ready":
+            continue
+        probe = " ".join(
+            _status_key(value)
+            for value in (
+                status,
+                column.get("title"),
+                column.get("job_template"),
+                column.get("output_artifact"),
+            )
+        )
+        if any(token in probe for token in ("apply", "verify", "verifying", "verification", "ready_to_apply")):
+            continue
+        position = int(column.get("position") or 0)
+        if apply_gate_position and position > apply_gate_position:
+            continue
+        candidates.append(column)
+    if not candidates:
+        return
+    producer = sorted(candidates, key=lambda item: int(item.get("position") or 0))[-1]
+    status = _status_key(producer.get("status_key"))
+    producer["job_template"] = producer.get("job_template") or status
+    producer["output_artifact"] = producer.get("output_artifact") or "code_change_bundle"
+    producer["success_action"] = "code_ready"
+    policy = producer.get("context_policy") if isinstance(producer.get("context_policy"), dict) else {}
+    producer["context_policy"] = {**policy, "output_contract": "code_change"}
+    transitions = [_status_key(item) for item in producer.get("transition_to") or [] if _status_key(item)]
+    if apply_gate not in transitions:
+        transitions.append(apply_gate)
+    producer["transition_to"] = transitions
+    _note(debug, f"coding workflow producer column {status!r} inferred from existing pre-apply column")
 
 
 def _dict_column_can_produce_code(column: dict[str, Any]) -> bool:

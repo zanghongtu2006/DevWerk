@@ -544,7 +544,7 @@ def _rule_target(rule: dict[str, Any]) -> str | None:
 
 def _can_apply_result_from(definition: WorkflowDefinition, column: Any) -> bool:
     target = _action_target(definition, ACTION_APPLY_SUCCEEDED)
-    return bool(target and _target_allowed(column, target))
+    return bool(target and _target_allowed(column, target, action=ACTION_APPLY_SUCCEEDED))
 
 
 def _allow_done_without_verification(definition: WorkflowDefinition) -> bool:
@@ -752,6 +752,8 @@ def _is_client_visible_action(action: str, rule: dict[str, Any]) -> bool:
 
 def _target_allowed(column: Any, target: str, *, action: str | None = None) -> bool:
     if action in LIFECYCLE_ACTIONS:
+        return True
+    if _action_declared_by_column(column, action):
         return True
     target_key = canonical_workflow_key(target)
     allowed = {canonical_workflow_key(item) for item in (column.transition_to or [])}

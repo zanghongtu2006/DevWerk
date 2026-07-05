@@ -581,6 +581,113 @@ def test_workflow_designer_aligns_verification_success_away_from_failure(monkeyp
     assert "verification column 'verifying' success_action 'verifying_complete' aligned to 'workflow_done'" in result["debug"]["normalization_notes"]
 
 
+def test_workflow_designer_aligns_verification_success_away_from_rework_loop(monkeypatch):
+    workflow_designer = _patch_designer(
+        monkeypatch,
+        {
+            "name": "verify-rework-loop",
+            "version": 1,
+            "workflow_type": "coding",
+            "requires_apply": True,
+            "columns": [
+                {
+                    "status_key": "implementation",
+                    "title": "Implementation",
+                    "position": 10,
+                    "transition_to": ["ready_to_apply"],
+                    "job_template": "implement_code",
+                    "output_artifact": "code_patch",
+                    "success_action": "code_ready",
+                    "context_policy": {"output_contract": "code_change"},
+                },
+                {"status_key": "ready_to_apply", "title": "Ready To Apply", "position": 20, "transition_to": ["backend_apply"]},
+                {
+                    "status_key": "backend_apply",
+                    "title": "Backend Apply",
+                    "position": 30,
+                    "transition_to": ["verification"],
+                    "job_template": "apply.backend_write",
+                    "output_artifact": "apply_result",
+                    "success_action": "apply_succeeded",
+                },
+                {
+                    "status_key": "verification",
+                    "title": "Verification",
+                    "position": 40,
+                    "transition_to": ["implementation", "done", "failed"],
+                    "job_template": "verify.points_mall",
+                    "output_artifact": "verification_report",
+                    "success_action": "advance",
+                },
+                {"status_key": "done", "title": "Done", "position": 90},
+                {"status_key": "failed", "title": "Failed", "position": 99},
+            ],
+            "actions": {
+                "code_ready": {"to": "ready_to_apply"},
+                "apply_succeeded": {"to": "verification"},
+                "verification_failed": {"to": "failed"},
+                "advance": {"to": "implementation"},
+                "workflow_done": {"to": "done"},
+                "fail": {"to": "failed"},
+                "abandon": {"to": "failed"},
+                "retry": {"to": "implementation"},
+            },
+        },
+    )
+
+    result = workflow_designer.design_project_workflow(
+        project_id="verify-rework-loop",
+        messages=[{"role": "user", "content": "coding workflow with implementation, apply, and verification."}],
+    )
+
+    columns = {column["status_key"]: column for column in result["workflow"]["columns"]}
+    assert columns["verification"]["success_action"] == "workflow_done"
+    assert result["workflow"]["actions"]["workflow_done"]["to"] == "done"
+    assert "done" in columns["verification"]["transition_to"]
+    assert "verification column 'verification' success_action 'advance' aligned to 'workflow_done'" in result["debug"]["normalization_notes"]
+
+
+def test_workflow_designer_infers_missing_code_producer_before_apply_gate(monkeypatch):
+    workflow_designer = _patch_designer(
+        monkeypatch,
+        {
+            "name": "missing-code-producer",
+            "version": 1,
+            "workflow_type": "coding",
+            "requires_apply": True,
+            "columns": [
+                {"status_key": "backlog", "title": "Backlog", "position": 1, "transition_to": ["in_progress"]},
+                {"status_key": "in_progress", "title": "In Progress", "position": 2, "transition_to": ["code_ready", "failed"]},
+                {"status_key": "code_ready", "title": "Code Ready", "position": 3, "success_action": "code_ready", "transition_to": ["ready_to_apply", "failed"]},
+                {"status_key": "ready_to_apply", "title": "Ready To Apply", "position": 4, "job_template": "apply_pending", "transition_to": ["applying"]},
+                {"status_key": "applying", "title": "Applying", "position": 5, "job_template": "backend_apply", "output_artifact": "apply_result", "success_action": "apply_succeeded", "transition_to": ["verifying"]},
+                {"status_key": "verifying", "title": "Verifying", "position": 6, "job_template": "verify_scaffold", "output_artifact": "verification_report", "success_action": "workflow_done", "transition_to": ["done", "failed"]},
+                {"status_key": "done", "title": "Done", "position": 90},
+                {"status_key": "failed", "title": "Failed", "position": 99},
+            ],
+            "actions": {
+                "workflow_done": {"to": "done"},
+                "fail": {"to": "failed"},
+                "abandon": {"to": "failed"},
+                "retry": {"to": "backlog"},
+            },
+        },
+    )
+
+    result = workflow_designer.design_project_workflow(
+        project_id="missing-code-producer",
+        messages=[{"role": "user", "content": "coding workflow with apply lifecycle."}],
+    )
+
+    columns = {column["status_key"]: column for column in result["workflow"]["columns"]}
+    assert columns["in_progress"]["success_action"] == "code_ready"
+    assert columns["in_progress"]["job_template"] == "in_progress"
+    assert columns["in_progress"]["output_artifact"] == "code_change_bundle"
+    assert columns["in_progress"]["context_policy"]["output_contract"] == "code_change"
+    assert "ready_to_apply" in columns["in_progress"]["transition_to"]
+    assert "coding workflow producer column 'in_progress' inferred from existing pre-apply column" in result["debug"]["normalization_notes"]
+
+
 def test_workflow_designer_prevents_non_code_column_from_using_code_ready(monkeypatch):
     workflow_designer = _patch_designer(
         monkeypatch,
