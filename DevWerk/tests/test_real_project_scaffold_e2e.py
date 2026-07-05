@@ -193,6 +193,89 @@ def test_real_http_project_conversation_creates_scaffold_on_disk(tmp_path):
         artifacts = task["task"].get("artifacts") or []
         assert any(item.get("artifact_type") == "backend_local_apply_result" for item in artifacts)
         assert any(item.get("artifact_type") == "workflow_result" for item in artifacts)
+
+        retry_root = tmp_path / "mini-program-points-mall-retry"
+        retry_task_request = (
+            f"Create a minimal retry scaffold on disk at target_root={retry_root.as_posix()}. "
+            "Return concrete outputs.code_patch.files with target_root. Include README.md, "
+            "backend-java/pom.xml, and backend-java/src/main/java/com/devwerk/points/RetryApplication.java."
+        )
+        delivery_failed = _request(
+            "POST",
+            f"{base_url}/v1/kanban/tasks",
+            {
+                "project_id": project_id,
+                "title": "M0-bootstrap: 创建工程骨架并落盘",
+                "description": "真实交付任务，生成 Spring Boot scaffold",
+                "status_key": "failed",
+            },
+        )
+        delivery_failed_id = delivery_failed["task"]["id"]
+        _request(
+            "POST",
+            f"{base_url}/v1/kanban/tasks/{delivery_failed_id}/artifacts",
+            {
+                "artifact_type": "workflow_request_body",
+                "payload": {
+                    "project_id": project_id,
+                    "mode": "agent",
+                    "interaction_mode": "auto",
+                    "backend_local": True,
+                    "workspace": {"root_id": project_id, "tree_preview": "", "source_map": None},
+                    "messages": [{"role": "user", "content": retry_task_request}],
+                },
+            },
+        )
+        _request(
+            "POST",
+            f"{base_url}/v1/kanban/tasks/{delivery_failed_id}/artifacts",
+            {
+                "artifact_type": "code_ready_bundle",
+                "payload": {"changed_paths": ["README.md"]},
+            },
+        )
+
+        cleanup_failed = _request(
+            "POST",
+            f"{base_url}/v1/kanban/tasks",
+            {
+                "project_id": project_id,
+                "title": f"Abandon task {delivery_failed_id[:8]}",
+                "description": "清理失败任务并生成 support-ticket 工单。无需重试。",
+                "status_key": "failed",
+            },
+        )
+        cleanup_failed_id = cleanup_failed["task"]["id"]
+        _request(
+            "POST",
+            f"{base_url}/v1/kanban/tasks/{cleanup_failed_id}/artifacts",
+            {
+                "artifact_type": "workflow_request_body",
+                "payload": {
+                    "project_id": project_id,
+                    "mode": "agent",
+                    "interaction_mode": "auto",
+                    "backend_local": True,
+                    "workspace": {"root_id": project_id, "tree_preview": "", "source_map": None},
+                    "messages": [{"role": "user", "content": "abandon cleanup"}],
+                },
+            },
+        )
+
+        retried = _request(
+            "POST",
+            f"{base_url}/v1/kanban/projects/{project_id}/conversation",
+            {"action": "message", "message": "你刚才的任务没有成功，需要重新启动", "metadata": {}},
+            timeout=60,
+        )
+        assert retried["ok"] is True, retried
+        assert retried["kind"] == "task_retried", retried
+        assert retried["task_id"] == delivery_failed_id, retried
+        retry_final_state = _wait_for_workflow(base_url, delivery_failed_id)
+        assert retry_final_state["status_key"] == success_status, retry_final_state
+        assert (retry_root / "README.md").is_file()
+        assert (retry_root / "backend-java" / "pom.xml").is_file()
+        assert (retry_root / "backend-java" / "src" / "main" / "java" / "com" / "devwerk" / "points" / "RetryApplication.java").is_file()
     finally:
         process.terminate()
         try:

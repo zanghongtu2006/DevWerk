@@ -345,11 +345,31 @@ def _normalize_workflow(
         coding=workflow["requires_apply"] or workflow["workflow_type"] == "coding",
     )
     _ensure_column_success_actions(workflow["columns"], workflow["actions"], debug=debug)
+    if workflow["requires_apply"] or workflow["workflow_type"] == "coding":
+        _align_reserved_success_actions(workflow["columns"], workflow["actions"], debug=debug)
+        _align_verification_success_actions(workflow["columns"], workflow["actions"], debug=debug)
     _align_column_transitions_with_actions(workflow["columns"], workflow["actions"], debug=debug)
     _sanitize_terminal_columns(workflow["columns"], workflow["actions"], debug=debug)
     if debug is not None:
         debug["normalized_workflow"] = workflow
     return workflow
+
+
+def normalize_workflow_payload(
+    value: object,
+    *,
+    base_workflow: dict[str, Any] | None = None,
+    debug: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Normalize a persisted workflow without calling an LLM.
+
+    Project workflow JSON can arrive from the project conversation, direct API
+    edits, imported databases, or hand-written dashboard changes. All of those
+    paths must pass through the same deterministic repair layer before the
+    state machine sees the definition.
+    """
+
+    return _normalize_workflow(value, base_workflow=base_workflow, debug=debug)
 
 
 def _repair_workflow_object(value: dict[str, Any], *, debug: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -605,6 +625,102 @@ def _ensure_column_success_actions(
         column["success_action"] = action
         actions.setdefault(action, {"to": target})
         _note(debug, f"column {column.get('status_key')!r} success_action {action!r} inferred to {target!r}")
+
+
+def _align_reserved_success_actions(
+    columns: list[dict[str, Any]],
+    actions: dict[str, dict[str, Any]],
+    *,
+    debug: dict[str, Any] | None,
+) -> None:
+    for column in columns:
+        if not isinstance(column, dict) or not column.get("job_template"):
+            continue
+        action = _status_key(column.get("success_action"))
+        if not action:
+            continue
+        transitions = [_status_key(item) for item in column.get("transition_to") or [] if _status_key(item)]
+        natural_target = next((item for item in transitions if item not in {"failed", "abandoned"}), "")
+        if not natural_target:
+            continue
+        should_replace = False
+        if action == "code_ready" and not _dict_column_can_produce_code(column):
+            should_replace = True
+        if action == "apply_succeeded" and not _dict_column_is_apply_runtime(column):
+            should_replace = True
+        if action == "workflow_done" and natural_target not in {"done", "complete", "completed"}:
+            should_replace = True
+        if not should_replace:
+            continue
+        replacement = _status_key(f"{column.get('status_key')}_complete")
+        column["success_action"] = replacement
+        actions[replacement] = {"to": natural_target}
+        _note(
+            debug,
+            f"column {column.get('status_key')!r} reserved success_action {action!r} aligned to {replacement!r}",
+        )
+
+
+def _align_verification_success_actions(
+    columns: list[dict[str, Any]],
+    actions: dict[str, dict[str, Any]],
+    *,
+    debug: dict[str, Any] | None,
+) -> None:
+    done_target = _status_key((actions.get("workflow_done") or {}).get("to")) or _status_key(
+        (actions.get("complete") or {}).get("to")
+    )
+    failure_targets = {
+        _status_key((actions.get(action) or {}).get("to"))
+        for action in ("fail", "abandon", "verification_failed")
+    }
+    failure_targets.discard("")
+    if not done_target:
+        return
+    for column in columns:
+        if not isinstance(column, dict) or not column.get("job_template"):
+            continue
+        status = _status_key(column.get("status_key"))
+        output = _status_key(column.get("output_artifact"))
+        template = _status_key(column.get("job_template"))
+        if not any(token in " ".join((status, output, template)) for token in ("verify", "verifying", "verification")):
+            continue
+        success_action = _status_key(column.get("success_action"))
+        success_target = _status_key((actions.get(success_action) or {}).get("to"))
+        if success_target and success_target not in failure_targets:
+            continue
+        previous = success_action or "<none>"
+        column["success_action"] = "workflow_done"
+        actions.setdefault("workflow_done", {"to": done_target})
+        transitions = [_status_key(item) for item in column.get("transition_to") or [] if _status_key(item)]
+        if done_target not in transitions:
+            transitions.append(done_target)
+        for failure_target in failure_targets:
+            if failure_target not in transitions:
+                transitions.append(failure_target)
+        column["transition_to"] = transitions
+        _note(debug, f"verification column {status!r} success_action {previous!r} aligned to 'workflow_done'")
+
+
+def _dict_column_can_produce_code(column: dict[str, Any]) -> bool:
+    policy = column.get("context_policy") if isinstance(column.get("context_policy"), dict) else {}
+    status = _status_key(column.get("status_key"))
+    output = _status_key(column.get("output_artifact"))
+    template = _status_key(column.get("job_template"))
+    if policy.get("requires_apply") is True or policy.get("output_contract") == "code_change":
+        return True
+    if any(token in status for token in ("ready_to_apply", "apply", "verify", "done", "fail", "abandon", "retry")):
+        return False
+    return any(token in template for token in ("code", "patch", "repair", "change", "scaffold", "generate")) or any(
+        token in output for token in ("code", "patch", "repair", "scaffold")
+    )
+
+
+def _dict_column_is_apply_runtime(column: dict[str, Any]) -> bool:
+    status = _status_key(column.get("status_key"))
+    output = _status_key(column.get("output_artifact"))
+    template = _status_key(column.get("job_template"))
+    return any(token in " ".join((status, output, template)) for token in ("apply", "write", "materialize"))
 
 
 def _align_column_transitions_with_actions(

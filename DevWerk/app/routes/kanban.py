@@ -1304,15 +1304,23 @@ def _is_explicit_project_retry_request(text: str) -> bool:
         "run again",
         "try again",
         "retry task",
+        "restart",
+        "restart it",
         "重试",
         "重跑",
         "重启任务",
+        "重新启动",
+        "重新启动任务",
         "重新执行",
         "重新跑",
         "再试一次",
         "再跑一次",
     )
-    return any(marker in lower for marker in markers)
+    if any(marker in lower for marker in markers):
+        return True
+    restart_markers = ("重新", "重启", "重试", "再跑", "再试", "restart", "retry", "re-run", "rerun")
+    failure_markers = ("没成功", "没有成功", "失败", "没跑", "没有跑", "failed", "fail", "not successful")
+    return any(marker in lower for marker in restart_markers) and any(marker in lower for marker in failure_markers)
 
 
 def _is_actionable_project_request(lower: str) -> bool:
@@ -1357,7 +1365,7 @@ def _project_retry_task_candidate(project_id: str, metadata: dict[str, Any]) -> 
     failure_statuses = _project_failure_statuses(project_id)
     for task_id in candidates:
         task = _task_for_project(project_id, task_id)
-        if task and str(task.get("status_key") or "") in failure_statuses:
+        if task and str(task.get("status_key") or "") in failure_statuses and _project_retry_task_score(task) >= 0:
             return task
 
     board = get_board(project_id)
@@ -1366,10 +1374,65 @@ def _project_retry_task_candidate(project_id: str, metadata: dict[str, Any]) -> 
         if not isinstance(column, dict):
             continue
         for task in column.get("tasks") or []:
-            if isinstance(task, dict) and str(task.get("status_key") or "") in failure_statuses:
-                tasks.append(task)
-    tasks.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+            if not isinstance(task, dict) or str(task.get("status_key") or "") not in failure_statuses:
+                continue
+            detail = _task_for_project(project_id, str(task.get("id") or "")) or task
+            if _project_retry_task_score(detail) >= 0:
+                tasks.append(detail)
+    tasks.sort(key=lambda item: (_project_retry_task_score(item), str(item.get("updated_at") or "")), reverse=True)
     return tasks[0] if tasks else None
+
+
+def _project_retry_task_score(task: dict[str, Any]) -> int:
+    haystack = " ".join(
+        str(value or "").lower()
+        for value in (
+            task.get("title"),
+            task.get("description"),
+            task.get("metadata"),
+        )
+    )
+    cleanup_markers = (
+        "abandon",
+        "abandoned",
+        "cleanup",
+        "support_ticket",
+        "support-ticket",
+        "ticket",
+        "工单",
+        "清理",
+        "放弃",
+        "撤掉",
+        "标记为 abandoned",
+        "无需重试",
+    )
+    if any(marker in haystack for marker in cleanup_markers):
+        return -1000
+    score = 0
+    delivery_markers = (
+        "bootstrap",
+        "scaffold",
+        "spring",
+        "maven",
+        "uniapp",
+        "code",
+        "patch",
+        "工程",
+        "骨架",
+        "创建",
+        "生成",
+        "实现",
+        "落盘",
+        "编译",
+    )
+    score += sum(5 for marker in delivery_markers if marker in haystack)
+    for artifact in task.get("artifacts") or []:
+        if not isinstance(artifact, dict):
+            continue
+        artifact_type = str(artifact.get("artifact_type") or "").lower()
+        if artifact_type in {"code_ready_bundle", "code_patch", "workflow_request_body", "workflow_run_request"}:
+            score += 25
+    return score
 
 
 def _project_failure_statuses(project_id: str) -> set[str]:

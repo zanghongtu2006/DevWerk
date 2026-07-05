@@ -15,6 +15,7 @@ from app.services.workflow_definition import (
     validate_managed_workflow_definition,
     workflow_from_dict,
 )
+from app.services.workflow_designer import normalize_workflow_payload
 
 _log = logging.getLogger("devwerk.kanban")
 _initialized = False
@@ -352,9 +353,19 @@ def update_project_settings(
     ensure_project(pid)
     ensure_project_settings(pid)
     workflow_definition = None
+    normalized_workflow: dict[str, Any] | None = None
     if workflow is not None:
-        workflow_definition = workflow_from_dict(workflow)
+        debug: dict[str, Any] = {}
+        current_workflow = get_project_workflow(pid).get("workflow") or {}
+        normalized_workflow = normalize_workflow_payload(workflow, base_workflow=current_workflow, debug=debug)
+        workflow_definition = workflow_from_dict(normalized_workflow)
         validate_managed_workflow_definition(workflow_definition)
+        if debug.get("normalization_notes"):
+            _log.debug(
+                "kanban workflow normalized project_id=%s notes=%s",
+                pid,
+                debug.get("normalization_notes"),
+            )
     now = _now()
     updates = []
     params: list[Any] = []
@@ -366,7 +377,7 @@ def update_project_settings(
         params.append(_json(parameters))
     if workflow is not None:
         updates.append("workflow_json = ?")
-        params.append(_json(workflow))
+        params.append(_json(normalized_workflow or workflow))
     if updates:
         updates.append("updated_at = ?")
         params.append(now)
@@ -390,8 +401,7 @@ def get_project_workflow(project_id: str | None = None) -> dict[str, Any]:
 
 
 def update_project_workflow(project_id: str | None, workflow: dict[str, Any]) -> dict[str, Any]:
-    definition = workflow_from_dict(workflow)
-    update_project_settings(project_id, workflow=definition_to_dict(definition))
+    update_project_settings(project_id, workflow=workflow)
     return get_project_workflow(project_id)
 
 

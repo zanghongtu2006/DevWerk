@@ -286,8 +286,10 @@ def test_workflow_designer_aligns_column_transition_to_action_target(monkeypatch
     )
 
     planning = next(item for item in result["workflow"]["columns"] if item["status_key"] == "planning")
-    assert "ready_to_apply" in planning["transition_to"]
-    assert "column 'planning' transition_to appended 'ready_to_apply' from action 'code_ready'" in result["debug"]["normalization_notes"]
+    assert planning["success_action"] == "planning_complete"
+    assert result["workflow"]["actions"]["planning_complete"]["to"] == "implementation"
+    assert "implementation" in planning["transition_to"]
+    assert "column 'planning' reserved success_action 'code_ready' aligned to 'planning_complete'" in result["debug"]["normalization_notes"]
 
 
 def test_workflow_designer_accepts_string_actions_and_infers_column_success(monkeypatch):
@@ -528,6 +530,110 @@ def test_workflow_designer_repairs_real_minimax_coding_lifecycle_shape(monkeypat
     assert actions["retry"]["to"] == "retry_pending"
     assert "coding lifecycle action 'code_ready' target 'designing' aligned to 'ready_to_apply'" in notes
     assert "action 'abandon' target 'abandoned' normalized to 'failed'" in notes
+
+
+def test_workflow_designer_aligns_verification_success_away_from_failure(monkeypatch):
+    workflow_designer = _patch_designer(
+        monkeypatch,
+        {
+            "name": "verify-success-bug",
+            "version": 1,
+            "workflow_type": "coding",
+            "requires_apply": True,
+            "columns": [
+                {"status_key": "implementation", "title": "Implementation", "position": 10, "transition_to": ["ready_to_apply"], "job_template": "code", "output_artifact": "code_patch", "success_action": "code_ready", "context_policy": {"output_contract": "code_change"}},
+                {"status_key": "ready_to_apply", "title": "Ready To Apply", "position": 20, "transition_to": ["verifying"]},
+                {
+                    "status_key": "verifying",
+                    "title": "Verifying",
+                    "position": 30,
+                    "transition_to": ["verification_failed"],
+                    "job_template": "verify generated scaffold",
+                    "output_artifact": "verification_report",
+                    "success_action": "verifying_complete",
+                },
+                {"status_key": "verification_failed", "title": "Verification Failed", "position": 40, "transition_to": ["implementation"]},
+                {"status_key": "done", "title": "Done", "position": 90},
+                {"status_key": "failed", "title": "Failed", "position": 99},
+            ],
+            "actions": {
+                "code_ready": {"to": "ready_to_apply"},
+                "apply_succeeded": {"to": "verifying"},
+                "verifying_complete": {"to": "verification_failed"},
+                "verification_failed": {"to": "verification_failed"},
+                "workflow_done": {"to": "done"},
+                "fail": {"to": "failed"},
+                "abandon": {"to": "failed"},
+                "retry": {"to": "implementation"},
+            },
+        },
+    )
+
+    result = workflow_designer.design_project_workflow(
+        project_id="verify-success-bug",
+        messages=[{"role": "user", "content": "coding workflow with apply and verification."}],
+    )
+
+    columns = {column["status_key"]: column for column in result["workflow"]["columns"]}
+    assert columns["verifying"]["success_action"] == "workflow_done"
+    assert "done" in columns["verifying"]["transition_to"]
+    assert "verification_failed" in columns["verifying"]["transition_to"]
+    assert "verification column 'verifying' success_action 'verifying_complete' aligned to 'workflow_done'" in result["debug"]["normalization_notes"]
+
+
+def test_workflow_designer_prevents_non_code_column_from_using_code_ready(monkeypatch):
+    workflow_designer = _patch_designer(
+        monkeypatch,
+        {
+            "name": "reserved-action-misuse",
+            "version": 1,
+            "workflow_type": "coding",
+            "requires_apply": True,
+            "columns": [
+                {
+                    "status_key": "intake",
+                    "title": "Requirement Intake",
+                    "position": 10,
+                    "transition_to": ["code_generation"],
+                    "job_template": "intake_job",
+                    "output_artifact": "requirement_spec",
+                    "success_action": "code_ready",
+                },
+                {
+                    "status_key": "code_generation",
+                    "title": "Code Generation",
+                    "position": 20,
+                    "transition_to": ["ready_to_apply"],
+                    "job_template": "generate scaffold code",
+                    "output_artifact": "generated_scaffold_bundle",
+                    "success_action": "code_ready",
+                },
+                {"status_key": "ready_to_apply", "title": "Ready To Apply", "position": 30, "transition_to": ["done"]},
+                {"status_key": "done", "title": "Done", "position": 90},
+                {"status_key": "failed", "title": "Failed", "position": 99},
+            ],
+            "actions": {
+                "code_ready": {"to": "ready_to_apply"},
+                "apply_succeeded": {"to": "done"},
+                "verification_failed": {"to": "failed"},
+                "workflow_done": {"to": "done"},
+                "fail": {"to": "failed"},
+                "abandon": {"to": "failed"},
+                "retry": {"to": "intake"},
+            },
+        },
+    )
+
+    result = workflow_designer.design_project_workflow(
+        project_id="reserved-action-misuse",
+        messages=[{"role": "user", "content": "coding workflow with intake and code generation."}],
+    )
+
+    columns = {column["status_key"]: column for column in result["workflow"]["columns"]}
+    assert columns["intake"]["success_action"] == "intake_complete"
+    assert result["workflow"]["actions"]["intake_complete"]["to"] == "code_generation"
+    assert columns["code_generation"]["success_action"] == "code_ready"
+    assert "column 'intake' reserved success_action 'code_ready' aligned to 'intake_complete'" in result["debug"]["normalization_notes"]
 
 
 def test_workflow_designer_uses_repair_llm_after_invalid_first_output(monkeypatch):

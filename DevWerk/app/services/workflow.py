@@ -177,9 +177,28 @@ def _transition_by_definition(task_id: str, action: str, payload: dict[str, Any]
     if definition.column(to_status) is None:
         raise ValueError(f"workflow action {action!r} targets unknown status {to_status!r}")
     if current_column is not None and not _target_allowed(current_column, to_status, action=action):
-        raise ValueError(
-            f"workflow action {action!r} cannot move from {current_status!r} to {to_status!r}"
-        )
+        if _action_declared_by_column(current_column, action):
+            add_event(
+                task_id,
+                "workflow_transition_missing_edge_allowed",
+                {
+                    "action": action,
+                    "from_status": current_status,
+                    "to_status": to_status,
+                    "reason": "action is declared by the current column but transition_to was missing",
+                },
+            )
+            _log.warning(
+                "workflow transition edge repaired at runtime task_id=%s action=%s from=%s to=%s",
+                task_id,
+                action,
+                current_status,
+                to_status,
+            )
+        else:
+            raise ValueError(
+                f"workflow action {action!r} cannot move from {current_status!r} to {to_status!r}"
+            )
 
     data = dict(payload or {})
     data.setdefault("action", action)
@@ -733,6 +752,15 @@ def _target_allowed(column: Any, target: str, *, action: str | None = None) -> b
         return True
     allowed = set(column.transition_to or [])
     return target == column.status_key or target in allowed
+
+
+def _action_declared_by_column(column: Any, action: str | None) -> bool:
+    action_key = str(action or "").strip().lower().replace("-", "_")
+    if not action_key:
+        return False
+    declared = {str(getattr(column, "success_action", "") or "").strip().lower().replace("-", "_")}
+    declared.update(str(item or "").strip().lower().replace("-", "_") for item in (getattr(column, "failure_actions", None) or []))
+    return action_key in declared
 
 
 def _dedupe(values: list[str]) -> list[str]:
