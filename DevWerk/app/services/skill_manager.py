@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from app.services.kanban import get_project_settings, update_project_settings
+from app.kanban.store import get_project_settings, update_project_settings
 
 
 SKILL_ENTRYPOINT = "SKILL.md"

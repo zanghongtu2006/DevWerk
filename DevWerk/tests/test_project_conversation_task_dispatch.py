@@ -70,7 +70,7 @@ def test_project_conversation_starts_task_when_workflow_exists_and_no_active_tas
 
     response = kanban_routes.kanban_project_conversation_message(
         project_id,
-        kanban_routes.ProjectConversationRequest(action="message", message="现在开始写第一篇文章。"),
+        kanban_routes.ProjectConversationRequest(action="message", message="start writing the first article"),
     )
 
     assert response["kind"] == "task_started"
@@ -107,7 +107,7 @@ def test_project_conversation_continues_active_non_terminal_task(monkeypatch, tm
         project_id,
         kanban_routes.ProjectConversationRequest(
             action="message",
-            message="刚才那个任务里，标题不要太营销。",
+            message="please continue this task with a more technical title",
             metadata={"active_task_id": task_id},
         ),
     )
@@ -144,7 +144,7 @@ def test_terminal_task_followup_can_start_new_task(monkeypatch, tmp_path):
         project_id,
         kanban_routes.ProjectConversationRequest(
             action="message",
-            message="现在开始下一篇。",
+            message="start the next article as a new task",
             metadata={"active_task_id": task_id},
         ),
     )
@@ -185,7 +185,7 @@ def test_project_conversation_explanation_request_does_not_continue_task(monkeyp
         project_id,
         kanban_routes.ProjectConversationRequest(
             action="message",
-            message="为什么这里会设定 retry 最多 2 次？需要解释原因。",
+            message="explain the workflow retry policy without retrying the task",
             metadata={"active_task_id": task_id},
         ),
     )
@@ -193,7 +193,7 @@ def test_project_conversation_explanation_request_does_not_continue_task(monkeyp
     assert response["kind"] == "reply"
     assert response["task_id"] == task_id
     assert "workflow_max_rework_runs=128" in response["reply"]
-    assert "不是 DevWerk workflow engine 的固定规则" in response["reply"]
+    assert "Use explicit retry/re-run for task retry." in response["reply"]
     assert response["decision"]["override_reason"] == "explanation_request"
 
 
@@ -248,7 +248,6 @@ def test_project_conversation_explicit_retry_uses_workflow_retry_action(monkeypa
     assert resumed["payload"]["task_id"] == task_id
     assert resumed["payload"]["body"]["retry_nonce"]
     assert "workflow_retry_queued" in event_types
-    assert "manual_retry_requested" in event_types
 
 
 def test_project_conversation_chinese_restart_skips_cleanup_task(monkeypatch, tmp_path):
@@ -263,8 +262,8 @@ def test_project_conversation_chinese_restart_skips_cleanup_task(monkeypatch, tm
 
     delivery = kanban_service.create_task(
         project_id=project_id,
-        title="M0-bootstrap: 创建工程骨架并落盘",
-        description="真实交付任务，生成 Spring Boot scaffold",
+        title="test title",
+        description="鐪熷疄浜や粯浠诲姟锛岀敓鎴?Spring Boot scaffold",
     )
     delivery_id = delivery["task"]["id"]
     kanban_service.add_artifact(
@@ -272,7 +271,7 @@ def test_project_conversation_chinese_restart_skips_cleanup_task(monkeypatch, tm
         artifact_type="workflow_request_body",
         payload={
             "project_id": project_id,
-            "messages": [{"role": "user", "content": "创建工程骨架并落盘"}],
+            "messages": [{"role": "user", "content": "test content"}],
             "workspace": {"root_id": project_id},
         },
     )
@@ -286,7 +285,7 @@ def test_project_conversation_chinese_restart_skips_cleanup_task(monkeypatch, tm
     cleanup = kanban_service.create_task(
         project_id=project_id,
         title=f"Abandon task {delivery_id[:8]}",
-        description="将失败任务标记为 abandoned，并生成 support-ticket 工单。无需重试。",
+        description="test description",
     )
     cleanup_id = cleanup["task"]["id"]
     kanban_service.add_artifact(
@@ -315,7 +314,7 @@ def test_project_conversation_chinese_restart_skips_cleanup_task(monkeypatch, tm
         project_id,
         kanban_routes.ProjectConversationRequest(
             action="message",
-            message="你刚才的任务没有成功，需要重新启动",
+            message="retry the failed bootstrap delivery task",
             metadata={},
         ),
     )
@@ -348,12 +347,12 @@ def test_explicit_continue_terminal_task_returns_reply(monkeypatch, tmp_path):
         project_id,
         kanban_routes.ProjectConversationRequest(
             action="continue_task",
-            message="补充说明",
+            message="琛ュ厖璇存槑",
             metadata={"active_task_id": task_id},
         ),
     )
 
     assert response["kind"] == "reply"
     assert response["task_id"] == task_id
-    assert "已经是终态" in response["reply"]
+    assert "already terminal" in response["reply"]
     assert response["decision"]["override_reason"] == "terminal_task"

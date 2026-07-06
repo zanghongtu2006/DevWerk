@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import settings
-from app.services.kanban import add_artifact, add_event, get_conversation, get_task
+from app.kanban.store import add_artifact, add_event, get_conversation, get_task
 
 
 TABLE_MEMORY_ITEMS = "kb_memory_items"

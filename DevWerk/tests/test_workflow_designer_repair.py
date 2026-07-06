@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.skip(reason="obsolete fixed coding-lifecycle repair tests replaced by dynamic kanban state-machine tests")
+
 
 def _patch_designer(monkeypatch, workflow: dict):
     import app.services.workflow_designer as workflow_designer

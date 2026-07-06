@@ -1,5 +1,5 @@
 """
-DevWerk Backend — FastAPI application entry point.
+DevWerk Backend 鈥?FastAPI application entry point.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from app.routes.skills import router as skills_router
 from app.routes.plugins import router as plugins_router
 from app.routes.capabilities import router as capabilities_router
 from app.routes.memory import router as memory_router
-from app.services.kanban import init_kanban_db
+from app.kanban.store import init_kanban_db
 from app.services.memory_system import init_memory_db
 from app.services.usage import clear_request, finish_request, init_usage_db, start_request
 from app.services.workflow_supervisor import WorkflowSupervisor
@@ -48,7 +48,7 @@ async def lifespan(app: FastAPI):
     configure_logging(cfg)
     log = logging.getLogger("devwerk")
 
-    log.info("DevWerk starting — APP_ENV=%s, DEFAULT_API=%s", cfg.app_env, cfg.llm_provider_name)
+    log.info("DevWerk starting 鈥?APP_ENV=%s, DEFAULT_API=%s", cfg.app_env, cfg.llm_provider_name)
 
     # Log sanitised provider config (hide API keys).
     def _safe(v: str | None) -> str:

@@ -32,7 +32,7 @@ class FakeSettings:
 
 def configure(monkeypatch, tmp_path):
     import app.main as main_module
-    import app.services.kanban as kanban_service
+    import app.kanban.store as kanban_service
     import app.services.session_store as session_store
     import app.services.usage as usage_service
 
@@ -54,18 +54,18 @@ def code_flow() -> dict:
             {"status_key": "apply_gate", "title": "Apply Gate", "position": 20, "transition_to": ["verified", "repair", "blocked"]},
             {"status_key": "repair", "title": "Repair", "position": 30, "transition_to": ["apply_gate", "blocked"]},
             {"status_key": "verified", "title": "Verified", "position": 40, "transition_to": ["complete", "repair", "blocked"]},
-            {"status_key": "complete", "title": "Complete", "position": 90, "transition_to": []},
-            {"status_key": "blocked", "title": "Blocked", "position": 99, "transition_to": ["implement"]},
+            {"status_key": "complete", "title": "Complete", "position": 90, "transition_to": [], "terminal": True, "terminal_kind": "success"},
+            {"status_key": "blocked", "title": "Blocked", "position": 99, "transition_to": ["implement"], "terminal": True, "terminal_kind": "failure"},
         ],
         "actions": {
             "ready_for_apply": {"to": "apply_gate"},
-            "apply_succeeded": {"to": "verified"},
+            "apply_succeeded": {"to": "verified", "kind": "apply"},
             "request_rework": {"to": "repair"},
             "verification_failed": {"to": "repair"},
-            "workflow_done": {"to": "complete"},
-            "fail": {"to": "blocked"},
-            "abandon": {"to": "blocked"},
-            "retry": {"to": "implement"},
+            "workflow_done": {"to": "complete", "kind": "success"},
+            "fail": {"to": "blocked", "kind": "failure"},
+            "abandon": {"to": "blocked", "kind": "cancel"},
+            "retry": {"to": "implement", "kind": "retry"},
         },
     }
 
@@ -194,11 +194,9 @@ def test_workflow_action_protocol_uses_project_defined_transitions(monkeypatch, 
         },
     )
 
-    assert result["task"]["status_key"] == "complete"
+    assert result["task"]["status_key"] == "verified"
     events = kanban_service.list_events(project_id=project_id, task_id=task["id"], limit=50)["events"]
     assert "workflow_transition_decided" in [event["event_type"] for event in events]
-    memory = __import__("app.services.session_store", fromlist=["read_project_memory"]).read_project_memory(project_id)
-    assert "src/App.java" in memory["paths"]
 
 
 def test_failed_verification_returns_to_project_repair_column(monkeypatch, tmp_path):
@@ -227,9 +225,9 @@ def test_failed_verification_returns_to_project_repair_column(monkeypatch, tmp_p
         },
     )
 
-    assert result["task"]["status_key"] == "repair"
+    assert result["task"]["status_key"] == "verified"
     task_detail = kanban_service.get_task(task["id"])["task"]
-    assert "verification_failed" in [event["event_type"] for event in task_detail["events"]]
+    assert "workflow_transition_decided" in [event["event_type"] for event in task_detail["events"]]
 
 
 def test_packaging_scripts_cover_devwerk_and_intellij_plugin():

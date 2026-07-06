@@ -11,7 +11,7 @@ class FakeSettings:
 
 
 def configure_kanban(monkeypatch, tmp_path):
-    import app.services.kanban as kanban_service
+    import app.kanban.store as kanban_service
     import app.services.session_store as session_store
 
     fake = FakeSettings(tmp_path / "devwerk.db", tmp_path / "sessions")
@@ -43,30 +43,37 @@ def coding_workflow(name: str = "coding-workflow") -> dict[str, Any]:
                 "status_key": "implementation",
                 "title": "Implementation",
                 "position": 20,
-                "transition_to": ["ready_to_apply", "failed"],
+                "transition_to": ["backend_write", "failed"],
                 "job_template": "implement_code_change",
                 "input_artifacts": ["analysis_bundle"],
                 "output_artifact": "code_change_bundle",
-                "success_action": "code_ready",
+                "success_action": "implementation_ready",
                 "failure_actions": ["fail"],
                 "context_policy": {"output_contract": "code_change"},
             },
-            {"status_key": "ready_to_apply", "title": "Ready To Apply", "position": 30, "transition_to": ["applied", "failed"]},
+            {
+                "status_key": "backend_write",
+                "title": "Backend Write",
+                "position": 30,
+                "transition_to": ["applied", "failed"],
+                "runtime": "backend_apply",
+                "success_action": "write_applied",
+            },
             {"status_key": "applied", "title": "Applied", "position": 40, "transition_to": ["verified", "failed"]},
             {"status_key": "verified", "title": "Verified", "position": 50, "transition_to": ["done", "failed"]},
-            {"status_key": "done", "title": "Done", "position": 90, "transition_to": []},
-            {"status_key": "failed", "title": "Failed", "position": 99, "transition_to": ["analysis"]},
+            {"status_key": "done", "title": "Done", "position": 90, "transition_to": [], "terminal": True, "terminal_kind": "success"},
+            {"status_key": "failed", "title": "Failed", "position": 99, "transition_to": ["analysis"], "terminal": True, "terminal_kind": "failure"},
         ],
         "actions": {
             "analysis_ready": {"to": "analysis"},
-            "code_ready": {"to": "ready_to_apply"},
-            "apply_succeeded": {"to": "applied"},
+            "implementation_ready": {"to": "backend_write", "kind": "advance"},
+            "write_applied": {"to": "applied", "kind": "apply"},
             "verification_passed": {"to": "verified"},
             "verification_failed": {"to": "failed"},
-            "workflow_done": {"to": "done"},
-            "fail": {"to": "failed"},
-            "abandon": {"to": "failed"},
-            "retry": {"to": "analysis"},
+            "workflow_done": {"to": "done", "kind": "success"},
+            "fail": {"to": "failed", "kind": "failure"},
+            "abandon": {"to": "failed", "kind": "cancel"},
+            "retry": {"to": "analysis", "kind": "retry"},
         },
     }
 

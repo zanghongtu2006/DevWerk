@@ -17,7 +17,7 @@ from app.services.capability_broker import CapabilityBroker
 from app.services.capability_catalog import capability_catalog
 from app.services.code_context import build_code_context_summary
 from app.services.conversation_context import context_debug_payload, prepare_conversation_context
-from app.services.kanban import (
+from app.kanban.store import (
     add_artifact,
     add_event,
     add_project_event,
@@ -46,15 +46,15 @@ from app.services.provider_errors import is_retryable_llm_error
 from app.services.tool_protocol import normalize_tool_request
 from app.services.verification_policy import configured_post_apply_tool_requests, verification_feedback_summary
 from app.services.workflow import apply_workflow_action, record_phase_output
-from app.services.workflow_definition import (
-    WorkflowAction,
+from app.kanban.definition import (
+    ActionKind,
     WorkflowColumn,
     WorkflowDefinition,
-    WorkflowStatus,
     canonical_workflow_key,
     workflow_column_can_produce_code,
     workflow_from_dict,
 )
+from app.kanban.state_machine import WorkflowStateMachine
 
 _log = logging.getLogger("devwerk.workflow_engine")
 
@@ -108,7 +108,7 @@ class WorkflowEngine:
                 task_id,
                 "WORKFLOW_EMPTY",
                 "Workflow has no executable columns.",
-                status_key=_failure_status(definition) or _current_status(task_id),
+                status_key=_failure_status_required(definition),
             )
             _safe_fail(task_id, {"phase": "workflow", "reason": response.error_message})
             _notify_project_conversation_failure(
@@ -166,7 +166,7 @@ class WorkflowEngine:
                     task_id,
                     "UNSUPPORTED_WORKFLOW_JOB",
                     str(exc),
-                    status_key=_failure_status(definition) or current.status_key,
+                    status_key=_failure_status_required(definition),
                 )
                 _safe_fail(task_id, {"phase": current.status_key, "reason": response.error_message})
                 _notify_project_conversation_failure(
@@ -264,7 +264,7 @@ class WorkflowEngine:
                 )
 
             if not target_status:
-                failure_status = _failure_status(definition) or current.status_key
+                failure_status = _failure_status_required(definition)
                 response = _failure_response(
                     task_id,
                     "WORKFLOW_BAD_ACTION",
@@ -313,7 +313,7 @@ class WorkflowEngine:
                     task_id,
                     "WORKFLOW_FAILED",
                     f"Workflow moved to failure status {target_status!r}.",
-                    status_key=target_status or _failure_status(definition) or "failed",
+                    status_key=target_status or _failure_status_required(definition),
                 )
                 _notify_project_conversation_failure(
                     task_id,
@@ -374,7 +374,7 @@ class WorkflowEngine:
                         task_id,
                         "BACKEND_LOCAL_APPLY_FAILED",
                         "Backend-local apply or verification failed.",
-                        status_key=target_status or _failure_status(definition) or "failed",
+                        status_key=target_status or _failure_status_required(definition),
                     )
                     _notify_project_conversation_failure(
                         task_id,
@@ -441,7 +441,7 @@ class WorkflowEngine:
                     task_id,
                     "WORKFLOW_NO_NEXT_COLUMN",
                     f"Workflow stopped at {target_status!r} without a code result.",
-                    status_key=target_status or _failure_status(definition) or "failed",
+                    status_key=target_status or _failure_status_required(definition),
                 )
                 if not _failure_status(definition) or target_status not in _failure_statuses(definition):
                     apply_workflow_action(task_id, "fail", {"phase": current.status_key, "reason": response.error_message})
@@ -462,7 +462,7 @@ class WorkflowEngine:
             task_id,
             "WORKFLOW_LOOP_EXHAUSTED",
             "Workflow exhausted without producing a result.",
-            status_key=_failure_status(definition) or "failed",
+            status_key=_failure_status_required(definition),
         )
         _safe_fail(task_id, {"phase": "workflow", "reason": response.error_message})
         _notify_project_conversation_failure(
@@ -603,9 +603,9 @@ class WorkflowEngine:
                 reason="Runtime apply column found a revision, but it contains no concrete file operations.",
             )
 
-        code_ready = _latest_task_artifact_payload(task_id, "code_ready_bundle") or {}
+        code_change = _latest_task_artifact_payload(task_id, "code_change_bundle") or {}
         root = (
-            str(code_ready.get("target_root") or code_ready.get("project_root") or "").strip()
+            str(code_change.get("target_root") or code_change.get("project_root") or "").strip()
             or _effective_project_root(body)
             or _absolute_root_from_ops(ops)
         )
@@ -640,7 +640,7 @@ class WorkflowEngine:
             },
         )
 
-        moved = apply_workflow_action(task_id, WorkflowAction.APPLY_RESULT, apply_payload)
+        moved = apply_workflow_action(task_id, _runtime_success_action(definition, column, ActionKind.APPLY.value), apply_payload)
         target_status = (moved.get("task") or {}).get("status_key")
         summary = (
             f"Runtime apply wrote {len(apply_payload.get('changed_paths') or [])} file(s) under {root}."
@@ -657,7 +657,7 @@ class WorkflowEngine:
             outputs={"apply_result": apply_payload},
             warnings=[] if apply_payload.get("ok") else [summary],
             decision="approve" if apply_payload.get("ok") else "fail",
-            next_action=WorkflowAction.APPLY_RESULT,
+            next_action=_runtime_success_action(definition, column, ActionKind.APPLY.value),
         )
         state.phase_outputs.append(output)
         _event(
@@ -667,12 +667,12 @@ class WorkflowEngine:
                 "status_key": column.status_key,
                 "agent": agent,
                 "decision": output["decision"],
-                "action": WorkflowAction.APPLY_RESULT,
+                "action": _runtime_success_action(definition, column, ActionKind.APPLY.value),
                 "runtime": "backend_apply",
             },
         )
         return ColumnResult(
-            action=WorkflowAction.APPLY_RESULT,
+            action=_runtime_success_action(definition, column, ActionKind.APPLY.value),
             target_status=target_status,
             decision="approve" if apply_payload.get("ok") else "fail",
         )
@@ -688,10 +688,10 @@ class WorkflowEngine:
         _event(task_id, "backend_local_apply_blocked", {"phase": column.status_key, "reason": reason})
         failed = apply_workflow_action(
             task_id,
-            WorkflowAction.FAIL,
+            _runtime_failure_action(definition, column),
             {"phase": column.status_key, "reason": reason, "_engine_internal": True},
         )
-        return ColumnResult(action=WorkflowAction.FAIL, target_status=(failed.get("task") or {}).get("status_key"), decision="fail")
+        return ColumnResult(action=_runtime_failure_action(definition, column), target_status=(failed.get("task") or {}).get("status_key"), decision="fail")
 
     async def _run_generic_column(
         self,
@@ -940,7 +940,7 @@ class WorkflowEngine:
                 target_root = str(code_response.planning.get("target_root") or code_response.planning.get("project_root") or "").strip()
             add_artifact(
                 task_id,
-                artifact_type="code_ready_bundle",
+                artifact_type="code_change_bundle",
                 payload={
                     "revision_id": revision["id"],
                     "phase": column.status_key,
@@ -954,13 +954,14 @@ class WorkflowEngine:
                     "created_at": revision.get("created_at"),
                 },
             )
-            if _should_force_code_ready(definition, column):
-                action = "code_ready"
+            if workflow_column_can_produce_code(column) and column.success_action:
+                action = column.success_action
+                target_status = _action_target(definition, action) or column.status_key
                 output = record_phase_output(
                     task_id,
                     phase=column.status_key,
                     agent=agent,
-                    status_key=_action_target(definition, action) or "ready_to_apply",
+                    status_key=target_status,
                     summary=summary,
                     inputs=context,
                     outputs=phase_bundle,
@@ -992,7 +993,13 @@ class WorkflowEngine:
                     "workflow_column_completed",
                     {"status_key": column.status_key, "agent": agent, "decision": decision, "action": action},
                 )
-                response = _ready_response(task_id, project_id, (moved.get("task") or {}).get("status_key") or "ready_to_apply", code_response)
+                response = _ready_response(
+                    task_id,
+                    project_id,
+                    (moved.get("task") or {}).get("status_key") or target_status,
+                    code_response,
+                    waiting_for="apply_result",
+                )
                 response.planning = {
                     **(response.planning or {}),
                     "revision_id": revision["id"],
@@ -1005,7 +1012,7 @@ class WorkflowEngine:
                 if local_backend_enabled(body):
                     next_apply_column = _next_executable_after_transition(
                         definition,
-                        (moved.get("task") or {}).get("status_key") or "ready_to_apply",
+                        (moved.get("task") or {}).get("status_key") or target_status,
                         column,
                     )
                     if next_apply_column is not None and _should_run_runtime_apply_column(next_apply_column, next_apply_column.job_template):
@@ -1161,7 +1168,7 @@ class WorkflowEngine:
                         add_artifact(task_id, artifact_type="backend_local_apply_result", payload=apply_payload)
                         action_payload.update(apply_payload)
                         if apply_payload.get("ok") is not True:
-                            action = WorkflowAction.FAIL
+                            action = _runtime_failure_action(definition, column)
                             action_payload["reason"] = str(apply_payload.get("error_message") or "Backend-local apply failed.")
                         _event(
                             task_id,
@@ -1188,7 +1195,7 @@ class WorkflowEngine:
                         )
                         failed = apply_workflow_action(
                             task_id,
-                            WorkflowAction.FAIL,
+                            _runtime_failure_action(definition, column),
                             {
                                 "phase": column.status_key,
                                 "reason": reason,
@@ -1198,7 +1205,7 @@ class WorkflowEngine:
                             },
                         )
                         return ColumnResult(
-                            action=WorkflowAction.FAIL,
+                            action=_runtime_failure_action(definition, column),
                             target_status=(failed.get("task") or {}).get("status_key"),
                             decision="fail",
                         )
@@ -1568,15 +1575,6 @@ def _action_for_target(
     candidates = [
         column.success_action or "",
         *(column.failure_actions or []),
-        "workflow_done",
-        "complete",
-        "completed",
-        "code_ready",
-        "apply_succeeded",
-        "verification_failed",
-        "fail",
-        "abandon",
-        "retry",
     ]
     candidates.extend(action for action in definition.actions if action not in candidates)
     for action in candidates:
@@ -1595,35 +1593,34 @@ def _generic_column_action(
     if requested and _is_valid_column_action(definition, column, requested):
         return requested
     if decision == "fail":
-        return _failure_action(column)
+        return _runtime_failure_action(definition, column)
     if decision in {"request_replan", "request_rework"}:
         for action in [requested, *(column.failure_actions or [])]:
             if action and _is_valid_column_action(definition, column, action):
                 return action
-        return _failure_action(column)
+        return _runtime_failure_action(definition, column)
     success = _preferred_success_action(definition, column)
     if success:
         return success
-    return _failure_action(column)
+    return _runtime_failure_action(definition, column)
 
 
 def _preferred_success_action(definition: WorkflowDefinition, column: WorkflowColumn) -> str | None:
     if column.success_action and _is_valid_column_action(definition, column, column.success_action):
         return column.success_action
-    preferred_targets = [target for target in column.transition_to if target != "failed"]
+    failure_targets = definition.terminal_statuses("failure")
+    preferred_targets = [target for target in column.transition_to if target not in failure_targets]
     for action, rule in definition.actions.items():
         target = canonical_workflow_key(rule.get("to")) if isinstance(rule, dict) else ""
         if target in preferred_targets:
             return action
-    done_target = _action_target(definition, "workflow_done")
-    if done_target in column.transition_to and _is_valid_column_action(definition, column, "workflow_done"):
-        return "workflow_done"
     return None
 
 
 def _preferred_terminal_success_action(definition: WorkflowDefinition) -> str | None:
-    for action in ("workflow_done", "complete", "completed"):
-        if _action_target(definition, action):
+    success_targets = definition.terminal_statuses("success")
+    for action, rule in definition.actions.items():
+        if canonical_workflow_key(rule.get("to")) in success_targets:
             return action
     return None
 
@@ -1645,22 +1642,12 @@ def _is_valid_column_action(definition: WorkflowDefinition, column: WorkflowColu
     target = _action_target(definition, action)
     if not target:
         return False
-    if action in {"fail", "retry", "abandon"}:
+    if action in column.declared_actions():
+        return True
+    from_rule = canonical_workflow_key((definition.action(action) or {}).get("from") or (definition.action(action) or {}).get("from_status"))
+    if from_rule == column.status_key:
         return True
     return target == column.status_key or target in set(column.transition_to or [])
-
-
-def _should_force_code_ready(definition: WorkflowDefinition, column: WorkflowColumn) -> bool:
-    if definition.action(WorkflowAction.CODE_READY) is None:
-        return False
-    if not workflow_column_can_produce_code(column):
-        return False
-    policy = column.context_policy if isinstance(column.context_policy, dict) else {}
-    if definition.is_coding and column.success_action == WorkflowAction.CODE_READY:
-        return True
-    if policy.get("requires_apply") is True:
-        return True
-    return _action_target(definition, WorkflowAction.CODE_READY) in set(column.transition_to or [])
 
 
 def _generic_done_response(
@@ -1669,6 +1656,9 @@ def _generic_done_response(
     status_key: str,
     state: WorkflowRunState,
 ) -> IdeChatResponse:
+    status_key = canonical_workflow_key(status_key)
+    if not status_key:
+        raise RuntimeError("workflow completion requires an explicit success terminal status")
     latest = state.phase_outputs[-1] if state.phase_outputs else {}
     summary = str(latest.get("summary") or "Workflow completed.")
     if state.execute_response is not None:
@@ -1690,7 +1680,7 @@ def _generic_done_response(
         reply=summary,
         done=True,
         task_id=task_id,
-        status_key=status_key or "done",
+        status_key=status_key,
         phase_output=latest or None,
         planning={
             "project_id": project_id,
@@ -1912,25 +1902,23 @@ def _model_list(model: type[FileOp] | type[PatchOp], value: object) -> list[File
     return out
 
 
-def _semantic_targets(definition: WorkflowDefinition, actions: tuple[str, ...]) -> set[str]:
-    targets: set[str] = set()
-    for action in actions:
-        target = _action_target(definition, action)
-        if target:
-            targets.add(target)
-    return targets
-
-
 def _success_statuses(definition: WorkflowDefinition) -> set[str]:
-    return _semantic_targets(definition, ("workflow_done", "complete", "completed"))
+    return definition.terminal_statuses("success")
 
 
 def _failure_statuses(definition: WorkflowDefinition) -> set[str]:
-    return _semantic_targets(definition, ("fail", "abandon"))
+    return definition.terminal_statuses("failure")
 
 
 def _failure_status(definition: WorkflowDefinition) -> str | None:
     return next(iter(_failure_statuses(definition)), None)
+
+
+def _failure_status_required(definition: WorkflowDefinition) -> str:
+    status = _failure_status(definition)
+    if status:
+        return status
+    raise RuntimeError("workflow definition has no explicit failure terminal")
 
 
 def _is_success_terminal(definition: WorkflowDefinition, status_key: str | None) -> bool:
@@ -1945,14 +1933,37 @@ def _should_run_runtime_apply_column(column: WorkflowColumn, job_template: str |
     policy = column.context_policy if isinstance(column.context_policy, dict) else {}
     if policy.get("runtime") == "backend_apply" or policy.get("runtime_apply") is True:
         return True
-    template = canonical_workflow_key(job_template or column.job_template or "")
-    output = canonical_workflow_key(column.output_artifact or "")
-    status = canonical_workflow_key(column.status_key)
-    if template in {"apply", "backend_apply", "apply_runtime"}:
-        return True
-    if output in {"apply_result", "backend_local_apply_result"} and "apply" in status:
-        return True
-    return False
+    return column.runtime == "backend_apply"
+
+
+def _runtime_success_action(definition: WorkflowDefinition, column: WorkflowColumn, preferred_kind: str = "") -> str:
+    if column.success_action:
+        return column.success_action
+    machine = WorkflowStateMachine(definition)
+    if preferred_kind:
+        for action in _valid_column_actions(definition, column):
+            if definition.action_kind(action) == preferred_kind:
+                return action
+    for action in _valid_column_actions(definition, column):
+        if definition.action_kind(action) != ActionKind.FAILURE.value:
+            return action
+    return machine.success_action_for(column)
+
+
+def _runtime_failure_action(definition: WorkflowDefinition, column: WorkflowColumn | None) -> str:
+    return WorkflowStateMachine(definition).failure_action_for(column)
+
+
+def _valid_column_actions(definition: WorkflowDefinition, column: WorkflowColumn) -> list[str]:
+    actions: list[str] = []
+    transitions = set(column.transition_to or [])
+    declared = column.declared_actions()
+    for action, rule in definition.actions.items():
+        target = canonical_workflow_key(rule.get("to"))
+        from_rule = canonical_workflow_key(rule.get("from") or rule.get("from_status"))
+        if action in declared or target in transitions or from_rule == column.status_key:
+            actions.append(action)
+    return actions
 
 
 def _latest_revision(task_id: str) -> dict[str, Any] | None:
@@ -2280,28 +2291,35 @@ def _project_root_from_messages(messages: object) -> str:
     if not text:
         return ""
     explicit = re.findall(
-        r"(?:target_root|project_root|workspace_root)\s*[:=]\s*[`'\"]?([A-Za-z]:[\\/][^\s`'\",，。；;]+)",
+        r"(?:target_root|project_root|workspace_root)\s*[:=]\s*[`'\"]?([A-Za-z]:[\\/][^\s`'\",锛屻€傦紱;]+)",
         text,
         flags=re.IGNORECASE,
     )
     if explicit:
-        return explicit[-1].rstrip("`'\".,;，。；")
-    paths = re.findall(r"\b[A-Za-z]:[\\/](?:[^\s`'\"，。；;]+)", text)
+        return explicit[-1].rstrip("`'\".,;锛屻€傦紱")
+    paths = re.findall(r"\b[A-Za-z]:[\\/](?:[^\s`'\"锛屻€傦紱;]+)", text)
     usable = [
-        item.rstrip("`'\".,;，。；")
+        item.rstrip("`'\".,;锛屻€傦紱")
         for item in paths
         if not any(part in item.replace("\\", "/").lower().split("/") for part in {"target", "build", ".devwerk"})
     ]
     return usable[-1] if usable else ""
 
 
-def _ready_response(task_id: str, project_id: str, status_key: str, execute_response: IdeChatResponse) -> IdeChatResponse:
+def _ready_response(
+    task_id: str,
+    project_id: str,
+    status_key: str,
+    execute_response: IdeChatResponse,
+    *,
+    waiting_for: str | None = None,
+) -> IdeChatResponse:
     response = execute_response.model_copy(deep=True)
     response.task_id = task_id
     response.status_key = status_key or "complete"
-    if response.status_key == "ready_to_apply":
-        response.next_action = "apply_result"
-        response.waiting_for = "apply_result"
+    if waiting_for:
+        response.next_action = waiting_for
+        response.waiting_for = waiting_for
         response.done = False
     else:
         response.waiting_for = None
@@ -2334,7 +2352,7 @@ def _ensure_post_apply_verification_requests(response: IdeChatResponse, project_
     return list(by_id.values())
 
 
-def _failure_response(task_id: str, error_code: str, error_message: str, *, status_key: str = "failed") -> IdeChatResponse:
+def _failure_response(task_id: str, error_code: str, error_message: str, *, status_key: str) -> IdeChatResponse:
     return IdeChatResponse(
         ok=False,
         reply="",
@@ -2630,8 +2648,6 @@ def _is_runtime_executable_column(definition: WorkflowDefinition, column: Workfl
     status = canonical_workflow_key(column.status_key)
     if status in _terminal_statuses(definition):
         return False
-    if definition.is_coding and status == _action_target(definition, WorkflowAction.CODE_READY):
-        return False
     return True
 
 
@@ -2669,7 +2685,9 @@ def _entry_action_for_status(definition: WorkflowDefinition, status_key: str) ->
 
 def _failure_action(column: WorkflowColumn) -> str:
     actions = column.failure_actions or []
-    return "fail" if "fail" in actions else (actions[0] if actions else "fail")
+    if not actions:
+        raise ValueError(f"workflow column {column.status_key!r} has no declared failure action")
+    return actions[0]
 
 
 def _active_agent(body: dict[str, Any]) -> str:

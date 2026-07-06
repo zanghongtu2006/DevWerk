@@ -13,7 +13,7 @@ class FakeSettings:
 
 
 def configure_kanban(monkeypatch, tmp_path):
-    import app.services.kanban as kanban_service
+    import app.kanban.store as kanban_service
     import app.services.session_store as session_store
 
     fake = FakeSettings(tmp_path)

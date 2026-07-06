@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from app.services.kanban import compress_conversation_messages, get_conversation, get_project_settings
+from app.kanban.store import compress_conversation_messages, get_conversation, get_project_settings
 
 
 DEFAULT_CONTEXT_BUDGET = 24_000

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from app.core.config import settings
-from app.services.kanban import (
+from app.kanban.store import (
     add_artifact,
     add_event,
     get_latest_artifact_payload,

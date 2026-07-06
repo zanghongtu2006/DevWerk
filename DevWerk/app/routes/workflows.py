@@ -24,7 +24,7 @@ from fastapi.responses import StreamingResponse
 
 from app.core.config import settings
 from app.models.protocol import IdeChatResponse, ToolResult
-from app.services.kanban import (
+from app.kanban.store import (
     add_artifact,
     add_event,
     append_conversation_message,
@@ -49,6 +49,7 @@ from app.services.provider_errors import (
 from app.services.usage import clear_request, finish_request, start_request, usage_summary
 from app.services.workflow import apply_workflow_action
 from app.services.workflow_engine import WorkflowEngine
+from app.kanban.definition import workflow_from_dict
 
 router = APIRouter()
 _log = logging.getLogger("devwerk.workflows")
@@ -169,7 +170,7 @@ def continue_workflow_payload(task_id: str, incoming: dict) -> dict:
         return {"ok": False, "task_id": task_id, "error_code": "BAD_ACTION", "error_message": f"unsupported conversation action: {action}"}
     task = detail.get("task") or {}
     status_key = str(task.get("status_key") or "")
-    if status_key in {"done", "failed"}:
+    if status_key in _workflow_terminal_statuses(str(task.get("project_id") or "default")):
         return {
             "ok": False,
             "task_id": task_id,
@@ -531,12 +532,13 @@ def _run_workflow_thread(task_id: str, body: dict) -> None:
         finish_request(ctx, status_code=200, success=True)
     except Exception as exc:  # noqa: BLE001
         _log.exception("workflow runner failed task_id=%s", task_id)
+        failure_status = _workflow_failure_status(project_id) or str((get_task(task_id).get("task") or {}).get("status_key") or "")
         response = IdeChatResponse(
             ok=False,
             reply="",
             done=True,
             task_id=task_id,
-            status_key="failed",
+            status_key=failure_status,
             error_code="WORKFLOW_ERROR",
             error_message=f"{type(exc).__name__}: {exc}",
             retryable=True,
@@ -588,14 +590,13 @@ def _workflow_state_payload(task_id: str, *, include_result: bool, result_after:
 
 def _workflow_terminal_statuses(project_id: str) -> set[str]:
     workflow = get_project_workflow(project_id).get("workflow") or {}
-    actions = workflow.get("actions") if isinstance(workflow.get("actions"), dict) else {}
-    terminals = set()
-    for action in ("workflow_done", "complete", "completed", "fail", "abandon"):
-        rule = actions.get(action) if isinstance(actions, dict) else None
-        target = str((rule or {}).get("to") or "").strip().lower() if isinstance(rule, dict) else ""
-        if target:
-            terminals.add(target)
-    return terminals
+    return workflow_from_dict(workflow if isinstance(workflow, dict) else {}).terminal_statuses()
+
+
+def _workflow_failure_status(project_id: str) -> str:
+    workflow = get_project_workflow(project_id).get("workflow") or {}
+    statuses = workflow_from_dict(workflow if isinstance(workflow, dict) else {}).terminal_statuses("failure")
+    return next(iter(statuses), "")
 
 
 def workflow_state_payload(task_id: str, *, include_result: bool = True, result_after: str | None = None) -> dict:
@@ -640,7 +641,7 @@ async def _workflow_event_stream(task_id: str, *, result_after: str | None = Non
             yield _sse("workflow_result", {"task_id": task_id, "status_key": status_key, "result": result})
             return
 
-        if status_key == "failed":
+        if status_key in _workflow_terminal_statuses(project_id):
             yield _sse("workflow_error", _workflow_public_state(state))
             return
 

@@ -20,7 +20,7 @@ class SupervisorSettings:
 
 
 def _configure(monkeypatch, tmp_path):
-    import app.services.kanban as kanban_service
+    import app.kanban.store as kanban_service
     import app.services.session_store as session_store
     import app.services.workflow_supervisor as supervisor_service
 

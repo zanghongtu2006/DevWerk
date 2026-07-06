@@ -13,7 +13,7 @@ class FakeSettings:
 
 
 def configure(monkeypatch, tmp_path):
-    import app.services.kanban as kanban_service
+    import app.kanban.store as kanban_service
     import app.services.memory_system as memory_system
     import app.services.session_store as session_store
 
@@ -298,7 +298,7 @@ def test_coding_workflow_rejects_done_without_apply_result(monkeypatch, tmp_path
 
 def test_verification_success_action_loop_is_normalized_to_workflow_done():
     import app.services.workflow_engine as workflow_engine_service
-    from app.services.workflow_definition import workflow_from_dict
+    from app.kanban.definition import workflow_from_dict
 
     definition = workflow_from_dict(
         {
@@ -1101,7 +1101,7 @@ async def test_backend_local_coding_flow_follows_transition_graph_to_runtime_app
 
 
 def test_transition_graph_executes_target_column_when_target_is_executable():
-    from app.services.workflow_definition import workflow_from_dict
+    from app.kanban.definition import workflow_from_dict
     from app.services.workflow_engine import _next_executable_after_transition
 
     definition = workflow_from_dict(
@@ -1259,7 +1259,7 @@ def test_runtime_skips_code_ready_apply_gate_even_if_it_has_execution_fields(mon
     kanban.update_project_workflow("runtime-apply-gate-skip", workflow)
 
     import app.services.workflow_engine as workflow_engine_service
-    from app.services.workflow_definition import workflow_from_dict
+    from app.kanban.definition import workflow_from_dict
 
     definition = workflow_from_dict(kanban.get_project_workflow("runtime-apply-gate-skip")["workflow"])
     executable_statuses = [column.status_key for column in workflow_engine_service._executable_columns(definition)]

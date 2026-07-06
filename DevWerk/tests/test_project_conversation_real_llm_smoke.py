@@ -70,7 +70,7 @@ def test_project_conversation_real_llm_smoke(monkeypatch, tmp_path, case):
     monkeypatch.setenv("DEVWERK_USAGE_TRACKING", "true")
 
     from app.core.config import reload_settings
-    import app.services.kanban as kanban_service
+    import app.kanban.store as kanban_service
     import app.services.memory_system as memory_system
     import app.services.usage as usage_service
     import app.routes.kanban as kanban_routes
@@ -102,4 +102,3 @@ def test_project_conversation_real_llm_smoke(monkeypatch, tmp_path, case):
             assert workflow["actions"]["code_ready"]["to"] == "ready_to_apply"
     elif case["expect_design"]:
         assert response.get("kind") in {"reply", "workflow_design_failed"}
-

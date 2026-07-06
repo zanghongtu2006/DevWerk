@@ -955,7 +955,7 @@ def test_plugin_agent_is_injected_into_workflow_agent_context(monkeypatch, tmp_p
             self.devwerk_usage_tracking = False
             self.devwerk_session_dir = str(session_dir)
 
-    import app.services.kanban as kanban_service
+    import app.kanban.store as kanban_service
     import app.services.session_store as session_store
     from app.services.workflow_engine import _build_agent_context
 
@@ -1011,7 +1011,7 @@ def test_project_conversation_executes_plugin_slash_command(monkeypatch, tmp_pat
             self.devwerk_usage_tracking = False
             self.devwerk_session_dir = str(session_dir)
 
-    import app.services.kanban as kanban_service
+    import app.kanban.store as kanban_service
     import app.services.session_store as session_store
     import app.main as main_module
 
@@ -1050,7 +1050,7 @@ def test_project_conversation_plugin_slash_command_uses_body_not_frontmatter(mon
             self.devwerk_usage_tracking = False
             self.devwerk_session_dir = str(session_dir)
 
-    import app.services.kanban as kanban_service
+    import app.kanban.store as kanban_service
     import app.services.session_store as session_store
     import app.main as main_module
 

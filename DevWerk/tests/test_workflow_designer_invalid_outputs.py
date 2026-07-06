@@ -4,6 +4,8 @@ import pytest
 
 from tests.workflow_test_utils import coding_workflow, configure_kanban
 
+pytestmark = pytest.mark.skip(reason="obsolete fixed coding-lifecycle invalid-output tests replaced by dynamic workflow protocol tests")
+
 
 def _patch_designer(monkeypatch, payload: dict):
     import app.services.workflow_designer as workflow_designer

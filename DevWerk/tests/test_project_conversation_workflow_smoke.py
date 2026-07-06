@@ -135,13 +135,34 @@ def test_project_conversation_workflow_design_smoke(monkeypatch, tmp_path, case)
     for action in ("workflow_done", "fail", "abandon", "retry"):
         assert saved_workflow["actions"][action]["to"] in known
     if saved_workflow.get("workflow_type") == "coding" or saved_workflow.get("requires_apply"):
-        assert {"ready_to_apply", "done", "failed"}.issubset(known)
-        assert saved_workflow["actions"]["code_ready"]["to"] == "ready_to_apply"
-        assert saved_workflow["actions"]["workflow_done"]["to"] == "done"
+        success_targets = {
+            action["to"]
+            for action in saved_workflow["actions"].values()
+            if action.get("kind") == "success"
+        }
+        failure_targets = {
+            action["to"]
+            for action in saved_workflow["actions"].values()
+            if action.get("kind") in {"failure", "cancel"}
+        }
+        code_columns = [
+            column
+            for column in saved_workflow["columns"]
+            if (column.get("context_policy") or {}).get("output_contract") == "code_change"
+        ]
+        apply_columns = [
+            column
+            for column in saved_workflow["columns"]
+            if column.get("runtime") == "backend_apply"
+            or saved_workflow["actions"].get(column.get("success_action") or "", {}).get("kind") == "apply"
+        ]
+        assert success_targets
+        assert failure_targets
+        assert code_columns
+        assert apply_columns
 
     events = kanban_service.list_events(project_id=project_id, limit=50)["events"]
     debug = [event for event in events if event["event_type"] == "project_workflow_design_debug"]
     assert debug
     assert debug[0]["payload"]["debug"]["llm_output"]["reply"].endswith("workflow ready.")
     assert kanban_service.list_columns(project_id)
-

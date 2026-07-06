@@ -10,7 +10,7 @@ from typing import Any
 
 from app.core.config import settings
 from app.services.session_store import append_task_event
-from app.services.workflow_definition import (
+from app.kanban.definition import (
     empty_workflow_definition,
     validate_managed_workflow_definition,
     workflow_from_dict,
@@ -1324,16 +1324,12 @@ def _project_stats_many(conn: sqlite3.Connection, project_ids: list[str]) -> dic
 def _workflow_terminal_statuses_from_db(conn: sqlite3.Connection, project_id: str) -> tuple[set[str], set[str]]:
     row = conn.execute("SELECT workflow_json FROM kb_project_settings WHERE project_id = ?", (project_id,)).fetchone()
     workflow = _loads(row["workflow_json"], {}) if row is not None else {}
-    actions = workflow.get("actions") if isinstance(workflow, dict) and isinstance(workflow.get("actions"), dict) else {}
-    def target(action: str) -> str:
-        rule = actions.get(action)
-        return str((rule or {}).get("to") or "").strip().lower() if isinstance(rule, dict) else ""
-
-    success = {target(action) for action in ("workflow_done", "complete", "completed")}
-    failure = {target(action) for action in ("fail", "abandon")}
-    success.discard("")
-    failure.discard("")
-    return success, failure
+    try:
+        definition = workflow_from_dict(workflow if isinstance(workflow, dict) else {})
+        return definition.terminal_statuses("success"), definition.terminal_statuses("failure")
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("project terminal status lookup failed project_id=%s error=%s", project_id, exc)
+        return set(), set()
 
 
 def _default_agents() -> dict[str, Any]:
@@ -1575,12 +1571,19 @@ def definition_to_dict(definition: Any) -> dict[str, Any]:
                 "title": col.title,
                 "position": col.position,
                 "transition_to": col.transition_to,
+                "kind": col.kind,
+                "agent": col.agent,
+                "runtime": col.runtime,
                 "job_template": col.job_template,
                 "input_artifacts": col.input_artifacts or [],
                 "output_artifact": col.output_artifact,
+                "output_contract": col.output_contract,
                 "success_action": col.success_action,
                 "failure_actions": col.failure_actions or [],
                 "context_policy": col.context_policy or {},
+                "retry_policy": col.retry_policy or {},
+                "terminal": col.terminal,
+                "terminal_kind": col.terminal_kind,
             }
             for col in definition.columns
         ],

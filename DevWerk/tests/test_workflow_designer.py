@@ -11,7 +11,7 @@ class FakeSettings:
 
 
 def _configure(monkeypatch, tmp_path):
-    import app.services.kanban as kanban_service
+    import app.kanban.store as kanban_service
     import app.services.session_store as session_store
 
     fake = FakeSettings(tmp_path / "devwerk.db", tmp_path / "sessions")
@@ -181,11 +181,13 @@ def test_workflow_designer_prompt_teaches_coding_lifecycle_contract(monkeypatch)
     assert result["workflow"]["workflow_type"] == "coding"
     assert "workflow_type='coding'" in system
     assert "requires_apply=true" in system
-    assert "ready_to_apply" in system
-    assert "code_ready" in system
-    assert "apply_succeeded" in system
-    assert "verification_failed" in system
-    assert "must not use success_action=workflow_done" in system
+    assert "terminal=true" in system
+    assert "terminal_kind" in system
+    assert "kind='apply'" in system
+    assert "output_contract='code_change'" in system
+    assert "ready_to_apply" not in system
+    assert "code_ready" not in system
+    assert "apply_succeeded" not in system
 
 
 def test_workflow_designer_preserves_coding_lifecycle_metadata(monkeypatch):
@@ -213,7 +215,7 @@ def test_workflow_designer_preserves_coding_lifecycle_metadata(monkeypatch):
 
 def test_workflow_designer_can_create_non_coding_writing_workflow(monkeypatch):
     from app.services import workflow_designer
-    from app.services.workflow_definition import validate_managed_workflow_definition, workflow_from_dict
+    from app.kanban.definition import validate_managed_workflow_definition, workflow_from_dict
 
     monkeypatch.setattr(
         workflow_designer,
@@ -344,9 +346,13 @@ def test_workflow_designer_repairs_common_llm_action_aliases(monkeypatch):
         messages=[{"role": "user", "content": "Create a coding workflow."}],
     )
 
-    assert result["workflow"]["actions"]["abandon"]["to"] == "failed"
+    from app.kanban.definition import workflow_from_dict
+
+    definition = workflow_from_dict(result["workflow"])
+    assert definition.terminal_statuses("failure") == {"failed"}
+    assert "abandoned" not in {column["status_key"] for column in result["workflow"]["columns"]}
     assert result["debug"]["normalization_notes"]
-    assert any("abandoned" in note for note in result["debug"]["normalization_notes"])
+    assert all("abandoned" not in str(rule.get("to")) for rule in result["workflow"]["actions"].values())
 
 
 def test_workflow_designer_records_effective_llm_debug(monkeypatch):
@@ -480,8 +486,11 @@ def test_project_conversation_designs_pipeline_for_mini_program_request(monkeypa
     assert response["ok"] is True
     assert response["kind"] == "workflow_design"
     saved_workflow = kanban_service.get_project_workflow(project_id)["workflow"]
-    assert saved_workflow["actions"]["abandon"]["to"] == "failed"
-    assert saved_workflow["actions"]["workflow_done"]["to"] == "done"
+    from app.kanban.definition import workflow_from_dict
+
+    definition = workflow_from_dict(saved_workflow)
+    assert definition.terminal_statuses("success") == {"done"}
+    assert definition.terminal_statuses("failure") == {"failed"}
     assert kanban_service.list_columns(project_id)
     events = kanban_service.list_events(project_id=project_id, limit=20)["events"]
     debug_events = [event for event in events if event["event_type"] == "project_workflow_design_debug"]

@@ -14,7 +14,7 @@ from app.routes.workflows import (
     workflow_state_payload,
 )
 from app.routes.kanban import WorkflowActionRequest, kanban_task_action
-from app.services.kanban import get_task, list_events, list_projects
+from app.kanban.store import get_task, list_events, list_projects
 
 
 MCP_INSTRUCTIONS = """

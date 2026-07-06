@@ -18,7 +18,7 @@ from app.routes.web_ui import render_web_ui
 from app.services.llm_factory import get_llm_client
 from app.services.local_capability_provider import execute_tool_requests, merge_backend_capabilities
 from app.services.provider_errors import is_retryable_llm_error
-from app.services.kanban import (
+from app.kanban.store import (
     add_artifact,
     add_event,
     add_project_event,
@@ -54,6 +54,7 @@ from app.services.tool_protocol import ToolProtocolError, normalize_tool_request
 from app.services.verification_policy import verification_failed, verification_has_policy
 from app.services.workflow import apply_workflow_action, current_workflow_state
 from app.services.workflow_designer import design_project_workflow
+from app.kanban.definition import workflow_from_dict
 
 router = APIRouter(prefix="/kanban", tags=["Kanban"])
 ui_router = APIRouter(tags=["Kanban UI"])
@@ -1313,7 +1314,7 @@ def _extract_absolute_paths_from_messages(messages: list[dict[str, Any]]) -> lis
     )
     paths: list[Path] = []
     for match in _ABSOLUTE_PATH_RE.finditer(text):
-        cleaned = str(match.group("path") or "").strip().strip(".,;:，。；：)]}）】")
+        cleaned = str(match.group("path") or "").strip().strip(".,;:)]}")
         try:
             path = Path(cleaned).expanduser()
             if path.is_absolute():
@@ -1468,15 +1469,7 @@ def _active_project_task(project_id: str, preferred_task_id: object = None) -> d
 
 def _project_terminal_statuses(project_id: str) -> set[str]:
     workflow = get_project_workflow(project_id).get("workflow") or {}
-    actions = workflow.get("actions") if isinstance(workflow.get("actions"), dict) else {}
-    terminals: set[str] = set()
-    for action in ("workflow_done", "complete", "completed", "fail", "abandon"):
-        rule = actions.get(action) if isinstance(actions, dict) else None
-        if isinstance(rule, dict):
-            target = str(rule.get("to") or "").strip().lower()
-            if target:
-                terminals.add(target)
-    return terminals
+    return workflow_from_dict(workflow if isinstance(workflow, dict) else {}).terminal_statuses()
 
 
 def _record_project_conversation_reply(
@@ -1516,32 +1509,31 @@ def _is_project_explanation_request(text: str) -> bool:
         return False
     markers = (
         "?",
-        "？",
-        "为什么",
-        "为何",
-        "怎么回事",
-        "解释",
-        "说明",
-        "原因",
-        "是否",
-        "是不是",
-        "我不知道",
-        "不理解",
-        "需要讨论",
-        "分析任务失败",
-        "失败原因",
+        "\uff1f",
+        "\u4e3a\u4ec0\u4e48",
+        "\u4e3a\u4f55",
+        "\u600e\u4e48\u56de\u4e8b",
+        "\u89e3\u91ca",
+        "\u8bf4\u660e",
+        "\u539f\u56e0",
+        "\u662f\u5426",
+        "\u662f\u4e0d\u662f",
+        "\u6211\u4e0d\u77e5\u9053",
+        "\u4e0d\u7406\u89e3",
+        "\u9700\u8981\u8ba8\u8bba",
+        "\u5206\u6790\u4efb\u52a1\u5931\u8d25",
+        "\u5931\u8d25\u539f\u56e0",
         "retry max",
-        "retry 最多",
-        "重试上限",
-        "最多 2",
-        "最多2",
+        "retry \u6700\u5927",
+        "\u91cd\u8bd5\u4e0a\u9650",
+        "\u6700\u591a2",
+        "\u6700\u5927",
         "why",
         "explain",
         "how does",
         "what is",
     )
     return any(marker in lower for marker in markers)
-
 
 def _is_explicit_project_retry_request(text: str) -> bool:
     lower = str(text or "").strip().lower()
@@ -1558,38 +1550,37 @@ def _is_explicit_project_retry_request(text: str) -> bool:
         "retry task",
         "restart",
         "restart it",
-        "重试",
-        "重跑",
-        "重启任务",
-        "重新启动",
-        "重新启动任务",
-        "重新执行",
-        "重新跑",
-        "再试一次",
-        "再跑一次",
+        "\u91cd\u8bd5",
+        "\u91cd\u8dd1",
+        "\u91cd\u542f\u4efb\u52a1",
+        "\u91cd\u65b0\u542f\u52a8",
+        "\u91cd\u65b0\u542f\u52a8\u4efb\u52a1",
+        "\u91cd\u65b0\u6267\u884c",
+        "\u518d\u8bd5\u4e00\u6b21",
+        "\u518d\u8dd1\u4e00\u6b21",
     )
     if any(marker in lower for marker in markers):
         return True
-    restart_markers = ("重新", "重启", "重试", "再跑", "再试", "restart", "retry", "re-run", "rerun")
-    failure_markers = ("没成功", "没有成功", "失败", "没跑", "没有跑", "failed", "fail", "not successful")
+    restart_markers = ("\u91cd\u65b0", "\u91cd\u542f", "\u91cd\u8bd5", "\u518d\u8dd1", "\u518d\u8bd5", "restart", "retry", "re-run", "rerun")
+    failure_markers = ("\u6ca1\u6210\u529f", "\u6ca1\u6709\u6210\u529f", "\u5931\u8d25", "\u6ca1\u8dd1", "\u6ca1\u6709\u8dd1", "failed", "fail", "not successful")
     return any(marker in lower for marker in restart_markers) and any(marker in lower for marker in failure_markers)
 
 
 def _is_actionable_project_request(lower: str) -> bool:
     markers = (
-        "排查",
-        "修复",
-        "解决",
-        "执行",
-        "测试",
-        "重新",
-        "继续",
-        "创建",
-        "生成",
-        "落盘",
-        "写入",
-        "搭建",
-        "实现",
+        "\u6392\u67e5",
+        "\u4fee\u590d",
+        "\u89e3\u51b3",
+        "\u6267\u884c",
+        "\u6d4b\u8bd5",
+        "\u91cd\u65b0",
+        "\u7ee7\u7eed",
+        "\u521b\u5efa",
+        "\u751f\u6210",
+        "\u843d\u76d8",
+        "\u5199\u5165",
+        "\u642d\u5efa",
+        "\u5b9e\u73b0",
         "run",
         "fix",
         "repair",
@@ -1600,7 +1591,6 @@ def _is_actionable_project_request(lower: str) -> bool:
         "implement",
     )
     return any(marker in lower for marker in markers)
-
 
 def _project_retry_task_candidate(project_id: str, metadata: dict[str, Any]) -> dict[str, Any] | None:
     candidates: list[str] = []
@@ -1651,12 +1641,12 @@ def _project_retry_task_score(task: dict[str, Any]) -> int:
         "support_ticket",
         "support-ticket",
         "ticket",
-        "工单",
-        "清理",
-        "放弃",
-        "撤掉",
-        "标记为 abandoned",
-        "无需重试",
+        "宸ュ崟",
+        "娓呯悊",
+        "鏀惧純",
+        "鎾ゆ帀",
+        "鏍囪涓?abandoned",
+        "鏃犻渶閲嶈瘯",
     )
     if any(marker in haystack for marker in cleanup_markers):
         return -1000
@@ -1669,35 +1659,27 @@ def _project_retry_task_score(task: dict[str, Any]) -> int:
         "uniapp",
         "code",
         "patch",
-        "工程",
-        "骨架",
-        "创建",
-        "生成",
-        "实现",
-        "落盘",
-        "编译",
+        "宸ョ▼",
+        "楠ㄦ灦",
+        "鍒涘缓",
+        "鐢熸垚",
+        "瀹炵幇",
+        "钀界洏",
+        "缂栬瘧",
     )
     score += sum(5 for marker in delivery_markers if marker in haystack)
     for artifact in task.get("artifacts") or []:
         if not isinstance(artifact, dict):
             continue
         artifact_type = str(artifact.get("artifact_type") or "").lower()
-        if artifact_type in {"code_ready_bundle", "code_patch", "workflow_request_body", "workflow_run_request"}:
+        if artifact_type in {"code_change_bundle", "code_patch", "workflow_request_body", "workflow_run_request"}:
             score += 25
     return score
 
 
 def _project_failure_statuses(project_id: str) -> set[str]:
     workflow = get_project_workflow(project_id).get("workflow") or {}
-    actions = workflow.get("actions") if isinstance(workflow.get("actions"), dict) else {}
-    failures: set[str] = set()
-    for action in ("fail", "abandon"):
-        rule = actions.get(action) if isinstance(actions, dict) else None
-        if isinstance(rule, dict):
-            target = str(rule.get("to") or "").strip().lower()
-            if target:
-                failures.add(target)
-    return failures or {"failed"}
+    return workflow_from_dict(workflow if isinstance(workflow, dict) else {}).terminal_statuses("failure")
 
 
 def _task_for_project(project_id: str, task_id: str) -> dict[str, Any] | None:
@@ -1810,26 +1792,23 @@ def _project_explanation_reply(
         failure_reason = str(workflow_result.get("error_message") or workflow_result.get("reply") or "").strip()
 
     lines = [
-        "我先回答这个问题，不会把这条消息当成任务继续执行。",
+        "\u6211\u5148\u56de\u7b54\u8fd9\u4e2a\u95ee\u9898\uff0c\u4e0d\u4f1a\u628a\u8fd9\u6761\u6d88\u606f\u5f53\u6210\u4efb\u52a1\u7ee7\u7eed\u6267\u884c\u3002",
         "",
-        f"- 当前 DevWerk 引擎的重试上限来自 `{policy['source']}`：`workflow_max_rework_runs={policy['workflow_max_rework_runs']}`，`workflow_max_total_runs={policy['workflow_max_total_runs']}`。",
-        "- 你看到的 `retry 最多 2 次` 不是 DevWerk workflow engine 的固定规则；它来自上一次 LLM 生成的 `failure_handling` 任务说明/phase output。",
-        "- LLM 在那段内容里把失败原因写成了“编译/JDK 环境/Maven 仓库”等假设；这只能算模型推测，不是工具诊断证据，也不应该被当成事实。",
+        f"- DevWerk retry limits source `{policy['source']}`: workflow_max_rework_runs={policy['workflow_max_rework_runs']}, workflow_max_total_runs={policy['workflow_max_total_runs']}.",
+        "- If you see 'retry max 2', it should be LLM-generated task text or phase output, not a fixed workflow-engine rule.",
+        "- LLM guesses about failure causes are not tool diagnostics; use workflow events, artifacts, and command output as evidence.",
     ]
     if task_id:
-        lines.append(f"- 当前关联 task 是 `{task_id}`，状态是 `{status}`。")
+        lines.append(f"- Current task: `{task_id}`, status: `{status}`.")
     if terminal:
-        lines.append("- 这个 task 已经处于终态，普通 `continue_task` 不应继续写入；需要用显式 Re-run/Retry 创建受控重试，或者新建任务。")
+        lines.append("- This task is terminal. Normal continue_task must not write more work; use explicit retry/re-run to restart.")
     if failure_reason:
-        lines.append(f"- 最近一次后端记录的失败摘要：{failure_reason[:800]}")
-    lines.extend(
-        [
-            "",
-            "这次问题的根因是 project conversation agent 把你的“为什么/解释”类消息误判成了 `continue_task`。后端现在会对这类消息做硬保护：解释类输入只能回复说明，terminal task 也不会被继续执行。",
-        ]
-    )
+        lines.append(f"- Latest backend failure summary: {failure_reason[:800]}")
+    lines.extend([
+        "",
+        "Explanation-style messages only return an explanation and do not advance workflow. Use explicit retry/re-run for task retry.",
+    ])
     return "\n".join(lines)
-
 
 def _terminal_task_continue_reply(project_id: str, task_id: str, task_message: str) -> str:
     task = _task_for_project(project_id, task_id) or {}
@@ -1838,13 +1817,14 @@ def _terminal_task_continue_reply(project_id: str, task_id: str, task_message: s
     reason = ""
     if isinstance(failure, dict):
         reason = str(failure.get("reason") or failure.get("error_message") or "").strip()
-    suffix = f"\n\n最近失败摘要：{reason[:800]}" if reason else ""
-    return (
-        f"这个任务 `{task_id}` 已经是终态 `{status}`，不能用普通继续消息推进。\n\n"
-        "如果要重新执行，请使用显式 Re-run/Retry；如果只是讨论失败原因或策略，我会保持在项目对话里解释，不会启动 workflow。"
-        f"{suffix}"
-    )
-
+    lines = [
+        f"Task `{task_id}` is already terminal at `{status}`.",
+        "I will not continue writing into a terminal task from a normal conversation message.",
+        "Use explicit Re-run/Retry to create a controlled retry, or start a new task if the goal changed.",
+    ]
+    if reason:
+        lines.append(f"Latest recorded failure: {reason[:800]}")
+    return "\n".join(lines)
 
 def _project_md(project_id: str) -> str:
     settings_payload = get_project_settings(project_id)
@@ -1903,8 +1883,9 @@ def _handle_project_workflow_design(
         if exc.status_code != 400:
             raise
         reply = (
-            "我理解你的项目目标，但还需要确认这是 coding、writing、research 还是 review 流程，"
-            "才能创建有效的工作流。你可以补充希望的阶段、完成标准和失败处理方式。"
+            "I understand the project goal, but DevWerk still needs a valid workflow definition "
+            "with explicit columns, terminal success/failure columns, and actions. Please clarify "
+            "the workflow type, stages, completion criteria, and failure handling."
         )
         add_project_event(
             project_id,

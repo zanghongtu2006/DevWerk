@@ -11,7 +11,7 @@ class FakeSettings:
 
 
 def _configure(monkeypatch, tmp_path):
-    import app.services.kanban as kanban_service
+    import app.kanban.store as kanban_service
     import app.services.session_store as session_store
 
     fake = FakeSettings(tmp_path / "devwerk.db", tmp_path / "sessions")
@@ -115,14 +115,14 @@ def test_workflow_agent_context_includes_capability_catalog_and_client_offers(mo
             "name": "context-capabilities-flow",
             "columns": [
                 {"status_key": "inspect", "title": "Inspect", "position": 10, "transition_to": ["done", "failed"]},
-                {"status_key": "done", "title": "Done", "position": 90, "terminal": "success", "transition_to": []},
-                {"status_key": "failed", "title": "Failed", "position": 99, "terminal": "failure", "transition_to": ["inspect"]},
+                {"status_key": "done", "title": "Done", "position": 90, "terminal": True, "terminal_kind": "success", "transition_to": []},
+                {"status_key": "failed", "title": "Failed", "position": 99, "terminal": True, "terminal_kind": "failure", "transition_to": ["inspect"]},
             ],
             "actions": {
-                "workflow_done": {"to": "done"},
-                "fail": {"to": "failed"},
-                "retry": {"to": "inspect"},
-                "abandon": {"to": "failed"},
+                "workflow_done": {"to": "done", "kind": "success"},
+                "fail": {"to": "failed", "kind": "failure"},
+                "retry": {"to": "inspect", "kind": "retry"},
+                "abandon": {"to": "failed", "kind": "cancel"},
             },
         },
     )

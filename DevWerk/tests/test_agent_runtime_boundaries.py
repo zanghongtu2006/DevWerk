@@ -1,7 +1,7 @@
 from app.services.agent_definition import agent_catalog_from_dict
 from app.services.capability_broker import CapabilityBroker
 from app.services.job_scheduler import JobScheduler
-from app.services.workflow_definition import workflow_from_dict
+from app.kanban.definition import workflow_from_dict
 
 
 def test_column_job_and_agent_are_independently_configurable():
