@@ -15,7 +15,7 @@
 
 ## 2. 核心定义
 
-> Workflow 以 Column 为基础单元。Task 沿 Column 构成的显式状态机运行；每次进入 Column 产生独立 Column Run。Column 统一声明处理逻辑、执行方式、上下文、能力、输入输出契约和 transition，直到 Task 明确进入 `done` 或 `failed`。
+> Workflow 以 Column 为基础单元。Task 沿 Column 构成的显式状态机运行；每次进入非终态 Column 产生独立 Column Run。Column 统一声明处理逻辑、执行方式、上下文、能力、输入输出契约和 transition，直到 Task 明确进入 `done` 或 `failed` sentinel。
 
 目标：
 
@@ -71,8 +71,8 @@ workflow_revision:
   revision_no:
   status: draft | published | retired
   start_column_id:
-  success_terminal_column_id:
-  failure_terminal_column_id:
+  success_terminal_key: done
+  failure_terminal_key: failed
   created_by_conversation_agent_run_id:
   created_at:
   definition_hash:
@@ -86,6 +86,7 @@ workflow_revision:
 - Task 迁移必须由 conversation-agent 通过 Intervention Run 显式执行。
 - 旧 revision 保留用于恢复、审计和解释。
 - 未来多 workflow 扩展不得要求重写 Task/Column Run 核心模型。
+- `done/failed` 是没有 executor、不会创建 Column Run 的 terminal sentinel。
 
 ## 5. Column Definition 与 Column Run 分离
 
@@ -95,9 +96,13 @@ Workflow revision 内的不可变定义，描述一个阶段应该如何工作�
 
 ### Column Run
 
-某个 Task 实际进入 Column 后产生的一次运行实例，记录状态、attempt、执行器、上下文引用、工件、等待和结果。
+某个 Task 实际进入非终态 Column 后产生的一次 visit 实例，记录 `visit_no`、输入快照、聚合状态、最终 outcome 和工件。
 
 一个 Column Definition 可以被多个 Task 使用；每次进入都创建独立 Column Run。
+
+### Column Attempt
+
+Column Run 内的一次不可变执行尝试，记录 executor、lease、checkpoint、AwaitHandle、receipt 与结果。Retry 在同一 Column Run 下创建递增的 Column Attempt；transition 再次进入同一 Column 才创建新的 Column Run。
 
 ## 6. Column 统一抽象
 
@@ -158,19 +163,12 @@ column_run:
   task_id:
   workflow_revision_id:
   column_id:
-  attempt_no:
+  visit_no:
   status:
   health:
-  executor_kind:
-  executor_id:
-  lease_owner:
-  lease_expires_at:
-  heartbeat_at:
   input_snapshot_ref:
   output_artifact_ref:
   outcome:
-  waiting_kind:
-  wait_handle_id:
   error_code:
   error_summary:
   started_at:
@@ -178,7 +176,26 @@ column_run:
   state_version:
 ```
 
-Retry 创建新的 attempt 或新的 Column Run attempt 记录，不覆盖历史执行证据。
+```yaml
+column_attempt:
+  id:
+  project_id:
+  column_run_id:
+  attempt_no:
+  status:
+  executor_kind:
+  executor_id:
+  lease_owner:
+  lease_expires_at:
+  heartbeat_at:
+  checkpoint_ref:
+  wait_handle_id:
+  started_at:
+  finished_at:
+  state_version:
+```
+
+Retry 只创建新的 Column Attempt，不覆盖历史执行证据。
 
 ## 8. Run Status 与 Business Outcome 分离
 
@@ -192,6 +209,8 @@ succeeded
 failed
 interrupted
 ```
+
+Column Attempt 使用同一前向状态并额外允许 `cancelled`。Run 在活跃阶段镜像当前 Attempt 的 `pending/running/waiting`，在 contract 通过或重试/恢复决定耗尽后聚合为 `succeeded/failed/interrupted`。
 
 Business outcome 表示下一步业务路由，例如：
 
@@ -210,16 +229,16 @@ complete
 ```text
 Current Column + Validated Outcome
 → Explicit Transition
-→ Next Column or Terminal
+→ Next Column or Terminal Sentinel
 ```
 
 禁止用 `succeeded` 自动推断唯一下一列，也禁止从输出文本关键词猜 outcome。
 
-## 9. Column Run 状态定义
+## 9. Column Run 与 Attempt 状态定义
 
 ### `pending`
 
-Run 已创建但尚未执行，必须有明确 `pending_reason`：
+Run 已创建但尚未执行，或 Attempt 尚未取得 lease，必须有明确 `pending_reason`：
 
 - waiting_dispatch
 - waiting_input
@@ -230,7 +249,7 @@ Run 已创建但尚未执行，必须有明确 `pending_reason`：
 
 ### `running`
 
-执行器已取得 lease，必须记录：
+Attempt 执行器已取得 lease，必须记录：
 
 - owner
 - executor_kind
@@ -241,7 +260,7 @@ Run 已创建但尚未执行，必须有明确 `pending_reason`：
 
 ### `waiting`
 
-当前执行暂停，等待明确外部条件。必须有 `waiting_kind`、AwaitHandle、resume condition、next check 和 deadline。
+当前 Attempt 已释放执行资源并等待明确条件。必须有判别型 AwaitHandle、resume condition、next check 或关联 event，以及 hard deadline。
 
 ### `succeeded`
 
@@ -249,7 +268,7 @@ Run 已创建但尚未执行，必须有明确 `pending_reason`：
 
 ### `failed`
 
-当前 attempt 无法成功完成。Runtime 先执行 retry/recovery/failure policy；只有状态机显式进入 failure terminal 时 Task 才成为 `failed`。
+当前 Attempt 无法成功完成。Runtime 先执行 retry/recovery policy；预算允许时在同一 Run 创建新 Attempt，耗尽时令 Run failed 并执行显式 failure outcome。只有 transition 进入 `failed` sentinel 时 Task 才成为 `failed`。
 
 ### `interrupted`
 
@@ -261,7 +280,7 @@ Conversation Agent 在发布 Workflow revision 时，为每个非终态 Column �
 
 ### Capability Sequence Executor
 
-`kind=capability_sequence` 不启动 LLM Agent，按声明的 capability steps、参数引用、成功 outcome 和失败 outcome 执行。文件、命令、MCP、外部 API、数据转换和 contract validation 都通过统一 Capability Registry 完成。
+`kind=capability_sequence` 不启动 LLM Agent，按声明的 capability steps、参数引用、成功 outcome 和失败 outcome 执行。所有 step 都通过统一 Capability Registry 完成；Version 1 release 内置 project file、sandboxed command、数据转换和 contract validation，其他 adapter 作为兼容扩展注册。
 
 ### Agent Executor
 
@@ -308,7 +327,7 @@ agent：
 - 不修改 workflow 或其他 task。
 - 只获取完成当前 Column Run 必需 context。
 - 完成后销毁。
-- 重试创建新 attempt，不复用污染上下文。
+- 重试创建新 Column Attempt，不复用污染上下文。
 
 ## 13. Context Pack 契约
 
@@ -375,6 +394,8 @@ Input Contract 无法满足
 
 输入不满足时不能启动 agent 让其猜测缺失信息。
 
+Task 首次 dispatch 与从 waiting/recovering 恢复前，Repository 在短事务内使用 `state_version` 检查 `v1_task_dependencies`、Project/Column WIP limit 与 `v1_resource_claims`。依赖未完成、额度已满或资源冲突时不取得 Attempt lease；首次 dispatch 前只创建或更新 Scheduling Entry，Column Run 已存在时才可使用关联该 Attempt 的 event AwaitHandle。Conversation Agent 提出决定，确定性 guard 最终裁决。
+
 ## 15. Output Contract
 
 agent/runtime 返回后必须验证：
@@ -413,6 +434,8 @@ failed
 
 只有 `done` 和 `failed` 是终态。
 
+Task 另有独立 control state：`active -> pause_requested -> paused -> active`。Pause 先阻止新领取，在当前 capability 到达安全 checkpoint、释放 Attempt lease 后完成；AwaitHandle 与 checkpoint 保留但不恢复执行。Terminal Task 的 control state 规范化为 `active`。
+
 ### `done`
 
 必须通过显式 success terminal transition 到达，并满足：
@@ -420,14 +443,14 @@ failed
 - 当前 Column Run succeeded
 - output contract 通过
 - 必需 artifact 存在
-- workflow success terminal 明确
+- workflow success terminal sentinel 明确
 - terminal state/event 原子持久化
 
 Conversation Agent 在终态后异步观察和汇报。需要项目级复核的 workflow 必须在 `done` 前声明独立 review Column，Runtime 不依赖隐藏的同步验收门。
 
 ### `failed`
 
-必须通过显式 failure terminal 到达，并记录：
+必须通过显式 failure terminal sentinel 到达，并记录：
 
 - 最后失败 Column/Run
 - failure reason/code
@@ -440,7 +463,7 @@ Conversation Agent 在终态后异步观察和汇报。需要项目级复核的 
 
 ### Revision 迁移
 
-迁移只允许在 Task 已暂停且没有活跃 lease 时执行。请求必须声明目标 revision、目标 Column、context/artifact 继承策略和期望 `state_version`。Runtime 重新验证目标 input contract，以 CAS transaction 切换 revision 与 Column、创建新 attempt 并写审计事件；验证或 CAS 未通过时保持原 revision 和状态。
+迁移只允许在 `control_state=paused` 且没有活跃 Task/Attempt lease 时执行。请求必须声明目标 revision、目标 Column、context/artifact 继承策略和期望 `state_version`。Runtime 重新验证目标 input contract，以 CAS transaction 切换 revision 与 Column、创建新的 Column Run 与首个 Attempt 并写审计事件；验证或 CAS 未通过时保持原 revision 和状态。
 
 “没有下一列”不能表示 `done`。它是 workflow definition error 或 runtime anomaly。
 
@@ -483,35 +506,27 @@ flowchart TD
 
 ```yaml
 transition:
-  id:
-  workflow_revision_id:
-  from_column_id:
   outcome:
-  to_column_id:
-  kind: normal | retry | recovery | escalation | terminal_success | terminal_failure
-  guard:
-  max_traversals:
-  priority:
+  target:
 ```
 
 规则：
 
-- `from_column_id + outcome` 在同一优先级必须确定。
-- guard 使用受控表达式，不执行任意代码。
-- 每个循环有 `max_traversals`、时间或预算出口。
-- terminal transition 没有隐藏后继。
+- 每个 `(Column key, outcome)` 必须有且只有一个 target。
+- Version 1 不支持 transition guard 或 priority；业务分支由 executor 返回不同的枚举 outcome。
+- 每个循环由 Column `max_visits` 提供确定性出口。
+- terminal sentinel 没有隐藏后继，也不创建 Column Run。
 - Runtime 只能执行当前 revision 已声明 transition。
 
 ## 19. Retry、Recovery 与 Failure
 
-Column Run 失败后的顺序：
+Column Attempt 失败后的顺序：
 
-1. 判断 retry policy 和 attempt budget。
-2. 判断显式 recovery transition。
-3. 判断是否需要 conversation-agent Intervention Run。
-4. 无法恢复时进入 failure terminal。
-5. 写 failure artifact/event。
-6. 通知 conversation-agent。
+1. 判断 retry policy 和 attempt budget；允许时在同一 Run 创建新 Attempt。
+2. 预算耗尽时将 Column Run 标记 failed，并产生声明的 failure outcome。
+3. 根据唯一 transition 进入 recovery Column 或 `failed` sentinel。
+4. 判断是否需要 conversation-agent Intervention Run。
+5. 写 failure artifact/event 并通知 conversation-agent。
 
 Column Run `failed` 不自动令 Task `failed`。只有 failure terminal 使 Task 终止。
 
@@ -526,8 +541,8 @@ DevWerk 不能保证 LLM 或第三方服务成功，但必须保证：
 ### 长等待五个核心组件
 
 1. **AwaitHandle**：持久化异步操作身份、外部 job、状态、期限和恢复信息。
-2. **WaitPolicy**：定义查询、callback、soft/stale/hard deadline、重试、取消和 timeout outcome。
-3. **ProgressAdapter**：把 LLM、图片、视频、进程、MCP 和外部 API 的不同进度转换为统一证据。
+2. **WaitPolicy**：以判别联合定义 poll、event 或 timer 恢复方式、deadline、取消和 timeout outcome。
+3. **Progress Evidence**：可选能力进度统一为 alive、value、message、last activity 和 provider status。
 4. **Runtime Reconciler**：在定时巡检和服务重启后恢复 orphan pending/running/waiting。
 5. **Workflow Liveness Validator**：发布 revision 前验证所有 waiting、循环、失败和中断路径最终能够到达 `done` 或 `failed`。
 
@@ -547,34 +562,17 @@ DevWerk 不能保证 LLM 或第三方服务成功，但必须保证：
 
 ### Waiting
 
-当前不需要保留推理 agent，正在等待外部条件：
-
-- 图片/视频 job
-- 外部 API callback
-- 其他 Task artifact
-- 用户输入
-- rate limit
-- 资源槽位
-- provider 恢复
+当前不需要保留推理 agent，正在等待 poll 结果、相关 event 或 timer 到期。
 
 长时间 active computing 保持 `running`；持久异步等待使用 `waiting`。
 
-## 22. Waiting Kind
+## 22. Wait Policy 判别联合
 
-统一分类：
+- `kind=poll`：查询 capability、arguments、interval、resume condition、soft/stale/hard deadline、success/timeout outcome required；cancel/cleanup capability optional。
+- `kind=event`：event type、correlation key、soft/hard deadline、success/timeout outcome required；用于用户输入和 Task dependency 等内部事件。
+- `kind=timer`：`resume_at` 或 `delay_seconds` 二者之一，以及 hard deadline 与 success/timeout outcome required。
 
-```text
-external_job
-dependency
-user_input
-rate_limit
-resource
-scheduled_time
-provider_recovery
-unknown_external_result
-```
-
-每种 waiting 都必须有独立 resume condition 和 timeout outcome。
+每种策略均冻结到 AwaitHandle；Version 1 release 不定义 provider 专用 waiting kind。
 
 ## 23. Durable AwaitHandle
 
@@ -584,37 +582,22 @@ await_handle:
   project_id:
   task_id:
   column_run_id:
-  waiting_kind:
-
-  provider:
-  operation_type:
-  external_job_id:
+  column_attempt_id:
+  kind: poll | event | timer
   idempotency_key:
-
   status:
   health:
   progress_value:
   progress_message:
-
   created_at:
   updated_at:
   last_progress_at:
   next_check_at:
-
   soft_deadline:
   stale_deadline:
   hard_deadline:
-
-  poll_capability:
-  poll_arguments:
-  callback_policy:
-  retry_policy:
-  resume_condition:
-  success_outcome:
-  timeout_outcome:
-  cancel_capability:
-  cleanup_capability:
-
+  policy_snapshot:
+  checkpoint_ref:
   secret_reference:
   state_version:
 ```
@@ -623,23 +606,36 @@ AwaitHandle 必须持久化，不能只存在 worker 内存。Secret 只保存�
 
 Handle 在外部任务终态、取消或最终过期并完成 reconciliation 后清理；agent 退出时不销毁。
 
-## 24. 等待时释放 Agent
+## 24. Capability Result 与恢复
+
+所有 capability 返回统一判别结果：
+
+```yaml
+capability_result:
+  status: completed | awaiting | failed
+  output:
+  error:
+  await_handle_draft:
+  checkpoint:
+```
+
+`awaiting` 要求 `await_handle_draft` 与 `checkpoint`。Runtime 在同一短事务保存 Handle、Attempt checkpoint、execution receipt 与 sequence step cursor，并将 Attempt/Run/Task 置为 waiting。
 
 ```text
-Agent 发起异步 Tool/API
-→ Tool 返回 AwaitHandle
-→ Agent 写 compact checkpoint
+Agent 或 Sequence Step 调用 Capability
+→ Capability 返回 awaiting
+→ Runtime 原子保存 AwaitHandle 与 compact checkpoint
 → Agent Segment 结束并释放 context
-→ Column Run waiting
-→ Callback/Poller/Reconciler 跟踪
-→ 外部结果完成
-→ Column Run 恢复
-→ 创建新的 Ephemeral Agent Segment
+→ Poll/Event/Timer Reconciler 跟踪
+→ 恢复条件成立
+→ Agent Executor 创建同一 Attempt 的新 Segment；Sequence Executor 从持久 step cursor 继续
 ```
 
 新的 segment 只获得原 Task、Column、checkpoint 和外部结果，不恢复上一 agent 的完整会话。
 
 ## 25. Soft、Stale、Hard Deadline
+
+Hard deadline 适用于所有 AwaitHandle；soft/stale deadline 是 poll handle 的附加健康阈值。
 
 ### Soft Deadline
 
@@ -661,14 +657,7 @@ Agent 发起异步 Tool/API
 
 ### Hard Deadline
 
-本次等待不允许继续无界延长。到达后执行显式 timeout outcome：
-
-- retry
-- cancel_and_retry
-- return_to_previous_column
-- switch_provider（policy 允许或 conversation-agent 明确决定）
-- escalate
-- fail_task
+本次等待不允许继续无界延长。到达后先执行声明的 cancel/cleanup capability，再产生 Column `wait_policy.timeout_outcome`。该 outcome 必须在 revision 中唯一映射到 retry/recovery Column 或 `failed` sentinel。
 
 conversation-agent 可以延期，但每次必须记录原因、新期限和 extension budget；延期次数有上限。
 
@@ -688,18 +677,17 @@ unknown
 
 ```yaml
 status: waiting
-waiting_kind: external_job
+kind: poll
 health: healthy
-provider_status: rendering
 progress_value: 72
 last_progress_at: 30_seconds_ago
 ```
 
-总耗时不是唯一判断依据。一个等待 20 分钟但持续渲染的视频任务可以健康；一个等待 3 分钟但连续 poll 失败的普通 API 可以 degraded。
+总耗时不是唯一判断依据；持续提供可信 progress evidence 的长等待可以保持 healthy，连续查询失败或超过 stale deadline 的等待进入 degraded/stalled。
 
-## 27. ProgressAdapter
+## 27. Progress Evidence
 
-每种 capability 把自身进度统一转换为：
+Capability 可以把自身进度转换为统一的可选证据：
 
 ```yaml
 progress_evidence:
@@ -711,50 +699,7 @@ progress_evidence:
   estimated_completion:
 ```
 
-### LLM
-
-- stream token/chunk
-- provider request ID
-- last chunk time
-- tool call
-- partial output
-- usage checkpoint
-
-Token 增长证明活跃，不证明结果质量。
-
-### 图片/视频
-
-- external job ID
-- queue/render status
-- percentage
-- queue position
-- estimated completion
-- callback
-
-### Shell/Process
-
-- PID
-- heartbeat
-- CPU time
-- stdout/stderr 增量
-- 文件变化
-- exit code
-
-### MCP
-
-- request ID
-- progress notification
-- server heartbeat
-- partial result
-- cancellation capability
-
-### External API
-
-- HTTP/provider request ID
-- Retry-After
-- callback
-- status endpoint
-- idempotency key
+Version 1 Reconciler 只依赖该通用结构与 deadline，不要求 capability 专用 ProgressAdapter。Evidence 证明活跃度，不证明结果质量。
 
 ## 28. Provider 错误分类
 
@@ -787,10 +732,8 @@ Token 增长证明活跃，不证明结果质量。
 - 先按 idempotency key 查询。
 - 有 status endpoint 时先查询。
 - 不能确认时进入 `unknown_external_result`。
-- 不盲目重复图片生成、发布、支付等操作。
+- 不重复执行缺少 completed receipt 的非幂等副作用。
 - 唤醒 conversation-agent。
-
-Provider 切换不能是隐藏 fallback，必须由 Column policy 允许或 conversation-agent 明确、可审计地决定。
 
 ## 29. Workflow Liveness Validator
 
@@ -805,13 +748,14 @@ conversation-agent 发布 revision 前必须通过静态完整性检查。
 - interrupted
 - waiting expired
 - retry exhausted
-- cancellation
+
+Cancellation 不依赖业务 transition；Validator 验证每种 executor/wait kind 都具备 lease release、cancel/cleanup 与原子 `failed(failure_code=cancelled)` 协议。
 
 每个 waiting 明确：
 
 - resume condition
 - check strategy
-- soft/stale/hard deadline
+- hard deadline；poll 另有 soft/stale deadline
 - timeout outcome
 
 每个循环明确：
@@ -820,6 +764,8 @@ conversation-agent 发布 revision 前必须通过静态完整性检查。
 - 时间或预算上限
 - 退出 edge
 - 可达 done 或 failed
+
+Version 1 不支持 guard/priority，因此 liveness 基于 `(column,outcome)` 唯一 target 与 `max_visits` 做静态验证。
 
 禁止：
 
@@ -841,10 +787,11 @@ Runtime Reconciler 独立于原 worker 定期检查：
 - heartbeat 是否过期
 - waiting 是否到 `next_check_at`
 - soft/stale/hard deadline
-- external job 是否完成
+- 到期 poll/event/timer AwaitHandle 是否满足恢复条件
 - dependency 是否满足
 - 是否存在无 owner 的 run
 - terminal event 是否已通知 conversation-agent
+- Task control state 是否允许恢复执行
 
 可执行：
 
@@ -852,7 +799,7 @@ Runtime Reconciler 独立于原 worker 定期检查：
 - 标记 interrupted
 - 查询 AwaitHandle
 - 恢复 waiting
-- 创建新 attempt
+- 创建新 Column Attempt
 - 执行 recovery transition
 - 唤醒 conversation-agent
 - 明确进入 failed
@@ -863,8 +810,8 @@ Runtime Reconciler 独立于原 worker 定期检查：
 
 - Task 当前 Column
 - Column Run status/health
-- execution mode
-- attempt
+- executor kind
+- Column Run visit 与 Column Attempt
 - lease/heartbeat
 - input/output artifact
 - AwaitHandle
@@ -886,7 +833,7 @@ lease 过期、owner 不存在或 worker 丢失时：
 - 不假设成功或失败。
 - 转为 interrupted。
 - 检查 artifact、checkpoint 和 execution receipt。
-- 可恢复则恢复，否则创建新 attempt。
+- 可恢复则恢复，否则创建新 Column Attempt。
 - 通知 conversation-agent。
 
 ### 外部副作用
@@ -908,6 +855,8 @@ lease 过期、owner 不存在或 worker 丢失时：
 - `task.done`
 - `task.failed`
 - `task.cancelled`
+- `task.paused`
+- `task.resumed`
 
 Task 终态记录：
 
@@ -916,47 +865,43 @@ terminal_at
 terminal_event_id
 conversation_agent_notified_at
 conversation_agent_observed_at
+conversation_agent_acknowledged_at
 conversation_agent_action
 ```
 
-不能只证明通知已发送，还要知道 conversation-agent 是否观察并处理。
+Mailbox 使用 claim lease 与 at-least-once delivery。读取只进入 claimed；只有治理决定或显式 audited no-op 成功持久化后，才在同一短事务写 `observed_at/acknowledged_at`。失败或 claim lease 过期自动重新投递。
 
 ## 33. SQLite 单库设计
 
-所有 Project 使用一个 SQLite。Project 通过 `project_id` 隔离结构化状态，通过 `workspace_root` 隔离用户工作区；`internal_artifact_root` 保存 DevWerk 管理的证据文件，并且不向 Project 文件 capability 暴露。
+服务级 `data_root/devwerk.db` 是所有 Project 共享的 SQLite。Project 通过 `project_id` 隔离结构化状态，通过 `workspace_root` 隔离用户工作区；每个 `internal_artifact_root=data_root/projects/{project_id}` 保存该 Project 的证据文件，并且不向 Project 文件 capability 暴露。
 
-建议表组：
+物理表名和约束以通用设计的 Canonical Data Dictionary 为准，本节只列 Kanban 相关子集：
 
 ### Workflow Definition
 
-- `workflows`
-- `workflow_revisions`
-- `workflow_columns`
-- `workflow_transitions`
+- `v1_workflows`
+- `v1_workflow_revisions`
 
 ### Task Runtime
 
-- `tasks`
-- `column_runs`
-- `agent_runs`
-- `run_checkpoints`
-- `await_handles`
-- `execution_receipts`
+- `v1_tasks`
+- `v1_column_runs`
+- `v1_column_attempts`
+- `v1_agent_runs`
+- `v1_agent_segments`
+- `v1_await_handles`
+- `v1_execution_receipts`
+- `v1_task_dependencies`
+- `v1_resource_claims`
+- `v1_scheduling_entries`
 
 ### Evidence
 
-- `events`
-- `artifacts`
-- `artifact_links`
-- `usage_aggregates`
+- `v1_events`
+- `v1_artifacts`
+- `v1_project_mailbox`
 
-### Read Projection
-
-- `kanban_task_projection`
-- `active_run_projection`
-- `workflow_revision_summary`
-
-所有表的 Project 数据带 `project_id`；外键和 repository API 验证 Project 一致性。
+所有 Project-scoped 表直接携带 `project_id`；复合外键和 repository API 验证 Project 一致性。Version 1 Web 使用有界 indexed read query 与 event cursor；物化 projection 是兼容优化，不属于 release gate。
 
 ## 34. SQL 与文件分工
 
@@ -970,12 +915,11 @@ SQLite 保存：
 - event metadata 和紧凑 payload
 - artifact metadata、path、hash、size、type
 - terminal state 和 notification
-- projection
 
 文件保存：
 
 - 大模型超长 raw response
-- 图片、视频、音频
+- 二进制与媒体 artifact
 - 代码包、压缩包
 - 大型 tool output
 - screenshot
@@ -992,7 +936,7 @@ Dashboard 和 scheduler 不读取文件正文，只读取 SQLite metadata；正�
 - WAL mode
 - 合理 busy timeout
 - 短 transaction
-- transaction 内禁止网络、LLM、MCP 和大文件写入
+- transaction 内禁止网络、模型调用、外部 capability 和大文件写入
 - 关键状态立即提交
 - 高频进度合并节流
 - 批量维护小批次执行
@@ -1019,21 +963,21 @@ Dashboard 和 scheduler 不读取文件正文，只读取 SQLite metadata；正�
 ## 36. 索引建议
 
 ```text
-workflow_revisions(project_id, workflow_id, revision_no)
-workflow_columns(workflow_revision_id, key)
-workflow_transitions(workflow_revision_id, from_column_id, outcome)
-tasks(project_id, status, updated_at, id)
-tasks(project_id, workflow_revision_id, status, id)
-column_runs(task_id, status, id)
-column_runs(project_id, status, heartbeat_at, id)
-column_runs(project_id, lease_expires_at, status, id)
-agent_runs(column_run_id, attempt_no, id)
-await_handles(status, next_check_at, id)
-await_handles(project_id, health, hard_deadline, id)
-events(project_id, id)
-events(task_id, id)
-artifacts(project_id, task_id, created_at, id)
-execution_receipts(column_run_id, idempotency_key)
+v1_workflows(project_id, id)
+v1_workflow_revisions(project_id, workflow_id, revision_no)
+v1_tasks(project_id, status, updated_at, id)
+v1_tasks(project_id, workflow_revision_id, status, id)
+v1_column_runs(project_id, task_id, visit_no)
+v1_column_attempts(project_id, status, lease_expires_at, id)
+v1_column_attempts(column_run_id, attempt_no)
+v1_agent_runs(project_id, column_attempt_id, id)
+v1_await_handles(project_id, status, next_check_at, id)
+v1_await_handles(project_id, health, hard_deadline, id)
+v1_events(project_id, id)
+v1_events(task_id, id)
+v1_artifacts(project_id, task_id, created_at, id)
+v1_execution_receipts(project_id, capability_id, idempotency_key)
+v1_resource_claims(project_id, resource_key, lease_expires_at)
 ```
 
 要求：
@@ -1046,14 +990,14 @@ execution_receipts(column_run_id, idempotency_key)
 
 ## 37. Web Kanban 渲染
 
-Kanban 用户侧只读，渲染使用轻量 projection：
+Kanban 用户侧只读，Version 1 使用有界 indexed read query 返回轻量 read model：
 
 ```text
 task_id
 project_id
 title
 task_status
-current_column_id
+current_column_key
 current_column_name
 run_status
 run_health
@@ -1071,7 +1015,7 @@ state_version
 4. Event、Artifact、Run detail 按需分页。
 5. 不轮询整张 board，不加载 raw artifact。
 
-Projection 与关键状态转移尽量在同一短 transaction 更新。
+关键状态转移与 event cursor 在同一短 transaction 提交；客户端按 event 后的资源 `state_version` 拉取一致 read model。物化 projection 是后续兼容优化。
 
 ## 38. Event 降噪
 
@@ -1098,22 +1042,23 @@ Projection 与关键状态转移尽量在同一短 transaction 更新。
 
 以下操作原子提交：
 
-- Task 创建 + workflow revision 固定 + start Column pending run
-- Column Run succeeded + output artifact metadata + transition + next pending run
-- Column Run failed + retry/recovery decision
-- waiting + AwaitHandle 创建
-- AwaitHandle terminal + Run 恢复入队
+- Task 创建 + workflow revision 固定 + start Column pending Run/Attempt
+- Column Attempt succeeded + Run output artifact metadata + transition + next pending Run/Attempt
+- Column Attempt failed + retry/recovery decision + 可选新 Attempt
+- waiting + AwaitHandle + checkpoint + execution receipt + step cursor
+- AwaitHandle terminal + Attempt 恢复入队
 - Task terminal + terminal event + Project mailbox notification
+- governance decision/audited no-op + mailbox ack
 
-使用 `state_version` 或 optimistic concurrency 防止重复 callback、poll 和 recovery 覆盖新状态。
+使用 `state_version` 和幂等键防止重复 event、poll、timer 和 recovery 覆盖新状态。
 
 ## 40. 自驱动保证
 
 DevWerk 不能保证外部服务一定成功，但必须保证：
 
-1. 每个 waiting 有明确 kind、owner 和 AwaitHandle。
-2. 每个 waiting 有 `next_check_at`。
-3. 每个 waiting 有 soft/stale/hard deadline。
+1. 每个 waiting 有明确 poll/event/timer kind、owner 和 AwaitHandle。
+2. 每个 waiting 有 `next_check_at` 或 event correlation key。
+3. 每个 waiting 有 hard deadline；poll waiting 另有 soft/stale deadline。
 4. 每个 waiting 有 resume 和 timeout outcome。
 5. 每个循环有次数、时间或预算上限。
 6. 服务重启后可以恢复。
@@ -1128,18 +1073,19 @@ DevWerk 不能保证外部服务一定成功，但必须保证：
 ## 41. Version 1 验收不变量
 
 - Workflow 以统一 Column Definition 为基础。
-- 每次进入 Column 创建独立 Column Run。
+- 每次进入非终态 Column 创建独立 Column Run；retry 在 Run 下创建新的 Column Attempt。
 - Run status 与 business outcome 分离。
 - 每个非终态 Column 显式使用 `capability_sequence` 或 `agent` executor；Runtime 不根据列名或业务文本选择 executor。
 - Agent Context 不包含无界历史。
 - Input 不满足不执行，Output 不满足不推进。
-- transition 全部来自固定 revision。
+- transition 全部来自固定 revision，且每个 `(column,outcome)` 只有一个 target。
 - Task 只有 done/failed 两种终态。
 - 无下一列不代表成功。
 - Column failed 先走 retry/recovery，failure terminal 才使 Task failed。
 - waiting 可以长期健康，但不能无期限和无退出策略。
-- AwaitHandle、ProgressAdapter、Liveness Validator、Reconciler 都存在。
+- CapabilityResult、AwaitHandle、Progress Evidence、Liveness Validator、Reconciler 都存在。
+- Task pause/resume 使用独立 control state，只有 paused 且无活跃 lease 才允许迁移。
 - 服务重启不会留下永久 orphan pending/running/waiting。
 - terminal 和异常进入 conversation-agent mailbox。
 - SQLite 不承受逐 token、逐 heartbeat 和大正文写入。
-- Kanban Web 使用分页 projection 和增量更新。
+- Kanban Web 使用分页 read model 和增量 event cursor。

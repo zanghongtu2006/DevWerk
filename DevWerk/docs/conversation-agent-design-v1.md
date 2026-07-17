@@ -78,11 +78,11 @@ Project 是 DevWerk 的首要隔离边界，用来隔离：
 - 调度决定
 - workspace 路径与文件访问范围
 
-所有结构化记录必须携带 `project_id`。任何跨 Project 读取、调度、上下文装配或文件操作都必须显式授权，Version 1 默认禁止。
+所有 Project-scoped 结构化记录必须直接携带 `project_id`。服务级 policy/config 记录明确标记为 service scope。任何跨 Project 读取、调度、上下文装配或文件操作都必须显式授权，Version 1 默认禁止。
 
-### Workspace Root 与 Internal Artifact Root
+### Workspace Root、Data Root 与 Internal Artifact Root
 
-每个 Project 拥有一个规范化后的 `workspace_root`，代表用户项目工作区根目录。DevWerk 另行管理 `internal_artifact_root`，用于保存系统证据与运行工件。
+每个 Project 拥有一个规范化后的 `workspace_root`，代表用户项目工作区根目录。DevWerk 拥有服务级 `data_root`，共享 SQLite 位于 `data_root/devwerk.db`；每个 Project 的 `internal_artifact_root=data_root/projects/{project_id}`，只保存该 Project 的系统证据与运行工件。
 
 它不同于 DevWerk 内部状态目录：
 
@@ -90,8 +90,11 @@ Project 是 DevWerk 的首要隔离边界，用来隔离：
 workspace_root
   用户项目源码、文档和交付物
 
+data_root/devwerk.db
+  所有 Project 共享的 SQLite
+
 internal_artifact_root
-  SQLite、运行工件、附件、审计归档和临时文件
+  单个 Project 的运行工件、附件、审计归档和临时文件
 ```
 
 要求：
@@ -155,6 +158,8 @@ Version 1 不允许通过创建第二个 conversation-agent 来绕过同一 Proj
 ## 7. Web 用户治理边界
 
 Version 1 的用户治理入口只有 Web conversation。
+
+Version 1 的部署信任模型是单用户、可信 operator 的本地服务。服务端根据 conversation job 派生 Project access 与 mutation scope；普通客户端不能提交或提升自身权限。Operator 配置只来自启动配置或使用进程启动时生成 secret 的 loopback admin channel，并完整审计。多用户认证、Project membership 和远程部署授权属于后续版本。
 
 用户通过自然语言表达：
 
@@ -319,6 +324,8 @@ Backlog / Workflow / Task / Scheduling Mutations
 - worker task/agent run 可以并发。
 - dispatch、retry、restart、cancel、migration 必须幂等。
 
+Conversation Agent 提出调度决定，Repository 以 `state_version` 在短事务内检查 `task_dependencies`、Project/Column WIP limit 和 `resource_claims`，再原子创建 Scheduling Entry 与 claim。依赖、额度或资源冲突未满足时不启动 Task，并返回结构化事实供下一次治理决定使用。
+
 ## 12. 事件驱动监督
 
 conversation-agent 由以下版本化点分事件唤醒；event stream 与 Project mailbox 使用相同 `event_type`：
@@ -330,7 +337,7 @@ conversation-agent 由以下版本化点分事件唤醒；event stream 与 Proje
 - `retry.exhausted`
 - `run.long_running`、`run.degraded`、`run.stalled`
 - `lease.expired`、`column.interrupted`
-- `task.done`、`task.failed`、`task.cancelled`
+- `task.done`、`task.failed`、`task.cancelled`、`task.paused`、`task.resumed`
 - `project.recovery.started`
 - `supervision.review.due`
 
@@ -343,6 +350,7 @@ conversation-agent 由以下版本化点分事件唤醒；event stream 与 Proje
 → 继续观察 / 调度 / Direct Run / Intervention Run
 → 验证操作结果
 → 提交项目事实与审计
+→ 在同一短事务确认 mailbox event
 → 安排下一次 review
 → 必要时向用户汇报
 ```
@@ -362,7 +370,7 @@ conversation-agent 不因单纯运行时间较长就中断 worker。它结合 he
 `failed` 后 conversation-agent 可以：
 
 - 重启调度
-- 创建新 attempt
+- 在当前 Column Run 创建新 Column Attempt
 - 返回前一个 Column
 - 改派 agent
 - 修正 task
@@ -376,7 +384,7 @@ Task 只有在 output contract、artifact/evidence policy 与显式 success term
 
 取消是一个可审计终态操作：Task 原子进入 `failed`，记录 `failure_code=cancelled`、`task.cancelled` event、failure artifact 与 mailbox 通知。
 
-Task revision 迁移只允许在 Task 已暂停且没有活跃 lease 时执行。迁移请求必须声明目标 revision、目标 Column、context/artifact 继承策略和期望 `state_version`；Runtime 重新验证目标 input contract，以 CAS transaction 切换 revision 与 Column、创建新 attempt 并写入审计事件。验证或 CAS 失败时保持原 revision 和状态。
+Task 使用独立 `control_state=active|pause_requested|paused`。暂停请求先阻止领取新工作，在当前 capability 到达安全 checkpoint 并释放 lease 后成为 `paused`；AwaitHandle 与 checkpoint 保留但不恢复执行。Task revision 迁移只允许在 `paused` 且没有活跃 lease 时执行。迁移请求必须声明目标 revision、目标 Column、context/artifact 继承策略和期望 `state_version`；Runtime 重新验证目标 input contract，以 CAS transaction 切换 revision 与 Column、创建新的 Column Run 与首个 Attempt 并写入审计事件。验证或 CAS 失败时保持原 revision 和状态。
 
 ## 14. Tool 与权限
 
@@ -387,19 +395,19 @@ conversation-agent Version 1 拥有 Project 内系统级能力：
 - agent 创建、配置、停止和改派
 - event、artifact、run、log 和 provider 状态读取
 - Project workspace 文件读写
-- shell/process
-- skill、tool、MCP 和外部 API 调用
+- sandboxed command/process
+- Version 1 Capability Registry 中已启用的 skill/tool
 - scheduled review 与 recovery
 
 Version 1 暂不实现用户审批边界，但仍要求：
 
-- Project Path containment
+- workspace_root containment
 - 审计事件
 - 必要 snapshot/revision
 - 幂等操作
 - 明确错误记录
 
-Capability Registry 根据 `side_effect_kind` 与 Project 配置执行确定性风险策略。Version 1 默认只启用 `workspace_root` 内可恢复、可审计的读写与本地进程能力；不可逆远程写入、付费调用、发布和远程删除 capability 默认禁用，只有 Project operator 显式配置后才能进入可用目录。Version 1 不提供逐操作用户审批界面；细粒度权限和交互式高风险审批是 release 后高优先级需求。
+Capability Registry 根据 `side_effect_kind` 与 Project 配置执行确定性风险策略。Version 1 只启用 `workspace_root` 内可恢复、可审计的能力；不可逆远程写入、付费调用、发布和远程删除不进入 release 目录。Command capability 仅接受结构化 argv，并在 OS/container sandbox 中限制 filesystem mount、network、environment、credentials、child process、CPU、内存、输出与时间；cwd containment 本身不视为进程隔离。Version 1 不提供逐操作用户审批界面；细粒度权限和交互式高风险审批是 release 后高优先级需求。
 
 ## 15. Worker Agent 边界
 
@@ -407,7 +415,7 @@ worker agent：
 
 - 接收明确 task/column contract。
 - 只处理当前 Column Run。
-- 使用允许的 context、skill、tool 和 MCP。
+- 使用 Column 明确允许的 context 与 capability。
 - 返回结构化 outcome、artifact、evidence 和 risk。
 - 可以报告 blocked、failed 或需要帮助。
 - 不得修改 Project 目标、其他 task 或 workflow。
@@ -417,7 +425,7 @@ worker 的 `success` 只是输出声明。Runtime 必须验证 Column output con
 
 ## 16. SQLite 与文件存储总原则
 
-DevWerk Version 1 使用一个 SQLite 数据库保存所有 Project 的结构化事实。Project 通过 `project_id` 做逻辑隔离，通过 `workspace_root` 做用户工作区隔离；`internal_artifact_root` 独立保存 DevWerk 管理的证据文件。
+DevWerk Version 1 使用 `data_root/devwerk.db` 保存所有 Project 的结构化事实。Project 通过 `project_id` 做逻辑隔离，通过 `workspace_root` 做用户工作区隔离；每个 `internal_artifact_root` 独立保存该 Project 的 DevWerk 证据文件。
 
 存储原则：
 
@@ -428,24 +436,26 @@ DevWerk Version 1 使用一个 SQLite 数据库保存所有 Project 的结构化
 - 不在 dashboard 查询中读取大文件正文。
 - 不为每个 Project 创建独立 SQLite。
 
-## 17. 建议的 SQLite 记录
+## 17. SQLite 领域记录
+
+物理表名与约束以通用设计文档的 Canonical Data Dictionary 为准；本节使用相同 `v1_*` 名称，不定义第二套 schema。
 
 ### Project 与 Agent
 
-- `projects`
-- `conversation_agents`
-- `project_settings`
-- `project_mailbox`
-- `scheduled_reviews`
+- `v1_projects`
+- `v1_conversation_agents`
+- `v1_platform_policy_revisions`
+- `v1_project_settings`
+- `v1_project_mailbox`
+- `v1_scheduled_reviews`
 
-`projects` 至少包含：
+`v1_projects` 至少包含：
 
 ```text
 id
 name
 status
 workspace_root
-internal_artifact_root
 active_workflow_revision_id
 created_at
 updated_at
@@ -454,12 +464,14 @@ state_version
 
 ### Conversation 与治理
 
-- `conversation_threads`
-- `conversation_messages`
-- `backlog_items`
-- `scheduling_decisions`
-- `direct_runs`
-- `intervention_runs`
+- `v1_conversations`
+- `v1_conversation_messages`
+- `v1_backlog_items`
+- `v1_scheduling_entries`
+- `v1_task_dependencies`
+- `v1_resource_claims`
+- `v1_direct_runs`
+- `v1_intervention_runs`
 
 普通文本消息可以保存在 SQLite，附件和超大正文使用文件。消息表保存 Project、thread、role、时间、正文或正文引用。
 
@@ -473,10 +485,10 @@ state_version
 
 ## 18. 建议的文件存储
 
-DevWerk 内部文件目录建议与用户 Project Path 分开：
+服务级 `data_root` 与用户 `workspace_root` 分开，Project artifact root 由 `project_id` 确定性派生：
 
 ```text
-data/
+data_root/
   devwerk.db
   projects/
     {project_id}/
@@ -533,7 +545,7 @@ SQLite 只有一个有效 writer。DevWerk 即使规模不大，也必须避免 
 - dispatch/retry/migration 幂等记录
 - AwaitHandle 创建和终态
 - mailbox claim/ack
-- Project Path 或治理配置变化
+- workspace_root 或治理配置变化
 
 **可以节流合并**：
 
@@ -550,16 +562,16 @@ SQLite 只有一个有效 writer。DevWerk 即使规模不大，也必须避免 
 关键索引按真实访问路径建设，至少包括：
 
 ```text
-projects(status, updated_at, id)
-project_mailbox(project_id, state, available_at, id)
-conversation_messages(project_id, thread_id, id)
-backlog_items(project_id, state, priority, updated_at, id)
-tasks(project_id, status, updated_at, id)
-events(project_id, id)
-events(task_id, id)
-artifacts(project_id, task_id, created_at, id)
-scheduling_decisions(project_id, created_at, id)
-scheduled_reviews(state, due_at, id)
+v1_projects(status, updated_at, id)
+v1_project_mailbox(project_id, state, available_at, id)
+v1_conversation_messages(project_id, conversation_id, id)
+v1_backlog_items(project_id, state, priority, updated_at, id)
+v1_tasks(project_id, status, updated_at, id)
+v1_events(project_id, id)
+v1_events(task_id, id)
+v1_artifacts(project_id, task_id, created_at, id)
+v1_scheduling_entries(project_id, status, created_at, id)
+v1_scheduled_reviews(state, due_at, id)
 ```
 
 规则：
@@ -574,14 +586,7 @@ scheduled_reviews(state, due_at, id)
 
 ## 21. Web 投影与渲染性能
 
-Web 页面不直接拼接整个 Project 历史。建议在同一个 SQLite 内维护轻量 projection：
-
-- `project_summary_projection`
-- `kanban_task_projection`
-- `active_run_projection`
-- `project_activity_cursor`
-
-Projection 只保存渲染所需摘要：状态、标题、进度、风险、最后活动、计数和版本号，不复制大正文。
+Web 页面不直接拼接整个 Project 历史。Version 1 使用有界 indexed read query 返回渲染所需摘要：状态、标题、进度、风险、最后活动、计数和版本号，不复制大正文。物化 projection 是兼容优化，不属于 release gate。
 
 渲染流程：
 
@@ -591,7 +596,7 @@ Projection 只保存渲染所需摘要：状态、标题、进度、风险、最
 4. 消息、event、artifact、run detail 按需分页加载。
 5. 大文件正文通过文件 endpoint 按需读取。
 
-Projection 更新与关键状态转移尽量在同一短 transaction 中完成，避免页面看到不一致状态。
+事件游标与关键状态转移在同一短 transaction 中提交，客户端以事件后的资源版本读取一致快照。
 
 ## 22. 数据保留与归档
 
@@ -629,6 +634,10 @@ Projection 更新与关键状态转移尽量在同一短 transaction 中完成�
 - 复杂审批流
 - 细粒度 RBAC
 - 多人协同编辑
+- 多用户认证与远程部署授权
+- MCP、callback receiver 与多 Provider 自动切换作为 release gate
+- 不可逆外部 capability
+- 复杂物化 Web projection
 - 新记忆系统设计
 
 ## 26. 验收不变量
@@ -640,7 +649,9 @@ Projection 更新与关键状态转移尽量在同一短 transaction 中完成�
 - Project 文件 capability 不会逃逸 `workspace_root`，也不能进入 `internal_artifact_root`。
 - Formal Task、Direct Run、Intervention Run 可区分和审计。
 - 调度前存在 Readiness Decision。
+- dispatch 由 dependency、WIP 与 resource claim 的确定性 transaction guard 约束。
 - Project governance 串行，worker execution 可并发。
+- command capability 在受限 sandbox 内运行。
 - task done/failed 和运行异常都会进入 mailbox。
 - SQLite transaction 不包含网络、LLM 或大文件操作。
 - Web board 不依赖全量历史查询和全量轮询。
