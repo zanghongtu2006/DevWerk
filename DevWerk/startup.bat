@@ -38,13 +38,18 @@ if not "%APP_ENV%"=="development" if not "%APP_ENV%"=="production" if not "%APP_
     exit /b 1
 )
 
-set "PYTHON_EXE=python"
-if exist ".venv\Scripts\python.exe" set "PYTHON_EXE=.venv\Scripts\python.exe"
-if defined DEVWERK_PYTHON set "PYTHON_EXE=%DEVWERK_PYTHON%"
+set "PYTHON_EXE=venv\Scripts\python.exe"
+
+if not exist "%PYTHON_EXE%" (
+    echo [DevWerk] Project virtual environment not found: %CD%\%PYTHON_EXE%
+    echo [DevWerk] Restore the existing DevWerk venv before starting the service.
+    exit /b 1
+)
 
 "%PYTHON_EXE%" --version >nul 2>&1
 if errorlevel 1 (
-    echo [DevWerk] Python not found. Install Python 3.10+ and retry.
+    echo [DevWerk] Project virtual environment cannot be executed: %CD%\%PYTHON_EXE%
+    echo [DevWerk] DevWerk will not fall back to a system Python interpreter.
     exit /b 1
 )
 
@@ -63,7 +68,7 @@ if /i "%UVICORN_ACCESS_LOG%"=="false" set "UVICORN_ACCESS_FLAG=--no-access-log"
 if /i "%UVICORN_ACCESS_LOG%"=="0" set "UVICORN_ACCESS_FLAG=--no-access-log"
 if /i "%UVICORN_ACCESS_LOG%"=="no" set "UVICORN_ACCESS_FLAG=--no-access-log"
 
-"%PYTHON_EXE%" -c "import fastapi, mcp, uvicorn" >nul 2>&1
+"%PYTHON_EXE%" -c "import fastapi, pydantic, uvicorn" >nul 2>&1
 if errorlevel 1 (
     echo [DevWerk] Service dependencies are missing or out of date.
     echo [DevWerk] Installing requirements into %PYTHON_EXE% ...
@@ -74,18 +79,20 @@ if errorlevel 1 (
     )
 )
 
-"%PYTHON_EXE%" -c "import fastapi, mcp, uvicorn" >nul 2>&1
+"%PYTHON_EXE%" -c "import fastapi, pydantic, uvicorn" >nul 2>&1
 if errorlevel 1 (
     echo [DevWerk] Dependency verification failed after installation.
     exit /b 1
 )
 
 echo [DevWerk] Starting in %APP_ENV% mode...
+echo [DevWerk] Python:             %CD%\%PYTHON_EXE%
 echo [DevWerk] Starting uvicorn on http://%HOST%:%PORT% ...
 echo [DevWerk] Log level:          %LOG_LEVEL%
 echo [DevWerk] API docs:           http://localhost:%PORT%/docs
 echo [DevWerk] Alternative docs:   http://localhost:%PORT%/redoc
-echo [DevWerk] MCP endpoint:       http://localhost:%PORT%/mcp
+echo [DevWerk] Web workbench:      http://localhost:%PORT%/
+echo [DevWerk] Health endpoint:    http://localhost:%PORT%/v1/health
 echo.
 echo [DevWerk] Press Ctrl+C to stop.
 echo.

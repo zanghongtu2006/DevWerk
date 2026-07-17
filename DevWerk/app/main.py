@@ -1,175 +1,84 @@
-"""
-DevWerk Backend 鈥?FastAPI application entry point.
-"""
+"""DevWerk V1 FastAPI application entry point."""
 
 from __future__ import annotations
 
 import logging
-import re
-import sys
-import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-
-# Ensure the project root is on the import path so 'app' resolves.
-sys.path.insert(0, str(__file__.rsplit("/", 2)[0]))
 
 from app.core.config import settings
 from app.core.logging import configure_logging, configure_logging_from_env
-from app.mcp_server import create_mcp_server
-from app.routes.workflows import _start_workflow_thread, router as workflow_router, workflow_worker_age
-from app.routes.kanban import router as kanban_router
-from app.routes.kanban import ui_router as kanban_ui_router
-from app.routes.settings import router as settings_router
-from app.routes.skills import router as skills_router
-from app.routes.plugins import router as plugins_router
-from app.routes.capabilities import router as capabilities_router
-from app.routes.memory import router as memory_router
-from app.kanban.store import init_kanban_db
-from app.services.memory_system import init_memory_db
-from app.services.usage import clear_request, finish_request, init_usage_db, start_request
-from app.services.workflow_supervisor import WorkflowSupervisor
+from app.services.usage import init_usage_db
+from app.v1.api import router as v1_router
+from app.v1.capabilities import build_core_registry
+from app.v1.conversation import ConversationAgent
+from app.v1.runtime import RuntimeSupervisor
+from app.v1.store import V1Store
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Lifecycle events on startup and shutdown.
-
-    - Log active configuration (without secrets).
-    - Validate provider credentials on startup so failures are visible immediately.
-    """
     cfg = settings()
     configure_logging(cfg)
     log = logging.getLogger("devwerk")
-
-    log.info("DevWerk starting 鈥?APP_ENV=%s, DEFAULT_API=%s", cfg.app_env, cfg.llm_provider_name)
-
-    # Log sanitised provider config (hide API keys).
-    def _safe(v: str | None) -> str:
-        if v is None:
-            return "<not set>"
-        if len(v) > 8:
-            return v[:4] + "****" + v[-4:]
-        return "****"
-
-    llm = cfg.get_llm_config("project")
-    safe_config = {k: _safe(v) if k == "api_key" else v for k, v in llm.items()}
-    log.info("Active LLM config: %s", safe_config)
+    log.info("DevWerk V1 starting app_env=%s db=%s", cfg.app_env, cfg.devwerk_db_path)
     init_usage_db()
-    init_kanban_db()
-    init_memory_db()
-    supervisor = WorkflowSupervisor(
-        start_workflow=_start_workflow_thread,
-        active_worker_age=workflow_worker_age,
-        config=cfg,
-    )
-    if bool(getattr(cfg, "workflow_supervisor_enabled", True)):
+    store = V1Store(cfg.devwerk_db_path)
+    registry = build_core_registry()
+    supervisor = RuntimeSupervisor(store, registry, interval=cfg.workflow_supervisor_interval_seconds)
+    app.state.v1_store = store
+    app.state.v1_registry = registry
+    app.state.v1_control_token = cfg.devwerk_control_token
+    conversation = ConversationAgent(store, registry, on_task_created=supervisor.wake)
+    app.state.v1_conversation = conversation
+    app.state.v1_supervisor = supervisor
+    if cfg.workflow_supervisor_enabled:
         supervisor.start()
-
-    if cfg.app_env == "production" and not cfg.is_production:
-        log.warning("Running in production but APP_ENV is not 'production'!")
-
-    async with app.state.devwerk_mcp.session_manager.run():
-        try:
-            yield
-        finally:
-            supervisor.stop()
-
-    log.info("DevWerk shutting down.")
+    try:
+        yield
+    finally:
+        conversation.stop()
+        supervisor.stop()
+        log.info("DevWerk V1 stopped")
 
 
 def create_app() -> FastAPI:
     configure_logging_from_env()
-    devwerk_mcp, mcp_http_app = create_mcp_server()
     app = FastAPI(
-        title="DevWerk API",
-        description="AI-driven workflow and agent runtime for engineering capability providers.",
-        version="0.1.0",
+        title="DevWerk V1 API",
+        description="Conversation-led multi-agent workflow runtime",
+        version="1.0.0",
         lifespan=lifespan,
     )
-    app.state.devwerk_mcp = devwerk_mcp
-
-    # Allow local capability providers to call the API.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],   # tighten in production via ALLOWED_ORIGINS env var
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Accept", "Content-Type", "X-DevWerk-Control-Token"],
     )
+    app.include_router(v1_router, prefix="/v1", tags=["DevWerk V1"])
+    web_root = Path(__file__).resolve().parent / "web"
+    app.mount("/web/static", StaticFiles(directory=web_root / "static"), name="web-static")
 
-    @app.middleware("http")
-    async def usage_tracking_middleware(request: Request, call_next):
-        log = logging.getLogger("devwerk.request")
-        started = time.monotonic()
-        if not request.url.path.startswith("/v1/"):
-            response = await call_next(request)
-            log.debug(
-                "request path=%s method=%s status=%s duration_ms=%s",
-                request.url.path,
-                request.method,
-                response.status_code,
-                int((time.monotonic() - started) * 1000),
-            )
-            return response
+    def index() -> FileResponse:
+        return FileResponse(web_root / "templates" / "dashboard.html")
 
-        project_id = request.headers.get("X-DevWerk-Project-Id") or request.query_params.get("project_id")
-        task_id = (
-            request.headers.get("X-DevWerk-Task-Id")
-            or request.query_params.get("task_id")
-            or _task_id_from_path(request.url.path)
-        )
-        ctx = start_request(project_id, route=request.url.path, action=request.method, task_id=task_id)
-        log.debug(
-            "request start method=%s path=%s project_id=%s task_id=%s query=%s",
-            request.method,
-            request.url.path,
-            project_id,
-            task_id,
-            str(request.query_params),
-        )
-        try:
-            response = await call_next(request)
-            finish_request(ctx, status_code=response.status_code, success=response.status_code < 500)
-            log.debug(
-                "request end method=%s path=%s project_id=%s status=%s duration_ms=%s",
-                request.method,
-                request.url.path,
-                ctx.project_id,
-                response.status_code,
-                int((time.monotonic() - started) * 1000),
-            )
-            return response
-        except Exception as exc:  # noqa: BLE001
-            finish_request(ctx, status_code=500, success=False, error_type=type(exc).__name__)
-            log.exception(
-                "request failed method=%s path=%s project_id=%s duration_ms=%s",
-                request.method,
-                request.url.path,
-                ctx.project_id,
-                int((time.monotonic() - started) * 1000),
-            )
-            raise
-        finally:
-            clear_request()
-
-    app.include_router(workflow_router, prefix="/v1", tags=["Workflows"])
-    app.include_router(kanban_router, prefix="/v1", tags=["Kanban"])
-    app.include_router(settings_router, prefix="/v1", tags=["Settings"])
-    app.include_router(skills_router, prefix="/v1", tags=["Skills"])
-    app.include_router(plugins_router, prefix="/v1", tags=["Plugins"])
-    app.include_router(capabilities_router, prefix="/v1", tags=["Capabilities"])
-    app.include_router(memory_router, prefix="/v1", tags=["Memory"])
-    app.include_router(kanban_ui_router)
-    app.mount("/web/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "web" / "static")), name="web-static")
-    # Mount last so existing FastAPI routes win and /mcp is served without a redirect.
-    app.mount("/", mcp_http_app, name="mcp")
+    for route, name in (
+        ("/", "web-root"),
+        ("/workbench", "web-overview"),
+        ("/dashboard", "web-projects"),
+        ("/kanban", "web-kanban"),
+        ("/tasks", "web-tasks"),
+        ("/events", "web-events"),
+    ):
+        app.add_api_route(route, index, methods=["GET"], include_in_schema=False, name=name)
 
     return app
 
@@ -177,23 +86,7 @@ def create_app() -> FastAPI:
 app = create_app()
 
 
-def _task_id_from_path(path: str) -> str | None:
-    match = re.match(r"^/v1/(?:workflows|kanban/tasks)/([^/]+)", path)
-    if not match:
-        return None
-    return match.group(1)
-
-
 if __name__ == "__main__":
-    # Allow:  python app/main.py
-    # Equivalent to: uvicorn app.main:app --reload --port 8000
     cfg = settings()
     configure_logging(cfg)
-    uvicorn.run(
-        "app.main:app",
-        host=cfg.host,
-        port=cfg.port,
-        reload=cfg.reload,
-        log_level=cfg.log_level.lower(),
-        access_log=cfg.uvicorn_access_log,
-    )
+    uvicorn.run("app.main:app", host=cfg.host, port=cfg.port, reload=cfg.reload, log_level=cfg.log_level.lower(), access_log=cfg.uvicorn_access_log)

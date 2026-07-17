@@ -218,13 +218,15 @@ def record_llm_usage(
     duration_ms: int,
     success: bool,
     error_type: str | None = None,
+    project_id: str | None = None,
+    task_id: str | None = None,
 ) -> None:
     if not _enabled():
         return
 
     ctx = current_request()
-    project_id = ctx.project_id if ctx else str(uuid.uuid4())
-    task_id = ctx.task_id if ctx else None
+    resolved_project_id = project_id if project_id is not None else (ctx.project_id if ctx else str(uuid.uuid4()))
+    resolved_task_id = task_id if task_id is not None else (ctx.task_id if ctx else None)
     request_id = ctx.request_id if ctx else None
     normalized = _normalize_usage(usage or {})
 
@@ -243,8 +245,8 @@ def record_llm_usage(
                 """,
                 (
                     request_id,
-                    project_id,
-                    task_id,
+                    resolved_project_id,
+                    resolved_task_id,
                     agent_name,
                     provider,
                     model,
@@ -265,8 +267,8 @@ def record_llm_usage(
         _log.debug(
             "llm usage recorded request_id=%s project_id=%s task_id=%s agent=%s provider=%s model=%s usage=%s duration_ms=%s success=%s error=%s",
             request_id,
-            project_id,
-            task_id,
+            resolved_project_id,
+            resolved_task_id,
             agent_name,
             provider,
             model,

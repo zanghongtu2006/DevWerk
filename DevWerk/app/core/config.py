@@ -43,7 +43,6 @@ class ApiProfile:
     model: str
     timeout: float
     effort_level: str | None = None
-    enable_schema: bool = True
     trust_env_proxy: bool = False
 
 
@@ -67,7 +66,6 @@ class AgentModelConfig:
             "model": self.model,
             "timeout": self.api.timeout,
             "effort_level": self.api.effort_level,
-            "enable_schema": self.api.enable_schema,
             "trust_env_proxy": self.api.trust_env_proxy,
             "thinking_mode": self.thinking_mode,
             "temperature": self.temperature,
@@ -97,22 +95,18 @@ class Settings(BaseSettings):
     log_retention_days: int = Field(default=30)
     uvicorn_access_log: bool = Field(default=True)
 
-    # Persistent workflow supervision. Non-terminal Kanban tasks are recovered
-    # after worker loss and are failed explicitly when an external boundary or
-    # execution lease expires.
+    # Persistent workflow supervision. Column-specific retry/wait policies own
+    # execution deadlines; this setting controls only the durable dispatcher.
     workflow_supervisor_enabled: bool = Field(default=True)
     workflow_supervisor_interval_seconds: float = Field(default=5.0)
-    workflow_queued_recovery_seconds: int = Field(default=15)
-    workflow_execution_timeout_seconds: int = Field(default=1800)
-    workflow_client_timeout_seconds: int = Field(default=1800)
-    workflow_user_timeout_seconds: int = Field(default=86400)
 
     # Local usage accounting.
     devwerk_usage_tracking: bool = Field(default=True)
     devwerk_db_path: str = Field(default="./data/devwerk.db")
+    devwerk_control_token: str = Field(default="")
 
-    # JSON LLM catalog and routing map. This is the preferred configuration
-    # surface; legacy provider env vars below are used only as a fallback.
+    # JSON LLM catalog and routing map. Environment variables provide the
+    # built-in default catalog when no JSON file is configured.
     devwerk_llm_config_path: str = Field(default="./config/llm.json")
     devwerk_llm_config_json: str | None = Field(default=None)
 
@@ -124,9 +118,9 @@ class Settings(BaseSettings):
     devwerk_max_tokens: int = Field(default=4096)
     devwerk_trust_env_proxy: bool = Field(default=False)
 
-    # Legacy fallback profile selector. The JSON routing map is preferred.
+    # Default provider/profile selector used when routing does not override it.
     devwerk_default_api: str = Field(default="anthropic")
-    devwerk_default_agent: str = Field(default="project")
+    devwerk_default_agent: str = Field(default="conversation")
 
     # OpenAI-compatible API profile.
     openai_base_url: str = Field(default="https://api.openai.com/v1")
@@ -150,7 +144,6 @@ class Settings(BaseSettings):
     ollama_base_url: str = Field(default="http://127.0.0.1:11434")
     ollama_model: str = Field(default="deepseek-r1:32b")
     ollama_timeout: float = Field(default=180.0)
-    ollama_enable_schema: bool = Field(default=True)
 
     # Backward-compatible selector. If set, it becomes the default API profile.
     llm_provider: str | None = Field(default=None)
@@ -203,19 +196,19 @@ class Settings(BaseSettings):
             try:
                 value = json.loads(path.read_text(encoding="utf-8"))
                 if isinstance(value, dict):
-                    return _normalize_llm_config(value, self._legacy_llm_config())
+                    return _normalize_llm_config(value, self._default_llm_config())
             except Exception as exc:  # noqa: BLE001
                 raise ValueError(f"LLM config file {path} is not valid JSON: {exc}") from exc
         if self.devwerk_llm_config_json:
             try:
                 value = json.loads(self.devwerk_llm_config_json)
                 if isinstance(value, dict):
-                    return _normalize_llm_config(value, self._legacy_llm_config())
+                    return _normalize_llm_config(value, self._default_llm_config())
             except Exception as exc:  # noqa: BLE001
                 raise ValueError(f"DEVWERK_LLM_CONFIG_JSON is not valid JSON: {exc}") from exc
-        return self._legacy_llm_config()
+        return self._default_llm_config()
 
-    def _legacy_llm_config(self) -> dict[str, Any]:
+    def _default_llm_config(self) -> dict[str, Any]:
         anthropic_model = (
             self.claude_code_subagent_model
             or self.anthropic_model
@@ -282,7 +275,6 @@ class Settings(BaseSettings):
                     "base_url": self.ollama_base_url,
                     "api_key": "",
                     "timeout": self.ollama_timeout,
-                    "enable_schema": self.ollama_enable_schema,
                     "trust_env_proxy": self.devwerk_trust_env_proxy,
                     "models": {
                         self.ollama_model: {
@@ -317,7 +309,6 @@ class Settings(BaseSettings):
                 model=str(model_settings.get("model") or first_model_id),
                 timeout=float(provider.get("timeout") or 180.0),
                 effort_level=_none_if_empty(model_settings.get("effort_level") or provider.get("effort_level")),
-                enable_schema=bool(provider.get("enable_schema", True)),
                 trust_env_proxy=bool(provider.get("trust_env_proxy", self.devwerk_trust_env_proxy)),
             )
         if profiles:
@@ -361,7 +352,7 @@ class Settings(BaseSettings):
         }
 
     def agent_config(self, agent: str | None = None) -> AgentModelConfig:
-        agent_name = (agent or self.devwerk_default_agent or "project").strip().lower()
+        agent_name = (agent or self.devwerk_default_agent or "conversation").strip().lower()
         llm_config = self.llm_config()
         profile, model_key, model_settings = self._resolve_llm_ref(agent_name, llm_config)
         return AgentModelConfig(
@@ -415,7 +406,6 @@ class Settings(BaseSettings):
             model=str(model_settings.get("model") or model_key),
             timeout=float(provider.get("timeout") or 180.0),
             effort_level=_none_if_empty(model_settings.get("effort_level") or provider.get("effort_level")),
-            enable_schema=bool(provider.get("enable_schema", True)),
             trust_env_proxy=bool(provider.get("trust_env_proxy", self.devwerk_trust_env_proxy)),
         )
         return profile, model_key, model_settings
@@ -498,8 +488,8 @@ def _split_model_ref(model_ref: str) -> tuple[str, str]:
 
 def _routing_keys(agent: str) -> list[str]:
     aliases = {
-        "project": ["project", "default"],
-        "context-indexer": ["context-indexer", "default"],
+        "conversation": ["conversation", "default"],
+        "column": ["column", "default"],
     }
     return aliases.get(agent, [agent, "default"])
 

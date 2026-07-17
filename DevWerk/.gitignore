@@ -1,8 +1,6 @@
 # Python
 __pycache__/
 *.py[cod]
-*.pyc
-*.pyo
 *.pyd
 *.egg-info/
 dist/
@@ -21,23 +19,26 @@ env/
 *.swo
 *~
 
-# Environment and secrets
+# Environment and local configuration
 .env
-.env.local
-.env.development
-.env.production
-.env.test
+.env.*
 config/llm.json
 
-# Test and coverage
+# Tests and coverage
+.pytest_cache/
+.ruff_cache/
 htmlcov/
 .coverage
-.pytest_cache/
 .tox/
 .nox/
 
-# Misc
-*.log
+# Runtime state
 data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# OS metadata
 .DS_Store
 Thumbs.db

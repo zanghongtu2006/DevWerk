@@ -1,10 +1,8 @@
 {
   "routing": {
     "default": "minimax/m3",
-    "product": "deepseek/deepseek-chat",
-    "design": "deepseek/deepseek-chat",
-    "architecture": "minimax/m3",
-    "compression": "ollama/deepseek-r1:32b"
+    "conversation": "minimax/m3",
+    "column": "minimax/m3"
   },
   "llms": {
     "minimax": {
@@ -57,7 +55,6 @@
       "api_key": "",
       "timeout": 180,
       "trust_env_proxy": false,
-      "enable_schema": true,
       "models": {
         "deepseek-r1:32b": {
           "temperature": 0.4,

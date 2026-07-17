@@ -16,8 +16,10 @@ from app.services.usage import record_llm_usage
 _log = logging.getLogger("devwerk.llm_factory")
 
 
-def get_llm_client(agent: str = "project") -> "UsageTrackedClient":
-    cfg = settings().get_llm_config(agent)
+def get_llm_client(agent: str = "project", timeout_seconds: float | None = None) -> "UsageTrackedClient":
+    cfg = dict(settings().get_llm_config(agent))
+    if timeout_seconds is not None:
+        cfg["timeout"] = min(float(cfg.get("timeout") or timeout_seconds), max(1.0, float(timeout_seconds)))
     protocol = str(cfg.get("protocol") or "").lower()
 
     if protocol == "openai":
@@ -38,16 +40,13 @@ class UsageTrackedClient:
         self._client = client
         self._config = config
 
-    def chat_structured(self, *args, **kwargs):
-        return self._tracked_call("chat_structured", *args, **kwargs)
-
-    def chat_json(self, *args, **kwargs):
-        return self._tracked_call("chat_json", *args, **kwargs)
+    def complete(self, *args, project_id=None, task_id=None, **kwargs):
+        return self._tracked_call("complete", *args, project_id=project_id, task_id=task_id, **kwargs)
 
     def __getattr__(self, name: str):
         return getattr(self._client, name)
 
-    def _tracked_call(self, method_name: str, *args, **kwargs):
+    def _tracked_call(self, method_name: str, *args, project_id=None, task_id=None, **kwargs):
         started = time.monotonic()
         success = False
         error_type: str | None = None
@@ -78,6 +77,8 @@ class UsageTrackedClient:
                     duration_ms=duration_ms,
                     success=success,
                     error_type=error_type,
+                    project_id=project_id,
+                    task_id=task_id,
                 )
             except Exception as usage_error:  # noqa: BLE001
                 _log.exception("usage telemetry failed and was ignored: %s", usage_error)

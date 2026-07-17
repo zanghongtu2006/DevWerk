@@ -1,71 +1,27 @@
-"""
-Ollama local LLM client.
-
-Handles the /api/chat endpoint. Works with any Ollama-compatible server.
-"""
+"""Ollama native message and tool-call adapter."""
 
 from __future__ import annotations
 
 import json
-import logging
-from typing import Any, Dict, List
+from typing import Any
 
 import requests as http_requests
 
-from app.core.schema import MODEL_RESPONSE_SCHEMA
-from app.services.validation import ModelResponseValidationError, validate_model_response
-
-_log = logging.getLogger("devwerk.llm.ollama")
-
 
 class OllamaClient:
-    def __init__(self, config: dict | None = None):
+    def __init__(self, config: dict[str, Any]):
         self.last_usage: dict[str, Any] | None = None
-        """
-        Args:
-            config: Plain dict with keys: base_url, model, timeout, enable_schema.
-                    If None, reads from app settings (legacy behaviour).
-        """
-        if config:
-            self.base_url: str = config.get("base_url", "http://127.0.0.1:11434").rstrip("/")
-            self.model: str = config.get("model", "deepseek-r1:32b")
-            self.timeout: float = float(config.get("timeout", 180.0))
-            self.enable_schema: bool = bool(config.get("enable_schema", True))
-            self.temperature: float = float(config.get("temperature", 0.4))
-            self.top_p: float | None = config.get("top_p")
-            self.trust_env_proxy: bool = bool(config.get("trust_env_proxy", False))
-        else:
-            from app.core.config import settings
-            cfg = settings().get_llm_config("project")
-            self.base_url = cfg.get("base_url", "http://127.0.0.1:11434").rstrip("/")
-            self.model = cfg.get("model", "deepseek-r1:32b")
-            self.timeout = float(cfg.get("timeout", 180.0))
-            self.enable_schema = bool(cfg.get("enable_schema", True))
-            self.temperature = float(cfg.get("temperature", 0.4))
-            self.top_p = cfg.get("top_p")
-            self.trust_env_proxy = bool(cfg.get("trust_env_proxy", False))
-
+        self.base_url = str(config.get("base_url") or "http://127.0.0.1:11434").rstrip("/")
+        self.model = str(config.get("model") or "deepseek-r1:32b")
+        self.timeout = float(config.get("timeout") or 180)
+        self.temperature = float(config.get("temperature") or 0.4)
+        self.top_p = config.get("top_p")
         self.url = f"{self.base_url}/api/chat"
         self.session = http_requests.Session()
-        self.session.trust_env = self.trust_env_proxy
-        _log.debug(
-            "Ollama client configured base_url=%s model=%s timeout=%s trust_env_proxy=%s",
-            self.base_url,
-            self.model,
-            self.timeout,
-            self.trust_env_proxy,
-        )
+        self.session.trust_env = bool(config.get("trust_env_proxy", False))
 
-    def chat_structured(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
-        obj = self.chat_json(messages, schema=MODEL_RESPONSE_SCHEMA if self.enable_schema else None)
-        try:
-            validate_model_response(obj)
-        except ValueError as exc:
-            raise ModelResponseValidationError(str(exc), obj=obj) from exc
-        return obj
-
-    def chat_json(self, messages: List[Dict[str, str]], schema: dict | None = None) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
+    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {
             "model": self.model,
             "stream": False,
             "messages": messages,
@@ -73,42 +29,32 @@ class OllamaClient:
         }
         if self.top_p is not None:
             payload["options"]["top_p"] = float(self.top_p)
+        if tools:
+            payload["tools"] = tools
+        response = self.session.post(self.url, json=payload, timeout=self.timeout)
+        response.raise_for_status()
+        data = response.json()
+        self.last_usage = _usage(data)
+        message = data.get("message")
+        if not isinstance(message, dict):
+            raise ValueError("Ollama returned no message")
+        calls: list[dict[str, Any]] = []
+        for index, raw in enumerate(message.get("tool_calls") or []):
+            function = raw.get("function") if isinstance(raw, dict) else None
+            if not isinstance(function, dict):
+                continue
+            arguments = function.get("arguments") or {}
+            if isinstance(arguments, str):
+                arguments = json.loads(arguments)
+            if not isinstance(arguments, dict):
+                raise ValueError("tool call arguments must be a JSON object")
+            calls.append({"id": str(raw.get("id") or f"ollama-{index}"), "name": str(function.get("name") or ""), "arguments": arguments})
+        content = message.get("content")
+        return {"text": content if isinstance(content, str) else "", "tool_calls": calls, "usage": self.last_usage}
 
-        # Only send schema if the server/model is known to support it.
-        # Older models (e.g. llama3 without --format flag) may reject it.
-        payload["format"] = schema if schema is not None else "json"
 
-        resp = self.session.post(self.url, json=payload, timeout=self.timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        self.last_usage = self._extract_usage(data)
-
-        content = (data.get("message") or {}).get("content")
-        if isinstance(content, dict):
-            obj = content
-        elif isinstance(content, str):
-            try:
-                obj = json.loads(content)
-            except json.JSONDecodeError:
-                raise ValueError(
-                    f"Ollama returned non-JSON content: {content[:200]!r}"
-                )
-        else:
-            raise ValueError(
-                f"Ollama returned unexpected content type: {type(content).__name__}"
-            )
-
-        return obj
-
-    @staticmethod
-    def _extract_usage(data: Dict[str, Any]) -> Dict[str, Any]:
-        input_tokens = data.get("prompt_eval_count")
-        output_tokens = data.get("eval_count")
-        total_tokens = None
-        if isinstance(input_tokens, int) and isinstance(output_tokens, int):
-            total_tokens = input_tokens + output_tokens
-        return {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": total_tokens,
-        }
+def _usage(data: dict[str, Any]) -> dict[str, Any]:
+    input_tokens = data.get("prompt_eval_count")
+    output_tokens = data.get("eval_count")
+    total = input_tokens + output_tokens if isinstance(input_tokens, int) and isinstance(output_tokens, int) else None
+    return {"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total}

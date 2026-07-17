@@ -1,193 +1,149 @@
-# DevWerk Service
+# DevWerk V1 Service
 
-DevWerk is the product core: a FastAPI service that owns projects, Kanban
-workflow definitions, dynamic workflow-node agents, durable task state, project
-memory, usage accounting, MCP, and the Web UI.
+This directory contains the standalone DevWerk Version 1 service. It is a conversation-led, Column-based multi-agent workflow runtime backed by one SQLite database and Project-scoped files.
 
-In IDE mode, source writes go through the provider's guarded apply and snapshot
-path. In backend-local mode, the service can write into an explicitly supplied
-isolated project root using the same workflow artifact and apply-result
-protocol. Both paths must produce durable events and artifacts.
+## Design Authority
 
-## Setup
+- [`docs/generic-conversation-agent-and-declarative-column-runtime.md`](docs/generic-conversation-agent-and-declarative-column-runtime.md) — normative implementation source of truth
+- [`docs/conversation-agent-design-v1.md`](docs/conversation-agent-design-v1.md)
+- [`docs/kanban-workflow-design-v1.md`](docs/kanban-workflow-design-v1.md)
+- [`docs/v1-test-contract.md`](docs/v1-test-contract.md)
+
+The generic Agent/Column Runtime document governs implementation details. The two earlier design records preserve confirmed product intent; any old schema examples in them are superseded by the normative document. The full `tests` directory protects only the current contract.
+
+## Runtime Shape
+
+```mermaid
+flowchart LR
+    U["User / Web"] --> C["Project Conversation Agent"]
+    C --> W["Immutable Workflow Revision"]
+    W --> S["Runtime Supervisor"]
+    S --> R["Column Run"]
+    R --> D["Deterministic Runtime"]
+    R --> A["Ephemeral Agent"]
+    D --> E["Artifact + Event + Outcome"]
+    A --> E
+    E --> S
+    S --> T["Task done / failed"]
+    T --> M["Project Mailbox"]
+    M --> C
+```
+
+## Active Modules
+
+```text
+app/main.py
+app/core/config.py
+app/core/logging.py
+app/v1/domain.py
+app/v1/store.py
+app/v1/files.py
+app/v1/contracts.py
+app/v1/capabilities.py
+app/v1/agent.py
+app/v1/conversation.py
+app/v1/runtime.py
+app/v1/llm.py
+app/v1/api.py
+app/services/anthropic_client.py
+app/services/openai_client.py
+app/services/ollama_client.py
+app/services/llm_factory.py
+app/services/provider_errors.py
+app/services/usage.py
+app/web/
+```
+
+Anything outside this list must have a current, explicit reason to exist before it is added to the service.
+
+## Core Contracts
+
+### Project and Conversation Agent
+
+Project is the isolation boundary. Each Project persists exactly one logical Conversation Agent identity, a canonical and unique `base_dir`, its conversation, Workflow revisions, Tasks, Runs, Events, Artifacts, and mailbox notifications.
+
+The Conversation Agent is a general-purpose tool-using Agent with Project-manager, Agile-coach, Kanban and recovery responsibilities. It has no task-type classifier. It may answer or directly execute bounded work, or publish a conversation-generated Workflow revision and create formal Tasks through capabilities. Same-Project turns are serialized.
+
+### Workflow and Task
+
+A valid Workflow:
+
+- has unique Column keys;
+- has exactly one `done` terminal and one `failed` terminal;
+- has no transitions leaving a terminal;
+- has no unreachable Columns;
+- gives every non-terminal Column an explicit transition path to a terminal;
+- rejects duplicate outcomes and unknown transition targets.
+
+Task creation pins the active revision. Publishing a new revision never rewrites an existing Task.
+
+### Runtime and Evidence
+
+Every Column entry creates a Column Run. `capability_sequence` Columns execute declared capability steps without an LLM. `agent` Columns create an ephemeral Agent Run that shares the same iterative AgentCore as the Conversation Agent, but receives bounded Project + Task + Column context and a declared tool allowlist.
+
+Source code contains no business Workflow factory, task-type route, domain prompt, directory layout rule, or Column-name executor branch. Instructions, contracts, capabilities and transitions are immutable Workflow revision data generated and updated through conversation or the system API.
+
+Failed attempts remain immutable evidence. Retry exhaustion routes the Task through the explicit failed terminal instead of silently setting a terminal state. Terminal events also create durable Project mailbox entries for Conversation Agent observation.
+
+Execution leases are renewable. Expired running Tasks become `recovering`, produce an event, and enter the Project mailbox so the supervisor can drive them again.
+
+### SQLite and Files
+
+SQLite uses WAL, `busy_timeout`, short explicit transactions, Project-scoped query indexes, and no network/LLM/file work inside transactions. Project files use canonical containment checks and atomic replace writes. Artifact records contain path, type, size, and SHA-256 rather than large file bodies.
+
+## Run
+
+Use only the checked-in virtual environment launcher:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-copy .env.example .env
-copy config\llm.example.json config\llm.json
+cd D:\workspace\DevWerk\DevWerk
 .\startup.bat
 ```
 
-Default URLs:
+Default endpoints:
 
-```text
-http://localhost:8000/workbench
-http://localhost:8000/dashboard
-http://localhost:8000/kanban
-http://localhost:8000/tasks
-http://localhost:8000/docs
-http://localhost:8000/mcp
-```
+- `/v1/health`
+- `/v1/projects`
+- `/v1/projects/{project_id}/conversation`
+- `/v1/projects/{project_id}/conversation-jobs/{job_id}`
+- `/v1/projects/{project_id}/workflow`
+- `/v1/projects/{project_id}/board`
+- `/v1/projects/{project_id}/projection`
+- `/v1/projects/{project_id}/stream`
+- `/v1/projects/{project_id}/tasks`
+- `/v1/projects/{project_id}/tasks/{task_id}`
+- `/v1/projects/{project_id}/tasks/{task_id}/runs`
+- `/v1/projects/{project_id}/tasks/{task_id}/events`
+- `/v1/projects/{project_id}/tasks/{task_id}/artifacts`
+- `/v1/projects/{project_id}/events`
+- `/v1/projects/{project_id}/agent-runs`
+- `/v1/projects/{project_id}/tasks/{task_id}/agent-runs`
+- `/v1/projects/{project_id}/agent-runs/{agent_run_id}`
+- `/v1/projects/{project_id}/governance`
+
+Trusted automation publishes Workflows at `/v1/projects/{project_id}/automation/workflow` and creates readiness-approved Tasks at `/v1/projects/{project_id}/automation/tasks`. Both require `X-DevWerk-Control-Token`; the read-only Web UI never exposes this control plane.
+
+## Web Workbench
+
+- `/` and `/workbench`: Project overview
+- `/dashboard`: Project Conversation Agent workspace
+- `/kanban`: read-only Column/Task projection
+- `/tasks`: Task, Column Run, Artifact, and Event evidence
+- `/events`: Project event timeline
+
+The native ES-module client is split into `core`, `ui`, `pages`, and `styles`. It loads a compact Kanban projection once, then follows the Project event cursor over SSE. Task pages expose Column contracts plus complete Agent message/tool audit drill-down without periodic full-board polling.
 
 ## LLM Configuration
 
-`.env` should stay small:
+Copy `config/llm.example.json` to the ignored `config/llm.json`, or set `DEVWERK_LLM_CONFIG_JSON`. Routing keys used by the V1 runtime are `conversation` and `column`, with `default` as fallback. Supported protocols are Anthropic-compatible Messages, OpenAI-compatible Chat Completions, and Ollama Chat.
 
-```env
-DEVWERK_LLM_CONFIG_PATH=./config/llm.json
-LOG_LEVEL=debug
-LOG_FILE_ENABLED=true
-LOG_DIR=./data/logs
-```
+Do not commit provider credentials.
 
-Structured model settings live in `config/llm.json`, which is ignored by git.
-`routing.default` is required. Other route keys are optional aliases that
-projects or dynamically spawned workflow-node agents may reference.
-
-```json
-{
-  "routing": {
-    "default": "minimax/m3",
-    "project": "minimax/m3",
-    "context-indexer": "minimax/m3"
-  },
-  "llms": {
-    "minimax": {
-      "api": "anthropic",
-      "base_url": "https://api.minimaxi.com/anthropic",
-      "api_key": "API_TOKEN",
-      "trust_env_proxy": false,
-      "models": {
-        "m3": {
-          "model": "M3",
-          "temperature": 0.2,
-          "max_tokens": 4096,
-          "thinking_mode": "max"
-        }
-      }
-    }
-  }
-}
-```
-
-The Anthropic-compatible client and workflow engine tolerate common provider
-format drift:
-
-- JSON embedded inside `raw_text`, `reply`, `summary`, or `content`
-- repeated/trailing text around the first JSON object
-- file bundles shaped as `code_patch.files`, `staged_patch.files`,
-  `source_bundle.files`, or another dict containing `files` with `path` and
-  `content`
-
-The state machine still requires semantic actions from the active workflow; the
-normalizer only maps provider output into the configured protocol.
-
-## Workflow Model
-
-DevWerk no longer creates default Kanban columns. A project starts as
-`unconfigured`. The project conversation agent must define columns, semantic
-actions, transition rules, node agents, and capability requirements before a
-task can run.
-
-Runtime flow:
-
-```text
-project conversation -> saved workflow definition -> task -> workflow engine
-  -> column -> job_template -> scheduler -> temporary node agent
-  -> phase artifact/events/revision -> semantic action -> next column
-```
-
-Only two built-in agents exist:
-
-- `project-agent`: talks with the user to create and maintain projects,
-  workflows, node agents, and task requests.
-- `context-indexer`: a local no-LLM helper that turns client source maps and
-  diagnostics into compact project context when a workflow column asks for it.
-
-All other agents are spawned from workflow columns. If a column references an
-unknown `job_template`, DevWerk derives a temporary `{column}-agent` from the
-project agent defaults or a project override. The agent is disposed after the
-column run; durable state is kept as artifacts, events, revisions, task memory,
-and project memory.
-
-Completion is explicit. A workflow must define success and failure actions such
-as `workflow_done`, `fail`, and `abandon`; DevWerk does not treat a no-transition
-column as a hidden success terminal. Coding workflows also require a concrete
-code result before completion. A code result may come from plugin apply evidence
-or from backend-local apply evidence.
-
-## Web UI
-
-`/workbench`, `/dashboard`, `/kanban`, and `/tasks` share the same backend Web
-shell. HTML, CSS, and JavaScript are split under:
-
-```text
-app/web/templates/dashboard.html
-app/web/static/dashboard.css
-app/web/static/dashboard.js
-```
-
-All displayed projects, tasks, usage, events, memory, workflow columns, and
-settings are loaded from backend APIs. The UI must not use demo metrics or
-front-end mock data for operational views.
-
-## Main APIs
-
-- `POST /v1/workflows`
-- `GET /v1/workflows/{task_id}`
-- `GET /v1/workflows/{task_id}/events`
-- `GET /v1/workflows/{task_id}/result`
-- `POST /v1/workflows/{task_id}/messages`
-- `GET /v1/usage/summary?project_id=&task_id=`
-- `GET /v1/kanban/projects`
-- `POST /v1/kanban/projects`
-- `GET/PUT /v1/kanban/projects/{project_id}/workflow`
-- `POST /v1/kanban/projects/{project_id}/workflow/design`
-- `POST /v1/kanban/tasks/{task_id}/actions`
-- `GET/PUT /v1/settings`
-
-Legacy `/v1/plan` and `/v1/execute` APIs have been removed. Clients should use
-`/v1/workflows` and workflow message/action APIs.
-
-## Runtime Data
-
-Default paths:
-
-```text
-data/devwerk.db
-data/logs/devwerk.log
-data/sessions/{projectId}/audit_events.jsonl
-data/sessions/{projectId}/project_memory.json
-data/sessions/{projectId}/project_memory.jsonl
-```
-
-SQLite is the source of truth for projects, settings, columns, tasks,
-conversations, events, artifacts, column runs, and candidate revisions. Project
-memory is a compact reusable summary; it is not a raw transcript.
-
-## Checks
+## Test Gate
 
 ```powershell
-cd DevWerk
-$env:LOG_FILE_ENABLED='false'
-.\.venv\Scripts\python.exe -m compileall app tests
-.\.venv\Scripts\python.exe -m pytest tests -q
-
-# optional live LLM scaffold smoke; requires config/llm.json routing.default
-$env:DEVWERK_RUN_REAL_PROJECT_SCAFFOLD_SMOKE='1'
-.\.venv\Scripts\python.exe -m pytest tests\test_real_project_scaffold_e2e.py -q -s
-
-cd ..\idea-plugin
-.\gradlew.bat compileKotlin
+.\venv\Scripts\python.exe -m pytest tests -q
+.\venv\Scripts\python.exe -m compileall app tests
 ```
 
-## Ground Rules
-
-- The service is framework-neutral and must not hard-code Java, IntelliJ,
-  Maven, Gradle, VS Code, CI, `src`, `test`, or business directory layouts.
-- Tool requests use semantic capability names such as `project.compile`,
-  `source.diagnostics`, `workspace.read`, and `process.run`.
-- Capability providers map those names to their own SDK or runtime.
-- Kanban is the task driver. Human-visible dashboard state is an audit view,
-  not a manual drag-and-drop state machine.
+Every file in `tests` belongs to the current V1 contract. Do not add skipped historical tests or compatibility fixtures. Provider tests exercise native tool-call normalization without network access; real-provider validation remains an explicit external preflight.

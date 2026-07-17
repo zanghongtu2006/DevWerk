@@ -1,338 +1,153 @@
-"""
-Anthropic-compatible Messages API client.
-
-Designed to work with Claude Code style environment variables and MiniMax's
-Anthropic-compatible endpoint, for example:
-  ANTHROPIC_BASE_URL=https://api.minimaxi.com/anthropic
-  ANTHROPIC_AUTH_TOKEN=...
-  ANTHROPIC_MODEL=M3
-"""
+"""Anthropic-compatible native message and tool-call adapter."""
 
 from __future__ import annotations
 
 import json
-import logging
-from typing import Any, Dict, List
+import time
+from typing import Any
 
 import requests as http_requests
 
 from app.services.provider_errors import raise_for_provider_payload, raise_for_provider_response
-from app.services.validation import ModelResponseValidationError, validate_model_response
-
-_log = logging.getLogger("devwerk.llm.anthropic")
 
 
 class AnthropicClient:
-    def __init__(self, config: dict | None = None):
+    def __init__(self, config: dict[str, Any]):
         self.last_usage: dict[str, Any] | None = None
-        self.api_name: str = "anthropic"
-        if config:
-            self.api_name = config.get("api_name", self.api_name)
-            self.base_url: str = config.get("base_url", "https://api.minimaxi.com/anthropic").rstrip("/")
-            self.api_key: str | None = config.get("api_key")
-            self.model: str = config.get("model", "M3")
-            self.timeout: float = float(config.get("timeout", 180.0))
-            self.effort_level: str | None = config.get("effort_level")
-            self.thinking_mode: str | None = config.get("thinking_mode")
-            self.temperature: float = float(config.get("temperature", 0.2))
-            self.top_p: float | None = config.get("top_p")
-            self.max_tokens: int = int(config.get("max_tokens", 4096))
-            self.trust_env_proxy: bool = bool(config.get("trust_env_proxy", False))
-        else:
-            from app.core.config import settings
-            cfg = settings().get_llm_config("project")
-            self.api_name = cfg.get("api_name", self.api_name)
-            self.base_url = cfg.get("base_url", "https://api.minimaxi.com/anthropic").rstrip("/")
-            self.api_key = cfg.get("api_key")
-            self.model = cfg.get("model", "M3")
-            self.timeout = float(cfg.get("timeout", 180.0))
-            self.effort_level = cfg.get("effort_level")
-            self.thinking_mode = cfg.get("thinking_mode")
-            self.temperature = float(cfg.get("temperature", 0.2))
-            self.top_p = cfg.get("top_p")
-            self.max_tokens = int(cfg.get("max_tokens", 4096))
-            self.trust_env_proxy = bool(cfg.get("trust_env_proxy", False))
-
-        self.url = f"{self.base_url}/v1/messages" if not self.base_url.endswith("/v1") else f"{self.base_url}/messages"
+        self.api_name = str(config.get("api_name") or "anthropic")
+        self.base_url = str(config.get("base_url") or "https://api.anthropic.com").rstrip("/")
+        self.api_key = config.get("api_key")
+        self.model = str(config.get("model") or "claude-sonnet-4-5")
+        self.timeout = float(config.get("timeout") or 180)
+        self.temperature = float(config.get("temperature") or 0.2)
+        self.top_p = config.get("top_p")
+        self.max_tokens = int(config.get("max_tokens") or 4096)
+        self.max_retries = max(0, int(config.get("max_retries") or 0))
+        self.url = f"{self.base_url}/messages" if self.base_url.endswith("/v1") else f"{self.base_url}/v1/messages"
         self.session = http_requests.Session()
-        self.session.trust_env = self.trust_env_proxy
-        _log.debug(
-            "Anthropic-compatible client configured api_name=%s base_url=%s model=%s timeout=%s trust_env_proxy=%s",
-            self.api_name,
-            self.base_url,
-            self.model,
-            self.timeout,
-            self.trust_env_proxy,
-        )
-
+        self.session.trust_env = bool(config.get("trust_env_proxy", False))
         if not self.api_key:
             raise ValueError(f"api_key is not set for LLM provider {self.api_name!r}.")
 
-    def chat_structured(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
-        obj = self.chat_json(messages)
-        if obj.get("raw_text") and not _has_structured_output(obj):
-            obj = _fallback_structured_response(messages, str(obj.get("raw_text") or ""))
-        try:
-            validate_model_response(obj)
-        except ValueError as exc:
-            raise ModelResponseValidationError(str(exc), obj=obj) from exc
-        return obj
-
-    def chat_json(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
-        system_text, user_messages = self._split_system(messages)
-        headers = {
-            "x-api-key": self.api_key or "",
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-            "authorization": f"Bearer {self.api_key}",
-        }
-
-        payload: Dict[str, Any] = {
+    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        system, provider_messages = self._to_provider_messages(messages)
+        payload: dict[str, Any] = {
             "model": self.model,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
-            "system": system_text,
-            "messages": user_messages,
+            "system": system,
+            "messages": provider_messages,
         }
         if self.top_p is not None:
             payload["top_p"] = float(self.top_p)
-        metadata = {}
-        if self.effort_level:
-            metadata["effort_level"] = self.effort_level
-        if self.thinking_mode:
-            metadata["thinking_mode"] = self.thinking_mode
-        if metadata:
-            payload["metadata"] = metadata
-
-        resp = self.session.post(self.url, json=payload, headers=headers, timeout=self.timeout)
-        raise_for_provider_response(resp, provider="anthropic", api_name=self.api_name)
-
-        data = resp.json()
+        if tools:
+            payload["tools"] = [
+                {
+                    "name": item["function"]["name"],
+                    "description": item["function"].get("description", ""),
+                    "input_schema": item["function"].get("parameters") or {"type": "object"},
+                }
+                for item in tools
+            ]
+        headers = {
+            "x-api-key": str(self.api_key),
+            "authorization": f"Bearer {self.api_key}",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        response = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.session.post(self.url, json=payload, headers=headers, timeout=self.timeout)
+                break
+            except http_requests.exceptions.ReadTimeout:
+                if attempt >= self.max_retries:
+                    raise
+                time.sleep(min(2 ** (attempt + 1), 8))
+        assert response is not None
+        raise_for_provider_response(response, provider="anthropic", api_name=self.api_name)
+        data = response.json()
         raise_for_provider_payload(
             data,
             provider="anthropic",
             api_name=self.api_name,
-            status_code=resp.status_code,
-            request_id=resp.headers.get("request-id") or resp.headers.get("x-request-id"),
+            status_code=response.status_code,
+            request_id=response.headers.get("request-id") or response.headers.get("x-request-id"),
         )
-        self.last_usage = self._extract_usage(data)
-        content = self._extract_text(data)
-        obj = self._parse_json_object(content)
-        return obj
-
-    @staticmethod
-    def _extract_usage(data: Dict[str, Any]) -> Dict[str, Any]:
-        usage = data.get("usage")
-        if not isinstance(usage, dict):
-            return {}
-        return {
-            "input_tokens": usage.get("input_tokens"),
-            "output_tokens": usage.get("output_tokens"),
-            "total_tokens": usage.get("total_tokens"),
-            "cached_input_tokens": usage.get("cache_read_input_tokens"),
-            "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
-        }
-
-    @staticmethod
-    def _split_system(messages: List[Dict[str, str]]) -> tuple[str, List[Dict[str, Any]]]:
-        system_parts: list[str] = []
-        out: list[dict[str, Any]] = []
-        for message in messages:
-            role = (message.get("role") or "user").strip().lower()
-            content = message.get("content") or ""
-            if role == "system":
-                system_parts.append(content)
+        self.last_usage = _usage(data.get("usage"))
+        text: list[str] = []
+        calls: list[dict[str, Any]] = []
+        for item in data.get("content") or []:
+            if not isinstance(item, dict):
                 continue
-            if role not in {"user", "assistant"}:
-                role = "user"
-            out.append({"role": role, "content": content})
-
-        if not out:
-            out.append({"role": "user", "content": "Return a valid DevWerk JSON response."})
-        return "\n\n".join(p for p in system_parts if p).strip(), out
-
-    @staticmethod
-    def _extract_text(data: Dict[str, Any]) -> str:
-        content = data.get("content")
-        if isinstance(content, str):
-            return content.strip()
-        parts: list[str] = []
-        if isinstance(content, list):
-            for item in content:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("type") in {"text", "output_text"} and isinstance(item.get("text"), str):
-                    parts.append(item["text"])
-        text = "\n".join(parts).strip()
-        if not text:
-            raise ValueError("Anthropic-compatible API returned empty text content")
-        return text
+            if item.get("type") in {"text", "output_text"} and isinstance(item.get("text"), str):
+                text.append(item["text"])
+            elif item.get("type") == "tool_use":
+                arguments = item.get("input") or {}
+                if not isinstance(arguments, dict):
+                    raise ValueError("tool_use input must be a JSON object")
+                calls.append({"id": str(item.get("id") or ""), "name": str(item.get("name") or ""), "arguments": arguments})
+        return {"text": "\n".join(text).strip(), "tool_calls": calls, "usage": self.last_usage}
 
     @staticmethod
-    def _parse_json_object(text: str) -> Dict[str, Any]:
-        cleaned = text.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.strip("`").strip()
-            if cleaned.lower().startswith("json"):
-                cleaned = cleaned[4:].strip()
-
-        try:
-            return _normalize_top_level_json(json.loads(cleaned), cleaned)
-        except json.JSONDecodeError as first_exc:
-            decoded = _decode_first_json_value(cleaned)
-            if decoded is not None:
-                value, trailing = decoded
-                if trailing:
-                    _log.debug(
-                        "Anthropic-compatible API returned JSON with trailing text; parsed first object trailing_chars=%s",
-                        len(trailing),
+    def _to_provider_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+        systems: list[str] = []
+        converted: list[dict[str, Any]] = []
+        for message in messages:
+            role = str(message.get("role") or "user")
+            if role == "system":
+                systems.append(str(message.get("content") or ""))
+                continue
+            if role == "assistant":
+                blocks: list[dict[str, Any]] = []
+                if message.get("content"):
+                    blocks.append({"type": "text", "text": str(message["content"])})
+                for call in message.get("tool_calls") or []:
+                    function = call.get("function") or {}
+                    arguments = function.get("arguments") or {}
+                    if isinstance(arguments, str):
+                        arguments = json.loads(arguments)
+                    blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": str(call.get("id") or ""),
+                            "name": str(function.get("name") or ""),
+                            "input": arguments,
+                        }
                     )
-                return _normalize_top_level_json(value, cleaned)
-            repaired = _decode_json_with_missing_closers(cleaned)
-            if repaired is not None:
-                _log.debug("Anthropic-compatible API returned JSON with missing trailing closers; repaired first value")
-                return _normalize_top_level_json(repaired, cleaned)
-            _log.debug(
-                "Anthropic-compatible API returned non-JSON text; using raw_text fallback. error=%s snippet=%r",
-                first_exc,
-                cleaned[:500],
-            )
-            return {"raw_text": cleaned, "reply": cleaned}
-
-
-def _decode_first_json_value(text: str) -> tuple[Any, str] | None:
-    """Decode the first complete JSON value embedded in provider text.
-
-    Some Anthropic-compatible providers occasionally append prose or repeat the
-    same JSON object after the first valid object. A first-brace/last-brace
-    slice turns that into invalid JSON, so use JSONDecoder.raw_decode to consume
-    exactly one JSON value and preserve the extra text for diagnostics.
-    """
-
-    start_candidates = [index for index in (text.find("{"), text.find("[")) if index >= 0]
-    if not start_candidates:
-        return None
-    start = min(start_candidates)
-    decoder = json.JSONDecoder()
-    try:
-        value, end = decoder.raw_decode(text[start:])
-    except json.JSONDecodeError:
-        return None
-    trailing = text[start + end :].strip()
-    return value, trailing
-
-
-def _decode_json_with_missing_closers(text: str) -> Any | None:
-    """Repair provider JSON only when it is missing trailing ]/} closers.
-
-    The repair is deliberately narrow: it does not alter interior content,
-    commas, quotes, or keys. It only appends the closers required by the
-    observed stack when the JSON-looking value reaches end-of-text while still
-    structurally open.
-    """
-
-    start_candidates = [index for index in (text.find("{"), text.find("[")) if index >= 0]
-    if not start_candidates:
-        return None
-    start = min(start_candidates)
-    segment = text[start:].strip()
-    stack: list[str] = []
-    in_string = False
-    escaped = False
-    for index, char in enumerate(segment):
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char in "{[":
-            stack.append("}" if char == "{" else "]")
-        elif char in "}]":
-            if not stack or stack[-1] != char:
-                if stack and not segment[index + 1 :].strip():
-                    expected = stack.pop()
-                    candidate = segment[:index] + expected + "".join(reversed(stack))
-                    try:
-                        return json.loads(candidate)
-                    except json.JSONDecodeError:
-                        return None
-                return None
-            stack.pop()
-    if in_string or not stack or len(stack) > 8:
-        return None
-    try:
-        return json.loads(segment + "".join(reversed(stack)))
-    except json.JSONDecodeError:
-        return None
-
-
-def _normalize_top_level_json(value: Any, raw_text: str) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return value
-    if not isinstance(value, list):
-        return {"raw_text": raw_text, "reply": raw_text}
-
-    if len(value) == 1 and isinstance(value[0], dict) and any(
-        key in value[0] for key in ("reply", "ops", "tool_requests", "patch_ops", "done")
-    ):
-        _log.debug("Anthropic-compatible API returned a single-item envelope array; unwrapping it")
-        return value[0]
-
-    if value and all(isinstance(item, dict) and item.get("op") in {"create_dir", "create_file", "update_file", "delete_path"} and item.get("path") for item in value):
-        _log.debug("Anthropic-compatible API returned a top-level file-op array; normalizing count=%s", len(value))
-        return {
-            "reply": "Generated file operations.",
-            "code_tree": None,
-            "ops": [
-                {
-                    "op": item.get("op"),
-                    "path": item.get("path"),
-                    "language": item.get("language"),
-                    "content": item.get("content"),
+                converted.append({"role": "assistant", "content": blocks})
+                continue
+            if role == "tool":
+                block = {
+                    "type": "tool_result",
+                    "tool_use_id": str(message.get("tool_call_id") or ""),
+                    "content": str(message.get("content") or ""),
                 }
-                for item in value
-            ],
-            "tool_requests": [],
-            "patch_ops": [],
-            "done": True,
-        }
-
-    if value and all(isinstance(item, dict) and item.get("tool") for item in value):
-        _log.debug("Anthropic-compatible API returned a top-level tool-request array; normalizing count=%s", len(value))
-        return {
-            "reply": "",
-            "code_tree": None,
-            "ops": [],
-            "tool_requests": value,
-            "patch_ops": [],
-            "done": False,
-        }
-
-    _log.warning("Anthropic-compatible API returned an unsupported top-level JSON array; using raw_text fallback count=%s", len(value))
-    return {"raw_text": raw_text, "reply": raw_text}
+                if converted and converted[-1]["role"] == "user" and isinstance(converted[-1]["content"], list):
+                    converted[-1]["content"].append(block)
+                else:
+                    converted.append({"role": "user", "content": [block]})
+                continue
+            content = str(message.get("content") or "")
+            if converted and converted[-1]["role"] == "user" and isinstance(converted[-1]["content"], str):
+                converted[-1]["content"] += "\n\n" + content
+            else:
+                converted.append({"role": "user", "content": content})
+        if not converted:
+            converted.append({"role": "user", "content": ""})
+        return "\n\n".join(item for item in systems if item), converted
 
 
-def _has_structured_output(obj: dict[str, Any]) -> bool:
-    return bool(obj.get("ops") or obj.get("tool_requests") or obj.get("patch_ops") or obj.get("done"))
-
-
-def _fallback_structured_response(messages: list[dict[str, str]], raw_text: str) -> dict[str, Any]:
-    _log.debug(
-        "Anthropic-compatible structured fallback: non_json_text messages=%s raw_chars=%s",
-        len(messages),
-        len(raw_text),
-    )
+def _usage(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    input_tokens = value.get("input_tokens")
+    output_tokens = value.get("output_tokens")
+    total = input_tokens + output_tokens if isinstance(input_tokens, int) and isinstance(output_tokens, int) else value.get("total_tokens")
     return {
-        "reply": raw_text[:1000],
-        "code_tree": None,
-        "ops": [],
-        "tool_requests": [],
-        "patch_ops": [],
-        "done": False,
-        "raw_model_text": raw_text[:1000],
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total,
+        "cached_input_tokens": value.get("cache_read_input_tokens"),
+        "cache_creation_input_tokens": value.get("cache_creation_input_tokens"),
     }

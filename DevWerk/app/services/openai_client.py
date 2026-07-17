@@ -1,148 +1,94 @@
-"""
-OpenAI-compatible Chat Completions client.
-
-Targets the widely implemented /v1/chat/completions API rather than a
-provider-specific endpoint, so it can work with OpenAI and compatible gateways.
-"""
+"""OpenAI-compatible native message and tool-call adapter."""
 
 from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List
+from typing import Any
 
 import requests as http_requests
 
-from app.core.schema import MODEL_RESPONSE_SCHEMA
 from app.services.provider_errors import raise_for_provider_payload, raise_for_provider_response
-from app.services.validation import ModelResponseValidationError, validate_model_response
+
 
 _log = logging.getLogger("devwerk.llm.openai")
 
 
 class OpenAIClient:
-    def __init__(self, config: dict | None = None):
+    def __init__(self, config: dict[str, Any]):
         self.last_usage: dict[str, Any] | None = None
-        self.api_name: str = "openai"
-        if config:
-            self.api_name = config.get("api_name", self.api_name)
-            self.base_url: str = config.get("base_url", "https://api.openai.com/v1").rstrip("/")
-            self.api_key: str | None = config.get("api_key")
-            self.model: str = config.get("model", "gpt-4o-mini")
-            self.timeout: float = float(config.get("timeout", 180.0))
-            self.temperature: float = float(config.get("temperature", 0.2))
-            self.top_p: float | None = config.get("top_p")
-            self.max_tokens: int | None = config.get("max_tokens")
-            self.trust_env_proxy: bool = bool(config.get("trust_env_proxy", False))
-        else:
-            from app.core.config import settings
-            cfg = settings().get_llm_config("project")
-            self.api_name = cfg.get("api_name", self.api_name)
-            self.base_url = cfg.get("base_url", "https://api.openai.com/v1").rstrip("/")
-            self.api_key = cfg.get("api_key")
-            self.model = cfg.get("model", "gpt-4o-mini")
-            self.timeout = float(cfg.get("timeout", 180.0))
-            self.temperature = float(cfg.get("temperature", 0.2))
-            self.top_p = cfg.get("top_p")
-            self.max_tokens = cfg.get("max_tokens")
-            self.trust_env_proxy = bool(cfg.get("trust_env_proxy", False))
-
+        self.api_name = str(config.get("api_name") or "openai")
+        self.base_url = str(config.get("base_url") or "https://api.openai.com/v1").rstrip("/")
+        self.api_key = config.get("api_key")
+        self.model = str(config.get("model") or "gpt-4o-mini")
+        self.timeout = float(config.get("timeout") or 180)
+        self.temperature = float(config.get("temperature") or 0.2)
+        self.top_p = config.get("top_p")
+        self.max_tokens = config.get("max_tokens")
         if not self.base_url.endswith("/v1"):
-            self.base_url = f"{self.base_url}/v1"
+            self.base_url += "/v1"
         self.url = f"{self.base_url}/chat/completions"
         self.session = http_requests.Session()
-        self.session.trust_env = self.trust_env_proxy
-        _log.debug(
-            "OpenAI-compatible client configured api_name=%s base_url=%s model=%s timeout=%s trust_env_proxy=%s",
-            self.api_name,
-            self.base_url,
-            self.model,
-            self.timeout,
-            self.trust_env_proxy,
-        )
-
+        self.session.trust_env = bool(config.get("trust_env_proxy", False))
         if not self.api_key:
             raise ValueError(f"api_key is not set for LLM provider {self.api_name!r}.")
 
-    def chat_structured(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
-        obj = self.chat_json(messages, schema=MODEL_RESPONSE_SCHEMA)
-        try:
-            validate_model_response(obj)
-        except ValueError as exc:
-            raise ModelResponseValidationError(str(exc), obj=obj) from exc
-        return obj
-
-    def chat_json(self, messages: List[Dict[str, str]], schema: dict | None = None) -> Dict[str, Any]:
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        payload: Dict[str, Any] = {
+    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
-            "response_format": {"type": "json_object"},
         }
+        if tools:
+            payload.update({"tools": tools, "tool_choice": "auto"})
         if self.top_p is not None:
             payload["top_p"] = float(self.top_p)
         if self.max_tokens:
             payload["max_tokens"] = int(self.max_tokens)
-        if schema is not None:
-            payload["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "devwerk_json_response",
-                    "strict": True,
-                    "schema": schema,
-                },
-            }
-
-        resp = self.session.post(self.url, json=payload, headers=headers, timeout=self.timeout)
-        if resp.status_code == 400:
-            text = (resp.text or "").lower()
-            if any(key in text for key in ("json_schema", "response_format", "schema")):
-                fallback = dict(payload)
-                fallback["response_format"] = {"type": "json_object"}
-                resp = self.session.post(self.url, json=fallback, headers=headers, timeout=self.timeout)
-
-        raise_for_provider_response(resp, provider="openai", api_name=self.api_name)
-        data = resp.json()
+        response = self.session.post(
+            self.url,
+            json=payload,
+            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            timeout=self.timeout,
+        )
+        raise_for_provider_response(response, provider="openai", api_name=self.api_name)
+        data = response.json()
         raise_for_provider_payload(
             data,
             provider="openai",
             api_name=self.api_name,
-            status_code=resp.status_code,
-            request_id=resp.headers.get("request-id") or resp.headers.get("x-request-id"),
+            status_code=response.status_code,
+            request_id=response.headers.get("request-id") or response.headers.get("x-request-id"),
         )
-        self.last_usage = self._extract_usage(data)
-        content = self._extract_content(data)
-        obj = json.loads(content)
-        return obj
-
-    @staticmethod
-    def _extract_usage(data: Dict[str, Any]) -> Dict[str, Any]:
-        usage = data.get("usage")
-        if not isinstance(usage, dict):
-            return {}
-        details = usage.get("prompt_tokens_details")
-        if not isinstance(details, dict):
-            details = {}
-        return {
-            "input_tokens": usage.get("prompt_tokens") or usage.get("input_tokens"),
-            "output_tokens": usage.get("completion_tokens") or usage.get("output_tokens"),
-            "total_tokens": usage.get("total_tokens"),
-            "cached_input_tokens": details.get("cached_tokens"),
-        }
-
-    @staticmethod
-    def _extract_content(data: Dict[str, Any]) -> str:
+        self.last_usage = _usage(data.get("usage"))
         choices = data.get("choices")
-        if not isinstance(choices, list) or not choices:
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
             raise ValueError("OpenAI-compatible API returned no choices")
-        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        message = choices[0].get("message")
         if not isinstance(message, dict):
             raise ValueError("OpenAI-compatible API returned no message")
+        calls: list[dict[str, Any]] = []
+        for raw in message.get("tool_calls") or []:
+            function = raw.get("function") if isinstance(raw, dict) else None
+            if not isinstance(function, dict):
+                continue
+            arguments = function.get("arguments") or {}
+            if isinstance(arguments, str):
+                arguments = json.loads(arguments)
+            if not isinstance(arguments, dict):
+                raise ValueError("tool call arguments must be a JSON object")
+            calls.append({"id": str(raw.get("id") or ""), "name": str(function.get("name") or ""), "arguments": arguments})
         content = message.get("content")
-        if isinstance(content, str) and content.strip():
-            return content.strip()
-        raise ValueError("OpenAI-compatible API returned empty message content")
+        return {"text": content if isinstance(content, str) else "", "tool_calls": calls, "usage": self.last_usage}
+
+
+def _usage(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    details = value.get("prompt_tokens_details") if isinstance(value.get("prompt_tokens_details"), dict) else {}
+    return {
+        "input_tokens": value.get("prompt_tokens") or value.get("input_tokens"),
+        "output_tokens": value.get("completion_tokens") or value.get("output_tokens"),
+        "total_tokens": value.get("total_tokens"),
+        "cached_input_tokens": details.get("cached_tokens"),
+    }

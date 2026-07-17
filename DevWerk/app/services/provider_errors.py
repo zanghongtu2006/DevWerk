@@ -124,7 +124,9 @@ def raise_for_provider_payload(
     request_id: str | None = None,
 ) -> None:
     provider_code = _extract_provider_code(payload)
-    if provider_code in (None, 0):
+    provider_error_type = _extract_error_type(payload)
+    has_error_object = isinstance(payload, dict) and payload.get("error") not in (None, {}, "")
+    if provider_code in (None, 0) and not provider_error_type and not has_error_object:
         return
     details = classify_provider_payload(
         payload,
@@ -240,9 +242,22 @@ def classify_provider_payload(
 def is_retryable_llm_error(exc: BaseException) -> bool:
     if isinstance(exc, LLMProviderError):
         return exc.retryable
-    name = type(exc).__name__
+    name = type(exc).__name__.lower()
     text = str(exc).lower()
-    return "readtimeout" in name.lower() or "timeout" in text
+    # Connection / transport errors are transient — retry them.
+    if any(token in name for token in (
+        "timeout", "readtimeout", "connection", "connect",
+        "ssl", "tlserror", "certificate", "reset",
+    )):
+        return True
+    if any(token in text for token in (
+        "timeout", "timed out", "connection reset",
+        "eof occurred", "ssl", "tls",
+        "connection refused", "connection aborted",
+        "broken pipe", "reset by peer",
+    )):
+        return True
+    return False
 
 
 def llm_error_code(exc: BaseException, default: str = "MODEL_ERROR") -> str:
@@ -295,7 +310,19 @@ def _extract_error_type(value: Any) -> str | None:
         return str(text) if text else None
     if isinstance(value, dict):
         text = value.get("type") or value.get("error_type")
-        return str(text) if text else None
+        if text:
+            normalized = str(text).strip().lower()
+            # Successful Anthropic-compatible responses use type="message".
+            # Only explicit error-shaped top-level types are error evidence.
+            if normalized.endswith("_error") or normalized in {
+                "error",
+                "authentication_error",
+                "permission_error",
+                "rate_limit_error",
+                "overloaded_error",
+                "timeout_error",
+            }:
+                return normalized
     return None
 
 

@@ -1,58 +1,72 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="icon" href="data:," />
-  <title>DevWerk</title>
-  <link rel="stylesheet" href="/web/static/dashboard.css?v=20260630c" />
-  <script src="/web/static/dashboard.js?v=20260630c" defer></script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <link rel="icon" href="data:,">
+  <title>DevWerk · Multi-agent delivery</title>
+  <link rel="stylesheet" href="/web/static/dashboard.css?v=20260717">
+  <script type="module" src="/web/static/dashboard.js?v=20260717"></script>
 </head>
-<body data-page="{{ active_page }}">
+<body data-current-route="overview">
+  <div id="loading-bar" class="loading-bar" aria-hidden="true"><i></i><span id="loading-label" class="sr-only"></span></div>
   <div class="app-shell">
-    <aside class="global-nav">
-      <div class="brand">
-        <span class="brand-mark"></span>
-        <span class="brand-name">DevWerk</span>
-        <button class="nav-collapse" title="Collapse navigation">&laquo;</button>
-      </div>
+    <aside class="global-nav" aria-label="Global navigation">
+      <a class="brand" href="/workbench" data-route="overview" aria-label="DevWerk overview">
+        <span class="brand-symbol"><i></i><i></i><i></i></span>
+        <span><b>DevWerk</b><small>Agentic delivery</small></span>
+      </a>
       <nav class="nav-list">
-        <a class="nav-link" data-nav="overview" href="/workbench"><span data-icon="O"></span>Overview</a>
-        <a class="nav-link" data-nav="projects" href="/dashboard"><span data-icon="P"></span>Projects</a>
-        <a class="nav-link" data-nav="kanban" href="/kanban"><span data-icon="K"></span>Kanban</a>
-        <a class="nav-link" data-nav="tasks" href="/tasks"><span data-icon="T"></span>Tasks</a>
-        <a class="nav-link" data-nav="events" href="/dashboard#events"><span data-icon="E"></span>Events</a>
-        <a class="nav-link" data-nav="memory" href="/dashboard#memory"><span data-icon="M"></span>Memory</a>
-        <a class="nav-link" data-nav="analytics" href="/dashboard#analytics"><span data-icon="A"></span>Analytics</a>
-        <a class="nav-link" data-nav="settings" href="/dashboard#settings"><span data-icon="S"></span>Settings</a>
+        <a href="/workbench" data-route="overview"><span class="nav-icon">◫</span><span>Overview</span></a>
+        <a href="/dashboard" data-route="projects"><span class="nav-icon">⌂</span><span>Projects</span></a>
+        <a href="/kanban" data-route="kanban"><span class="nav-icon">▥</span><span>Kanban</span></a>
+        <a href="/tasks" data-route="tasks"><span class="nav-icon">✓</span><span>Tasks</span></a>
+        <a href="/events" data-route="events"><span class="nav-icon">↻</span><span>Events</span></a>
       </nav>
-      <div class="nav-footer">
-        <div class="identity"><span class="avatar">DW</span><span><b>DevWerk Console</b><small>Local backend UI</small></span></div>
-        <div class="footer-links"><span>Docs</span><span>Help</span></div>
+      <div class="nav-foot">
+        <span class="runtime-avatar">DW</span>
+        <span><b>Local Runtime</b><small id="runtime-status" class="runtime-status connecting"><i></i>Connecting</small></span>
       </div>
     </aside>
-    <aside class="project-rail">
-      <div class="rail-head">
-        <h2>Projects</h2>
-        <button id="newProjectRail" class="icon-button" title="New project">+</button>
+
+    <aside class="project-rail" aria-label="Project navigation">
+      <header><div><span class="rail-kicker">WORKSPACE</span><h2>Projects</h2></div><button id="rail-new-project" class="icon-button" type="button" title="创建 Project" aria-label="创建 Project">+</button></header>
+      <label class="project-search"><span aria-hidden="true"></span><input id="project-search" type="search" placeholder="搜索 Project" autocomplete="off"></label>
+      <div id="project-list" class="project-list" aria-live="polite">
+        <div class="rail-project-skeleton"><i></i><span></span></div>
+        <div class="rail-project-skeleton"><i></i><span></span></div>
+        <div class="rail-project-skeleton"><i></i><span></span></div>
       </div>
-      <label class="search-box"><span></span><input id="projectSearch" placeholder="Search projects..." /></label>
-      <div id="projectList" class="project-list"></div>
-      <a class="rail-link" href="/dashboard">View all projects &rarr;</a>
+      <button id="new-project" class="rail-create" type="button"><span>+</span>New project</button>
     </aside>
-    <main class="workspace">
-      <header class="topbar">
-        <div class="context-pill"><span class="hex"></span><b id="ctxProject">default</b></div>
-        <span id="ctxStatus" class="badge green">Active</span>
-        <label class="top-select"><span>Environment</span><select id="ctxEnv"><option>default</option></select></label>
-        <label class="top-select wide"><span>Model Route</span><select id="ctxModelRoute"><option>default</option></select></label>
-        <span class="top-spacer"></span>
-        <button id="refresh" class="button ghost">Refresh</button>
-        <button class="icon-button" title="Notifications">N</button>
-        <button class="icon-button" title="Settings">S</button>
+
+    <section class="workspace">
+      <header class="workspace-topbar">
+        <button id="project-rail-toggle" class="mobile-menu" type="button" aria-label="打开 Project 列表">☰</button>
+        <div class="context-mark"><span></span></div>
+        <div class="context-copy"><b id="context-project">Loading workspace…</b><small id="context-id">正在连接 Backend API</small></div>
+        <span id="context-status" class="context-status neutral"><i></i>Loading</span>
+        <div class="topbar-spacer"></div>
+        <span class="governance-note">Conversation writes · Board reads</span>
+        <button id="refresh" class="refresh-button" type="button" title="刷新当前项目"><span>↻</span>Refresh</button>
       </header>
-      <section id="page" class="page"></section>
-    </main>
+      <main id="page" class="page" tabindex="-1">
+        <div class="page-loading" aria-live="polite"><div class="loading-heading"><span class="skeleton block wide"></span><span class="skeleton block medium"></span></div><div class="loading-grid"><div class="skeleton-card"><span class="skeleton line"></span><span class="skeleton line"></span><span class="skeleton line short"></span></div><div class="skeleton-card"><span class="skeleton line"></span><span class="skeleton line"></span><span class="skeleton line short"></span></div><div class="skeleton-card"><span class="skeleton line"></span><span class="skeleton line"></span><span class="skeleton line short"></span></div></div><span class="sr-only">正在加载 DevWerk</span></div>
+      </main>
+    </section>
+    <button class="rail-backdrop" type="button" aria-label="关闭 Project 列表" onclick="document.querySelector('.app-shell').classList.remove('rail-open')"></button>
   </div>
+
+  <dialog id="project-dialog" class="project-dialog">
+    <form id="project-form">
+      <header><div><span class="eyebrow">NEW PROJECT</span><h2>创建隔离的 Project</h2><p>Project path 是 Context 与所有生成文件的边界。</p></div><button id="project-dialog-close" class="dialog-close" type="button" aria-label="关闭">×</button></header>
+      <label><span>名称</span><input name="name" required maxlength="120" placeholder="例如：我的项目"></label>
+      <label><span>说明</span><textarea name="description" rows="3" maxlength="4000" placeholder="这个 Project 的目标和背景"></textarea></label>
+      <label><span>Project path</span><input name="base_dir" required placeholder="D:\workspace\my-project"><small>DevWerk 只会在这个目录边界内创建和验证产物。</small></label>
+      <footer><button class="button" id="project-dialog-cancel" type="button" onclick="document.getElementById('project-dialog').close()">取消</button><button class="button primary" type="submit">创建 Project</button></footer>
+    </form>
+  </dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
 </body>
 </html>
