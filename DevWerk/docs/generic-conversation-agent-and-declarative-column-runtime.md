@@ -115,6 +115,7 @@ Version 1 Conversation Capability 目录：
 - `project.files.write`
 - `project.files.search`
 - `project.command.run`
+- `artifact.inspect` / `artifact.read`
 - `workflow.inspect`
 - `workflow.publish`
 - `backlog.record` / `backlog.inspect` / `backlog.list`
@@ -122,7 +123,7 @@ Version 1 Conversation Capability 目录：
 - `task.create`
 - `task.list`
 - `task.inspect`
-- `task.pause` / `task.resume` / `task.retry` / `task.cancel` / `task.migrate`
+- `task.pause` / `task.resume` / `task.retry` / `task.rerun` / `task.cancel` / `task.migrate`
 - `intervention.record`
 - `supervision.review.schedule`
 - `run.inspect`
@@ -134,6 +135,8 @@ Version 1 Conversation Capability 目录：
 Conversation API 使用显式 `mutation_scope`：`observe` 只读，`govern` 允许 backlog、调度、监督和 Task 控制，`execute` 额外允许 Project 内直接执行。Workflow 发布和 Task 创建分别由 `allow_workflow_mutation`、`allow_task_mutation` 确定性 guard 控制。授权表示可以执行，不表示必须执行；所有 mutation capability 定义输入 schema、Project scope、幂等键和事件。
 
 Conversation turn 的直接 write/process 使用有界预算。预算耗尽后返回结构化 `GovernanceDecisionRequired`；Conversation Agent 必须形成 `HOLD`、`QUEUE`、`SPLIT`、请求用户方向或 `DISPATCH` 决策。只有 Readiness 与当前 Workflow 适配均通过时才创建 Formal Task。一旦 `task.create` 成功，本轮进入 **delegated** 边界：Conversation Agent继续监督，但不再直接完成该 Formal Task。
+
+`task.retry` 只对尚未 terminal 的 Task 在当前 Column Run 创建新 Attempt；`done/failed` 绝不复活。`task.rerun` 为 terminal Task 原子创建 successor Task，记录 `rerun_of_task_id`、新的 readiness/scheduling fact 与固定 Workflow revision，原 Task 保持不可变。
 
 ### 5.4 监督职责
 
@@ -254,6 +257,8 @@ Capability Risk Policy 以 `side_effect_kind` 和 Project 配置执行确定性 
 
 `project.command.run` 只能通过隔离执行器运行结构化 argv。执行器必须限制可见文件系统为声明的 workspace mount，使用显式环境变量 allowlist，默认禁用网络与凭据注入，限制 child process、CPU、内存、输出与时间，并保存 started/completed execution receipt。仅设置 cwd 或规范化路径不构成进程隔离。
 
+`artifact.inspect/read` 只接受同一 `project_id` 的 artifact ID，由 Artifact Repository 校验归属、lifecycle、hash、size 与 media type。`inspect` 只返回 metadata；`read` 对文本执行字符上限和分页，对二进制返回受控引用。Context Compiler 只能通过这两个能力解析 Column 声明的 artifact 引用，不能把 `internal_artifact_root` 暴露给 workspace file capability。
+
 ### 7.1 Capability 绑定不变量
 
 Version 1 Capability 绑定不变量：
@@ -263,6 +268,7 @@ Version 1 Capability 绑定不变量：
 - `CapabilitySequenceExecutor.steps[].capability` 使用同一动态枚举；
 - Workflow 发布仍由 Registry 二次校验，防止绕过工具 schema 的 API 请求引用未知能力；
 - Registry 以 `delegable_to_column` 元数据区分项目级控制能力与可委派执行能力；`workflow.publish`、`task.create`、Task 控制能力和 `agent.instruction.update` 不进入 Column 枚举。Task 数量与调度只由 Conversation Agent 决定，Column Agent 不得递归创建或重排 Task；
+- `artifact.inspect/read` 是可委派只读能力；Context Compiler 预取与 Column Agent 按需读取均经过相同 Artifact Repository scope/size/hash 校验；
 - 能力目录只表达通用工具事实，不根据 Column instruction、Task 领域、文件名或用户关键词推断、补齐或替换能力。
 
 纯推理 Column 如果确实不需要外部副作用，也必须显式选择一个无副作用的通用 capability（例如 `system.noop`），从而把“只需推理”变成可审计决策，而不是字段遗漏。
@@ -284,7 +290,7 @@ Version 1 Capability 绑定不变量：
 
 `schema_version/name/entry/terminals/columns` 为 required；`description` 默认空字符串。`done` 与 `failed` 是保留的 terminal sentinel key，不出现在 `columns` 数组中、不包含 executor，也不创建 Column Run。
 
-发布时执行结构与 liveness 校验：Column key 唯一、entry 存在、每个 `(column,outcome)` 只有一个 target、target 是 Column key 或 terminal sentinel、所有 Column 可达、每个 Column 均有到 sentinel 的受限路径；failure、interrupted、retry exhausted、wait success 和 timeout outcome 均映射到已声明 transition；每个循环有 `max_visits`。Version 1 transition 不支持 guard 或 priority，业务分支由 executor 提交不同的枚举 outcome。取消具备独立的原子 failed 终态、清理与通知协议。校验不理解业务内容。
+发布时执行结构与 liveness 校验：Column key 唯一、entry 存在、每个 `(column,outcome)` 只有一个 target、target 是 Column key 或 terminal sentinel、所有 Column 可达、每个 Column 均有到 sentinel 的受限路径；`runtime_outcomes` 与 wait success/timeout value 均映射到已声明 transition；每个循环有 `max_visits`。Version 1 transition 不支持 guard 或 priority，业务分支由 executor 提交不同的枚举 outcome。取消具备独立的原子 failed 终态、清理与通知协议。校验不理解业务内容。
 
 ### 8.2 Column Schema
 
@@ -311,6 +317,13 @@ Version 1 Capability 绑定不变量：
     {"outcome": "success", "target": "done"},
     {"outcome": "failure", "target": "failed"}
   ],
+  "runtime_outcomes": {
+    "input_missing": "failure",
+    "execution_failed": "failure",
+    "interrupted": "failure",
+    "retry_exhausted": "failure",
+    "max_visits_exceeded": "failure"
+  },
   "retry": {"max_attempts": 3, "backoff_seconds": 5, "retryable_errors": ["provider_transient"]},
   "wait_policy": null,
   "max_visits": 100,
@@ -318,11 +331,13 @@ Version 1 Capability 绑定不变量：
 }
 ```
 
-`key/name/instruction/executor/input_contract/output_contract/transitions/retry/max_visits` 为 required；`context` 与 `metadata` 默认空对象，`wait_policy` 默认 `null`。Executor 使用按 `kind` 判别的联合 schema：`agent` 要求 `capabilities/max_iterations/max_tool_calls`；`capability_sequence` 要求 `steps/success_outcome/failure_outcome`，不接受 Agent 字段。Transition 只有 required 的 `outcome/target`，同一 Column 的 outcome 不得重复。
+`key/name/instruction/executor/input_contract/output_contract/transitions/runtime_outcomes/retry/max_visits` 为 required；`context` 与 `metadata` 默认空对象，`wait_policy` 默认 `null`。Executor 使用按 `kind` 判别的联合 schema：`agent` 要求 `capabilities/max_iterations/max_tool_calls`；`capability_sequence` 要求 `steps/success_outcome/failure_outcome`，不接受 Agent 字段。Transition 只有 required 的 `outcome/target`，同一 Column 的 outcome 不得重复。
+
+`runtime_outcomes` 的五个 key 均 required，其 value 必须是当前 Column 已声明的 transition outcome。Runtime 只按异常类型查表，不从错误文本、Column 名称或业务内容推断路由。Wait success/timeout 使用冻结 WaitPolicy 中的 outcome，并接受相同 transition 校验。
 
 `instruction`、contract、glob、capability 选择都是 Workflow revision 中的数据。它们可以描述任意领域，但不得被复制到源码常量。
 
-`max_visits` 是与领域无关的循环熔断器：即使所有 Column Run 都返回已声明的非失败 outcome，Task 也不能无限循环；超过上限后按该 Column 的失败/重试策略进入 failed 路径。
+`max_visits` 是与领域无关的循环熔断器：即使所有 Column Run 都返回已声明的非失败 outcome，Task 也不能无限循环；超过上限后 Runtime 使用 `runtime_outcomes.max_visits_exceeded` 选择唯一 transition。
 
 ### 8.3 两类通用 Executor
 
@@ -358,6 +373,8 @@ Capability Sequence 在每个 step 前写 started receipt，完成后写 complet
 
 Runtime 可以按 `executor.kind` 从 Executor Registry 选择基础设施策略；这是协议级多态，不是业务分支。允许的 kind 只有已注册的通用 executor，未知 kind 在 Workflow 发布时即拒绝。
 
+Version 1 不存在持久“专业 worker agent”实体或 worker pool 配置。每个 Agent Executor Attempt 以冻结的 instruction、capability、Provider/model 与预算创建临时 Column Agent；其 `v1_agent_runs/segments` 仅是运行审计事实。改派表示安全结束或中断当前 Attempt，再以新的冻结 executor/model 配置创建下一个 Attempt，不修改已存在的 Agent Run。
+
 ### 8.4 Wait Policy 判别联合
 
 `wait_policy` 按 `kind` 使用以下 Version 1 联合类型：
@@ -370,23 +387,57 @@ Runtime 可以按 `executor.kind` 从 Executor Registry 选择基础设施策略
 
 ## 9. 状态机、等待与终态保证
 
-### 9.1 Task 状态
+### 9.1 Canonical State Transition Tables
+
+所有状态 mutation 均要求匹配 `project_id` 与 `expected_state_version`，以单条条件 UPDATE 或同一短 transaction CAS 提交。未列出的 edge 一律返回 `transition_not_allowed`。
 
 Task execution state：
 
-`pending -> running -> waiting/recovering -> running -> done|failed`
+| Source | Target | Trigger | Additional guard |
+|---|---|---|---|
+| pending | running | first Attempt claimed | control active；readiness、dependency、WIP、resource guard 通过 |
+| running | waiting | active Attempt 持久化 AwaitHandle | handle 与 checkpoint 已原子提交 |
+| running | recovering | active Attempt interrupted | 原 lease 已失效或释放 |
+| waiting | running | AwaitHandle resume condition 成立 | control active；handle settlement CAS 成功 |
+| waiting | recovering | handle stalled 或恢复失败 | recovery budget 可用 |
+| recovering | running | recovery/new Attempt claimed | control active；无其他 active lease |
+| running | done | transition 到 success sentinel | Run succeeded；contract/evidence 通过 |
+| pending/running/waiting/recovering | failed | transition 到 failure sentinel 或 cancel | terminal artifact/event/mailbox 同事务提交 |
 
-Task control state 独立为 `active | pause_requested | paused`。`task.pause` 以 CAS 将 control state 置为 `pause_requested`；Runtime 停止领取新工作，协作取消或等待当前 capability 到安全 checkpoint，释放 lease 后置为 `paused`。AwaitHandle 与 checkpoint 在暂停时保留但不触发恢复执行。`task.resume` 将 `paused` 置回 `active` 并重新入队。只有 `paused` 且无活跃 Task/Attempt lease 时允许迁移。`done/failed` 的 control state 固定为 `active`。
+Task control state：
 
-Column Run 状态：
+| Source | Target | Trigger | Additional guard |
+|---|---|---|---|
+| active | pause_requested | task.pause | Task 非 terminal |
+| pause_requested | paused | safe checkpoint reached | 无 active Task/Attempt lease；运行中的 Attempt 已持久化 `task.resumed` event AwaitHandle，既有 Handle 冻结 |
+| pause_requested | active | task.resume | pause 尚未完成 |
+| paused | active | task.resume | migration transaction 不在进行；control AwaitHandle settlement 与重新入队原子提交 |
+| any non-active | active | Task terminal transaction | 与 done/failed 原子规范化 |
 
-`pending -> running -> waiting -> succeeded|failed|interrupted`
+Column Run state：
 
-Column Attempt 状态：
+| Source | Target | Trigger | Additional guard |
+|---|---|---|---|
+| pending | running | first Attempt claimed | Attempt 属于该 Run |
+| running | waiting | active Attempt awaiting | AwaitHandle 已提交 |
+| waiting | running | Attempt resumed/new Attempt claimed | Task control active |
+| running | succeeded | Attempt succeeded | output contract 与 evidence 通过 |
+| running/waiting | failed | retry/recovery exhausted | `runtime_outcomes` 已解析 |
+| running/waiting | interrupted | recovery policy 暂停该 visit | active Attempt 已 interrupted |
 
-`pending -> running -> waiting -> succeeded|failed|interrupted|cancelled`
+Column Attempt state：
 
-Column Run 代表一次 visit；它在 retry budget 内顺序拥有一个或多个 immutable Attempt。Run 只在某个 Attempt 通过 output contract 后 `succeeded`，或 retry/recovery 决策耗尽后 `failed/interrupted`。Artifact、Agent Segment、AwaitHandle 与 execution receipt 均关联明确的 `column_attempt_id`。
+| Source | Target | Trigger | Additional guard |
+|---|---|---|---|
+| pending | running | lease claim | lease owner/expiry 原子写入 |
+| running | waiting | CapabilityResult awaiting | handle/checkpoint/receipt 原子提交 |
+| waiting | running | handle settled | 同一 Attempt 或新 Agent Segment |
+| running | succeeded | executor complete | output contract 通过 |
+| running | failed | execution/contract failure | failure artifact/receipt 已提交 |
+| running/waiting | interrupted | lease expiry/process loss | execution receipt 已核对 |
+| pending/running/waiting | cancelled | Task cancel/Attempt superseded | lease 释放并执行 cleanup |
+
+Column Run 代表一次 visit；它在 retry budget 内顺序拥有一个或多个 immutable Attempt。Artifact、Agent Segment、AwaitHandle 与 execution receipt 均关联明确的 `column_attempt_id`。
 
 ### 9.2 长等待分类
 
@@ -394,7 +445,7 @@ Column Run 代表一次 visit；它在 retry budget 内顺序拥有一个或多�
 
 - **Active**：有租约和 heartbeat，且 `last_progress_at` 在推进；
 - **Long running**：有 heartbeat，但进度间隔较长；Conversation Agent 收到观察事件但不立即杀死；
-- **Awaiting**：worker 已释放，存在符合 poll/event/timer schema、带 next check 或恢复事件和 deadline 的 AwaitHandle；
+- **Awaiting**：执行资源已释放，存在符合 poll/event/timer schema、带 next check 或恢复事件和 deadline 的 AwaitHandle；
 - **Stalled**：租约/heartbeat 过期且无合法 await handle；进入 recovering；
 - **Exhausted**：恢复或重试预算耗尽；进入 failed。
 
@@ -496,7 +547,7 @@ DevWerk 定义服务级 `data_root`：共享数据库固定为 `data_root/devwer
 
 - `v1_workflows`：`id/project_id/name/active_revision_id/state_version` required；Version 1 对 active workflow 使用 `project_id` unique。
 - `v1_workflow_revisions`：`id/project_id/workflow_id/revision_no/schema_version/definition_json/definition_hash` required；`(workflow_id,revision_no)` unique，`definition_hash` indexed。
-- `v1_tasks`：`id/project_id/workflow_revision_id/current_column_key/status/control_state/state_version` required；`(project_id,id)` unique。
+- `v1_tasks`：`id/project_id/workflow_revision_id/current_column_key/status/control_state/state_version` required，`rerun_of_task_id` optional；`(project_id,id)` unique，rerun foreign key 必须属于同一 Project。
 - `v1_column_runs`：`id/project_id/task_id/column_key/visit_no/status/outcome/state_version` required；`(task_id,visit_no)` unique。
 - `v1_column_attempts`：`id/project_id/column_run_id/attempt_no/status/lease_owner/lease_expires_at/state_version` required；`(column_run_id,attempt_no)` unique。
 - `v1_await_handles`：`id/project_id/task_id/column_run_id/column_attempt_id/kind/status/policy_json/checkpoint_ref/next_check_at/hard_deadline/state_version` required；settlement 只允许从 `pending` CAS 一次。
@@ -505,11 +556,13 @@ DevWerk 定义服务级 `data_root`：共享数据库固定为 `data_root/devwer
 - `v1_task_dependencies`：`project_id/task_id/depends_on_task_id/required_terminal` required；禁止自依赖，发布/派发时检查环。
 - `v1_resource_claims`：`project_id/resource_key/task_id/mode/lease_expires_at` required；`mode=exclusive|shared`，冲突由 transaction guard 判定。
 
+`v1_workflows.active_revision_id` 是 active revision 的唯一事实源；Project、API 与 Web 均通过 Project 的唯一 Workflow 派生，不在 `v1_projects` 保存副本。
+
 所有 JSON 字段在写入前由带 `schema_version` 的 JSON Schema 校验。API request/response 由同一领域模型生成 OpenAPI；required、enum、default 和 cross-field validator 不在 route 中另写一套。未知 schema version 返回 `schema_version_unsupported`。
 
 ### 10.2 状态、事件与幂等契约
 
-Task execution state 允许：`pending -> running|failed`，`running -> waiting|recovering|done|failed`，`waiting -> running|recovering|failed`，`recovering -> running|failed`；terminal 不再转移。Control state 允许：`active -> pause_requested -> paused -> active`，Task terminal 时规范化为 `active`。Column Run 与 Attempt 只允许按第 9.1 节前向转移。
+Task、control、Column Run 与 Column Attempt 只允许第 9.1 节 Canonical State Transition Tables 列出的 edge；machine-readable storage/API contract 使用相同 enum、trigger 和 CAS guard。`done/failed` terminal 不再转移。
 
 Event payload 统一为：
 
@@ -554,21 +607,31 @@ Artifacts 使用 JSON Schema Draft 2020-12，固定 `$id` 与 `schema_version`�
 
 Web 界面不得展示任务类别或领域模板。Workflow/Column 视图显示 executor kind、capabilities、contract、retry/wait policy；Task 详情显示 Column Runs、Agent Runs、Tool Invocations、artifact 和终态事件。页面使用有界并行请求、加载骨架和 event cursor，不使用高频全量刷新。
 
-## 13. Version 1 Release Slice
+## 13. Version 1 Ordered Release Gates
 
-Version 1 的 release gate 是一条可独立交付的纵向切线：
+Version 1 使用同一 `devwerk.*.v1` 协议与 `v1_*` storage contract，按三条可独立验收的纵向 gate 交付。较早 gate 遇到尚未启用的 Version 1 feature 时返回 `feature_not_enabled`，不改变 schema 或写入不完整事实。公开 Version 1 release 必须完成 V1a、V1b、V1c。
 
-- 单用户可信本地部署、一个可配置主 Provider；
-- `workspace_root/data_root/internal_artifact_root` 隔离；
-- 提交并验证五个 machine-readable contract artifacts；
-- Project 级 Conversation Agent、mailbox claim/ack 与持久治理循环；
-- 通用 AgentCore、Capability Registry、project file 与 sandboxed command capability；
-- `agent/capability_sequence` 两类 executor；
-- 唯一 transition、Column Run/Attempt、contract、retry、poll/event/timer AwaitHandle；
-- SQLite revision/task/run/attempt/artifact/event/mailbox/receipt、lease、heartbeat、CAS 与 restart reconciler；
-- 只读基础 Web：Project、Conversation、Kanban、Task、Run、Artifact、Event，所有列表使用 limit/cursor 与增量 event cursor。
+### V1a — Conversation-to-Agent Task
 
-MCP adapter、callback receiver、多 Provider 自动切换、专用 ProgressAdapter、复杂预计算 projection、多用户权限和不可逆外部 capability 是兼容扩展点，不属于 Version 1 release gate。扩展只能注册到现有协议，不改变 AgentCore、CapabilityResult、Workflow schema 或状态机。
+- 单用户可信本地部署、一个 active Project 验收切片与一个主 Provider；
+- 五个 machine-readable contract artifacts、三类 root 隔离、Project-scoped repository；
+- Project Conversation Agent、versioned policy/instruction、AgentCore、artifact/project file capabilities；
+- Agent Executor、唯一 transition、Column Run/Attempt、contract、done/failed terminal；
+- SQLite 基础事实、mailbox claim/ack、只读分页 Web。
+
+### V1b — Deterministic Execution and Recovery
+
+- Capability Sequence Executor、sandboxed command、execution receipt 与 step cursor；
+- retry/runtime_outcomes、lease/heartbeat、CAS/idempotency、restart reconciler；
+- terminal rerun successor、event cursor 与 Project 多实例隔离测试。
+
+### V1c — Durable Waiting and Governance
+
+- poll/event/timer CapabilityResult/AwaitHandle、deadline、checkpoint 与恢复；
+- pause/resume/migrate、dependency/WIP/resource dispatch guard；
+- scheduled supervision、long-running health、完整 liveness validator 与增量 Web 更新。
+
+MCP adapter、callback receiver、多 Provider 自动切换、专用 ProgressAdapter、复杂预计算 projection、多用户权限和不可逆外部 capability 是 Version 1 之后的兼容扩展点。扩展只能注册到现有协议，不改变 AgentCore、CapabilityResult、Workflow schema 或状态机。
 
 ## 14. 测试策略
 

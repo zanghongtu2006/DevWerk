@@ -81,6 +81,7 @@ workflow_revision:
 规则：
 
 - published revision 不可原地修改。
+- `v1_workflows.active_revision_id` 是 active revision 的唯一事实源，Project 不保存副本。
 - 新 Task 固定当前 revision。
 - 运行中 Task 不因新 revision 发布而自动变化。
 - Task 迁移必须由 conversation-agent 通过 Intervention Run 显式执行。
@@ -125,6 +126,12 @@ column:
   input_contract:
   output_contract:
   transitions: []
+  runtime_outcomes:
+    input_missing:
+    execution_failed:
+    interrupted:
+    retry_exhausted:
+    max_visits_exceeded:
   retry:
   wait:
   max_visits:
@@ -137,6 +144,7 @@ column:
 - `instruction` 是 Conversation Agent 在对话中生成并持久化到 Workflow revision 的阶段工作指令。
 - `metadata` 保存机器可读的展示与扩展信息，不承担运行时路由职责。
 - capability、contract、transition、retry、wait 与 context 均使用各自的结构化字段。
+- `runtime_outcomes` 把五类基础设施条件显式映射到当前 Column 已声明的 outcome。
 
 Instruction 不替代结构化 contract、transition 和 policy。
 
@@ -212,6 +220,8 @@ interrupted
 
 Column Attempt 使用同一前向状态并额外允许 `cancelled`。Run 在活跃阶段镜像当前 Attempt 的 `pending/running/waiting`，在 contract 通过或重试/恢复决定耗尽后聚合为 `succeeded/failed/interrupted`。
 
+合法 edge、trigger 与 CAS guard 仅以通用设计文档第 9.1 节 Canonical State Transition Tables 为准；本节只解释各状态含义。
+
 Business outcome 表示下一步业务路由，例如：
 
 ```text
@@ -268,11 +278,11 @@ Attempt 执行器已取得 lease，必须记录：
 
 ### `failed`
 
-当前 Attempt 无法成功完成。Runtime 先执行 retry/recovery policy；预算允许时在同一 Run 创建新 Attempt，耗尽时令 Run failed 并执行显式 failure outcome。只有 transition 进入 `failed` sentinel 时 Task 才成为 `failed`。
+当前 Attempt 无法成功完成。Runtime 先执行 retry/recovery policy；预算允许时在同一 Run 创建新 Attempt，耗尽时令 Run failed，并通过 `runtime_outcomes.retry_exhausted` 选择已声明 outcome。只有 transition 进入 `failed` sentinel 时 Task 才成为 `failed`。
 
 ### `interrupted`
 
-服务重启、worker 崩溃、lease 丢失或执行器消失造成的运行中断。它与业务失败分开，可以通过检查工件、执行收据和 checkpoint 决定恢复或新 attempt。
+服务重启、executor process 崩溃、lease 丢失或执行器消失造成运行中断时，先将 active Attempt 置为 `interrupted`。证据允许 retry 时 Run 保持 active 并创建新 Attempt；恢复预算耗尽时 Run 置为 `interrupted`，通过 `runtime_outcomes.interrupted` 路由。
 
 ## 10. 两种显式 Executor
 
@@ -375,6 +385,8 @@ agent：
 
 Context Pack 保存引用、hash、预算和编译摘要；不无界拼接历史。
 
+Context Compiler 通过 Project-scoped Artifact Repository 解析声明引用：metadata 使用 `artifact.inspect`，正文使用带类型/大小/分页上限的 `artifact.read`。Project file capability 永远不能直接读取 `internal_artifact_root`。
+
 ## 14. Input Contract
 
 Task 进入 Column 后先验证输入。
@@ -389,7 +401,7 @@ Input Contract 不满足但可等待
 
 Input Contract 无法满足
 → Column Run failed
-→ recovery/escalation/failure policy
+→ `runtime_outcomes.input_missing` 对应 transition
 ```
 
 输入不满足时不能启动 agent 让其猜测缺失信息。
@@ -416,7 +428,7 @@ Output Contract 不通过且可重试
 → 新 attempt
 
 Output Contract 不通过且预算耗尽
-→ failed + recovery/failure policy
+→ failed + `runtime_outcomes.retry_exhausted` 对应 transition
 ```
 
 允许有限、明确的协议重试；禁止无限修复 LLM 输出，禁止 output 不合法仍推进下一列。
@@ -434,7 +446,9 @@ failed
 
 只有 `done` 和 `failed` 是终态。
 
-Task 另有独立 control state：`active -> pause_requested -> paused -> active`。Pause 先阻止新领取，在当前 capability 到达安全 checkpoint、释放 Attempt lease 后完成；AwaitHandle 与 checkpoint 保留但不恢复执行。Terminal Task 的 control state 规范化为 `active`。
+Task execution/control state 的合法 edge、trigger 与 CAS guard 仅引用通用设计文档第 9.1 节，不在本文定义第二套转移图。
+
+Task 另有独立 control state：`active -> pause_requested -> paused -> active`。Pause 先阻止新领取；运行中的 Attempt 在 capability 安全 checkpoint 创建关联 `task.resumed` 的 event AwaitHandle并释放 lease，既有 AwaitHandle 则冻结。Resume 原子 settlement control handle 并重新入队。Terminal Task 的 control state 规范化为 `active`。
 
 ### `done`
 
@@ -460,6 +474,8 @@ Conversation Agent 在终态后异步观察和汇报。需要项目级复核的 
 - 推荐恢复方式
 
 取消原子进入 `failed`，并额外记录 `failure_code=cancelled`、`task.cancelled` event、failure artifact 与 Project mailbox 通知。
+
+`task.retry` 只在 Task 非终态时为当前 Run 创建新 Attempt。终态 Task 重做使用 `task.rerun` 创建带 `rerun_of_task_id` 的 successor Task；原 Task、Run、Attempt 和终态事件保持不可变。
 
 ### Revision 迁移
 
@@ -523,7 +539,7 @@ transition:
 Column Attempt 失败后的顺序：
 
 1. 判断 retry policy 和 attempt budget；允许时在同一 Run 创建新 Attempt。
-2. 预算耗尽时将 Column Run 标记 failed，并产生声明的 failure outcome。
+2. 预算耗尽时将 Column Run 标记 failed，并产生 `runtime_outcomes.retry_exhausted` 声明的 outcome；不可重试执行失败使用 `execution_failed`。
 3. 根据唯一 transition 进入 recovery Column 或 `failed` sentinel。
 4. 判断是否需要 conversation-agent Intervention Run。
 5. 写 failure artifact/event 并通知 conversation-agent。
@@ -602,7 +618,7 @@ await_handle:
   state_version:
 ```
 
-AwaitHandle 必须持久化，不能只存在 worker 内存。Secret 只保存安全引用，不保存明文凭据。
+AwaitHandle 必须持久化，不能只存在 executor 内存。Secret 只保存安全引用，不保存明文凭据。
 
 Handle 在外部任务终态、取消或最终过期并完成 reconciliation 后清理；agent 退出时不销毁。
 
@@ -749,6 +765,8 @@ conversation-agent 发布 revision 前必须通过静态完整性检查。
 - waiting expired
 - retry exhausted
 
+`runtime_outcomes` 必须完整提供 `input_missing/execution_failed/interrupted/retry_exhausted/max_visits_exceeded`，每个 value 都对应已声明的唯一 transition。Runtime 只按条件 key 查表，不从错误文本或业务内容选择 outcome。
+
 Cancellation 不依赖业务 transition；Validator 验证每种 executor/wait kind 都具备 lease release、cancel/cleanup 与原子 `failed(failure_code=cancelled)` 协议。
 
 每个 waiting 明确：
@@ -780,7 +798,7 @@ Version 1 不支持 guard/priority，因此 liveness 基于 `(column,outcome)` �
 
 ## 30. Runtime Reconciler
 
-Runtime Reconciler 独立于原 worker 定期检查：
+Runtime Reconciler 独立于原 executor process 定期检查：
 
 - pending 是否应该已入队
 - running lease 是否有效
@@ -796,7 +814,7 @@ Runtime Reconciler 独立于原 worker 定期检查：
 可执行：
 
 - 重新入队
-- 标记 interrupted
+- 标记 active Attempt interrupted
 - 查询 AwaitHandle
 - 恢复 waiting
 - 创建新 Column Attempt
@@ -828,12 +846,12 @@ Runtime Reconciler 独立于原 worker 定期检查：
 
 ### 异常 running
 
-lease 过期、owner 不存在或 worker 丢失时：
+lease 过期、owner 不存在或 executor process 丢失时：
 
 - 不假设成功或失败。
-- 转为 interrupted。
+- 将 active Attempt 转为 interrupted。
 - 检查 artifact、checkpoint 和 execution receipt。
-- 可恢复则恢复，否则创建新 Column Attempt。
+- 可恢复且预算允许则创建新 Column Attempt；否则将 Run 置为 interrupted 并执行 `runtime_outcomes.interrupted`。
 - 通知 conversation-agent。
 
 ### 外部副作用

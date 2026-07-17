@@ -17,7 +17,7 @@
 
 ## 2. 产品定义
 
-DevWerk 是一个完整的多 agent 工作流系统。每个 Project 拥有一个长期 conversation-agent，由它在 Web 端与用户持续交流，理解需求、建设 workflow、管理 backlog、拆解和调度 task、监督 worker，并在异常时诊断和恢复项目。
+DevWerk 是一个完整的多 agent 工作流系统。每个 Project 拥有一个长期 conversation-agent，由它在 Web 端与用户持续交流，理解需求、建设 workflow、管理 backlog、拆解和调度 task、监督临时 Column Agent/Attempt，并在异常时诊断和恢复项目。
 
 conversation-agent 同时承担：
 
@@ -43,9 +43,9 @@ flowchart TD
     CA --> OP["系统级操作<br/>诊断 · 暂停 · 重试 · 重启 · 改派"]
 
     WF --> OR["确定性 Workflow Orchestrator"]
-    OR --> A1["专业 Agent A"]
-    OR --> A2["专业 Agent B"]
-    OR --> A3["专业 Agent N"]
+    OR --> A1["Ephemeral Column Agent / Attempt 1"]
+    OR --> A2["Ephemeral Column Agent / Attempt 2"]
+    OR --> A3["Capability Sequence / Attempt N"]
 
     A1 --> ART["结果 · 工件 · 证据 · 状态"]
     A2 --> ART
@@ -59,7 +59,7 @@ flowchart TD
 
 - conversation-agent 负责理解、规划、治理、调度和语义判断。
 - workflow orchestrator 负责确定性状态推进和机械约束。
-- worker agent 负责明确范围内的专业工作。
+- ephemeral Column Agent 或 capability sequence 负责一个 Attempt 范围内的执行。
 - Kanban、task、event、artifact 和 run result 构成项目事实。
 
 ## 4. 核心领域概念
@@ -112,7 +112,7 @@ internal_artifact_root
 
 ### Backlog Item
 
-尚未达到执行条件的计划工作，可被澄清、拆分、合并、等待或取消；不绑定 workflow revision，不启动 worker。
+尚未达到执行条件的计划工作，可被澄清、拆分、合并、等待或取消；不绑定 workflow revision，不启动 Column Attempt。
 
 ### Formal Task
 
@@ -147,7 +147,7 @@ Version 1 不允许通过创建第二个 conversation-agent 来绕过同一 Proj
 - 默认委派，不为了并发而并发。
 - 主动限制 WIP，优先完成已开始的价值。
 - 先处理阻塞和失败，再启动更多工作。
-- 不信任 worker 的文本 `success`，检查工件和证据。
+- 不信任 Column Agent 的文本 `success`，检查工件和证据。
 - 项目事实变化时重新评估调度。
 - 能做出 `HOLD`、`MERGE`、`SPLIT`、`CANCEL` 等决定。
 - 派发后继续承担监督和验收责任。
@@ -185,7 +185,7 @@ Version 1 不提供用户直接修改：
 - Kanban 卡片位置
 - workflow column、transition 或 action
 - task 状态
-- agent 分配
+- executor/model 分配
 - workflow merge
 
 所有治理变化由 conversation-agent 理解用户请求后通过内部工具完成，避免用户状态与 agent 项目认知之间的双向 merge。
@@ -197,7 +197,7 @@ Version 1 不提供用户直接修改：
 适用于符合项目唯一 workflow 的正式交付：
 
 - 有明确目标、交付物和验收标准
-- 需要多个阶段或专业 agent
+- 需要多个阶段或独立语义执行
 - 存在依赖、返工、验证或长期跟踪
 - 需要在 Kanban 中持续展示
 
@@ -218,7 +218,7 @@ Direct Run 使用有界 write/process 预算。预算耗尽或工作边界发生
 
 - 诊断 pending/running/waiting 异常
 - 恢复 interrupted Column Run
-- 重试、改派或停止 worker
+- 重试、改派或停止 Column Attempt
 - 修正 task 上下文
 - 发布 workflow revision
 - 显式迁移 task
@@ -321,8 +321,8 @@ Backlog / Workflow / Task / Scheduling Mutations
 - 一个 Project 同时只有一个 conversation-agent governance lease。
 - mailbox event 可以并发写入，但按顺序领取和确认。
 - workflow、backlog 和调度决定串行提交。
-- worker task/agent run 可以并发。
-- dispatch、retry、restart、cancel、migration 必须幂等。
+- Column Attempt/Agent Run 可以并发。
+- dispatch、pre-terminal retry、terminal rerun、cancel、migration 必须幂等。
 
 Conversation Agent 提出调度决定，Repository 以 `state_version` 在短事务内检查 `task_dependencies`、Project/Column WIP limit 和 `resource_claims`，再原子创建 Scheduling Entry 与 claim。依赖、额度或资源冲突未满足时不启动 Task，并返回结构化事实供下一次治理决定使用。
 
@@ -355,7 +355,7 @@ conversation-agent 由以下版本化点分事件唤醒；event stream 与 Proje
 → 必要时向用户汇报
 ```
 
-conversation-agent 不因单纯运行时间较长就中断 worker。它结合 heartbeat、tool activity、token、artifact、状态变化、provider progress 和 task 语义判断。
+conversation-agent 不因单纯运行时间较长就中断 Column Attempt。它结合 heartbeat、tool activity、token、artifact、状态变化、provider progress 和 task 语义判断。
 
 ## 13. 终态与异常处理
 
@@ -365,17 +365,14 @@ conversation-agent 不因单纯运行时间较长就中断 worker。它结合 he
 - 产生 result/failure artifact 引用。
 - 写入 Project mailbox。
 - 唤醒 conversation-agent。
-- 记录 `notified_at` 和 `observed_at`。
+- 记录 `notified_at`、`observed_at` 和 `acknowledged_at`。
 
-`failed` 后 conversation-agent 可以：
+`failed` 是不可变终态。conversation-agent 可以：
 
-- 重启调度
-- 在当前 Column Run 创建新 Column Attempt
-- 返回前一个 Column
-- 改派 agent
-- 修正 task
-- 发布新 workflow revision 并显式迁移
-- Intervention Run 处理
+- 诊断并记录 Intervention Run
+- 通过 `task.rerun` 创建带 `rerun_of_task_id` 的 successor Task
+- 为 successor 选择当前或新发布的 workflow revision
+- 调整后续 backlog、调度或 Project instruction
 - 向用户汇报并请求方向
 
 Task 终态、运行异常和长期 waiting 都不能静默。
@@ -384,16 +381,16 @@ Task 只有在 output contract、artifact/evidence policy 与显式 success term
 
 取消是一个可审计终态操作：Task 原子进入 `failed`，记录 `failure_code=cancelled`、`task.cancelled` event、failure artifact 与 mailbox 通知。
 
-Task 使用独立 `control_state=active|pause_requested|paused`。暂停请求先阻止领取新工作，在当前 capability 到达安全 checkpoint 并释放 lease 后成为 `paused`；AwaitHandle 与 checkpoint 保留但不恢复执行。Task revision 迁移只允许在 `paused` 且没有活跃 lease 时执行。迁移请求必须声明目标 revision、目标 Column、context/artifact 继承策略和期望 `state_version`；Runtime 重新验证目标 input contract，以 CAS transaction 切换 revision 与 Column、创建新的 Column Run 与首个 Attempt 并写入审计事件。验证或 CAS 失败时保持原 revision 和状态。
+Task 使用独立 `control_state=active|pause_requested|paused`。暂停请求先阻止领取新工作；运行中的 Attempt 在 capability 安全 checkpoint 创建关联 `task.resumed` 的 event AwaitHandle并释放 lease，既有 AwaitHandle 则冻结，随后 Task 成为 `paused`。Resume 原子 settlement control handle 并重新入队。Task revision 迁移只允许在 `paused` 且没有活跃 lease 时执行。迁移请求必须声明目标 revision、目标 Column、context/artifact 继承策略和期望 `state_version`；Runtime 重新验证目标 input contract，以 CAS transaction 切换 revision 与 Column、创建新的 Column Run 与首个 Attempt 并写入审计事件。验证或 CAS 失败时保持原 revision 和状态。
 
 ## 14. Tool 与权限
 
 conversation-agent Version 1 拥有 Project 内系统级能力：
 
 - Project、workflow、revision、backlog、task CRUD
-- task dispatch、pause、resume、retry、cancel、migrate
-- agent 创建、配置、停止和改派
-- event、artifact、run、log 和 provider 状态读取
+- task dispatch、pause、resume、pre-terminal retry、terminal rerun、cancel、migrate
+- Column Attempt 停止与改派
+- event、artifact、run、log 和 provider 状态读取；artifact 内容通过 `artifact.inspect/read` 访问
 - Project workspace 文件读写
 - sandboxed command/process
 - Version 1 Capability Registry 中已启用的 skill/tool
@@ -409,9 +406,11 @@ Version 1 暂不实现用户审批边界，但仍要求：
 
 Capability Registry 根据 `side_effect_kind` 与 Project 配置执行确定性风险策略。Version 1 只启用 `workspace_root` 内可恢复、可审计的能力；不可逆远程写入、付费调用、发布和远程删除不进入 release 目录。Command capability 仅接受结构化 argv，并在 OS/container sandbox 中限制 filesystem mount、network、environment、credentials、child process、CPU、内存、输出与时间；cwd containment 本身不视为进程隔离。Version 1 不提供逐操作用户审批界面；细粒度权限和交互式高风险审批是 release 后高优先级需求。
 
-## 15. Worker Agent 边界
+## 15. Ephemeral Column Agent 边界
 
-worker agent：
+Version 1 不存在持久专业 worker 实体。每个 Agent Executor Attempt 创建一个 ephemeral Column Agent；改派表示安全结束或中断当前 Attempt，再用新的冻结 executor/model 配置创建下一个 Attempt。
+
+Column Agent：
 
 - 接收明确 task/column contract。
 - 只处理当前 Column Run。
@@ -421,7 +420,7 @@ worker agent：
 - 不得修改 Project 目标、其他 task 或 workflow。
 - 不得自行创建另一个 conversation-agent。
 
-worker 的 `success` 只是输出声明。Runtime 必须验证 Column output contract、artifact/evidence policy 与声明的 transition；需要额外复核时由 workflow 中显式的 review Column 完成。
+Column Agent 的 `success` 只是输出声明。Runtime 必须验证 Column output contract、artifact/evidence policy 与声明的 transition；需要额外复核时由 workflow 中显式的 review Column 完成。
 
 ## 16. SQLite 与文件存储总原则
 
@@ -456,7 +455,6 @@ id
 name
 status
 workspace_root
-active_workflow_revision_id
 created_at
 updated_at
 state_version
@@ -522,7 +520,7 @@ data_root/
 
 ## 19. SQLite 并发与写入策略
 
-SQLite 只有一个有效 writer。DevWerk 即使规模不大，也必须避免 worker、supervisor、Web 请求和 conversation-agent 争抢长写锁。
+SQLite 只有一个有效 writer。DevWerk 即使规模不大，也必须避免 Attempt、supervisor、Web 请求和 conversation-agent 争抢长写锁。
 
 建议：
 
@@ -542,7 +540,7 @@ SQLite 只有一个有效 writer。DevWerk 即使规模不大，也必须避免 
 
 - workflow revision 发布
 - task/column terminal transition
-- dispatch/retry/migration 幂等记录
+- dispatch/retry/rerun/migration 幂等记录
 - AwaitHandle 创建和终态
 - mailbox claim/ack
 - workspace_root 或治理配置变化
@@ -613,7 +611,7 @@ Web 页面不直接拼接整个 Project 历史。Version 1 使用有界 indexed 
 - Backlog Item 提升为 Task并固定 workflow revision
 - 调度决定 + queue entry + audit event
 - mailbox event claim
-- workflow revision 发布 + Project active revision 更新
+- workflow revision 发布 + `v1_workflows.active_revision_id` 更新
 - task terminal state + terminal event + mailbox notification
 - intervention action result + affected entity version
 
@@ -650,7 +648,7 @@ Web 页面不直接拼接整个 Project 历史。Version 1 使用有界 indexed 
 - Formal Task、Direct Run、Intervention Run 可区分和审计。
 - 调度前存在 Readiness Decision。
 - dispatch 由 dependency、WIP 与 resource claim 的确定性 transaction guard 约束。
-- Project governance 串行，worker execution 可并发。
+- Project governance 串行，Column Attempt execution 可并发。
 - command capability 在受限 sandbox 内运行。
 - task done/failed 和运行异常都会进入 mailbox。
 - SQLite transaction 不包含网络、LLM 或大文件操作。
