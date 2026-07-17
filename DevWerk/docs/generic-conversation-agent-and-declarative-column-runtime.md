@@ -8,7 +8,7 @@
 
 本文是 DevWerk 当前核心系统重构的第一事实。凡现有代码、测试或其他文档与本文冲突，以本文为准。实现以通用 Agent 协议、声明式 Workflow 数据和统一 Column 状态机为基础，所有任务差异均由项目数据表达。
 
-本轮范围是 Web 版 DevWerk 的后端核心与对应 Web 视图。IDEA Plugin 继续挂起。此前完整记忆系统的产品设计继续挂起，本轮只保留可扩展接口边界。
+本轮范围是 Web 版 DevWerk 的后端核心与对应 Web 视图。IDEA Plugin 与完整记忆系统产品设计不在本轮范围；本轮为记忆能力保留可扩展接口边界。
 
 ## 2. 不可违反的原则
 
@@ -78,9 +78,9 @@ flowchart LR
 
 每次用户消息触发一个独立 Agent Run。Run 结束后线程可以退出，但下一轮继续使用相同 Project 身份、指令 revision、会话和 mailbox，因此仍是“每项目一个长期实例”。同一 Project 的用户 turn 串行，多个 Project 可并行。
 
-### 5.2 指令不是源码模板
+### 5.2 版本化平台策略与 Project 指令
 
-Project 指令是可版本化的项目数据，不是 Python 常量。Project 创建时只保存用户提供的 Project 名称、描述和可选初始 instruction；未提供时 instruction 为空。Conversation Agent 可通过 `agent.instruction.update` 工具在对话中建立或调整自己的工作约定。
+Conversation Agent 的指令分为两层：版本化 `ConversationPlatformPolicy` 定义产品身份、治理职责、Readiness、WIP、验收、监督和安全策略；版本化 Project instruction 保存项目目标、约束和工作约定。Project instruction 可以为空，Platform Policy 始终存在。两层均冻结到 Agent Run 输入快照并记录 revision。
 
 AgentCore 不拼接自然语言模板。它把以下类型化对象稳定序列化为 Runtime Envelope：
 
@@ -88,7 +88,8 @@ AgentCore 不拼接自然语言模板。它把以下类型化对象稳定序列�
 {
   "protocol_version": "devwerk.agent.v1",
   "agent": {"kind": "conversation", "project_id": "...", "instruction_revision": 3},
-  "project": {"name": "...", "description": "...", "base_dir": "..."},
+  "platform_policy": {"revision": 1, "roles": ["general_agent", "project_manager", "agile_coach"], "governance": {}},
+  "project": {"name": "...", "description": "...", "workspace_root": "..."},
   "instruction": "持久化项目指令原文",
   "workflow": {"active_revision": "...", "summary": "..."},
   "constraints": {
@@ -104,7 +105,7 @@ Envelope 的字段来自 schema 和数据库，不因任务领域变化；工具
 
 ### 5.3 Conversation Agent 能力
 
-基础工具集：
+Version 1 Conversation Capability 目录：
 
 - `project.inspect`
 - `project.files.list`
@@ -114,18 +115,23 @@ Envelope 的字段来自 schema 和数据库，不因任务领域变化；工具
 - `project.command.run`
 - `workflow.inspect`
 - `workflow.publish`
+- `backlog.record` / `backlog.inspect` / `backlog.list`
+- `scheduling.decide` / `scheduling.inspect`
 - `task.create`
 - `task.list`
 - `task.inspect`
+- `task.pause` / `task.resume` / `task.retry` / `task.cancel` / `task.migrate`
+- `intervention.record`
+- `supervision.review.schedule`
 - `run.inspect`
 - `event.list`
 - `agent.instruction.update`
 
 未来的 skill、MCP 和外部 API 均注册为 Capability，不进入 AgentCore 分支。
 
-`start_task=false` 时，本轮禁用 `workflow.publish` 和 `task.create`，但仍允许讨论、读取状态和安全诊断。`start_task=true` 只是授权创建 Task，不要求一定创建。
+Conversation API 使用显式 `mutation_scope`：`observe` 只读，`govern` 允许 backlog、调度、监督和 Task 控制，`execute` 额外允许 Project 内直接执行。Workflow 发布和 Task 创建分别由 `allow_workflow_mutation`、`allow_task_mutation` 确定性 guard 控制。授权表示可以执行，不表示必须执行；所有 mutation capability 定义输入 schema、Project scope、幂等键和事件。
 
-Conversation turn 的直接 write/process 默认只有 3 次有界预算；预算耗尽后返回结构化 `DelegationRequired`，要求发布 Workflow 并创建正式 Task。一旦 `task.create` 成功，本轮即进入 **delegated** 边界：Conversation Agent 可以继续读取状态、解释计划和执行监督/恢复控制，但不得再通过文件写入或进程能力亲自完成这个正式 Task。直接执行只适用于没有创建 Task 的小任务、诊断、恢复和紧急处理。两条边界均由 AgentCore 按 capability 的 `side_effect_kind` 统一执行，不依赖任务领域、关键词或 Workflow 名称。
+Conversation turn 的直接 write/process 使用有界预算。预算耗尽后返回结构化 `GovernanceDecisionRequired`；Conversation Agent 必须形成 `HOLD`、`QUEUE`、`SPLIT`、请求用户方向或 `DISPATCH` 决策。只有 Readiness 与当前 Workflow 适配均通过时才创建 Formal Task。一旦 `task.create` 成功，本轮进入 **delegated** 边界：Conversation Agent继续监督，但不再直接完成该 Formal Task。
 
 ### 5.4 监督职责
 
@@ -217,24 +223,24 @@ Registry 负责：
 - 唯一 ID 和重复注册保护；
 - 根据 Agent/Column 白名单解析本轮工具；
 - JSON Schema 参数与结果校验；
-- Project base_dir、权限和超时注入；
+- Project workspace_root、权限和超时注入；
 - 统一成功/失败 Tool Result；
 - 写操作 artifact 登记；
 - 调用审计。
 
 Runtime 不直接调用文件、命令、MCP 或外部 API 实现；它只能向 Registry dispatch capability ID。
 
+Version 1 Capability Risk Policy 以 `side_effect_kind` 和 Project 配置执行确定性 guard。默认能力范围是 workspace_root 内可恢复、可审计的读写与本地进程操作。不可逆远程写入、付费调用、发布和远程删除 capability 默认 disabled；只有 Project operator 显式配置启用后才能进入 Registry 可用目录。Version 1 不提供逐操作用户审批界面。
+
 ### 7.1 Capability 绑定不变量
 
-真实黑盒测试暴露出一种协议级失败：Conversation Agent 先发明不存在的 capability ID，被 Registry 拒绝后又删除全部 capability，使 Workflow 虽能发布，但 Column Agent 只剩内部 `column.complete`，无法完成指令要求的文件或命令工作。
-
-因此 version-1 固定以下通用不变量：
+Version 1 Capability 绑定不变量：
 
 - 每个非终点 `AgentExecutor` 必须显式声明至少一个 capability；空列表和省略字段均拒绝发布；
 - `workflow.publish` 的工具 JSON Schema 从当前 Capability Registry 动态注入合法 capability ID 枚举，Conversation Agent 不得发明能力名；
 - `CapabilitySequenceExecutor.steps[].capability` 使用同一动态枚举；
 - Workflow 发布仍由 Registry 二次校验，防止绕过工具 schema 的 API 请求引用未知能力；
-- Registry 以 `delegable_to_column` 元数据区分项目级控制能力与可委派执行能力；`workflow.publish`、`task.create/retry/fail` 和 `agent.instruction.update` 不进入 Column 枚举。Task 数量与调度只由 Conversation Agent 决定，Column Agent 不得递归创建或重排 Task；
+- Registry 以 `delegable_to_column` 元数据区分项目级控制能力与可委派执行能力；`workflow.publish`、`task.create`、Task 控制能力和 `agent.instruction.update` 不进入 Column 枚举。Task 数量与调度只由 Conversation Agent 决定，Column Agent 不得递归创建或重排 Task；
 - 能力目录只表达通用工具事实，不根据 Column instruction、Task 领域、文件名或用户关键词推断、补齐或替换能力。
 
 纯推理 Column 如果确实不需要外部副作用，也必须显式选择一个无副作用的通用 capability（例如 `system.noop`），从而把“只需推理”变成可审计决策，而不是字段遗漏。
@@ -252,7 +258,7 @@ Runtime 不直接调用文件、命令、MCP 或外部 API 实现；它只能向
 }
 ```
 
-发布时执行纯结构校验：key 唯一、entry 存在、恰有 done/failed、transition outcome 唯一、target 存在、所有 Column 可达、每个非终点均有到终点路径。校验不理解业务含义。
+发布时执行结构与 liveness 校验：key 唯一、entry 存在、恰有 done/failed、transition outcome 唯一、target 存在、所有 Column 可达、每个非终点均有到终点路径；failure、interrupted、retry exhausted、wait success 和 timeout outcome 均映射到已声明 transition；每个循环有访问上限；取消具备独立的原子 failed 终态、清理与通知协议。校验不理解业务内容。
 
 ### 8.2 Column Schema
 
@@ -280,7 +286,19 @@ Runtime 不直接调用文件、命令、MCP 或外部 API 实现；它只能向
     {"outcome": "failure", "target": "failed"}
   ],
   "retry": {"max_attempts": 3, "backoff_seconds": 5, "retryable_errors": ["provider_transient"]},
-  "wait": {"timeout_seconds": 900, "heartbeat_seconds": 30, "stale_after_seconds": 180},
+  "wait": {
+    "waiting_kind": "external",
+    "poll_capability": "external.status.read",
+    "poll_arguments": {},
+    "resume_condition": {"status_in": ["succeeded"]},
+    "soft_deadline_seconds": 300,
+    "stale_after_seconds": 600,
+    "timeout_seconds": 1800,
+    "success_outcome": "success",
+    "timeout_outcome": "failure",
+    "cancel_capability": null,
+    "cleanup_capability": null
+  },
   "max_visits": 100,
   "terminal": null,
   "metadata": {}
@@ -345,13 +363,21 @@ Column Run 状态：
 
 外部图片、视频或异步 API 必须返回 await handle。Supervisor 到期调用声明的 poll capability；token/reference 在 handle 终态后销毁或脱敏归档。
 
-### 9.3 失败循环保护
+### 9.3 完成、取消与迁移
+
+Task 通过 output contract、artifact/evidence policy 和显式 success terminal transition 后成为 `done`。Conversation Agent 在终态后异步观察和汇报；需要项目级复核的 Workflow 必须在 done 前声明独立 review Column，因此不存在隐藏的同步验收门。
+
+Task 取消原子进入 `failed` terminal，并记录 `failure_code=cancelled`、`task.cancelled` event、failure artifact 与 mailbox 通知。
+
+Task revision 迁移只允许在 Task 已暂停且没有活跃 lease 时执行。请求明确目标 revision、目标 Column、context/artifact 继承策略和期望 `state_version`；Runtime 重新验证目标 input contract，以 CAS transaction 切换 revision/Column、创建新 attempt 并写审计事件。任一验证或 CAS 失败均保持原 revision 和状态。
+
+### 9.4 失败循环保护
 
 每次失败保存标准化 `failure_fingerprint`。同一 Column 连续出现相同 fingerprint 时采用更严格的重试上限；超过上限直接 failed 并通知 Conversation Agent，避免无意义自动修复循环。
 
-### 9.4 终态事件
+### 9.5 终态事件
 
-以下事件必须同时写入 append-only event stream 和 Project mailbox：
+以下版本化点分事件必须同时写入 append-only event stream 和 Project mailbox；mailbox 保留相同 `event_type`：
 
 - `task.done`
 - `task.failed`
@@ -359,12 +385,14 @@ Column Run 状态：
 - `run.long_running`
 - `await.deadline_exceeded`
 - `retry.exhausted`
+- `task.cancelled`
+- `column.interrupted`
 
 Mailbox 只有在 Conversation Agent 成功读取并纳入下一次监督上下文后才标记 observed。
 
 ## 10. SQLite 持久化与性能
 
-DevWerk 使用一个 SQLite 数据库，以 `project_id` 隔离逻辑上下文，以 Project `base_dir` 隔离文件产物。
+DevWerk 使用一个 SQLite 数据库，以 `project_id` 隔离逻辑上下文。Project `workspace_root` 是 Capability 可访问的用户工作区；`internal_artifact_root` 是 DevWerk 管理的内部证据目录，不向 Project 文件 Capability 暴露。两者分别执行 canonical containment 和符号链接目标校验。
 
 核心表：
 
@@ -382,6 +410,10 @@ DevWerk 使用一个 SQLite 数据库，以 `project_id` 隔离逻辑上下文�
 - `v1_artifacts`
 - `v1_events`
 - `v1_project_mailbox`
+- `v1_backlog_items`
+- `v1_scheduling_entries`
+- `v1_execution_receipts`
+- `v1_direct_runs` / `v1_intervention_runs`
 
 约束：
 
@@ -419,7 +451,7 @@ Web 界面不得展示任务类别或领域模板。Workflow/Column 视图显示
 
 ## 13. 实现基线
 
-- Project base_dir 安全边界；
+- workspace_root 与 internal_artifact_root 安全边界；
 - Project 级 Conversation Agent 与持久治理循环；
 - SQLite revision/task/run/artifact/event/mailbox 与 projection；
 - claim、lease、heartbeat 和 restart recovery；
@@ -435,7 +467,7 @@ Web 界面不得展示任务类别或领域模板。Workflow/Column 视图显示
 
 - 任意合法 Workflow graph 可发布；无终点、不可达、未知 capability/executor 必须拒绝。
 - Column instruction 和 contract 可包含任意领域内容，Runtime 行为不因文本改变。
-- Project base_dir 越界、绝对路径、`..`、shell 字符串命令被拒绝。
+- workspace_root 越界、绝对路径、`..`、shell 字符串命令被拒绝。
 
 ### 14.2 AgentCore 行为测试
 

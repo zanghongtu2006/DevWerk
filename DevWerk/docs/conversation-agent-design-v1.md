@@ -80,24 +80,24 @@ Project 是 DevWerk 的首要隔离边界，用来隔离：
 
 所有结构化记录必须携带 `project_id`。任何跨 Project 读取、调度、上下文装配或文件操作都必须显式授权，Version 1 默认禁止。
 
-### Project Path
+### Workspace Root 与 Internal Artifact Root
 
-每个 Project 拥有一个规范化后的 `project_path`，代表用户项目工作区根目录。
+每个 Project 拥有一个规范化后的 `workspace_root`，代表用户项目工作区根目录。DevWerk 另行管理 `internal_artifact_root`，用于保存系统证据与运行工件。
 
 它不同于 DevWerk 内部状态目录：
 
 ```text
-project_path
+workspace_root
   用户项目源码、文档和交付物
 
-DevWerk internal data root
+internal_artifact_root
   SQLite、运行工件、附件、审计归档和临时文件
 ```
 
 要求：
 
 - Project 创建时解析为绝对规范路径。
-- 文件工具只能在 `project_path` 内操作。
+- Project 文件 capability 只能在 `workspace_root` 内操作，且不能访问 `internal_artifact_root`。
 - 必须防止 `..`、符号链接、junction 或大小写差异逃逸。
 - Project 删除不默认删除用户工作区。
 - 同一物理路径被多个 Project 使用时必须明确检测并报告冲突。
@@ -150,7 +150,7 @@ Version 1 不允许通过创建第二个 conversation-agent 来绕过同一 Proj
 - 派发后继续承担监督和验收责任。
 - 小型交付、系统诊断、失败恢复和紧急情况可以直接执行。
 
-这些原则必须同时体现在 prompt、结构化调度协议和确定性 guard 中，不能只依赖人格描述。
+这些原则由版本化 `ConversationPlatformPolicy`、结构化调度协议和确定性 guard 共同实现。Platform Policy 是产品级正向行为与安全策略，始终存在并冻结到每次 Agent Run；Project instruction 仅保存项目目标、约束和工作约定，可以为空。两者均记录 revision，运行中不得隐式变化。
 
 ## 7. Web 用户治理边界
 
@@ -205,7 +205,7 @@ Version 1 不提供用户直接修改：
 - conversation-agent 使用自己的工具直接完成。
 - 结果和必要工件关联到对话与 Project。
 
-如果执行中出现多阶段、专业 agent、复杂依赖、独立验收或明显风险，必须停止继续扩张 Direct Run，把已有调查作为上下文升级为 Formal Task。
+Direct Run 使用有界 write/process 预算。预算耗尽或工作边界发生实质变化时，conversation-agent 停止直接扩张并形成新的治理决定：可以 `HOLD`、`QUEUE`、`SPLIT`、请求用户方向，或在 Readiness 与当前 workflow 适配均通过后 `DISPATCH` 为 Formal Task。已有调查以结构化上下文或 artifact 关联到该决定。
 
 ### Intervention Run
 
@@ -317,22 +317,22 @@ Backlog / Workflow / Task / Scheduling Mutations
 - mailbox event 可以并发写入，但按顺序领取和确认。
 - workflow、backlog 和调度决定串行提交。
 - worker task/agent run 可以并发。
-- dispatch、retry、restart、migration 必须幂等。
+- dispatch、retry、restart、cancel、migration 必须幂等。
 
 ## 12. 事件驱动监督
 
-conversation-agent 由以下事件唤醒：
+conversation-agent 由以下版本化点分事件唤醒；event stream 与 Project mailbox 使用相同 `event_type`：
 
-- 用户消息
-- task/column/agent 状态变化
-- 新 artifact 或 validation result
-- worker 求助
-- retry exhausted
-- wait slow/degraded/stalled
-- lease 过期或运行中断
-- task done/failed
-- 服务启动后的 recovery event
-- scheduled review
+- `conversation.message.created`
+- `task.state.changed`、`column.state.changed`、`agent.state.changed`
+- `artifact.created`、`validation.completed`
+- `agent.assistance.requested`
+- `retry.exhausted`
+- `run.long_running`、`run.degraded`、`run.stalled`
+- `lease.expired`、`column.interrupted`
+- `task.done`、`task.failed`、`task.cancelled`
+- `project.recovery.started`
+- `supervision.review.due`
 
 监督循环：
 
@@ -372,6 +372,12 @@ conversation-agent 不因单纯运行时间较长就中断 worker。它结合 he
 
 Task 终态、运行异常和长期 waiting 都不能静默。
 
+Task 只有在 output contract、artifact/evidence policy 与显式 success terminal transition 全部通过后才成为 `done`。需要项目级复核时，workflow 必须在 done 前声明独立 review Column；conversation-agent 在终态后异步观察、汇报和决定后续治理，不构成隐藏的同步验收门。
+
+取消是一个可审计终态操作：Task 原子进入 `failed`，记录 `failure_code=cancelled`、`task.cancelled` event、failure artifact 与 mailbox 通知。
+
+Task revision 迁移只允许在 Task 已暂停且没有活跃 lease 时执行。迁移请求必须声明目标 revision、目标 Column、context/artifact 继承策略和期望 `state_version`；Runtime 重新验证目标 input contract，以 CAS transaction 切换 revision 与 Column、创建新 attempt 并写入审计事件。验证或 CAS 失败时保持原 revision 和状态。
+
 ## 14. Tool 与权限
 
 conversation-agent Version 1 拥有 Project 内系统级能力：
@@ -393,7 +399,7 @@ Version 1 暂不实现用户审批边界，但仍要求：
 - 幂等操作
 - 明确错误记录
 
-细粒度权限和高风险操作审批是 Version 1 release 后高优先级需求。
+Capability Registry 根据 `side_effect_kind` 与 Project 配置执行确定性风险策略。Version 1 默认只启用 `workspace_root` 内可恢复、可审计的读写与本地进程能力；不可逆远程写入、付费调用、发布和远程删除 capability 默认禁用，只有 Project operator 显式配置后才能进入可用目录。Version 1 不提供逐操作用户审批界面；细粒度权限和交互式高风险审批是 release 后高优先级需求。
 
 ## 15. Worker Agent 边界
 
@@ -407,11 +413,11 @@ worker agent：
 - 不得修改 Project 目标、其他 task 或 workflow。
 - 不得自行创建另一个 conversation-agent。
 
-worker 的 `success` 只是输出声明，必须经过 Column output contract 和 conversation-agent 项目验收。
+worker 的 `success` 只是输出声明。Runtime 必须验证 Column output contract、artifact/evidence policy 与声明的 transition；需要额外复核时由 workflow 中显式的 review Column 完成。
 
 ## 16. SQLite 与文件存储总原则
 
-DevWerk Version 1 使用一个 SQLite 数据库保存所有 Project 的结构化事实。Project 通过 `project_id` 做逻辑隔离，通过 `project_path` 做工作区隔离。
+DevWerk Version 1 使用一个 SQLite 数据库保存所有 Project 的结构化事实。Project 通过 `project_id` 做逻辑隔离，通过 `workspace_root` 做用户工作区隔离；`internal_artifact_root` 独立保存 DevWerk 管理的证据文件。
 
 存储原则：
 
@@ -438,7 +444,8 @@ DevWerk Version 1 使用一个 SQLite 数据库保存所有 Project 的结构化
 id
 name
 status
-project_path
+workspace_root
+internal_artifact_root
 active_workflow_revision_id
 created_at
 updated_at
@@ -630,7 +637,7 @@ Projection 更新与关键状态转移尽量在同一短 transaction 中完成�
 - conversation-agent 在用户无新消息时仍能监督项目。
 - 用户治理变更只能经 conversation-agent 或确定性内部 runtime。
 - Project 结构化记录不会跨 `project_id` 泄漏。
-- 文件访问不会逃逸 `project_path`。
+- Project 文件 capability 不会逃逸 `workspace_root`，也不能进入 `internal_artifact_root`。
 - Formal Task、Direct Run、Intervention Run 可区分和审计。
 - 调度前存在 Readiness Decision。
 - Project governance 串行，worker execution 可并发。

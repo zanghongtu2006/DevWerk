@@ -1,6 +1,6 @@
 # DevWerk Kanban Workflow — Version 1 核心设计
 
-> 实现规范提示：本文保留已确认的 Kanban、状态机、等待和恢复产品决策。声明式 Column schema、通用 executor、Capability Registry 与无源码模板约束以 [`generic-conversation-agent-and-declarative-column-runtime.md`](./generic-conversation-agent-and-declarative-column-runtime.md) 为第一事实；本文中较早的字段示例已经被新 schema 替代。
+> 实现规范提示：本文定义 Kanban、状态机、等待和恢复产品决策。声明式 Column schema、通用 executor、Capability Registry 与无源码模板约束以 [`generic-conversation-agent-and-declarative-column-runtime.md`](./generic-conversation-agent-and-declarative-column-runtime.md) 为第一事实。
 
 **文档状态**：Version 1 已确认核心设计  
 **最后更新**：2026-07-17  
@@ -11,7 +11,7 @@
 
 本文定义 DevWerk Version 1 的 Kanban、Workflow、Column、Task、Column Run、临时 agent、状态机、长时间等待和异常恢复设计。
 
-本文是目标设计。现有实现如果依赖列名启发式、隐式终态、无界 waiting 或无限输出修复，应被视为设计偏差。
+本文是目标设计。实现与测试必须满足本文定义的显式 schema、状态机、终态和有界恢复契约。
 
 ## 2. 核心定义
 
@@ -103,51 +103,37 @@ Workflow revision 内的不可变定义，描述一个阶段应该如何工作�
 
 ```yaml
 column:
-  id:
-  workflow_revision_id:
   key:
   name:
-  description:
-  prompt:
-  meta:
-
-  execution_policy:
-    allowed_modes:
-      - runtime
-      - agent
-    default_mode: runtime | agent | auto
-    entry_decision:
-
-  flow:
-
+  instruction:
+  executor:
+    kind: capability_sequence | agent
+    capabilities: []
+    steps: []
+    max_iterations:
+    max_tool_calls:
+  context:
+    include_task: true
+    include_project: true
+    upstream_outputs: []
+    artifact_globs: []
   input_contract:
   output_contract:
-  acceptance_policy:
-
-  context_policy:
-
-  required_capabilities:
-  optional_capabilities:
-  skills:
-  tools:
-  mcp_servers:
-  external_apis:
-
-  timeout_policy:
-  retry_policy:
-  failure_policy:
-  wait_policy:
-
-  allowed_outcomes:
-  transitions:
+  transitions: []
+  retry:
+  wait:
+  max_visits:
+  terminal: null | success | failure
+  metadata: {}
 ```
 
-### Prompt 与 Meta
+### Instruction 与 Metadata
 
-- `prompt` 描述阶段角色、目标、判断原则和工作方式。
-- `meta` 描述机器可读约束、能力、风险、冲突域、资源和可观测性要求。
+- `instruction` 是 Conversation Agent 在对话中生成并持久化到 Workflow revision 的阶段工作指令。
+- `metadata` 保存机器可读的展示与扩展信息，不承担运行时路由职责。
+- capability、contract、transition、retry、wait 与 context 均使用各自的结构化字段。
 
-Prompt 不替代结构化 contract、transition 和 policy。
+Instruction 不替代结构化 contract、transition 和 policy。
 
 ### Column Flow
 
@@ -175,7 +161,7 @@ column_run:
   attempt_no:
   status:
   health:
-  execution_mode:
+  executor_kind:
   executor_id:
   lease_owner:
   lease_expires_at:
@@ -247,7 +233,7 @@ Run 已创建但尚未执行，必须有明确 `pending_reason`：
 执行器已取得 lease，必须记录：
 
 - owner
-- execution_mode
+- executor_kind
 - attempt
 - started_at
 - lease_expires_at
@@ -259,7 +245,7 @@ Run 已创建但尚未执行，必须有明确 `pending_reason`：
 
 ### `succeeded`
 
-当前 Column Run 已完成，output contract 与 acceptance policy 通过，并产生合法 outcome。它不等于 Task `done`。
+当前 Column Run 已完成，output contract 与 artifact/evidence policy 通过，并产生合法 outcome。它不等于 Task `done`。
 
 ### `failed`
 
@@ -269,40 +255,19 @@ Run 已创建但尚未执行，必须有明确 `pending_reason`：
 
 服务重启、worker 崩溃、lease 丢失或执行器消失造成的运行中断。它与业务失败分开，可以通过检查工件、执行收据和 checkpoint 决定恢复或新 attempt。
 
-## 10. 三种执行决策
+## 10. 两种显式 Executor
 
-Column Controller 在 Task 进入 Column 后，根据 Column Definition、Task 和能力状态选择执行模式。
+Conversation Agent 在发布 Workflow revision 时，为每个非终态 Column 明确选择一种 executor。Runtime 只解释已经冻结的选择。
 
-### Deterministic Runtime
+### Capability Sequence Executor
 
-不启动 LLM agent，按结构化 flow 执行：
+`kind=capability_sequence` 不启动 LLM Agent，按声明的 capability steps、参数引用、成功 outcome 和失败 outcome 执行。文件、命令、MCP、外部 API、数据转换和 contract validation 都通过统一 Capability Registry 完成。
 
-- shell command
-- MCP call
-- external API
-- 文件或 artifact 检查
-- 数据转换
-- 等待事件
-- contract validation
+### Agent Executor
 
-命令、参数和判断应来自结构化 flow/meta。仅用自然语言 prompt 驱动工具循环不属于 deterministic runtime。
+`kind=agent` 启动即生即死型 Column Agent，并冻结 instruction、context、capability allowlist、预算和 completion contract。
 
-### Ephemeral Agent
-
-需要语义分析、创作、编码、研究、判断或多轮工具调用时，启动即生即死型 sub-agent。
-
-### Auto
-
-conversation-agent 设计 Column 时允许 `auto`，Column Controller 根据：
-
-- Task 复杂度
-- 输入结构化程度
-- deterministic flow 是否足够
-- 是否需要语义判断
-- 是否需要多轮工具使用
-- 能力与 provider 健康度
-
-选择 runtime 或 agent。判断不明确时升级 conversation-agent，不使用列名或关键词猜测。
+Version 1 只接受 `capability_sequence` 与 `agent`。Conversation Agent 在发布 revision 前完成选择，Runtime 不再进行语义判定。
 
 ## 11. Agent 判定边界
 
@@ -319,19 +284,17 @@ conversation-agent 设计 Column 时允许 `auto`，Column Controller 根据：
 “Column 自己完成”只指：
 
 - 完全确定性的 Column Runtime；或
-- 由 Column Controller 创建一个轻量 ephemeral agent。
+- 由 Agent Executor 创建一个轻量 ephemeral agent。
 
 ## 12. Ephemeral Agent 组装
 
 ```text
 Agent Runtime 基础约束
 + Conversation-agent 提供的 Project Context
-+ Column Prompt
-+ Task Prompt
++ Column Instruction
++ Task Brief 与 Input
 + Input/Output Contract
-+ Selected Skills
-+ Allowed Tools
-+ Allowed MCP Servers
++ Capability Allowlist
 + Relevant Artifacts
 + Current Attempt Context
 = Ephemeral Column Agent
@@ -365,9 +328,9 @@ agent：
 ### Column Context
 
 - 阶段目标
-- Column prompt/meta
+- Column instruction/metadata
 - 输入、输出、验收契约
-- capabilities/skills/tools/MCP
+- capability allowlist
 - allowed outcomes
 - retry/failure/wait policy
 
@@ -379,7 +342,7 @@ agent：
 - deliverables
 - acceptance criteria
 - dependencies
-- task prompt
+- task brief/input
 - 上游 artifact reference
 
 ### Run Context
@@ -460,6 +423,8 @@ failed
 - workflow success terminal 明确
 - terminal state/event 原子持久化
 
+Conversation Agent 在终态后异步观察和汇报。需要项目级复核的 workflow 必须在 `done` 前声明独立 review Column，Runtime 不依赖隐藏的同步验收门。
+
 ### `failed`
 
 必须通过显式 failure terminal 到达，并记录：
@@ -471,6 +436,12 @@ failed
 - 是否可恢复
 - 推荐恢复方式
 
+取消原子进入 `failed`，并额外记录 `failure_code=cancelled`、`task.cancelled` event、failure artifact 与 Project mailbox 通知。
+
+### Revision 迁移
+
+迁移只允许在 Task 已暂停且没有活跃 lease 时执行。请求必须声明目标 revision、目标 Column、context/artifact 继承策略和期望 `state_version`。Runtime 重新验证目标 input contract，以 CAS transaction 切换 revision 与 Column、创建新 attempt 并写审计事件；验证或 CAS 未通过时保持原 revision 和状态。
+
 “没有下一列”不能表示 `done`。它是 workflow definition error 或 runtime anomaly。
 
 ## 17. 状态流转图
@@ -480,10 +451,10 @@ flowchart TD
     E["Task 进入 Column"] --> I["验证 Input Contract"]
 
     I -->|不满足| W["pending / waiting<br/>记录原因并通知 Conversation Agent"]
-    I -->|满足| D["Column Controller 选择执行模式"]
+    I -->|满足| D["Runtime 读取冻结的 Executor"]
 
-    D --> R["Deterministic Runtime<br/>命令 · MCP · API"]
-    D --> A["Ephemeral Agent<br/>Prompt · Skill · Tool · MCP"]
+    D --> R["Capability Sequence Executor"]
+    D --> A["Ephemeral Agent Executor"]
 
     R --> O["产生 Output + Outcome"]
     A --> O
@@ -634,15 +605,17 @@ await_handle:
   stale_deadline:
   hard_deadline:
 
-  poll_policy:
+  poll_capability:
+  poll_arguments:
   callback_policy:
   retry_policy:
   resume_condition:
+  success_outcome:
   timeout_outcome:
   cancel_capability:
+  cleanup_capability:
 
   secret_reference:
-  cleanup_policy:
   state_version:
 ```
 
@@ -672,7 +645,7 @@ Agent 发起异步 Tool/API
 
 比预期慢，需要关注但不失败：
 
-- 产生 `wait_slow`
+- 产生 `run.long_running`
 - 唤醒 conversation-agent
 - 检查 provider
 - 可以继续等待
@@ -924,16 +897,17 @@ lease 过期、owner 不存在或 worker 丢失时：
 
 以下事件进入 Project mailbox：
 
-- `input_missing`
-- `wait_slow`
-- `wait_degraded`
-- `wait_stalled`
-- `wait_hard_deadline`
-- `external_result_unknown`
-- `retry_exhausted`
-- `column_interrupted`
-- `task_done`
-- `task_failed`
+- `column.input_missing`
+- `run.long_running`
+- `run.degraded`
+- `run.stalled`
+- `await.deadline_exceeded`
+- `external.result.unknown`
+- `retry.exhausted`
+- `column.interrupted`
+- `task.done`
+- `task.failed`
+- `task.cancelled`
 
 Task 终态记录：
 
@@ -949,7 +923,7 @@ conversation_agent_action
 
 ## 33. SQLite 单库设计
 
-所有 Project 使用一个 SQLite。Project 通过 `project_id` 隔离结构化状态，通过 `project_path` 隔离工作区。
+所有 Project 使用一个 SQLite。Project 通过 `project_id` 隔离结构化状态，通过 `workspace_root` 隔离用户工作区；`internal_artifact_root` 保存 DevWerk 管理的证据文件，并且不向 Project 文件 capability 暴露。
 
 建议表组：
 
@@ -1156,7 +1130,7 @@ DevWerk 不能保证外部服务一定成功，但必须保证：
 - Workflow 以统一 Column Definition 为基础。
 - 每次进入 Column 创建独立 Column Run。
 - Run status 与 business outcome 分离。
-- runtime/agent/auto 决策不依赖列名启发式。
+- 每个非终态 Column 显式使用 `capability_sequence` 或 `agent` executor；Runtime 不根据列名或业务文本选择 executor。
 - Agent Context 不包含无界历史。
 - Input 不满足不执行，Output 不满足不推进。
 - transition 全部来自固定 revision。
