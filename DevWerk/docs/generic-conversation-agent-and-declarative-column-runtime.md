@@ -6,7 +6,7 @@
 
 ## 1. 文档效力
 
-本文是 DevWerk 当前核心系统重构的第一事实。凡现有代码、测试或其他文档与本文冲突，以本文为准。实现不得为了通过单个用例引入任务类别、领域 prompt、内置 workflow、Column 名称分支或目录布局特判。
+本文是 DevWerk 当前核心系统重构的第一事实。凡现有代码、测试或其他文档与本文冲突，以本文为准。实现以通用 Agent 协议、声明式 Workflow 数据和统一 Column 状态机为基础，所有任务差异均由项目数据表达。
 
 本轮范围是 Web 版 DevWerk 的后端核心与对应 Web 视图。IDEA Plugin 继续挂起。此前完整记忆系统的产品设计继续挂起，本轮只保留可扩展接口边界。
 
@@ -20,10 +20,10 @@
 6. 小任务直接交付时不创建 Task。不符合当前唯一 Task 流程的工作不应被强行塞入 Task。
 7. Workflow 必须包含且只能包含一个 done 和一个 failed 终点；任何非终点 Column 都必须存在到终点的可达路径。
 8. done/failed 必须形成事件并进入 Conversation Agent mailbox，不允许默认静默。
-9. 源码不得包含小说、软件、前端、后端、商城等业务 prompt、流程或校验器。
-10. 源码不得根据用户关键词、任务类别、Column key/name、文件路径前缀选择 prompt、Workflow 或执行逻辑。
-11. 源码不提供业务 Workflow 模板。Workflow、Column 指令、输入输出约束和能力选择均由 Conversation Agent 在对话中生成、发布和修改，并作为项目数据持久化。
-12. 运行时只实现通用协议、状态机、能力调用、契约校验、租约、等待、恢复、审计和终态保证。
+9. 源码只承载跨领域通用的 Agent 协议、能力契约和运行时机制。
+10. Prompt、Workflow、Column 指令、输入输出约束和能力选择均由 Conversation Agent 在对话中生成、发布和修改，并作为 Project 数据持久化。
+11. Runtime 依据类型化定义和持久化状态执行，不依据自然语言内容或领域语义选择执行路径。
+12. Runtime 统一提供状态机、能力调用、契约校验、租约、等待、恢复、审计和终态保证。
 
 ## 3. 术语
 
@@ -417,31 +417,19 @@ DevWerk 使用一个 SQLite 数据库，以 `project_id` 隔离逻辑上下文�
 
 Web 界面不得展示任务类别或领域模板。Workflow/Column 视图显示 executor kind、capabilities、contract、retry/wait policy；Task 详情显示 Column Runs、Agent Runs、Tool Invocations、artifact 和终态事件。页面使用有界并行请求、加载骨架和 event cursor，不使用高频全量刷新。
 
-## 13. 迁移与删除清单
-
-必须删除：
-
-- `CONVERSATION_SYSTEM`、`AGENT_SYSTEM`、`NOVEL_SYSTEM` 等源码 prompt 常量；
-- `task_type` 及 novel/software/generic/discussion 枚举路由；
-- `novel_workflow()`、`software_workflow()`、`generic_workflow()`；
-- `operation` 字段和 `if column.operation` 分派；
-- `_novel_chapter`、`_software_files`、`_verify_software`；
-- backend/frontend 路径约束、固定 Maven/npm 验证和固定章节数量；
-- 以旧字段、旧 factory 或业务分类为事实的测试。
-
-应保留并重构：
+## 13. 实现基线
 
 - Project base_dir 安全边界；
-- SQLite revision/task/run/artifact/event/mailbox；
+- Project 级 Conversation Agent 与持久治理循环；
+- SQLite revision/task/run/artifact/event/mailbox 与 projection；
 - claim、lease、heartbeat 和 restart recovery；
 - provider 配置与 usage 记录；
+- AgentCore、Capability Registry 与声明式 Column Runtime；
 - Web 的 Project、Conversation、Kanban、Task、Event 信息架构。
-
-旧数据库中的旧 Workflow revision 可以保留为历史 JSON，但新 Runtime 不执行含 legacy `operation/prompt/execution` 的 revision；运行中的旧 Task 应显式 failed，错误类型为 `legacy_workflow_unsupported`，并通知 Conversation Agent，而不是隐式套用兼容分支。
 
 ## 14. 测试策略
 
-测试只验证本文新契约，不保留旧契约兼容测试。
+测试以本文定义的 Version 1 契约为唯一验收依据。
 
 ### 14.1 结构测试
 
@@ -470,7 +458,7 @@ Web 界面不得展示任务类别或领域模板。Workflow/Column 视图显示
 
 使用三个互不相似、实现前未知的任务描述创建 Workflow。测试不得 monkeypatch 任务分类，也不得修改 Runtime 源码。只要它们通过声明式 Workflow + 通用 tools 完成，才证明系统泛化。
 
-源码扫描可以作为发布审计，但不替代行为测试。发布审计应确认核心目录中不存在被删除的旧常量/factory/operation 和已知业务约束。
+源码扫描可以作为发布审计，但不替代行为测试。发布审计确认核心目录只包含通用协议、声明式执行与基础设施能力。
 
 ## 15. Hermes Agent 参考结论
 
@@ -484,13 +472,13 @@ Web 界面不得展示任务类别或领域模板。Workflow/Column 视图显示
 - `hermes_cli/kanban_db.py`：SQLite board、原子 claim、attempt、heartbeat、stale recovery 和失败循环保护；
 - Developer Guide：同一个 Agent 核心服务多个接入面，prompt 分层与会话内冻结。
 
-没有复制 Hermes 源码中的任务分解、规格化或 delegation prompt。那些 prompt 在 Hermes 中是产品实现选择，而 DevWerk 的更高优先级约束是：所有业务指令和流程必须由 Conversation Agent 在对话中产生并持久化，源码只保留通用协议。
+Hermes 的参考范围限定为通用 Agent 循环、工具注册、委派隔离、可选 provider 生命周期与持久 Kanban 机制。DevWerk 的 Project 指令和流程由 Conversation Agent 在对话中产生并持久化。
 
 ## 16. 完成定义
 
 重构完成必须同时满足：
 
-1. 旧领域路由、prompt、workflow factory、operation handler 全部删除；
+1. 核心源码只实现通用 Agent、Capability、Workflow 与 Column Runtime 协议；
 2. Conversation Agent 与 Column Agent 共用 AgentCore；
 3. Workflow/Column 完全声明式且由对话/API 作为数据发布；
 4. 无 LLM capability sequence 测试全绿；
@@ -498,5 +486,5 @@ Web 界面不得展示任务类别或领域模板。Workflow/Column 视图显示
 6. 等待、恢复、重试、终态事件测试全绿；
 7. Web 能查看新 Workflow、Task、Run、artifact、event 和 Agent 审计数据；
 8. README 将本文列为核心规范，并明确 IDEA Plugin 挂起；
-9. 独立自然语言冒烟用例不得再触发领域模板串用；
+9. 独立自然语言冒烟用例均通过同一套通用协议完成；
 10. 所有计划、开发过程、结果和踩坑记录落入 `D:/workspace/codex-notes`。

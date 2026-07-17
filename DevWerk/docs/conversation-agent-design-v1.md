@@ -1,6 +1,6 @@
 # DevWerk Conversation Agent — Version 1 核心设计
 
-> 实现规范提示：本文保留已确认的产品身份、职责和治理决策。通用 AgentCore、Capability Registry、prompt 数据边界、Workflow/Column schema 与 Runtime 实现以 [`generic-conversation-agent-and-declarative-column-runtime.md`](./generic-conversation-agent-and-declarative-column-runtime.md) 为第一事实；本文中较早的实现示例不得用于恢复源码模板或领域分支。
+> 实现规范提示：本文定义已确认的产品身份、职责和治理决策。通用 AgentCore、Capability Registry、prompt 数据边界、Workflow/Column schema 与 Runtime 实现以 [`generic-conversation-agent-and-declarative-column-runtime.md`](./generic-conversation-agent-and-declarative-column-runtime.md) 为第一事实。
 
 **文档状态**：Version 1 已确认核心设计  
 **最后更新**：2026-07-17  
@@ -11,9 +11,9 @@
 
 本文定义 DevWerk Version 1 的 conversation-agent 产品身份、职责、运行循环、项目隔离、调度治理、监督机制和持久化边界。
 
-本文是目标设计，不是对现有代码行为的追认。当前实现与本文冲突时，应记录为设计偏差并在后续重构中解决，不应继续通过兼容补丁反向修改产品定义。
+本文是目标设计。实现、测试与其他说明均以本文确认的产品定义为依据。
 
-记忆系统的重新设计不属于本文范围。DevWerk 以前存在完整记忆方案，但当前实现已经偏移原模板；该主题保持挂起，等待独立审查。
+记忆系统的重新设计不属于本文范围；该主题保持挂起，等待独立设计与审查。
 
 ## 2. 产品定义
 
@@ -623,7 +623,6 @@ Projection 更新与关键状态转移尽量在同一短 transaction 中完成�
 - 细粒度 RBAC
 - 多人协同编辑
 - 新记忆系统设计
-- 为历史异常输出继续无限增加兼容补丁
 
 ## 26. 验收不变量
 
