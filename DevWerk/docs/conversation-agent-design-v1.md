@@ -153,7 +153,7 @@ Version 1 不允许通过创建第二个 conversation-agent 来绕过同一 Proj
 - 派发后继续承担监督和验收责任。
 - 小型交付、系统诊断、失败恢复和紧急情况可以直接执行。
 
-这些原则由版本化 `ConversationPlatformPolicy`、结构化调度协议和确定性 guard 共同实现。Platform Policy 是产品级正向行为与安全策略，始终存在并冻结到每次 Agent Run；Project instruction 仅保存项目目标、约束和工作约定，可以为空。两者均记录 revision，运行中不得隐式变化。
+这些原则由版本化 `ConversationPlatformPolicy`、结构化调度协议和确定性 guard 共同实现。Platform Policy 是产品级正向行为约定，始终存在并冻结到每次 Agent Run；Project instruction 仅保存项目目标、约束和工作约定，可以为空。两者均记录 revision，运行中不得隐式变化。
 
 ## 7. Web 用户治理边界
 
@@ -324,7 +324,7 @@ Backlog / Workflow / Task / Scheduling Mutations
 - Column Attempt/Agent Run 可以并发。
 - dispatch、pre-terminal retry、terminal rerun、cancel、migration 必须幂等。
 
-Conversation Agent 提出调度决定，Repository 以 `state_version` 在短事务内检查 `task_dependencies`、Project/Column WIP limit 和 `resource_claims`，再原子创建 Scheduling Entry 与 claim。依赖、额度或资源冲突未满足时不启动 Task，并返回结构化事实供下一次治理决定使用。
+Conversation Agent 提出调度决定，Repository 以 `state_version` 在短事务内检查 Task readiness、声明的 dependency、control state 和活跃 Attempt，再原子创建 Scheduling Entry。冲突时不启动 Task，并返回结构化事实供下一次治理决定使用。并发数量由 Conversation Agent 依据项目事实安排；Version 1 不要求资源锁或复杂 WIP claim 协议。
 
 ## 12. 事件驱动监督
 
@@ -392,19 +392,11 @@ conversation-agent Version 1 拥有 Project 内系统级能力：
 - Column Attempt 停止与改派
 - event、artifact、run、log 和 provider 状态读取；artifact 内容通过 `artifact.inspect/read` 访问
 - Project workspace 文件读写
-- sandboxed command/process
+- command/process
 - Version 1 Capability Registry 中已启用的 skill/tool
 - scheduled review 与 recovery
 
-Version 1 暂不实现用户审批边界，但仍要求：
-
-- workspace_root containment
-- 审计事件
-- 必要 snapshot/revision
-- 幂等操作
-- 明确错误记录
-
-Capability Registry 根据 `side_effect_kind` 与 Project 配置执行确定性风险策略。Version 1 只启用 `workspace_root` 内可恢复、可审计的能力；不可逆远程写入、付费调用、发布和远程删除不进入 release 目录。Command capability 仅接受结构化 argv，并在 OS/container sandbox 中限制 filesystem mount、network、environment、credentials、child process、CPU、内存、输出与时间；cwd containment 本身不视为进程隔离。Version 1 不提供逐操作用户审批界面；细粒度权限和交互式高风险审批是 release 后高优先级需求。
+Version 1 以低成本交付核心工作闭环为目标，不要求安全防护、安全检查、逐操作审批或容器隔离。Capability Registry 负责能力发现与调用；Command capability 接受结构化 argv，并提供工作目录、超时、输出上限和执行记录等基本运行参数。安全加固属于 release 后需求，不构成 Version 1 阻断条件。
 
 ## 15. Ephemeral Column Agent 边界
 
@@ -467,7 +459,6 @@ state_version
 - `v1_backlog_items`
 - `v1_scheduling_entries`
 - `v1_task_dependencies`
-- `v1_resource_claims`
 - `v1_direct_runs`
 - `v1_intervention_runs`
 
@@ -644,12 +635,10 @@ Web 页面不直接拼接整个 Project 历史。Version 1 使用有界 indexed 
 - conversation-agent 在用户无新消息时仍能监督项目。
 - 用户治理变更只能经 conversation-agent 或确定性内部 runtime。
 - Project 结构化记录不会跨 `project_id` 泄漏。
-- Project 文件 capability 不会逃逸 `workspace_root`，也不能进入 `internal_artifact_root`。
 - Formal Task、Direct Run、Intervention Run 可区分和审计。
 - 调度前存在 Readiness Decision。
-- dispatch 由 dependency、WIP 与 resource claim 的确定性 transaction guard 约束。
+- dispatch 检查 readiness、声明的 dependency、control state 与活跃 Attempt。
 - Project governance 串行，Column Attempt execution 可并发。
-- command capability 在受限 sandbox 内运行。
 - task done/failed 和运行异常都会进入 mailbox。
 - SQLite transaction 不包含网络、LLM 或大文件操作。
 - Web board 不依赖全量历史查询和全量轮询。

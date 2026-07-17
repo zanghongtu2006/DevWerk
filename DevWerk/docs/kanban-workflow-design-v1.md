@@ -69,23 +69,22 @@ workflow_revision:
   id:
   workflow_id:
   revision_no:
-  status: draft | published | retired
   start_column_id:
   success_terminal_key: done
   failure_terminal_key: failed
   created_by_conversation_agent_run_id:
-  created_at:
+  published_at:
   definition_hash:
 ```
 
 规则：
 
-- published revision 不可原地修改。
+- Version 1 只持久化 published immutable revision；Conversation Agent 的草拟内容保存在 conversation/backlog working data，不创建 draft revision。
+- Published revision 不可原地修改，也不使用 retired 状态；未激活的旧 revision永久保留用于运行、恢复、审计和解释。
 - `v1_workflows.active_revision_id` 是 active revision 的唯一事实源，Project 不保存副本。
 - 新 Task 固定当前 revision。
 - 运行中 Task 不因新 revision 发布而自动变化。
 - Task 迁移必须由 conversation-agent 通过 Intervention Run 显式执行。
-- 旧 revision 保留用于恢复、审计和解释。
 - 未来多 workflow 扩展不得要求重写 Task/Column Run 核心模型。
 - `done/failed` 是没有 executor、不会创建 Column Run 的 terminal sentinel。
 
@@ -116,6 +115,8 @@ column:
     kind: capability_sequence | agent
     capabilities: []
     steps: []
+    completed_outcome:
+    outcome_from:
     max_iterations:
     max_tool_calls:
   context:
@@ -133,7 +134,7 @@ column:
     retry_exhausted:
     max_visits_exceeded:
   retry:
-  wait:
+  wait_policy:
   max_visits:
   terminal: null | success | failure
   metadata: {}
@@ -143,8 +144,9 @@ column:
 
 - `instruction` 是 Conversation Agent 在对话中生成并持久化到 Workflow revision 的阶段工作指令。
 - `metadata` 保存机器可读的展示与扩展信息，不承担运行时路由职责。
-- capability、contract、transition、retry、wait 与 context 均使用各自的结构化字段。
+- capability、contract、transition、retry、wait_policy 与 context 均使用各自的结构化字段。
 - `runtime_outcomes` 把五类基础设施条件显式映射到当前 Column 已声明的 outcome。
+- Executor 是按 kind 判别的联合：Agent 使用 capabilities/budget；Sequence 使用 steps，并在 completed outcome/outcome reference 中二选一。不同 kind 的字段不能混用。
 
 Instruction 不替代结构化 contract、transition 和 policy。
 
@@ -290,7 +292,7 @@ Conversation Agent 在发布 Workflow revision 时，为每个非终态 Column �
 
 ### Capability Sequence Executor
 
-`kind=capability_sequence` 不启动 LLM Agent，按声明的 capability steps、参数引用、成功 outcome 和失败 outcome 执行。所有 step 都通过统一 Capability Registry 完成；Version 1 release 内置 project file、sandboxed command、数据转换和 contract validation，其他 adapter 作为兼容扩展注册。
+`kind=capability_sequence` 不启动 LLM Agent，按声明的 capability steps 与参数引用执行。全部 step `completed` 后使用固定 `completed_outcome` 或受限 `outcome_from`；Capability `failed` 只进入 Attempt retry 和 `runtime_outcomes`，不直接产生业务 outcome。所有 step 都通过统一 Capability Registry 完成；Version 1 release 内置 project file、command、数据转换和 contract validation，其他 adapter 作为兼容扩展注册。
 
 ### Agent Executor
 
@@ -406,7 +408,7 @@ Input Contract 无法满足
 
 输入不满足时不能启动 agent 让其猜测缺失信息。
 
-Task 首次 dispatch 与从 waiting/recovering 恢复前，Repository 在短事务内使用 `state_version` 检查 `v1_task_dependencies`、Project/Column WIP limit 与 `v1_resource_claims`。依赖未完成、额度已满或资源冲突时不取得 Attempt lease；首次 dispatch 前只创建或更新 Scheduling Entry，Column Run 已存在时才可使用关联该 Attempt 的 event AwaitHandle。Conversation Agent 提出决定，确定性 guard 最终裁决。
+Task 首次 dispatch 与从 waiting/recovering 恢复前，Repository 在短事务内使用 `state_version` 检查 readiness、声明的 dependency、control state 和活跃 Attempt。条件未满足时不取得 Attempt lease；首次 dispatch 前只创建或更新 Scheduling Entry。Conversation Agent 决定并发和优先级，Repository 防止同一 Task 被重复执行。
 
 ## 15. Output Contract
 
@@ -585,7 +587,7 @@ DevWerk 不能保证 LLM 或第三方服务成功，但必须保证：
 ## 22. Wait Policy 判别联合
 
 - `kind=poll`：查询 capability、arguments、interval、resume condition、soft/stale/hard deadline、success/timeout outcome required；cancel/cleanup capability optional。
-- `kind=event`：event type、correlation key、soft/hard deadline、success/timeout outcome required；用于用户输入和 Task dependency 等内部事件。
+- `kind=event`：event type、correlation key、hard deadline、success/timeout outcome required；用于用户输入和 Task dependency 等内部事件。
 - `kind=timer`：`resume_at` 或 `delay_seconds` 二者之一，以及 hard deadline 与 success/timeout outcome required。
 
 每种策略均冻结到 AwaitHandle；Version 1 release 不定义 provider 专用 waiting kind。
@@ -618,7 +620,7 @@ await_handle:
   state_version:
 ```
 
-AwaitHandle 必须持久化，不能只存在 executor 内存。Secret 只保存安全引用，不保存明文凭据。
+AwaitHandle 必须持久化，不能只存在 executor 内存。
 
 Handle 在外部任务终态、取消或最终过期并完成 reconciliation 后清理；agent 退出时不销毁。
 
@@ -910,7 +912,6 @@ Mailbox 使用 claim lease 与 at-least-once delivery。读取只进入 claimed�
 - `v1_await_handles`
 - `v1_execution_receipts`
 - `v1_task_dependencies`
-- `v1_resource_claims`
 - `v1_scheduling_entries`
 
 ### Evidence
@@ -995,7 +996,6 @@ v1_events(project_id, id)
 v1_events(task_id, id)
 v1_artifacts(project_id, task_id, created_at, id)
 v1_execution_receipts(project_id, capability_id, idempotency_key)
-v1_resource_claims(project_id, resource_key, lease_expires_at)
 ```
 
 要求：
