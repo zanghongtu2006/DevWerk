@@ -391,6 +391,7 @@ Task execution state：
 | Source | Target | Trigger | Additional guard |
 |---|---|---|---|
 | pending | running | first Attempt claimed | control active；readiness 与 dependency 满足，无其他活跃 Attempt |
+| pending | failed | `pending_deadline_at` 到期 | 仍不可派发；写 `failure_code=pending_timeout`、event 与 mailbox |
 | running | waiting | active Attempt 持久化 AwaitHandle | handle 与 checkpoint 已原子提交 |
 | running | recovering | active Attempt interrupted | 原 lease 已失效或释放 |
 | waiting | running | AwaitHandle resume condition 成立 | control active；handle settlement CAS 成功 |
@@ -407,6 +408,7 @@ Task control state：
 | pause_requested | paused | safe checkpoint reached | 无 active Task/Attempt lease；运行中的 Attempt 已持久化 `task.resumed` event AwaitHandle，既有 Handle 冻结 |
 | pause_requested | active | task.resume | pause 尚未完成 |
 | paused | active | task.resume | migration transaction 不在进行；control AwaitHandle settlement 与重新入队原子提交 |
+| paused | active | pause deadline 前显式 resume | 恢复执行资格并重新入队 |
 | any non-active | active | Task terminal transaction | 与 done/failed 原子规范化 |
 
 Column Run state：
@@ -414,6 +416,7 @@ Column Run state：
 | Source | Target | Trigger | Additional guard |
 |---|---|---|---|
 | pending | running | first Attempt claimed | Attempt 属于该 Run |
+| pending | failed | `claim_deadline_at` 到期 | 对应 Task 同事务进入 `failed` 并通知 mailbox |
 | running | waiting | active Attempt awaiting | AwaitHandle 已提交 |
 | waiting | running | Attempt resumed/new Attempt claimed | Task control active |
 | running | succeeded | Attempt succeeded | output contract 与 evidence 通过 |
@@ -434,7 +437,11 @@ Column Attempt state：
 
 Column Run 代表一次 visit；它在 retry budget 内顺序拥有一个或多个 immutable Attempt。Artifact、Agent Segment、AwaitHandle 与 execution receipt 均关联明确的 `column_attempt_id`。
 
-### 9.2 长等待分类
+### 9.2 非终态停滞硬期限
+
+Version 1 不允许 Formal Task 依赖无限期人工唤醒。Task 创建时必须持久化 `pending_deadline_at`；每次 pause 必须持久化 `pause_deadline_at`；Column Run 创建时必须持久化 `claim_deadline_at`。期限可由 Conversation Agent 根据任务性质选择，但创建后不延期。期限前，Conversation Agent 可以补充输入、调整依赖、恢复或取消；期限到达仍未推进时，Supervisor 以确定性 transaction 将 Task 置为 `failed`，写入对应 failure code、terminal event 与 Project mailbox。需要继续时创建 successor Task，不复活原 Task。
+
+### 9.3 长等待分类
 
 不能仅用总耗时判断异常：
 
@@ -446,7 +453,7 @@ Column Run 代表一次 visit；它在 retry budget 内顺序拥有一个或多�
 
 任何不能在当前 capability 调用内完成的工作必须返回 AwaitHandle。Supervisor 按 handle kind 查询、接收关联事件或触发 timer；token/reference 在 handle 终态后销毁或脱敏归档。
 
-### 9.3 完成、取消与迁移
+### 9.4 完成、取消与迁移
 
 Task 通过 output contract、artifact/evidence policy 和显式 success terminal transition 后成为 `done`。Conversation Agent 在终态后异步观察和汇报；需要项目级复核的 Workflow 必须在 done 前声明独立 review Column，因此不存在隐藏的同步验收门。
 
@@ -454,11 +461,11 @@ Task 取消原子进入 `failed` terminal，并记录 `failure_code=cancelled`�
 
 Task revision 迁移只允许在 `control_state=paused` 且没有活跃 Task/Attempt lease 时执行。请求明确目标 revision、目标 Column、context/artifact 继承策略和期望 `state_version`；Runtime 重新验证目标 input contract，以 CAS transaction 切换 revision/Column、创建新的 Column Run 与首个 Attempt 并写审计事件。任一验证或 CAS 失败均保持原 revision 和状态。
 
-### 9.4 失败循环保护
+### 9.5 失败循环保护
 
 每次失败保存标准化 `failure_fingerprint`。同一 Column 连续出现相同 fingerprint 时采用更严格的重试上限；超过上限直接 failed 并通知 Conversation Agent，避免无意义自动修复循环。
 
-### 9.5 终态事件
+### 9.6 终态事件
 
 Version 1 canonical event catalog 使用以下点分名称。监督相关事件同时写入 append-only event stream 和 Project mailbox；mailbox 保留相同 `event_type`：
 

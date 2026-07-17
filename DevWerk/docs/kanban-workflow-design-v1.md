@@ -257,7 +257,7 @@ Run 已创建但尚未执行，或 Attempt 尚未取得 lease，必须有明确 
 - waiting_dependency
 - waiting_resource
 
-满足条件却长期未调度属于异常，由 Runtime Reconciler 检测。
+Task 同时持久化 `pending_deadline_at`，Column Run 持久化 `claim_deadline_at`。条件始终未满足或满足后仍未领取，都不能无限停留；任一期限到达时由 Runtime Reconciler 将 Task 明确置为 `failed`，写 failure artifact、terminal event 与 Conversation Agent mailbox。
 
 ### `running`
 
@@ -450,7 +450,7 @@ failed
 
 Task execution/control state 的合法 edge、trigger 与 CAS guard 仅引用通用设计文档第 9.1 节，不在本文定义第二套转移图。
 
-Task 另有独立 control state：`active -> pause_requested -> paused -> active`。Pause 先阻止新领取；运行中的 Attempt 在 capability 安全 checkpoint 创建关联 `task.resumed` 的 event AwaitHandle并释放 lease，既有 AwaitHandle 则冻结。Resume 原子 settlement control handle 并重新入队。Terminal Task 的 control state 规范化为 `active`。
+Task 另有独立 control state：`active -> pause_requested -> paused -> active`。Pause 请求必须带创建后不可延期的 `pause_deadline_at`。Pause 先阻止新领取；运行中的 Attempt 在 capability checkpoint 创建关联 `task.resumed` 的 event AwaitHandle并释放 lease，既有 AwaitHandle 则冻结。Deadline 前显式 resume 会原子 settlement control handle 并重新入队；deadline 到达仍为 paused 时，Supervisor 将 Task 置为 `failed` 并通知 Conversation Agent。Terminal Task 的 control state 规范化为 `active`。
 
 ### `done`
 
