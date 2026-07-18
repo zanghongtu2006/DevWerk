@@ -34,7 +34,6 @@ async def lifespan(app: FastAPI):
     supervisor = RuntimeSupervisor(store, registry, interval=cfg.workflow_supervisor_interval_seconds)
     app.state.v1_store = store
     app.state.v1_registry = registry
-    app.state.v1_control_token = cfg.devwerk_control_token
     conversation = ConversationAgent(store, registry, on_task_created=supervisor.wake)
     app.state.v1_conversation = conversation
     app.state.v1_supervisor = supervisor
@@ -61,7 +60,7 @@ def create_app() -> FastAPI:
         allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
         allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Accept", "Content-Type", "X-DevWerk-Control-Token"],
+        allow_headers=["Accept", "Content-Type"],
     )
     app.include_router(v1_router, prefix="/v1", tags=["DevWerk V1"])
     web_root = Path(__file__).resolve().parent / "web"

@@ -121,7 +121,7 @@ Default endpoints:
 - `/v1/projects/{project_id}/agent-runs/{agent_run_id}`
 - `/v1/projects/{project_id}/governance`
 
-Trusted automation publishes Workflows at `/v1/projects/{project_id}/automation/workflow` and creates readiness-approved Tasks at `/v1/projects/{project_id}/automation/tasks`. Both require `X-DevWerk-Control-Token`; the read-only Web UI never exposes this control plane.
+V1 automation publishes Workflows at `/v1/projects/{project_id}/automation/workflow` and creates readiness-approved Tasks at `/v1/projects/{project_id}/automation/tasks` without an authentication gate. This is an explicit low-cost V1 boundary; the customer Web Kanban remains read-only and does not expose mutation controls. Authentication and approval are deferred until after V1.
 
 ## Web Workbench
 

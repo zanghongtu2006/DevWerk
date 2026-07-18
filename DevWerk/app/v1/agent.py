@@ -107,6 +107,7 @@ class AgentCore:
         calls_used = 0
         direct_effect_calls = 0
         delegated = False
+        latest_text = ""
         started = time.monotonic()
         try:
             for iteration in range(1, spec.max_iterations + 1):
@@ -132,6 +133,8 @@ class AgentCore:
                 assert response is not None
                 if not isinstance(response, AgentModelResponse):
                     response = AgentModelResponse.model_validate(response)
+                if response.text.strip():
+                    latest_text = response.text.strip()
                 for index, call in enumerate(response.tool_calls):
                     if not call.id:
                         call.id = f"call-{iteration}-{index + 1}"
@@ -229,6 +232,10 @@ class AgentCore:
                     raise RuntimeError("Conversation Agent returned neither tools nor final text")
                 self.store.finish_agent_run(run["id"], "succeeded", text, None, iteration, calls_used)
                 return AgentRunResult(run["id"], "succeeded", text, None, calls_used, iteration)
+            if spec.kind == "conversation" and delegated:
+                text = latest_text or "Durable task delegation was accepted and supervision will continue."
+                self.store.finish_agent_run(run["id"], "succeeded", text, None, spec.max_iterations, calls_used)
+                return AgentRunResult(run["id"], "succeeded", text, None, calls_used, spec.max_iterations)
             raise RuntimeError(f"agent iteration budget exceeded ({spec.max_iterations})")
         except Exception as exc:  # noqa: BLE001
             error = f"{type(exc).__name__}: {exc}"[:4000]

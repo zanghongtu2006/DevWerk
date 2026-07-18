@@ -31,7 +31,6 @@ def isolated_settings(tmp_path, monkeypatch):
     monkeypatch.setenv("DEVWERK_LLM_CONFIG_PATH", str(tmp_path / "missing-llm.json"))
     monkeypatch.setenv("DEVWERK_LLM_CONFIG_JSON", json.dumps(config))
     monkeypatch.setenv("WORKFLOW_SUPERVISOR_INTERVAL_SECONDS", "0.02")
-    monkeypatch.setenv("DEVWERK_CONTROL_TOKEN", "test-control-token")
     reload_settings()
 
 

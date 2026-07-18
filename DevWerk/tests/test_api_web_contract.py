@@ -8,9 +8,6 @@ from app.v1.domain import AgentModelResponse
 from tests.helpers import sequence_workflow, readiness
 
 
-CONTROL = {"X-DevWerk-Control-Token": "test-control-token"}
-
-
 def client() -> TestClient:
     from app.main import create_app
 
@@ -43,13 +40,11 @@ def test_declarative_api_workflow_reaches_done_without_llm(tmp_path):
             json={"name": "api", "description": "", "base_dir": str(tmp_path / "project")},
         ).json()
         workflow = sequence_workflow(content="api done").model_dump(mode="json")
-        assert web.post(f"/v1/projects/{project['id']}/automation/workflow", json={"workflow": workflow}).status_code == 403
-        published = web.post(f"/v1/projects/{project['id']}/automation/workflow", json={"workflow": workflow}, headers=CONTROL)
+        published = web.post(f"/v1/projects/{project['id']}/automation/workflow", json={"workflow": workflow})
         assert published.status_code == 201
         task = web.post(
             f"/v1/projects/{project['id']}/automation/tasks",
             json={"title": "deterministic", "brief": "", "input": {}, "readiness": readiness()},
-            headers=CONTROL,
         ).json()
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
@@ -72,7 +67,7 @@ def test_api_rejects_unknown_declared_capability(tmp_path):
         ).json()
         workflow = sequence_workflow().model_dump(mode="json")
         workflow["columns"][0]["executor"]["steps"][0]["capability"] = "not.registered"
-        response = web.post(f"/v1/projects/{project['id']}/automation/workflow", json={"workflow": workflow}, headers=CONTROL)
+        response = web.post(f"/v1/projects/{project['id']}/automation/workflow", json={"workflow": workflow})
         assert response.status_code == 422
         assert "unknown or non-delegable capabilities" in response.json()["detail"]
 

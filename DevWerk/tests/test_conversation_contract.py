@@ -39,6 +39,37 @@ def test_conversation_agent_publishes_data_defined_workflow_then_creates_task(st
         agent.stop()
 
 
+def test_durable_delegation_succeeds_at_iteration_budget_boundary(store, tmp_path):
+    project = store.create_project("budget-boundary", "", str(tmp_path / "project"))
+    workflow = sequence_workflow(name="budget-boundary").model_dump(mode="json")
+    responses = iter(
+        [
+            AgentModelResponse(tool_calls=[AgentToolCall(id="wf", name="workflow.publish", arguments={"workflow": workflow})]),
+            AgentModelResponse(tool_calls=[AgentToolCall(id="task", name="task.create", arguments={"title": "formal", "brief": "deliver", "input": {}, "readiness": readiness()})]),
+        ]
+    )
+    registry = build_core_registry()
+    core = AgentCore(store, registry, lambda *_args, **_kwargs: next(responses))
+    original_run = core.run
+
+    def bounded_run(spec):
+        return original_run(spec.__class__(**{**spec.__dict__, "max_iterations": 2}))
+
+    core.run = bounded_run
+    agent = ConversationAgent(store, registry, workers=1, agent_core=core)
+    try:
+        accepted = agent.submit(project["id"], "Delegate this formal delivery.", True)
+        assert agent.wait_for_idle()
+        job = store.get_conversation_job(accepted["job"]["id"])
+        assert job["status"] == "succeeded"
+        assert job["task_id"]
+        assert job["result"]["task_ids"] == [job["task_id"]]
+        assert len(job["result"]["workflow_revision_ids"]) == 1
+        assert "delegation" in job["result"]["reply"].lower()
+    finally:
+        agent.stop()
+
+
 def test_start_task_false_removes_workflow_and_task_tools(store, tmp_path):
     project = store.create_project("discussion", "", str(tmp_path / "project"))
     exposed: list[set[str]] = []

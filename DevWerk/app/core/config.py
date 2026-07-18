@@ -103,7 +103,6 @@ class Settings(BaseSettings):
     # Local usage accounting.
     devwerk_usage_tracking: bool = Field(default=True)
     devwerk_db_path: str = Field(default="./data/devwerk.db")
-    devwerk_control_token: str = Field(default="")
 
     # JSON LLM catalog and routing map. Environment variables provide the
     # built-in default catalog when no JSON file is configured.

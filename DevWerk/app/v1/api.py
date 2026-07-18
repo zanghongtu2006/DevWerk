@@ -3,7 +3,6 @@ from __future__ import annotations
 import sqlite3
 import asyncio
 import json
-import secrets
 from pathlib import Path
 from typing import Any
 
@@ -27,15 +26,6 @@ def supervisor(request: Request):
 
 def not_found(exc: KeyError) -> HTTPException:
     return HTTPException(status_code=404, detail=str(exc.args[0] if exc.args else exc))
-
-
-def require_control(request: Request) -> None:
-    expected = str(request.app.state.v1_control_token)
-    if not expected:
-        raise HTTPException(status_code=503, detail="automation control plane is disabled until DEVWERK_CONTROL_TOKEN is configured")
-    supplied = str(request.headers.get("X-DevWerk-Control-Token") or "")
-    if not supplied or not secrets.compare_digest(supplied, expected):
-        raise HTTPException(status_code=403, detail="automation control token is required")
 
 
 @router.get("/health")
@@ -100,8 +90,7 @@ def conversation_job(project_id: str, job_id: str, request: Request) -> dict[str
 
 @router.post("/projects/{project_id}/automation/workflow", status_code=201)
 def publish_workflow(project_id: str, payload: WorkflowPublishRequest, request: Request) -> dict[str, Any]:
-    """Control-plane endpoint for trusted automation, not a user Kanban edit API."""
-    require_control(request)
+    """V1 automation endpoint; the customer Kanban remains read-only."""
     try:
         store(request).get_project(project_id)
         validate_workflow_capabilities(payload.workflow, request.app.state.v1_registry)
@@ -122,7 +111,6 @@ def get_workflow(project_id: str, request: Request) -> dict[str, Any]:
 
 @router.post("/projects/{project_id}/automation/tasks", status_code=201)
 def create_task(project_id: str, payload: TaskCreate, request: Request) -> dict[str, Any]:
-    require_control(request)
     try:
         task = store(request).create_task(
             project_id,
