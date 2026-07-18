@@ -1,89 +1,69 @@
-# DevWerk
+# DevWerk IntelliJ 插件
 
-DevWerk 是一款面向 IntelliJ 平台（IDEA / PyCharm / WebStorm 等）的 AI 辅助开发插件，
-专注于 “可执行代码生成（CodeOps）”，而不仅仅是对话式补全。
+DevWerk IntelliJ 插件是 DevWerk 服务的能力提供者，也是项目侧的安全边界。它负责收集工作区证据、提供语义工具、向服务发起工作流请求，并在 IntelliJ 项目中应用已经批准的文件操作。
 
-与传统 AI 插件不同，DevWerk 要求模型输出结构化 JSON（包含文件树与文件操作），
-由插件在本地 安全、可控地执行文件创建 / 修改 / 删除。
+Kanban 状态、工作流设计和任务运行由 `../DevWerk/` 下的 FastAPI 服务负责，不由插件维护。
 
-## 核心特性
+## 当前状态
 
-🧠 CodeOps 协议
-AI 必须输出标准化 JSON（reply / code_tree / ops），而不是自由文本。
+- 插件版本：`0.0.1`
+- IntelliJ Platform 基线：`2024.1`（`sinceBuild=241`，`untilBuild=243.*`）
+- JVM：Java 17
+- 主要入口：IDE 右侧 **DevWerk** 工具窗口
+- 开发阶段：暂时挂起；DevWerk Version 1 服务能够独立完成任务后再恢复插件开发
 
-📂 真实文件系统操作
-支持：
+服务端已不再把旧 `/v1/plan`、`/v1/execute` 作为正式接口。后续集成应使用 `/v1/workflows`、工作流事件/消息和语义 action。
 
-创建目录
+## 主要职责
 
-创建文件
+- 收集项目树、source map、打开文件、变更文件和诊断信息
+- 提供 workspace list/read/search 能力
+- 在支持时提供编译、进程和 IDE 诊断能力
+- 在受保护的项目根目录内执行结构化文件操作
+- 对源码修改保存 before/after 快照
+- 在 IntelliJ 工具窗口中展示 DevWerk 交互
 
-覆盖更新文件
+## 安全模型
 
-删除文件或目录
+`SnapshotGuard` 在修改前保存目标文件快照，并在 apply 前检查快照完整性；执行成功后再保存修改后的状态。路径守卫用于阻止操作逃逸出项目根目录。
 
-🔌 多模型支持（无需统一后端）
+生成结果仍需要人工检查。HTTP 请求成功不等于代码交付成功，还应检查实际修改路径、IDE 诊断和工作流工件。
 
-Ollama（本地）
+## 构建
 
-OpenAI（GPT）
+```powershell
+cd idea-plugin
+.\gradlew.bat compileKotlin
+```
 
-Google Gemini
+常用开发任务：
 
-TechZukunft（专用后端）
+```powershell
+.\gradlew.bat test
+.\gradlew.bat runIde
+.\gradlew.bat buildPlugin
+```
 
-Custom HTTP（预留）
+构建产物位于 `build/`。
 
-🧩 Prompt 内置于插件
+## 目录结构
 
-通用模型（Ollama / GPT / Gemini）使用插件内置 Prompt + Schema
+```text
+src/main/kotlin/com/zanghongtu/devwerk/
+  DevWerkFsToolWindowPanel.kt   工具窗口 UI
+  DevwerkOperationRunner.kt    受保护的操作执行
+  SnapshotGuard.kt             修改前后快照
+  codeEditor/HttpAiClient.kt   服务客户端与工作流轮询
+  codeEditor/SourceMapBuilder.kt
+  codeEditor/WorkspaceTools.kt
+  settings/                    本地 provider 设置
+src/main/resources/META-INF/plugin.xml
+```
 
-不依赖中心化服务器
+## 配置与隐私
 
-便于开源与二次扩展
+Provider URL、模型和 token 保存在本地 IDE 设置中。不要提交凭据，也不要在问题报告中粘贴密钥。工作区内容是否离开 IDE，取决于用户选择的服务与 provider 配置。
 
-⚙️ 本地配置，不上传密钥
+## 许可证
 
-Token / URL / Model 均存储在本地 IDE 配置
-
-插件不会上传你的密钥或代码
-
-## 🖥 支持的 IDE
-
-DevWerk 基于 IntelliJ Platform，理论上支持：
-
-IntelliJ IDEA（Community / Ultimate）
-
-PyCharm
-
-WebStorm
-
-GoLand
-
-CLion
-
-Rider（部分功能）
-
-## 使用方式（简要）
-
-打开右侧 DevWerk 工具窗口
-
-点击 ⚙ 配置 AI Provider
-
-在对话框中输入你的需求（例如“生成一个 Maven Java 项目”）
-
-AI 返回 CodeOps JSON
-
-插件自动在项目中创建 / 修改文件
-
-## 开源说明
-
-本项目将逐步开源 插件核心逻辑与基础 Prompt
-
-高级 Prompt / 商业后端可能以独立方式提供
-
-欢迎 Issue / PR / 讨论
-
-## License
-
-TBD（建议 Apache-2.0 或 MIT）
+GNU LGPL 2.1，与仓库根目录许可证一致。
