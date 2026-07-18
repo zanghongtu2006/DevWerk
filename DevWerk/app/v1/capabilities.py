@@ -129,6 +129,20 @@ class CapabilityRegistry:
         with self._lock:
             return sorted(item.id for item in self._entries.values() if item.delegable_to_column)
 
+    def column_catalog(self, context: CapabilityContext) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": entry.id,
+                "description": entry.description,
+                "input_schema": entry.input_schema,
+                "output_schema": entry.output_schema,
+                "side_effect_kind": entry.side_effect_kind,
+                "parallel_safe": entry.parallel_safe,
+                "default_timeout": entry.default_timeout,
+            }
+            for entry in self.resolve(self.column_ids(), context)
+        ]
+
 
 OBJECT = {"type": "object"}
 

@@ -70,6 +70,19 @@ def test_workflow_publish_schema_exposes_live_capability_catalog(store, tmp_path
     assert "novel.writing" not in agent_capabilities["items"]["enum"]
 
 
+def test_project_column_catalog_exposes_only_delegable_contracts(store, tmp_path):
+    project = store.create_project("catalog", "", str(tmp_path / "project"))
+    registry = build_core_registry()
+    context = CapabilityContext(project_id=project["id"], project=project, store=store)
+
+    catalog = registry.column_catalog(context)
+    by_id = {item["id"]: item for item in catalog}
+    assert "project.files.write" in by_id
+    assert by_id["project.files.write"]["input_schema"]["required"] == ["path", "content"]
+    assert by_id["project.files.write"]["side_effect_kind"] == "write"
+    assert "task.create" not in by_id
+
+
 def test_workflow_publish_rejects_conversation_control_capability_for_column(store, tmp_path):
     project = store.create_project("role-boundary", "", str(tmp_path / "project"))
     registry = build_core_registry()

@@ -106,6 +106,7 @@ Default endpoints:
 - `/v1/projects`
 - `/v1/projects/{project_id}/conversation`
 - `/v1/projects/{project_id}/conversation-jobs/{job_id}`
+- `/v1/projects/{project_id}/capabilities`
 - `/v1/projects/{project_id}/workflow`
 - `/v1/projects/{project_id}/board`
 - `/v1/projects/{project_id}/projection`

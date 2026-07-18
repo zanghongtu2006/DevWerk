@@ -39,6 +39,11 @@ def test_declarative_api_workflow_reaches_done_without_llm(tmp_path):
             "/v1/projects",
             json={"name": "api", "description": "", "base_dir": str(tmp_path / "project")},
         ).json()
+        catalog_response = web.get(f"/v1/projects/{project['id']}/capabilities")
+        assert catalog_response.status_code == 200
+        catalog = {item["id"]: item for item in catalog_response.json()}
+        assert "project.files.write" in catalog
+        assert "task.create" not in catalog
         workflow = sequence_workflow(content="api done").model_dump(mode="json")
         published = web.post(f"/v1/projects/{project['id']}/automation/workflow", json={"workflow": workflow})
         assert published.status_code == 201

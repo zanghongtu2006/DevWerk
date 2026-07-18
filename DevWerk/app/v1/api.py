@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.v1.domain import ConversationRequest, ProjectCreate, TaskCreate, WorkflowPublishRequest
-from app.v1.capabilities import validate_workflow_capabilities
+from app.v1.capabilities import CapabilityContext, validate_workflow_capabilities
 
 
 router = APIRouter()
@@ -54,6 +54,17 @@ def list_projects(request: Request) -> list[dict[str, Any]]:
 def get_project(project_id: str, request: Request) -> dict[str, Any]:
     try:
         return store(request).get_project(project_id)
+    except KeyError as exc:
+        raise not_found(exc) from exc
+
+
+@router.get("/projects/{project_id}/capabilities")
+def project_capabilities(project_id: str, request: Request) -> list[dict[str, Any]]:
+    """Discover the live, project-available capability contracts for Column Runtime."""
+    try:
+        project = store(request).get_project(project_id)
+        context = CapabilityContext(project_id=project_id, project=project, store=store(request))
+        return request.app.state.v1_registry.column_catalog(context)
     except KeyError as exc:
         raise not_found(exc) from exc
 
