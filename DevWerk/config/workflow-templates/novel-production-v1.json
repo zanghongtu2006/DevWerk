@@ -1,0 +1,140 @@
+{
+  "id": "wftpl_novel_production_v1",
+  "template_key": "novel.production",
+  "version": 1,
+  "name": "长篇小说创作与逐章审查",
+  "description": "先冻结十份创作基线，再让严格串行的章节 Task 经过历史回顾与提要、同一 Writer 写作/返修、独立 Reviewer 审查和交付。",
+  "category": "creative_writing",
+  "tags": ["小说", "长篇写作", "逐章", "前情提要", "独立审查", "返修"],
+  "selection_guide": "用户要求多章节连续小说、章节前回顾历史、独立写作与审查并保留可追溯产物时使用。若用户仅要求短篇、单段文字或无需项目流程，不应应用。",
+  "parameter_schema": {
+    "type": "object",
+    "required": ["project_title", "premise", "chapter_target_characters", "chapter_max_characters"],
+    "properties": {
+      "project_title": {"type": "string", "minLength": 1},
+      "premise": {"type": "string", "minLength": 1},
+      "chapter_target_characters": {"type": "integer", "minimum": 1, "maximum": 20000},
+      "chapter_max_characters": {"type": "integer", "minimum": 1, "maximum": 20000}
+    },
+    "additionalProperties": false
+  },
+  "bundle": {
+    "defaults": {
+      "project_title": "未命名小说",
+      "premise": "由用户在对话中确认的小说主题、人物与约束。",
+      "chapter_target_characters": 2000,
+      "chapter_max_characters": 20000
+    },
+    "orchestration_plan": {
+      "schema_version": "devwerk.orchestration-plan.v1",
+      "intent_summary": "使用冻结的创作基线，严格串行完成十章连续小说，并让每章都具备历史提要、正文、独立审查和交付证据。",
+      "completion_definition": "十个章节 Task 依次到达 done；十份创作手册、十份提要、十份正文、逐章审查、INDEX.md 与 FINAL_ACCEPTANCE.md 均存在且最后一章完成最终验收。",
+      "flow_unit": "一章需要独立回顾历史、写作、审查和交付的小说章节。",
+      "lifecycle_summary": "首章先建立创作基线；每章读取冻结手册和全部已验收历史，生成提要，交给同一逻辑 Writer 写作或返修，由独立 Reviewer 接受或定向退回。",
+      "entry_meaning": "章节依赖已经满足，可以验证或建立冻结创作基线。",
+      "terminal_meaning": "done 表示该章及所需项目级文件已验收；failed 仅表示明确的执行失败，可由 Conversation Agent 对原 Task reopen。",
+      "columns": [
+        {"key":"foundation","responsibility":"建立或核验十份冻结创作手册。","execution_mode":"agent","entry_evidence":["Task 章节信息","项目题材与长度约束","已有 guides 文件"],"exit_evidence":["十份非空手册及一致性结论","foundation revision 证据"],"context_boundary":"只使用当前项目、Task、guides、chapters、summaries 与 reviews 文件。","review_or_rework_role":"基线冲突必须在本 Column 修订并重新核验，不得把不一致基线交给写手。"},
+        {"key":"recap","responsibility":"读取此前全部已验收章节并生成当前章前情提要。","execution_mode":"agent","entry_evidence":["十份冻结手册","此前章节正文","当前章节号"],"exit_evidence":["当前章节 summaries 文件","读取过的历史文件清单"],"context_boundary":"提要必须来自实际历史正文；第一章写开篇背景提要。","review_or_rework_role":"提要错误回到本 Column；发现基线冲突回到 foundation。"},
+        {"key":"write","responsibility":"同一逻辑 Writer 根据完整基线、提要、历史正文和 Reviewer 意见撰写或修改正文。","execution_mode":"agent","entry_evidence":["十份手册","当前提要","历史正文","现有正文与审核意见"],"exit_evidence":["当前章节正文及版本证据"],"context_boundary":"不得改写历史已验收章节或创作手册；正文不超过项目宽松上限。","review_or_rework_role":"Reviewer 退回时恢复同一 Writer session 并定向修改旧稿。"},
+        {"key":"review","responsibility":"独立检查长度、连续性、人物、伏笔、语言和十份手册遵循情况。","execution_mode":"agent","entry_evidence":["完整基线","当前提要与正文","全部历史正文","既往审核意见"],"exit_evidence":["结构化 review 文件","accepted 或定向回退结果"],"context_boundary":"Reviewer 不修改正文，只记录具体证据、位置、违反手册和修改要求。","review_or_rework_role":"正文问题回 write；提要问题回 recap；基线问题回 foundation。"},
+        {"key":"deliver","responsibility":"核验 Reviewer 接受的版本并交付章节；最后一章生成索引和最终验收。","execution_mode":"agent","entry_evidence":["accepted review","当前正文和提要","全部项目产物"],"exit_evidence":["章节交付证据","第十章的 INDEX.md 与 FINAL_ACCEPTANCE.md"],"context_boundary":"只交付 Reviewer 已接受的文件哈希；不代替 Reviewer 修改正文。","review_or_rework_role":"版本或文件不匹配回到 review。"}
+      ],
+      "task_portfolio": [
+        {"proposed_task_ref":"chapter_01","objective":"完成第01章及首章前的十份创作基线。","workflow_fit":"一章完整经过统一章节生命周期。","agent_execution":"required","dependencies":[],"conflict_domains":[{"kind":"workspace_path","identity":"chapters/01.md"},{"kind":"workspace_path","identity":"summaries/01.md"},{"kind":"workspace_path","identity":"guides"}],"exact_input_strings":[],"review_scope":"核验首章与全部创作基线。","retry_scope":"业务退回沿图流转；执行失败 reopen 原 Task。"},
+        {"proposed_task_ref":"chapter_02","objective":"完成第02章。","workflow_fit":"一章完整经过统一章节生命周期。","agent_execution":"required","dependencies":["chapter_01"],"conflict_domains":[{"kind":"workspace_path","identity":"chapters/02.md"},{"kind":"workspace_path","identity":"summaries/02.md"}],"exact_input_strings":[],"review_scope":"核验第02章及与历史连续性。","retry_scope":"业务退回沿图流转；执行失败 reopen 原 Task。"},
+        {"proposed_task_ref":"chapter_03","objective":"完成第03章。","workflow_fit":"一章完整经过统一章节生命周期。","agent_execution":"required","dependencies":["chapter_02"],"conflict_domains":[{"kind":"workspace_path","identity":"chapters/03.md"},{"kind":"workspace_path","identity":"summaries/03.md"}],"exact_input_strings":[],"review_scope":"核验第03章及与历史连续性。","retry_scope":"业务退回沿图流转；执行失败 reopen 原 Task。"},
+        {"proposed_task_ref":"chapter_04","objective":"完成第04章。","workflow_fit":"一章完整经过统一章节生命周期。","agent_execution":"required","dependencies":["chapter_03"],"conflict_domains":[{"kind":"workspace_path","identity":"chapters/04.md"},{"kind":"workspace_path","identity":"summaries/04.md"}],"exact_input_strings":[],"review_scope":"核验第04章及与历史连续性。","retry_scope":"业务退回沿图流转；执行失败 reopen 原 Task。"},
+        {"proposed_task_ref":"chapter_05","objective":"完成第05章。","workflow_fit":"一章完整经过统一章节生命周期。","agent_execution":"required","dependencies":["chapter_04"],"conflict_domains":[{"kind":"workspace_path","identity":"chapters/05.md"},{"kind":"workspace_path","identity":"summaries/05.md"}],"exact_input_strings":[],"review_scope":"核验第05章及与历史连续性。","retry_scope":"业务退回沿图流转；执行失败 reopen 原 Task。"},
+        {"proposed_task_ref":"chapter_06","objective":"完成第06章。","workflow_fit":"一章完整经过统一章节生命周期。","agent_execution":"required","dependencies":["chapter_05"],"conflict_domains":[{"kind":"workspace_path","identity":"chapters/06.md"},{"kind":"workspace_path","identity":"summaries/06.md"}],"exact_input_strings":[],"review_scope":"核验第06章及与历史连续性。","retry_scope":"业务退回沿图流转；执行失败 reopen 原 Task。"},
+        {"proposed_task_ref":"chapter_07","objective":"完成第07章。","workflow_fit":"一章完整经过统一章节生命周期。","agent_execution":"required","dependencies":["chapter_06"],"conflict_domains":[{"kind":"workspace_path","identity":"chapters/07.md"},{"kind":"workspace_path","identity":"summaries/07.md"}],"exact_input_strings":[],"review_scope":"核验第07章及与历史连续性。","retry_scope":"业务退回沿图流转；执行失败 reopen 原 Task。"},
+        {"proposed_task_ref":"chapter_08","objective":"完成第08章。","workflow_fit":"一章完整经过统一章节生命周期。","agent_execution":"required","dependencies":["chapter_07"],"conflict_domains":[{"kind":"workspace_path","identity":"chapters/08.md"},{"kind":"workspace_path","identity":"summaries/08.md"}],"exact_input_strings":[],"review_scope":"核验第08章及与历史连续性。","retry_scope":"业务退回沿图流转；执行失败 reopen 原 Task。"},
+        {"proposed_task_ref":"chapter_09","objective":"完成第09章。","workflow_fit":"一章完整经过统一章节生命周期。","agent_execution":"required","dependencies":["chapter_08"],"conflict_domains":[{"kind":"workspace_path","identity":"chapters/09.md"},{"kind":"workspace_path","identity":"summaries/09.md"}],"exact_input_strings":[],"review_scope":"核验第09章及与历史连续性。","retry_scope":"业务退回沿图流转；执行失败 reopen 原 Task。"},
+        {"proposed_task_ref":"chapter_10","objective":"完成第10章及全书最终验收。","workflow_fit":"一章完整经过统一章节生命周期并在交付时汇总项目。","agent_execution":"required","dependencies":["chapter_09"],"conflict_domains":[{"kind":"workspace_path","identity":"chapters/10.md"},{"kind":"workspace_path","identity":"summaries/10.md"},{"kind":"workspace_path","identity":"INDEX.md"},{"kind":"workspace_path","identity":"FINAL_ACCEPTANCE.md"}],"exact_input_strings":[],"review_scope":"核验第10章、全书连续性、索引和最终验收。","retry_scope":"业务退回沿图流转；执行失败 reopen 原 Task。"}
+      ],
+      "representative_task_ref": "chapter_01",
+      "representative_task_walkthrough": [
+        {"column_key":"foundation","receives":["题材与章节契约"],"action":"建立并交叉核验十份创作手册。","produces":["冻结创作基线"],"completion_evidence":["十份手册非空且一致"],"outcome":"foundation_ready"},
+        {"column_key":"recap","receives":["冻结创作基线与历史章节"],"action":"生成当前章提要。","produces":["前情提要"],"completion_evidence":["提要早于正文且来源可查"],"outcome":"recap_ready"},
+        {"column_key":"write","receives":["十份手册、提要和历史"],"action":"由 Writer 撰写正文。","produces":["正文草稿"],"completion_evidence":["正文文件与版本证据"],"outcome":"draft_ready"},
+        {"column_key":"review","receives":["基线、提要、历史和正文"],"action":"独立审查正文。","produces":["结构化审查意见"],"completion_evidence":["accepted 绑定当前正文版本"],"outcome":"accepted"},
+        {"column_key":"deliver","receives":["已接受正文和审查"],"action":"交付本章。","produces":["交付证据"],"completion_evidence":["产物齐全且版本匹配"],"outcome":"delivered"}
+      ],
+      "wip_group":"novel_chapter_serial",
+      "wip_limit":1,
+      "wip_decision":"每次只允许一个章节 Task 运行，且后一章依赖前一章 done。",
+      "concurrency_groups":[],
+      "serialization_reasons":["下一章提要必须读取前一章已验收正文。"],
+      "progress_evidence":["foundation、recap、draft、review、delivery 的 Column 事件和文件产物"],
+      "review_points":["十份基线冻结","逐章独立审查","第十章最终验收"],
+      "intervention_conditions":["执行失败","创作基线冲突","用户改变项目目标"],
+      "self_check":{"every_task_can_start_at_entry":true,"every_column_applies_to_every_task":true,"columns_are_process_stages_not_work_slices":true,"tasks_are_independently_reviewable":true,"context_handoffs_are_explicit":true,"concurrency_conflicts_are_declared":true,"terminal_and_rework_paths_are_explicit":true}
+    },
+    "workflow": {
+      "schema_version":"devwerk.workflow.v1",
+      "name":"小说章节创作与返修有向图",
+      "description":"每个章节 Task 复用同一有向图；审核可定向回退到基线、提要或同一 Writer。",
+      "entry":"foundation",
+      "terminals":{"success":"done","failure":"failed"},
+      "columns":[
+        {
+          "key":"foundation","name":"建立或核验创作基线",
+          "instruction":"你是创作基线 Agent。读取 Task 输入和项目现有文件。第01章动笔前必须创建并交叉核验 guides/outline.md、scene.md、dialogue.md、symbols.md、pacing.md、supporting_characters.md、emotion.md、anti_ai_style.md、body.md、era.md；总纲先于其余手册。后续章节只核验并读取同一冻结基线，不得擅自改写。手册必须覆盖人物、冲突、世界、伏笔、风格与一致性。Task input 的 chapter_target_characters 只是写作目标，不是验收上下界；只有 chapter_max_characters 是硬性长度上限，任何手册不得擅自增加更窄的字数窗口、百分比容差或由此产生的退回规则。用 project.files 工具留下证据。基线齐备且一致时 complete foundation_ready；可在本阶段解决的问题 complete foundation_needs_revision 让图回到本 Column；无法执行时 complete execution_failed 并写明原因。",
+          "executor":{"kind":"agent","capabilities":["project.files.list","project.files.read","project.files.write","project.files.measure"]},
+          "context":{"include_project":true,"include_task":true,"upstream_outputs":[],"artifact_globs":["guides/*.md"]},
+          "input_contract":{},"output_contract":{"type":"object","additionalProperties":true},
+          "transitions":[{"outcome":"foundation_ready","target":"recap"},{"outcome":"foundation_needs_revision","target":"foundation"},{"outcome":"execution_failed","target":"failed"}],
+          "metadata":{"purpose":"冻结十份创作手册；后续章节核验同一 revision","derives_agent":true,"writable_paths":["guides/*.md"]}
+        },
+        {
+          "key":"recap","name":"读取历史并生成前情提要",
+          "instruction":"你是独立提要 Agent。完整读取十份 guides 手册和此前所有已验收 chapters 正文，不能只读旧提要。第01章生成开篇背景提要。将当前章约100字提要写入 Task input 指定的 summary_path，并在输出列出实际读取的历史文件及提要 artifact。提要与历史一致时 complete recap_ready；提要需重做时 complete recap_needs_revision；发现 guides 自相矛盾时 complete foundation_invalid；无法执行时 complete execution_failed。",
+          "executor":{"kind":"agent","capabilities":["project.files.list","project.files.read","project.files.write","project.files.measure"]},
+          "context":{"include_project":true,"include_task":true,"upstream_outputs":["foundation"],"artifact_globs":["guides/*.md","chapters/*.md","summaries/*.md"]},
+          "input_contract":{},"output_contract":{"type":"object","additionalProperties":true},
+          "transitions":[{"outcome":"recap_ready","target":"write"},{"outcome":"recap_needs_revision","target":"recap"},{"outcome":"foundation_invalid","target":"foundation"},{"outcome":"execution_failed","target":"failed"}],
+          "metadata":{"purpose":"基于全部已验收正文生成本章提要","derives_agent":true,"writable_paths":[{"$ref":"/input/task/input/summary_path"}]}
+        },
+        {
+          "key":"write","name":"写作或根据审核意见返修",
+          "instruction":"你是本章节的 Writer。完整读取十份 guides 手册、本章 summaries 提要、此前全部已验收正文、当前正文和 reviews 中与本章有关的最新意见。首次写作生成连续、有冲突和伏笔的正文；返修时必须修改现有正文并逐项处理 Reviewer 意见，禁止从零盲写。正文目标和宽松上限来自 Task input，禁止重复填充。写入 body_path 后 complete draft_ready；发现冻结基线根本冲突时 complete foundation_invalid；无法执行时 complete execution_failed。",
+          "executor":{"kind":"agent","capabilities":["project.files.list","project.files.read","project.files.write","project.files.measure"]},
+          "context":{"include_project":true,"include_task":true,"upstream_outputs":["foundation","recap","review"],"artifact_globs":["guides/*.md","chapters/*.md","summaries/*.md","reviews/*.md"]},
+          "input_contract":{},"output_contract":{"type":"object","additionalProperties":true},
+          "transitions":[{"outcome":"draft_ready","target":"review"},{"outcome":"foundation_invalid","target":"foundation"},{"outcome":"execution_failed","target":"failed"}],
+          "metadata":{"purpose":"同一 Writer 会话持续写作和返修","derives_agent":true,"agent_session_key":"chapter_writer","writable_paths":[{"$ref":"/input/task/input/body_path"}]}
+        },
+        {
+          "key":"review","name":"独立审查章节",
+          "instruction":"你是独立 Reviewer，不得修改正文。读取十份 guides、当前提要、当前正文、此前全部章节和已有 review。检查 chapter_max_characters 硬性上限、人物与设定连续性、冲突伏笔、场景对话节奏情感身体时代细节以及去AI味规则；chapter_target_characters 只用于描述目标，不得仅因偏离目标而退回，也不得执行手册擅自增加的更窄字数窗口。将结构化意见写入 Task input 的 review_path，包含问题类别、证据位置、违反手册、修改要求和当前正文哈希。完全通过时 complete accepted；正文问题 complete chapter_rejected；提要错误 complete recap_rejected；基线错误 complete foundation_invalid；无法执行时 complete execution_failed。",
+          "executor":{"kind":"agent","capabilities":["project.files.list","project.files.read","project.files.write","project.files.measure"]},
+          "context":{"include_project":true,"include_task":true,"upstream_outputs":["foundation","recap","write"],"artifact_globs":["guides/*.md","chapters/*.md","summaries/*.md","reviews/*.md"]},
+          "input_contract":{},"output_contract":{"type":"object","additionalProperties":true},
+          "transitions":[{"outcome":"accepted","target":"deliver"},{"outcome":"chapter_rejected","target":"write"},{"outcome":"recap_rejected","target":"recap"},{"outcome":"foundation_invalid","target":"foundation"},{"outcome":"execution_failed","target":"failed"}],
+          "metadata":{"purpose":"独立验收并定向反馈，不修改正文","derives_agent":true,"writable_paths":[{"$ref":"/input/task/input/review_path"}]}
+        },
+        {
+          "key":"deliver","name":"交付章节与最终验收",
+          "instruction":"你是交付 Agent。读取 review 文件，确认 accepted 绑定的正文哈希与当前 body_path 一致，并核验 summary_path 和正文非空。若不匹配 complete delivery_rejected 返回 Reviewer。普通章节记录交付证据后 complete delivered。若 Task input is_final_chapter=true，还必须核验恰好十份章节和十份提要、十份 guides、全部 review 接受，生成完整 INDEX.md 和 FINAL_ACCEPTANCE.md 后才能 complete delivered。无法执行时 complete execution_failed。",
+          "executor":{"kind":"agent","capabilities":["project.files.list","project.files.read","project.files.write","project.files.measure"]},
+          "context":{"include_project":true,"include_task":true,"upstream_outputs":["review"],"artifact_globs":["guides/*.md","chapters/*.md","summaries/*.md","reviews/*.md","INDEX.md","FINAL_ACCEPTANCE.md"]},
+          "input_contract":{},"output_contract":{"type":"object","additionalProperties":true},
+          "transitions":[{"outcome":"delivered","target":"done"},{"outcome":"delivery_rejected","target":"review"},{"outcome":"execution_failed","target":"failed"}],
+          "metadata":{"purpose":"只交付 Reviewer 已接受版本；第十章完成项目验收","derives_agent":true,"writable_paths":["INDEX.md","FINAL_ACCEPTANCE.md"]}
+        }
+      ]
+    },
+    "tasks": [
+      {"proposed_task_ref":"chapter_01","title":"第01章","brief":"建立创作基线并完成第01章。","input":{"project_title":{"$param":"project_title"},"premise":{"$param":"premise"},"chapter_number":1,"summary_path":"summaries/01.md","body_path":"chapters/01.md","review_path":"reviews/01.md","chapter_target_characters":{"$param":"chapter_target_characters"},"chapter_max_characters":{"$param":"chapter_max_characters"},"is_final_chapter":false},"readiness":{"decision":"dispatch","scope":["第01章和十份创作基线"],"non_scope":[],"deliverables":["summaries/01.md","chapters/01.md","reviews/01.md","guides/outline.md","guides/scene.md","guides/dialogue.md","guides/symbols.md","guides/pacing.md","guides/supporting_characters.md","guides/emotion.md","guides/anti_ai_style.md","guides/body.md","guides/era.md"],"acceptance_criteria":["十份创作手册冻结","提要早于正文","Reviewer接受当前正文"],"dependencies_checked":true,"risks":[],"reason_summary":"首章可立即启动。"}},
+      {"proposed_task_ref":"chapter_02","title":"第02章","brief":"读取第01章后完成第02章。","input":{"project_title":{"$param":"project_title"},"premise":{"$param":"premise"},"chapter_number":2,"summary_path":"summaries/02.md","body_path":"chapters/02.md","review_path":"reviews/02.md","chapter_target_characters":{"$param":"chapter_target_characters"},"chapter_max_characters":{"$param":"chapter_max_characters"},"is_final_chapter":false},"readiness":{"decision":"dispatch","scope":["第02章"],"non_scope":[],"deliverables":["summaries/02.md","chapters/02.md","reviews/02.md"],"acceptance_criteria":["依赖第01章done","提要早于正文","Reviewer接受"],"dependencies_checked":true,"risks":[],"reason_summary":"依赖满足后自动调度。"}},
+      {"proposed_task_ref":"chapter_03","title":"第03章","brief":"读取既有章节后完成第03章。","input":{"project_title":{"$param":"project_title"},"premise":{"$param":"premise"},"chapter_number":3,"summary_path":"summaries/03.md","body_path":"chapters/03.md","review_path":"reviews/03.md","chapter_target_characters":{"$param":"chapter_target_characters"},"chapter_max_characters":{"$param":"chapter_max_characters"},"is_final_chapter":false},"readiness":{"decision":"dispatch","scope":["第03章"],"non_scope":[],"deliverables":["summaries/03.md","chapters/03.md","reviews/03.md"],"acceptance_criteria":["依赖前章done","Reviewer接受"],"dependencies_checked":true,"risks":[],"reason_summary":"依赖满足后自动调度。"}},
+      {"proposed_task_ref":"chapter_04","title":"第04章","brief":"读取既有章节后完成第04章。","input":{"project_title":{"$param":"project_title"},"premise":{"$param":"premise"},"chapter_number":4,"summary_path":"summaries/04.md","body_path":"chapters/04.md","review_path":"reviews/04.md","chapter_target_characters":{"$param":"chapter_target_characters"},"chapter_max_characters":{"$param":"chapter_max_characters"},"is_final_chapter":false},"readiness":{"decision":"dispatch","scope":["第04章"],"non_scope":[],"deliverables":["summaries/04.md","chapters/04.md","reviews/04.md"],"acceptance_criteria":["依赖前章done","Reviewer接受"],"dependencies_checked":true,"risks":[],"reason_summary":"依赖满足后自动调度。"}},
+      {"proposed_task_ref":"chapter_05","title":"第05章","brief":"读取既有章节后完成第05章。","input":{"project_title":{"$param":"project_title"},"premise":{"$param":"premise"},"chapter_number":5,"summary_path":"summaries/05.md","body_path":"chapters/05.md","review_path":"reviews/05.md","chapter_target_characters":{"$param":"chapter_target_characters"},"chapter_max_characters":{"$param":"chapter_max_characters"},"is_final_chapter":false},"readiness":{"decision":"dispatch","scope":["第05章"],"non_scope":[],"deliverables":["summaries/05.md","chapters/05.md","reviews/05.md"],"acceptance_criteria":["依赖前章done","Reviewer接受"],"dependencies_checked":true,"risks":[],"reason_summary":"依赖满足后自动调度。"}},
+      {"proposed_task_ref":"chapter_06","title":"第06章","brief":"读取既有章节后完成第06章。","input":{"project_title":{"$param":"project_title"},"premise":{"$param":"premise"},"chapter_number":6,"summary_path":"summaries/06.md","body_path":"chapters/06.md","review_path":"reviews/06.md","chapter_target_characters":{"$param":"chapter_target_characters"},"chapter_max_characters":{"$param":"chapter_max_characters"},"is_final_chapter":false},"readiness":{"decision":"dispatch","scope":["第06章"],"non_scope":[],"deliverables":["summaries/06.md","chapters/06.md","reviews/06.md"],"acceptance_criteria":["依赖前章done","Reviewer接受"],"dependencies_checked":true,"risks":[],"reason_summary":"依赖满足后自动调度。"}},
+      {"proposed_task_ref":"chapter_07","title":"第07章","brief":"读取既有章节后完成第07章。","input":{"project_title":{"$param":"project_title"},"premise":{"$param":"premise"},"chapter_number":7,"summary_path":"summaries/07.md","body_path":"chapters/07.md","review_path":"reviews/07.md","chapter_target_characters":{"$param":"chapter_target_characters"},"chapter_max_characters":{"$param":"chapter_max_characters"},"is_final_chapter":false},"readiness":{"decision":"dispatch","scope":["第07章"],"non_scope":[],"deliverables":["summaries/07.md","chapters/07.md","reviews/07.md"],"acceptance_criteria":["依赖前章done","Reviewer接受"],"dependencies_checked":true,"risks":[],"reason_summary":"依赖满足后自动调度。"}},
+      {"proposed_task_ref":"chapter_08","title":"第08章","brief":"读取既有章节后完成第08章。","input":{"project_title":{"$param":"project_title"},"premise":{"$param":"premise"},"chapter_number":8,"summary_path":"summaries/08.md","body_path":"chapters/08.md","review_path":"reviews/08.md","chapter_target_characters":{"$param":"chapter_target_characters"},"chapter_max_characters":{"$param":"chapter_max_characters"},"is_final_chapter":false},"readiness":{"decision":"dispatch","scope":["第08章"],"non_scope":[],"deliverables":["summaries/08.md","chapters/08.md","reviews/08.md"],"acceptance_criteria":["依赖前章done","Reviewer接受"],"dependencies_checked":true,"risks":[],"reason_summary":"依赖满足后自动调度。"}},
+      {"proposed_task_ref":"chapter_09","title":"第09章","brief":"读取既有章节后完成第09章。","input":{"project_title":{"$param":"project_title"},"premise":{"$param":"premise"},"chapter_number":9,"summary_path":"summaries/09.md","body_path":"chapters/09.md","review_path":"reviews/09.md","chapter_target_characters":{"$param":"chapter_target_characters"},"chapter_max_characters":{"$param":"chapter_max_characters"},"is_final_chapter":false},"readiness":{"decision":"dispatch","scope":["第09章"],"non_scope":[],"deliverables":["summaries/09.md","chapters/09.md","reviews/09.md"],"acceptance_criteria":["依赖前章done","Reviewer接受"],"dependencies_checked":true,"risks":[],"reason_summary":"依赖满足后自动调度。"}},
+      {"proposed_task_ref":"chapter_10","title":"第10章与最终验收","brief":"完成第10章、索引和全书验收。","input":{"project_title":{"$param":"project_title"},"premise":{"$param":"premise"},"chapter_number":10,"summary_path":"summaries/10.md","body_path":"chapters/10.md","review_path":"reviews/10.md","chapter_target_characters":{"$param":"chapter_target_characters"},"chapter_max_characters":{"$param":"chapter_max_characters"},"is_final_chapter":true},"readiness":{"decision":"dispatch","scope":["第10章和全书验收"],"non_scope":[],"deliverables":["summaries/10.md","chapters/10.md","reviews/10.md","INDEX.md","FINAL_ACCEPTANCE.md"],"acceptance_criteria":["依赖前章done","Reviewer接受","恰好十章十提要","索引和验收完整"],"dependencies_checked":true,"risks":[],"reason_summary":"依赖满足后自动调度并最终验收。"}}
+    ]
+  }
+}

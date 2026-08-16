@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from typing import Any
 
 from app.core.config import settings
+from app.core.debug_trace import trace_json
 from app.services.anthropic_client import AnthropicClient
 from app.services.ollama_client import OllamaClient
 from app.services.openai_client import OpenAIClient
@@ -14,12 +16,11 @@ from app.services.provider_errors import LLMProviderError
 from app.services.usage import record_llm_usage
 
 _log = logging.getLogger("devwerk.llm_factory")
+_trace_log = logging.getLogger("devwerk.llm.trace")
 
 
-def get_llm_client(agent: str = "project", timeout_seconds: float | None = None) -> "UsageTrackedClient":
+def get_llm_client(agent: str = "project") -> "UsageTrackedClient":
     cfg = dict(settings().get_llm_config(agent))
-    if timeout_seconds is not None:
-        cfg["timeout"] = min(float(cfg.get("timeout") or timeout_seconds), max(1.0, float(timeout_seconds)))
     protocol = str(cfg.get("protocol") or "").lower()
 
     if protocol == "openai":
@@ -47,13 +48,34 @@ class UsageTrackedClient:
         return getattr(self._client, name)
 
     def _tracked_call(self, method_name: str, *args, project_id=None, task_id=None, **kwargs):
+        trace_id = f"llm_{uuid.uuid4().hex}"
         started = time.monotonic()
-        success = False
-        error_type: str | None = None
+        trace_json(
+            _trace_log,
+            "llm.agent_input",
+            trace_id=trace_id,
+            project_id=project_id,
+            task_id=task_id,
+            agent=str(self._config.get("agent") or "project"),
+            provider=str(self._config.get("protocol") or self._config.get("api_name") or "unknown"),
+            model=str(self._config.get("model") or "unknown"),
+            method=method_name,
+            args=args,
+            kwargs=kwargs,
+        )
         try:
-            result = getattr(self._client, method_name)(*args, **kwargs)
-            success = True
-            return result
+            result = getattr(self._client, method_name)(*args, trace_id=trace_id, **kwargs)
+            trace_json(
+                _trace_log,
+                "llm.agent_output",
+                trace_id=trace_id,
+                project_id=project_id,
+                task_id=task_id,
+                agent=str(self._config.get("agent") or "project"),
+                provider=str(self._config.get("protocol") or self._config.get("api_name") or "unknown"),
+                model=str(self._config.get("model") or "unknown"),
+                output=result,
+            )
         except Exception as exc:  # noqa: BLE001
             if isinstance(exc, LLMProviderError):
                 details = exc.details
@@ -65,20 +87,41 @@ class UsageTrackedClient:
                 error_type = ":".join(parts)
             else:
                 error_type = type(exc).__name__
+            trace_json(
+                _trace_log,
+                "llm.agent_error",
+                trace_id=trace_id,
+                project_id=project_id,
+                task_id=task_id,
+                agent=str(self._config.get("agent") or "project"),
+                provider=str(self._config.get("protocol") or self._config.get("api_name") or "unknown"),
+                model=str(self._config.get("model") or "unknown"),
+                error_type=error_type,
+                error=str(exc),
+            )
+            record_llm_usage(
+                agent_name=str(self._config.get("agent") or "project"),
+                provider=str(self._config.get("protocol") or self._config.get("api_name") or "unknown"),
+                model=str(self._config.get("model") or "unknown"),
+                usage=getattr(self._client, "last_usage", None),
+                duration_ms=int((time.monotonic() - started) * 1000),
+                success=False,
+                error_type=error_type,
+                project_id=project_id,
+                task_id=task_id,
+                trace_id=trace_id,
+            )
             raise
-        finally:
-            duration_ms = int((time.monotonic() - started) * 1000)
-            try:
-                record_llm_usage(
-                    agent_name=str(self._config.get("agent") or "project"),
-                    provider=str(self._config.get("protocol") or self._config.get("api_name") or "unknown"),
-                    model=str(self._config.get("model") or "unknown"),
-                    usage=getattr(self._client, "last_usage", None),
-                    duration_ms=duration_ms,
-                    success=success,
-                    error_type=error_type,
-                    project_id=project_id,
-                    task_id=task_id,
-                )
-            except Exception as usage_error:  # noqa: BLE001
-                _log.exception("usage telemetry failed and was ignored: %s", usage_error)
+        record_llm_usage(
+            agent_name=str(self._config.get("agent") or "project"),
+            provider=str(self._config.get("protocol") or self._config.get("api_name") or "unknown"),
+            model=str(self._config.get("model") or "unknown"),
+            usage=getattr(self._client, "last_usage", None),
+            duration_ms=int((time.monotonic() - started) * 1000),
+            success=True,
+            error_type=None,
+            project_id=project_id,
+            task_id=task_id,
+            trace_id=trace_id,
+        )
+        return result

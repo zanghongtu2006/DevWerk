@@ -32,8 +32,8 @@ export function relativeTime(value) {
 export function statusTone(status) {
   if (["done", "succeeded"].includes(status)) return "success";
   if (["failed", "interrupted"].includes(status)) return "danger";
-  if (["running", "recovering"].includes(status)) return "active";
-  if (status === "waiting") return "warning";
+  if (status === "running") return "active";
+  if (["waiting", "recovering"].includes(status)) return "warning";
   return "neutral";
 }
 

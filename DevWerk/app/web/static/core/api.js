@@ -39,11 +39,12 @@ export const api = {
 };
 
 export async function loadProjectBundle(projectId) {
-  const [project, conversation, snapshot, events] = await Promise.all([
+  const [project, conversation, conversationStatus, snapshot, events] = await Promise.all([
     api.get(`/projects/${projectId}`),
     api.get(`/projects/${projectId}/conversation?limit=150`),
+    api.get(`/projects/${projectId}/conversation-state`),
     api.get(`/projects/${projectId}/projection`),
-    api.get(`/projects/${projectId}/events?limit=150`),
+    api.get(`/projects/${projectId}/events?limit=500`),
   ]);
   const board = {
     project,
@@ -51,7 +52,7 @@ export async function loadProjectBundle(projectId) {
     tasks: snapshot.projection.tasks,
     version: snapshot.version,
   };
-  return { conversation, board, events };
+  return { conversation, conversationStatus, board, events };
 }
 
 export async function loadTaskDetail(projectId, taskId) {

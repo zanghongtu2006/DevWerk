@@ -7,44 +7,52 @@ from typing import Any
 import requests as http_requests
 
 
-RETRYABLE_HTTP_STATUS = {408, 409, 425, 429, 500, 502, 503, 504, 529}
-
 ANTHROPIC_HTTP_ERROR_CODES = {
-    400: ("LLM_BAD_REQUEST", False),
-    401: ("LLM_AUTHENTICATION_ERROR", False),
-    402: ("LLM_BILLING_ERROR", False),
-    403: ("LLM_PERMISSION_ERROR", False),
-    404: ("LLM_NOT_FOUND", False),
-    413: ("LLM_REQUEST_TOO_LARGE", False),
-    429: ("LLM_RATE_LIMITED", True),
-    500: ("LLM_PROVIDER_ERROR", True),
-    504: ("LLM_TIMEOUT", True),
-    529: ("LLM_OVERLOADED", True),
+    400: "LLM_BAD_REQUEST",
+    401: "LLM_AUTHENTICATION_ERROR",
+    402: "LLM_BILLING_ERROR",
+    403: "LLM_PERMISSION_ERROR",
+    404: "LLM_NOT_FOUND",
+    413: "LLM_REQUEST_TOO_LARGE",
+    429: "LLM_RATE_LIMITED",
+    500: "LLM_PROVIDER_ERROR",
+    504: "LLM_TIMEOUT",
+    529: "LLM_OVERLOADED",
 }
 
 MINIMAX_ERROR_CODES = {
-    1000: ("LLM_PROVIDER_ERROR", True, "unknown error"),
-    1001: ("LLM_TIMEOUT", True, "request timeout"),
-    1002: ("LLM_RATE_LIMITED", True, "rate limit"),
-    1004: ("LLM_AUTHENTICATION_ERROR", False, "not authorized or token mismatch"),
-    1008: ("LLM_BILLING_ERROR", False, "insufficient balance"),
-    1024: ("LLM_PROVIDER_ERROR", True, "internal error"),
-    1026: ("LLM_INPUT_REJECTED", False, "sensitive input"),
-    1027: ("LLM_OUTPUT_REJECTED", False, "sensitive output"),
-    1033: ("LLM_PROVIDER_ERROR", True, "system error"),
-    1039: ("LLM_TOKEN_LIMIT", False, "token limit"),
-    1041: ("LLM_CONCURRENCY_LIMIT", True, "connection limit"),
-    1042: ("LLM_BAD_REQUEST", False, "invisible or illegal characters"),
-    2013: ("LLM_BAD_REQUEST", False, "invalid parameters"),
-    20132: ("LLM_BAD_REQUEST", False, "invalid sample or voice id"),
-    2037: ("LLM_BAD_REQUEST", False, "voice duration invalid"),
-    2039: ("LLM_BAD_REQUEST", False, "duplicate voice id"),
-    2042: ("LLM_PERMISSION_ERROR", False, "voice id permission denied"),
-    2045: ("LLM_RATE_LIMITED", True, "rate growth limit"),
-    2048: ("LLM_BAD_REQUEST", False, "prompt audio too long"),
-    2049: ("LLM_AUTHENTICATION_ERROR", False, "invalid API key"),
-    2056: ("LLM_RATE_LIMITED", True, "usage limit exceeded"),
+    1000: ("LLM_PROVIDER_ERROR", "unknown error"),
+    1001: ("LLM_TIMEOUT", "request timeout"),
+    1002: ("LLM_RATE_LIMITED", "rate limit"),
+    1004: ("LLM_AUTHENTICATION_ERROR", "not authorized or token mismatch"),
+    1008: ("LLM_BILLING_ERROR", "insufficient balance"),
+    1024: ("LLM_PROVIDER_ERROR", "internal error"),
+    1026: ("LLM_INPUT_REJECTED", "sensitive input"),
+    1027: ("LLM_OUTPUT_REJECTED", "sensitive output"),
+    1033: ("LLM_PROVIDER_ERROR", "system error"),
+    1039: ("LLM_TOKEN_LIMIT", "token limit"),
+    1041: ("LLM_CONCURRENCY_LIMIT", "connection limit"),
+    1042: ("LLM_BAD_REQUEST", "invisible or illegal characters"),
+    2013: ("LLM_BAD_REQUEST", "invalid parameters"),
+    20132: ("LLM_BAD_REQUEST", "invalid sample or voice id"),
+    2037: ("LLM_BAD_REQUEST", "voice duration invalid"),
+    2039: ("LLM_BAD_REQUEST", "duplicate voice id"),
+    2042: ("LLM_PERMISSION_ERROR", "voice id permission denied"),
+    2045: ("LLM_RATE_LIMITED", "rate growth limit"),
+    2048: ("LLM_BAD_REQUEST", "prompt audio too long"),
+    2049: ("LLM_AUTHENTICATION_ERROR", "invalid API key"),
+    2056: ("LLM_USAGE_LIMIT", "usage limit exceeded"),
 }
+
+RECOVERABLE_LLM_ERROR_CODES = frozenset(
+    {
+        "LLM_TIMEOUT",
+        "LLM_RATE_LIMITED",
+        "LLM_OVERLOADED",
+        "LLM_PROVIDER_ERROR",
+        "LLM_CONCURRENCY_LIMIT",
+    }
+)
 
 
 @dataclass
@@ -54,7 +62,6 @@ class ProviderErrorDetails:
     status_code: int | None
     error_code: str
     message: str
-    retryable: bool
     provider_code: int | None = None
     provider_error_type: str | None = None
     request_id: str | None = None
@@ -68,7 +75,6 @@ class ProviderErrorDetails:
             "error_code": self.error_code,
             "provider_code": self.provider_code,
             "provider_error_type": self.provider_error_type,
-            "retryable": self.retryable,
             "request_id": self.request_id,
             "message": self.message,
             "body_snippet": self.body_snippet,
@@ -79,10 +85,6 @@ class LLMProviderError(RuntimeError):
     def __init__(self, details: ProviderErrorDetails):
         self.details = details
         super().__init__(details.message)
-
-    @property
-    def retryable(self) -> bool:
-        return self.details.retryable
 
     @property
     def error_code(self) -> str:
@@ -102,6 +104,25 @@ class LLMProviderError(RuntimeError):
             parts.append(self.details.provider_error_type)
         parts.append(self.details.message)
         return ": ".join(parts)
+
+
+def provider_timeout_error(
+    exc: http_requests.Timeout,
+    *,
+    provider: str,
+    api_name: str,
+    timeout_seconds: float,
+) -> LLMProviderError:
+    return LLMProviderError(
+        ProviderErrorDetails(
+            provider=provider,
+            api_name=api_name,
+            status_code=None,
+            error_code="LLM_TIMEOUT",
+            message=f"Provider request exceeded {timeout_seconds:g} seconds: {exc}",
+            provider_error_type="timeout_error",
+        )
+    )
 
 
 def raise_for_provider_response(
@@ -144,8 +165,11 @@ def classify_provider_response(
     provider: str,
     api_name: str,
 ) -> ProviderErrorDetails:
-    body = _response_json(response)
-    body_snippet = _safe_text(response.text, 1000)
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    body_snippet = response.text
     status_code = int(response.status_code)
     request_id = response.headers.get("request-id") or response.headers.get("x-request-id")
     provider_key = f"{provider} {api_name} {getattr(response, 'url', '')}".lower()
@@ -154,7 +178,7 @@ def classify_provider_response(
     provider_message = _extract_message(body) or response.reason or f"HTTP {status_code}"
 
     if "minimax" in provider_key and provider_code in MINIMAX_ERROR_CODES:
-        error_code, retryable, default_message = MINIMAX_ERROR_CODES[int(provider_code)]
+        error_code, default_message = MINIMAX_ERROR_CODES[int(provider_code)]
         message = provider_message if provider_message and provider_message != str(provider_code) else default_message
         return ProviderErrorDetails(
             provider=provider,
@@ -162,23 +186,22 @@ def classify_provider_response(
             status_code=status_code,
             error_code=error_code,
             message=message,
-            retryable=retryable,
             provider_code=int(provider_code),
             provider_error_type=provider_error_type,
             request_id=request_id,
             body_snippet=body_snippet,
         )
 
-    error_code, retryable = ANTHROPIC_HTTP_ERROR_CODES.get(
+    error_code = ANTHROPIC_HTTP_ERROR_CODES.get(
         status_code,
-        ("LLM_PROVIDER_ERROR" if status_code >= 500 else "LLM_BAD_REQUEST", status_code in RETRYABLE_HTTP_STATUS),
+        "LLM_PROVIDER_ERROR" if status_code >= 500 else "LLM_BAD_REQUEST",
     )
     if provider_error_type == "overloaded_error":
-        error_code, retryable = "LLM_OVERLOADED", True
+        error_code = "LLM_OVERLOADED"
     elif provider_error_type == "rate_limit_error":
-        error_code, retryable = "LLM_RATE_LIMITED", True
+        error_code = "LLM_RATE_LIMITED"
     elif provider_error_type == "timeout_error":
-        error_code, retryable = "LLM_TIMEOUT", True
+        error_code = "LLM_TIMEOUT"
 
     return ProviderErrorDetails(
         provider=provider,
@@ -186,7 +209,6 @@ def classify_provider_response(
         status_code=status_code,
         error_code=error_code,
         message=provider_message,
-        retryable=retryable,
         provider_code=provider_code,
         provider_error_type=provider_error_type,
         request_id=request_id,
@@ -206,10 +228,10 @@ def classify_provider_payload(
     provider_code = _extract_provider_code(payload)
     provider_error_type = _extract_error_type(payload)
     provider_message = _extract_message(payload) or (str(provider_code) if provider_code is not None else "provider error")
-    body_snippet = _safe_text(json.dumps(payload, ensure_ascii=False, default=str), 1000)
+    body_snippet = json.dumps(payload, ensure_ascii=False, default=str)
 
     if "minimax" in provider_key and provider_code in MINIMAX_ERROR_CODES:
-        error_code, retryable, default_message = MINIMAX_ERROR_CODES[int(provider_code)]
+        error_code, default_message = MINIMAX_ERROR_CODES[int(provider_code)]
         message = provider_message if provider_message and provider_message != str(provider_code) else default_message
         return ProviderErrorDetails(
             provider=provider,
@@ -217,47 +239,33 @@ def classify_provider_payload(
             status_code=status_code,
             error_code=error_code,
             message=message,
-            retryable=retryable,
             provider_code=int(provider_code),
             provider_error_type=provider_error_type,
             request_id=request_id,
             body_snippet=body_snippet,
         )
 
-    retryable = (status_code in RETRYABLE_HTTP_STATUS) if status_code is not None else False
+    error_code = {
+        "overloaded_error": "LLM_OVERLOADED",
+        "rate_limit_error": "LLM_RATE_LIMITED",
+        "timeout_error": "LLM_TIMEOUT",
+        "authentication_error": "LLM_AUTHENTICATION_ERROR",
+        "permission_error": "LLM_PERMISSION_ERROR",
+    }.get(
+        provider_error_type,
+        "LLM_PROVIDER_ERROR" if status_code is not None and status_code >= 500 else "LLM_BAD_REQUEST",
+    )
     return ProviderErrorDetails(
         provider=provider,
         api_name=api_name,
         status_code=status_code,
-        error_code="LLM_PROVIDER_ERROR" if retryable else "LLM_BAD_REQUEST",
+        error_code=error_code,
         message=provider_message,
-        retryable=retryable,
         provider_code=provider_code,
         provider_error_type=provider_error_type,
         request_id=request_id,
         body_snippet=body_snippet,
     )
-
-
-def is_retryable_llm_error(exc: BaseException) -> bool:
-    if isinstance(exc, LLMProviderError):
-        return exc.retryable
-    name = type(exc).__name__.lower()
-    text = str(exc).lower()
-    # Connection / transport errors are transient — retry them.
-    if any(token in name for token in (
-        "timeout", "readtimeout", "connection", "connect",
-        "ssl", "tlserror", "certificate", "reset",
-    )):
-        return True
-    if any(token in text for token in (
-        "timeout", "timed out", "connection reset",
-        "eof occurred", "ssl", "tls",
-        "connection refused", "connection aborted",
-        "broken pipe", "reset by peer",
-    )):
-        return True
-    return False
 
 
 def llm_error_code(exc: BaseException, default: str = "MODEL_ERROR") -> str:
@@ -278,11 +286,12 @@ def llm_error_log_payload(exc: BaseException) -> dict[str, Any]:
     return {"error_type": type(exc).__name__, "message": str(exc)}
 
 
-def _response_json(response: http_requests.Response) -> Any:
-    try:
-        return response.json()
-    except (ValueError, json.JSONDecodeError):
-        return None
+def is_recoverable_llm_error(exc: BaseException) -> bool:
+    return isinstance(exc, LLMProviderError) and exc.error_code in RECOVERABLE_LLM_ERROR_CODES
+
+
+def is_recoverable_llm_error_code(error_code: str | None) -> bool:
+    return bool(error_code and error_code in RECOVERABLE_LLM_ERROR_CODES)
 
 
 def _extract_provider_code(value: Any) -> int | None:

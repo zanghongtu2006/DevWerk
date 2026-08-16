@@ -5,7 +5,7 @@ import time
 from fastapi.testclient import TestClient
 
 from app.v1.domain import AgentModelResponse
-from tests.helpers import sequence_workflow, readiness
+from tests.helpers import orchestration_plan, sequence_workflow, readiness
 
 
 def client() -> TestClient:
@@ -21,6 +21,7 @@ def test_web_routes_and_modular_assets_are_served():
             response = web.get(route)
             assert response.status_code == 200
             assert 'type="module"' in response.text
+            assert "no-store" in response.headers["cache-control"]
         for asset in (
             "/web/static/dashboard.js",
             "/web/static/core/api.js",
@@ -30,10 +31,60 @@ def test_web_routes_and_modular_assets_are_served():
             "/web/static/pages/tasks.js",
             "/web/static/pages/events.js",
         ):
-            assert web.get(asset).status_code == 200
+            response = web.get(asset)
+            assert response.status_code == 200
+            assert "no-store" in response.headers["cache-control"]
+        dashboard = web.get("/web/static/dashboard.js").text
+        assert "mergeConversationMessages" in dashboard
+        assert "after_id=" in dashboard
+        assert "before_id=" in dashboard
+        assert "refreshConversationStatus" in dashboard
+        assert "conversationProgressFromEvents" not in dashboard
+        assert "appendConversationProgress" not in dashboard
+        assert 'projects.js?v=20260804-debug1' in dashboard
+        projects = web.get("/web/static/pages/projects.js").text
+        assert 'components.js?v=20260804-debug1' in projects
+        assert "visibleConversationMessages" in projects
+        assert 'message.meta?.status === "failed"' not in projects
+        assert "conversationStatusStrip" in projects
+        assert "data-message-id" in projects
+        assert "加载更早消息" in projects
+        assert "工具结果" not in projects
+        assert "模型输出" not in projects
+        assert "Conversation 已失败" not in projects
+        assert "conversation-trace" not in projects
+        core_api = web.get("/web/static/core/api.js").text
+        assert "events?limit=500" in core_api
+        assert "conversation-state" in core_api
+        components = web.get("/web/static/ui/components.js").text
+        assert "data.content" in components
+        kanban = web.get("/web/static/pages/kanban.js").text
+        assert "Column 目的" in kanban
+        assert "Task 输入" in kanban
+        assert "上游结果" in kanban
+        assert "派生临时 Agent" in kanban
+        assert "查看原始 Runtime JSON" in kanban
+        assert "column.instruction" in kanban
+        tasks = web.get("/web/static/pages/tasks.js").text
+        assert "FAILURE REASON" in tasks
+        assert "失败阶段" in tasks
+        assert "查看原始 Runtime 错误" in tasks
+        assert "task.error" in tasks
 
 
-def test_declarative_api_workflow_reaches_done_without_llm(tmp_path):
+def test_declarative_api_workflow_reaches_done_without_llm(tmp_path, monkeypatch):
+    model_turn = 0
+
+    def conversation_model(_messages, _tools, **_kwargs):
+        nonlocal model_turn
+        model_turn += 1
+        if model_turn == 1:
+            return AgentModelResponse(tool_calls=[
+                {"id": "inspect", "name": "project.inspect", "arguments": {}}
+            ])
+        return AgentModelResponse(text="The deterministic Task reached its terminal state.")
+
+    monkeypatch.setattr("app.v1.agent.provider_complete", conversation_model)
     with client() as web:
         project = web.post(
             "/v1/projects",
@@ -44,12 +95,14 @@ def test_declarative_api_workflow_reaches_done_without_llm(tmp_path):
         catalog = {item["id"]: item for item in catalog_response.json()}
         assert "project.files.write" in catalog
         assert "task.create" not in catalog
-        workflow = sequence_workflow(content="api done").model_dump(mode="json")
-        published = web.post(f"/v1/projects/{project['id']}/automation/workflow", json={"workflow": workflow})
+        definition = sequence_workflow(content="api done")
+        plan = web.post(f"/v1/projects/{project['id']}/automation/orchestration-plans", json={"plan": orchestration_plan(definition).model_dump(mode="json")}).json()
+        workflow = definition.model_dump(mode="json")
+        published = web.post(f"/v1/projects/{project['id']}/automation/workflow", json={"orchestration_plan_id": plan["id"], "workflow": workflow})
         assert published.status_code == 201
         task = web.post(
             f"/v1/projects/{project['id']}/automation/tasks",
-            json={"title": "deterministic", "brief": "", "input": {}, "readiness": readiness()},
+            json={"orchestration_plan_id": plan["id"], "proposed_task_ref": "primary", "title": "deterministic", "brief": "", "input": {}, "readiness": readiness()},
         ).json()
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
@@ -70,14 +123,18 @@ def test_api_rejects_unknown_declared_capability(tmp_path):
             "/v1/projects",
             json={"name": "invalid", "description": "", "base_dir": str(tmp_path / "project")},
         ).json()
-        workflow = sequence_workflow().model_dump(mode="json")
+        definition = sequence_workflow()
+        plan = web.post(f"/v1/projects/{project['id']}/automation/orchestration-plans", json={"plan": orchestration_plan(definition).model_dump(mode="json")}).json()
+        workflow = definition.model_dump(mode="json")
         workflow["columns"][0]["executor"]["steps"][0]["capability"] = "not.registered"
-        response = web.post(f"/v1/projects/{project['id']}/automation/workflow", json={"workflow": workflow})
+        response = web.post(f"/v1/projects/{project['id']}/automation/workflow", json={"orchestration_plan_id": plan["id"], "workflow": workflow})
         assert response.status_code == 422
         assert "unknown or non-delegable capabilities" in response.json()["detail"]
 
 
 def test_conversation_and_agent_audit_endpoints(tmp_path, monkeypatch):
+    traces = []
+    monkeypatch.setattr("app.v1.api.trace_json", lambda _logger, event, **payload: traces.append((event, payload)))
     monkeypatch.setattr("app.v1.agent.provider_complete", lambda *_args, **_kwargs: AgentModelResponse(text="I inspected the Project."))
     with client() as web:
         project = web.post(
@@ -103,3 +160,28 @@ def test_conversation_and_agent_audit_endpoints(tmp_path, monkeypatch):
         detail = web.get(f"/v1/projects/{project['id']}/agent-runs/{runs[0]['id']}").json()
         assert detail["kind"] == "conversation"
         assert detail["tool_invocations"] == []
+        events = web.get(f"/v1/projects/{project['id']}/events?limit=150").json()
+        progress_kinds = [item["data"].get("kind") for item in events if item["type"] == "conversation.progress"]
+        assert progress_kinds == ["provider_wait", "model_output"]
+        messages = web.get(f"/v1/projects/{project['id']}/conversation?limit=10").json()
+        assert [item["role"] for item in messages] == ["user", "assistant"]
+        assert [item["meta"]["kind"] for item in messages] == ["message", "reply"]
+        after = web.get(
+            f"/v1/projects/{project['id']}/conversation?limit=10&after_id={messages[0]['id']}"
+        ).json()
+        before = web.get(
+            f"/v1/projects/{project['id']}/conversation?limit=10&before_id={messages[1]['id']}"
+        ).json()
+        assert [item["id"] for item in after] == [messages[1]["id"]]
+        assert [item["id"] for item in before] == [messages[0]["id"]]
+        invalid = web.get(
+            f"/v1/projects/{project['id']}/conversation?after_id={messages[0]['id']}&before_id={messages[1]['id']}"
+        )
+        assert invalid.status_code == 422
+        status = web.get(f"/v1/projects/{project['id']}/conversation-state").json()
+        assert status["job"]["id"] == accepted["job"]["id"]
+        assert status["job"]["status"] == "succeeded"
+        assert status["job"]["has_error"] is False
+        assert ("web.conversation_input", {"project_id": project["id"], "message": "Inspect only.", "start_task": False}) in traces
+        output_trace = next(payload for event, payload in traces if event == "web.conversation_output")
+        assert output_trace["output"]["job"]["id"] == accepted["job"]["id"]

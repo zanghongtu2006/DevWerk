@@ -41,9 +41,9 @@ class ApiProfile:
     base_url: str
     api_key: str | None
     model: str
-    timeout: float
     effort_level: str | None = None
     trust_env_proxy: bool = False
+    request_timeout_seconds: float = 600.0
 
 
 @dataclass(frozen=True)
@@ -64,9 +64,9 @@ class AgentModelConfig:
             "base_url": self.api.base_url,
             "api_key": self.api.api_key,
             "model": self.model,
-            "timeout": self.api.timeout,
             "effort_level": self.api.effort_level,
             "trust_env_proxy": self.api.trust_env_proxy,
+            "request_timeout_seconds": self.api.request_timeout_seconds,
             "thinking_mode": self.thinking_mode,
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -95,8 +95,7 @@ class Settings(BaseSettings):
     log_retention_days: int = Field(default=30)
     uvicorn_access_log: bool = Field(default=True)
 
-    # Persistent workflow supervision. Column-specific retry/wait policies own
-    # execution deadlines; this setting controls only the durable dispatcher.
+    # Persistent workflow supervision controls only the durable dispatcher.
     workflow_supervisor_enabled: bool = Field(default=True)
     workflow_supervisor_interval_seconds: float = Field(default=5.0)
 
@@ -104,59 +103,14 @@ class Settings(BaseSettings):
     devwerk_usage_tracking: bool = Field(default=True)
     devwerk_db_path: str = Field(default="./data/devwerk.db")
 
-    # JSON LLM catalog and routing map. Environment variables provide the
-    # built-in default catalog when no JSON file is configured.
+    # JSON LLM catalog and routing map. It is required and has no built-in fallback.
     devwerk_llm_config_path: str = Field(default="./config/llm.json")
     devwerk_llm_config_json: str | None = Field(default=None)
 
-    # Default agent runtime parameters. Project settings may reference these
-    # profiles but should not expose tokens or provider credentials.
-    devwerk_thinking_mode: str = Field(default="balanced")
-    devwerk_temperature: float = Field(default=0.2)
-    devwerk_top_p: float | None = Field(default=None)
-    devwerk_max_tokens: int = Field(default=4096)
+    # Transport setting; it does not cap the Agent loop. Anthropic requires a numeric value.
     devwerk_trust_env_proxy: bool = Field(default=False)
 
-    # Default provider/profile selector used when routing does not override it.
-    devwerk_default_api: str = Field(default="anthropic")
-    devwerk_default_agent: str = Field(default="conversation")
-
-    # OpenAI-compatible API profile.
-    openai_base_url: str = Field(default="https://api.openai.com/v1")
-    openai_api_key: str | None = Field(default=None)
-    openai_model: str = Field(default="gpt-4o-mini")
-    openai_timeout: float = Field(default=180.0)
-
-    # Anthropic-compatible API profile. Defaults match Claude Code + MiniMax.
-    anthropic_auth_token: str | None = Field(default=None)
-    anthropic_base_url: str = Field(default="https://api.minimaxi.com/anthropic")
-    anthropic_model: str = Field(default="M3")
-    anthropic_default_sonnet_model: str | None = Field(default=None)
-    anthropic_default_haiku_model: str | None = Field(default=None)
-    anthropic_default_opus_model: str | None = Field(default=None)
-    claude_code_subagent_model: str | None = Field(default=None)
-    claude_code_effort_level: str = Field(default="max")
-    disable_autoupdater: str | None = Field(default="1")
-    anthropic_timeout: float = Field(default=180.0)
-
-    # Ollama remains useful for local development.
-    ollama_base_url: str = Field(default="http://127.0.0.1:11434")
-    ollama_model: str = Field(default="deepseek-r1:32b")
-    ollama_timeout: float = Field(default=180.0)
-
-    # Backward-compatible selector. If set, it becomes the default API profile.
-    llm_provider: str | None = Field(default=None)
-
     @field_validator(
-        "openai_api_key",
-        "anthropic_auth_token",
-        "anthropic_default_sonnet_model",
-        "anthropic_default_haiku_model",
-        "anthropic_default_opus_model",
-        "claude_code_subagent_model",
-        "disable_autoupdater",
-        "llm_provider",
-        "devwerk_top_p",
         "devwerk_llm_config_path",
         "devwerk_llm_config_json",
         mode="before",
@@ -168,11 +122,6 @@ class Settings(BaseSettings):
         text = str(value).strip()
         return text or None
 
-    @field_validator("openai_base_url", "anthropic_base_url", "ollama_base_url", mode="after")
-    @classmethod
-    def _strip_trailing_slash(cls, value: str) -> str:
-        return value.rstrip("/")
-
     @property
     def is_production(self) -> bool:
         return self.app_env.lower() == "production"
@@ -181,110 +130,25 @@ class Settings(BaseSettings):
     def is_development(self) -> bool:
         return self.app_env.lower() in {"dev", "development", "local"}
 
-    @property
-    def active_provider(self) -> str:
-        return (self.llm_provider or self.devwerk_default_api or "anthropic").strip().lower()
-
-    @property
-    def llm_provider_name(self) -> str:
-        return self.active_provider
-
     def llm_config(self) -> dict[str, Any]:
         path = _resolve_config_path(self.devwerk_llm_config_path)
         if path.is_file():
             try:
                 value = json.loads(path.read_text(encoding="utf-8"))
                 if isinstance(value, dict):
-                    return _normalize_llm_config(value, self._default_llm_config())
+                    return _normalize_llm_config(value)
             except Exception as exc:  # noqa: BLE001
                 raise ValueError(f"LLM config file {path} is not valid JSON: {exc}") from exc
         if self.devwerk_llm_config_json:
             try:
                 value = json.loads(self.devwerk_llm_config_json)
                 if isinstance(value, dict):
-                    return _normalize_llm_config(value, self._default_llm_config())
+                    return _normalize_llm_config(value)
             except Exception as exc:  # noqa: BLE001
                 raise ValueError(f"DEVWERK_LLM_CONFIG_JSON is not valid JSON: {exc}") from exc
-        return self._default_llm_config()
-
-    def _default_llm_config(self) -> dict[str, Any]:
-        anthropic_model = (
-            self.claude_code_subagent_model
-            or self.anthropic_model
-            or self.anthropic_default_sonnet_model
-            or "M3"
+        raise ValueError(
+            f"LLM configuration is required: create {path} or set DEVWERK_LLM_CONFIG_JSON"
         )
-        return {
-            "routing": {
-                "default": "minimax/m3",
-                "architecture": "minimax/m3",
-                "product": "deepseek/deepseek-chat",
-                "design": "deepseek/deepseek-chat",
-                "compression": "ollama/deepseek-r1:32b",
-            },
-            "llms": {
-                "minimax": {
-                    "api": "anthropic",
-                    "base_url": self.anthropic_base_url,
-                    "api_key": self.anthropic_auth_token or "",
-                    "timeout": self.anthropic_timeout,
-                    "trust_env_proxy": self.devwerk_trust_env_proxy,
-                    "models": {
-                        "m3": {
-                            "model": anthropic_model,
-                            "temperature": self.devwerk_temperature,
-                            "top_p": self.devwerk_top_p,
-                            "max_tokens": self.devwerk_max_tokens,
-                            "thinking_mode": self.devwerk_thinking_mode,
-                            "effort_level": self.claude_code_effort_level,
-                        }
-                    },
-                },
-                "deepseek": {
-                    "api": "openai",
-                    "base_url": "https://api.deepseek.com/v1",
-                    "api_key": "",
-                    "timeout": self.openai_timeout,
-                    "trust_env_proxy": self.devwerk_trust_env_proxy,
-                    "models": {
-                        "deepseek-chat": {
-                            "temperature": 0.2,
-                            "max_tokens": self.devwerk_max_tokens,
-                            "thinking_mode": "balanced",
-                        }
-                    },
-                },
-                "openai": {
-                    "api": "openai",
-                    "base_url": self.openai_base_url,
-                    "api_key": self.openai_api_key or "",
-                    "timeout": self.openai_timeout,
-                    "trust_env_proxy": self.devwerk_trust_env_proxy,
-                    "models": {
-                        self.openai_model: {
-                            "temperature": self.devwerk_temperature,
-                            "top_p": self.devwerk_top_p,
-                            "max_tokens": self.devwerk_max_tokens,
-                            "thinking_mode": self.devwerk_thinking_mode,
-                        }
-                    },
-                },
-                "ollama": {
-                    "api": "ollama",
-                    "base_url": self.ollama_base_url,
-                    "api_key": "",
-                    "timeout": self.ollama_timeout,
-                    "trust_env_proxy": self.devwerk_trust_env_proxy,
-                    "models": {
-                        self.ollama_model: {
-                            "temperature": 0.4,
-                            "max_tokens": self.devwerk_max_tokens,
-                            "thinking_mode": "local",
-                        }
-                    },
-                },
-            },
-        }
 
     def api_profiles(self) -> dict[str, ApiProfile]:
         llm_config = self.llm_config()
@@ -297,71 +161,33 @@ class Settings(BaseSettings):
                 continue
             first_model_id = next(iter(models))
             model_settings = models.get(first_model_id) or {}
-            protocol = str(provider.get("api") or provider.get("protocol") or "openai").lower()
+            protocol = str(provider.get("api") or provider.get("protocol") or "").lower()
             if protocol not in {"openai", "anthropic", "ollama"}:
-                protocol = "openai"
+                raise ValueError(f"LLM provider {name!r} must declare api as openai, anthropic, or ollama")
             profiles[str(name).lower()] = ApiProfile(
                 name=str(name).lower(),
                 protocol=protocol,  # type: ignore[arg-type]
                 base_url=str(provider.get("base_url") or provider.get("url") or "").rstrip("/"),
                 api_key=_none_if_empty(provider.get("api_key") or provider.get("key")),
                 model=str(model_settings.get("model") or first_model_id),
-                timeout=float(provider.get("timeout") or 180.0),
                 effort_level=_none_if_empty(model_settings.get("effort_level") or provider.get("effort_level")),
                 trust_env_proxy=bool(provider.get("trust_env_proxy", self.devwerk_trust_env_proxy)),
+                request_timeout_seconds=float(provider.get("request_timeout_seconds", 600.0)),
             )
-        if profiles:
-            return profiles
-
-        anthropic_model = (
-            self.claude_code_subagent_model
-            or self.anthropic_model
-            or self.anthropic_default_sonnet_model
-            or "M3"
-        )
-        return {
-            "openai": ApiProfile(
-                name="openai",
-                protocol="openai",
-                base_url=self.openai_base_url,
-                api_key=self.openai_api_key,
-                model=self.openai_model,
-                timeout=self.openai_timeout,
-                trust_env_proxy=self.devwerk_trust_env_proxy,
-            ),
-            "anthropic": ApiProfile(
-                name="anthropic",
-                protocol="anthropic",
-                base_url=self.anthropic_base_url,
-                api_key=self.anthropic_auth_token,
-                model=anthropic_model,
-                timeout=self.anthropic_timeout,
-                effort_level=self.claude_code_effort_level,
-                trust_env_proxy=self.devwerk_trust_env_proxy,
-            ),
-            "ollama": ApiProfile(
-                name="ollama",
-                protocol="ollama",
-                base_url=self.ollama_base_url,
-                api_key=None,
-                model=self.ollama_model,
-                timeout=self.ollama_timeout,
-                trust_env_proxy=self.devwerk_trust_env_proxy,
-            ),
-        }
+        return profiles
 
     def agent_config(self, agent: str | None = None) -> AgentModelConfig:
-        agent_name = (agent or self.devwerk_default_agent or "conversation").strip().lower()
+        agent_name = (agent or "conversation").strip().lower()
         llm_config = self.llm_config()
         profile, model_key, model_settings = self._resolve_llm_ref(agent_name, llm_config)
         return AgentModelConfig(
             agent=agent_name,
             api=profile,
             model=str(model_settings.get("model") or model_key),
-            thinking_mode=str(model_settings.get("thinking_mode") or self.devwerk_thinking_mode or "balanced").strip().lower(),
-            temperature=float(model_settings.get("temperature", self.devwerk_temperature)),
-            top_p=model_settings.get("top_p", self.devwerk_top_p),
-            max_tokens=max(1, int(model_settings.get("max_tokens", self.devwerk_max_tokens))),
+            thinking_mode=str(model_settings["thinking_mode"]).strip().lower(),
+            temperature=float(model_settings["temperature"]),
+            top_p=model_settings.get("top_p"),
+            max_tokens=int(model_settings["max_tokens"]),
         )
 
     def _resolve_llm_ref(self, agent: str, llm_config: dict[str, Any]) -> tuple[ApiProfile, str, dict[str, Any]]:
@@ -376,12 +202,7 @@ class Settings(BaseSettings):
         if isinstance(model_ref, dict):
             model_ref = model_ref.get("primary") or model_ref.get("model")
         if not model_ref:
-            profile_name = self._agent_profile_name(agent)
-            profiles = self.api_profiles()
-            profile = profiles.get(profile_name)
-            if profile is None:
-                raise ValueError(f"Unknown API profile {profile_name!r} for agent {agent!r}.")
-            return profile, profile.model, {}
+            raise ValueError(f"No LLM route configured for agent {agent!r}")
 
         provider_name, model_key = _split_model_ref(str(model_ref))
         providers = llm_config.get("llms") or {}
@@ -394,23 +215,28 @@ class Settings(BaseSettings):
         model_settings = models.get(model_key) or {"model": model_key}
         if not isinstance(model_settings, dict):
             model_settings = {"model": model_key}
-        protocol = str(provider.get("api") or provider.get("protocol") or "openai").lower()
+        missing_settings = sorted(
+            key for key in ("temperature", "thinking_mode", "max_tokens")
+            if key not in model_settings
+        )
+        if missing_settings:
+            raise ValueError(
+                f"LLM model {model_ref!r} must explicitly configure: {', '.join(missing_settings)}"
+            )
+        protocol = str(provider.get("api") or provider.get("protocol") or "").lower()
         if protocol not in {"openai", "anthropic", "ollama"}:
-            protocol = "openai"
+            raise ValueError(f"LLM provider {provider_name!r} must declare api as openai, anthropic, or ollama")
         profile = ApiProfile(
             name=provider_name,
             protocol=protocol,  # type: ignore[arg-type]
             base_url=str(provider.get("base_url") or provider.get("url") or "").rstrip("/"),
             api_key=_none_if_empty(provider.get("api_key") or provider.get("key")),
             model=str(model_settings.get("model") or model_key),
-            timeout=float(provider.get("timeout") or 180.0),
             effort_level=_none_if_empty(model_settings.get("effort_level") or provider.get("effort_level")),
             trust_env_proxy=bool(provider.get("trust_env_proxy", self.devwerk_trust_env_proxy)),
+            request_timeout_seconds=float(provider.get("request_timeout_seconds", 600.0)),
         )
         return profile, model_key, model_settings
-
-    def _agent_profile_name(self, agent: str) -> str:
-        return self.active_provider
 
     def get_llm_config(self, agent: str | None = None) -> dict:
         return self.agent_config(agent).as_client_config()
@@ -423,7 +249,7 @@ class Settings(BaseSettings):
             )
 
 
-def _normalize_llm_config(value: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+def _normalize_llm_config(value: dict[str, Any]) -> dict[str, Any]:
     out = {
         "routing": value.get("routing") if isinstance(value.get("routing"), dict) else {},
         "llms": {},
@@ -434,7 +260,7 @@ def _normalize_llm_config(value: dict[str, Any], fallback: dict[str, Any]) -> di
             if not isinstance(raw, dict):
                 continue
             provider = dict(raw)
-            provider["api"] = str(provider.get("api") or provider.get("protocol") or "openai").lower()
+            provider["api"] = str(provider.get("api") or provider.get("protocol") or "").lower()
             provider["base_url"] = str(provider.get("base_url") or provider.get("url") or "").rstrip("/")
             if "api_key" not in provider and "key" in provider:
                 provider["api_key"] = provider.get("key")
@@ -447,7 +273,7 @@ def _normalize_llm_config(value: dict[str, Any], fallback: dict[str, Any]) -> di
                 provider["models"] = {}
             out["llms"][str(name).lower()] = provider
     if not out["llms"]:
-        out["llms"] = fallback.get("llms", {})
+        raise ValueError("llm.json must define at least one provider in llms")
     _validate_llm_default_route(out)
     return out
 

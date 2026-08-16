@@ -3,24 +3,33 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import requests as http_requests
+
+from app.core.debug_trace import trace_json
+from app.services.provider_errors import provider_timeout_error
+
+
+_trace_log = logging.getLogger("devwerk.llm.provider.ollama")
 
 
 class OllamaClient:
     def __init__(self, config: dict[str, Any]):
         self.last_usage: dict[str, Any] | None = None
-        self.base_url = str(config.get("base_url") or "http://127.0.0.1:11434").rstrip("/")
-        self.model = str(config.get("model") or "deepseek-r1:32b")
-        self.timeout = float(config.get("timeout") or 180)
-        self.temperature = float(config.get("temperature") or 0.4)
+        self.base_url = str(config["base_url"]).rstrip("/")
+        self.model = str(config["model"])
+        self.temperature = float(config["temperature"])
         self.top_p = config.get("top_p")
+        self.request_timeout_seconds = float(config.get("request_timeout_seconds", 600.0))
+        if self.request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be positive")
         self.url = f"{self.base_url}/api/chat"
         self.session = http_requests.Session()
         self.session.trust_env = bool(config.get("trust_env_proxy", False))
 
-    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, *, trace_id: str | None = None, require_tool: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
             "stream": False,
@@ -31,7 +40,38 @@ class OllamaClient:
             payload["options"]["top_p"] = float(self.top_p)
         if tools:
             payload["tools"] = tools
-        response = self.session.post(self.url, json=payload, timeout=self.timeout)
+        trace_json(
+            _trace_log,
+            "llm.provider_request",
+            trace_id=trace_id,
+            provider="ollama",
+            model=self.model,
+            url=self.url,
+            payload=payload,
+        )
+        try:
+            response = self.session.post(
+                self.url,
+                json=payload,
+                timeout=self.request_timeout_seconds,
+            )
+        except http_requests.Timeout as exc:
+            raise provider_timeout_error(
+                exc,
+                provider="ollama",
+                api_name="ollama",
+                timeout_seconds=self.request_timeout_seconds,
+            ) from exc
+        trace_json(
+            _trace_log,
+            "llm.provider_response",
+            trace_id=trace_id,
+            provider="ollama",
+            model=self.model,
+            status_code=response.status_code,
+            response_headers=dict(response.headers),
+            body=response.text,
+        )
         response.raise_for_status()
         data = response.json()
         self.last_usage = _usage(data)

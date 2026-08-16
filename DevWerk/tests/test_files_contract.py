@@ -30,3 +30,59 @@ def test_context_file_reads_are_bounded_and_skip_build_directories(tmp_path):
     selected = files.existing_texts("**/*.md", max_total_chars=20)
     assert {item["path"] for item in selected} == {"a.md", "nested/b.md"}
     assert sum(len(item["content"]) for item in selected) <= 20
+
+
+def test_project_files_verify_text_reports_exact_mismatch_and_match(tmp_path):
+    files = ProjectFiles(str(tmp_path / "project"))
+    files.write_text("proof.txt", "DEVWERK_CASE_A_OK")
+
+    mismatch = files.verify_text(
+        "proof.txt",
+        {
+            "expected_content": "DEVWERK_CASE_A_OK\n",
+            "expected_ends_with_newline": True,
+            "expected_line_count": 1,
+        },
+    )
+
+    assert mismatch["outcome"] == "mismatch"
+    assert not mismatch["matched"]
+    assert mismatch["mismatches"] == [
+        "expected_content",
+        "expected_ends_with_newline",
+    ]
+    assert mismatch["actual"]["utf8_characters"] == 17
+    assert not mismatch["actual"]["ends_with_newline"]
+
+    files.write_text("proof.txt", "DEVWERK_CASE_A_OK\n")
+    matched = files.verify_text(
+        "proof.txt",
+        {
+            "expected_content": "DEVWERK_CASE_A_OK\n",
+            "expected_ends_with_newline": True,
+            "expected_size_bytes": 18,
+            "expected_utf8_characters": 18,
+        },
+    )
+
+    assert matched["outcome"] == "matched"
+    assert matched["matched"]
+    assert matched["mismatches"] == []
+
+
+def test_project_files_verify_text_routes_missing_file_as_mismatch(tmp_path):
+    files = ProjectFiles(str(tmp_path / "project"))
+
+    result = files.verify_text(
+        "not-created-yet.txt",
+        {"expected_content": "READY\n"},
+    )
+
+    assert result["outcome"] == "mismatch"
+    assert result["matched"] is False
+    assert result["checks"] == {"expected_content": False}
+    assert result["mismatches"] == ["expected_content"]
+    assert result["actual"] == {
+        "path": "not-created-yet.txt",
+        "exists": False,
+    }

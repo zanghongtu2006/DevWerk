@@ -8,28 +8,42 @@ Version 1 is not released yet. The repository therefore carries one architecture
 
 The following documents define the product and runtime contract:
 
-- [`DevWerk/docs/generic-conversation-agent-and-declarative-column-runtime.md`](DevWerk/docs/generic-conversation-agent-and-declarative-column-runtime.md) — normative implementation source of truth
+- [`DevWerk/docs/generic-conversation-agent-and-declarative-column-runtime.md`](DevWerk/docs/generic-conversation-agent-and-declarative-column-runtime.md)
 - [`DevWerk/docs/conversation-agent-design-v1.md`](DevWerk/docs/conversation-agent-design-v1.md)
 - [`DevWerk/docs/kanban-workflow-design-v1.md`](DevWerk/docs/kanban-workflow-design-v1.md)
-- [`DevWerk/docs/v1-test-contract.md`](DevWerk/docs/v1-test-contract.md)
+- [`DevWerk/docs/conversation-agent-orchestration-soul-p0-design.md`](DevWerk/docs/conversation-agent-orchestration-soul-p0-design.md)
 
-When code, tests, or secondary documentation conflict with these documents, treat that as a defect. Do not restore an older API or behavior through compatibility patches.
+These four locked documents are equal architecture facts. When code, tests, or secondary documentation conflict with them, treat that as a defect. Do not restore an older API or behavior through compatibility patches.
+
+Implemented V1 runtime extensions are specified by:
+
+- [`DevWerk/docs/workflow-template-runtime-v1.md`](DevWerk/docs/workflow-template-runtime-v1.md)
+- [`DevWerk/docs/kanban-recovering-runtime-v1.md`](DevWerk/docs/kanban-recovering-runtime-v1.md)
+- [`DevWerk/docs/agent-tool-rejection-recovery-v1.md`](DevWerk/docs/agent-tool-rejection-recovery-v1.md)
+- [`DevWerk/docs/v1-test-contract.md`](DevWerk/docs/v1-test-contract.md)
 
 ## Version 1 Boundaries
 
+- V1 pre-release uses full, unredacted local debug tracing for Agent, Provider, Capability, and Runtime inputs and outputs. Functional completion and diagnosis take priority; authentication, approval, privacy controls, redaction, and production log minimization are deferred until after V1.
 - One logical Conversation Agent identity per Project.
+- Every governance Run preloads the versioned `DevWerk/DEVWERK.md` platform policy.
 - Conversation is the user-facing governance mutation surface.
 - Kanban, Task, Run, Event, and Artifact views are read-only to the user.
 - A Project isolates structured facts by `project_id` and files by canonical `base_dir`.
 - One active Workflow per Project, with immutable revisions.
+- A persisted OrchestrationPlan is required before Workflow publication and Task admission.
 - A Task is pinned to the Workflow revision active when it is created.
-- Column Definitions declare execution, contracts, outcomes, transitions, retry limits, and terminal meaning.
+- Column Definitions declare repeatable process stages, context boundaries, execution, contracts, outcomes, transitions, and retry limits.
 - Conversation Agent and ephemeral Column Agents share one general-purpose AgentCore and Capability Registry.
-- Conversation-created Workflow revisions are data; source code contains no business prompt or Workflow template.
+- Reusable business process knowledge lives in version-controlled declarative Workflow Template JSON and is persisted in SQLite; Python runtime code contains no domain-routing branch.
 - Columns select either a generic `agent` executor or a generic `capability_sequence` executor.
-- Every Column entry creates an independent Column Run record.
+- Every Column visit creates a Column Run; retry creates an immutable Attempt under that Run.
 - Runtime execution may be deterministic or use an ephemeral agent.
-- Only `done` and `failed` are Task terminal states, and both are explicit Workflow terminals.
+- Only `done` and `failed` are Task terminal states; both are reserved Workflow sentinels, not executable Columns.
+- V1RuntimePolicy centralizes scheduling, leases, recovery delay, context windows, page sizes, and SQLite limits. V1 does not impose model-iteration, tool-call, or wall-clock budgets on Agent execution.
+- Recoverable provider infrastructure failures move the same Task to non-terminal `recovering`; Kanban reclaims the same Column after `next_retry_at` without rebuilding the Task.
+- Tool calls rejected before producing a side effect remain visible evidence but do not prevent the Agent from choosing a valid alternative and completing the Column.
+- Task dispatch rechecks declared dependencies and conflict domains atomically before execution.
 - SQLite is the structured source of truth and uses WAL plus short transactions.
 - Large deliverables remain files; SQLite stores Artifact metadata, hashes, sizes, and relationships.
 - IDEA Plugin development, memory redesign, user approval boundaries, and multiple active Workflows are outside the current implementation scope.
@@ -46,7 +60,7 @@ DevWerk/
     web/          modular native-ES-module Web workbench
   docs/           authoritative V1 design and test contract
   tests/          V1-only automated contract tests
-  config/         LLM routing configuration
+  config/         LLM routing and declarative Workflow Templates
   scripts/        current V1 operational helpers
   startup.bat     project-venv-only service launcher
 
@@ -81,7 +95,9 @@ cd D:\workspace\DevWerk\DevWerk
 .\venv\Scripts\python.exe -m compileall app tests
 ```
 
-The tests cover declarative graph validation, Capability Registry dispatch, Project isolation, persistent Conversation Agent identity, immutable Workflow revisions, shared AgentCore tool loops, deterministic and ephemeral-agent Columns, explicit terminal paths, retry evidence, lease recovery, SQLite indexes, Artifact boundaries, native provider tool-call normalization, API behavior, and the read-only Web governance boundary.
+The tests cover declarative graph validation, Workflow Template discovery/application, Capability Registry dispatch, Project isolation, persistent Conversation Agent identity, immutable Workflow revisions, shared AgentCore tool loops, deterministic and ephemeral-agent Columns, persistent Writer sessions, explicit terminal paths, Kanban recovery, rejected-before-effect tool handling, SQLite indexes, Artifact boundaries, provider error classification and tool-call normalization, full debug logging, API behavior, and the read-only Web governance boundary.
+
+Conversation messages are stored with stable message IDs and timestamps and are rendered as normal user/Agent turns. Runtime status and tool audit evidence remain outside the human conversation bubbles and update over the Project SSE stream.
 
 Real-provider and three-project black-box acceptance evidence is kept outside the repository in `D:\workspace\codex-devwerk-project-files` so generated products do not pollute source control.
 

@@ -1,6 +1,6 @@
-import { api, loadProjectBundle, loadTaskDetail, openProjectStream } from "./core/api.js";
-import { routeFromPath, state, updateProjectUrl } from "./core/state.js";
-import { pageSkeleton } from "./ui/components.js";
+import { api, loadProjectBundle, loadTaskDetail, openProjectStream } from "./core/api.js?v=20260804-debug1";
+import { routeFromPath, state, updateProjectUrl } from "./core/state.js?v=20260804-debug1";
+import { pageSkeleton } from "./ui/components.js?v=20260804-debug1";
 import {
   closeProjectDialog,
   renderProjectRail,
@@ -10,12 +10,12 @@ import {
   showProjectDialog,
   showToast,
   toggleProjectRail,
-} from "./ui/shell.js";
-import { renderOverview } from "./pages/overview.js";
-import { renderProjects } from "./pages/projects.js";
-import { renderKanban } from "./pages/kanban.js";
-import { renderTasks } from "./pages/tasks.js";
-import { renderEvents } from "./pages/events.js";
+} from "./ui/shell.js?v=20260804-debug1";
+import { renderOverview } from "./pages/overview.js?v=20260804-debug1";
+import { renderProjects } from "./pages/projects.js?v=20260804-debug1";
+import { renderKanban } from "./pages/kanban.js?v=20260804-debug1";
+import { renderTasks } from "./pages/tasks.js?v=20260804-debug1";
+import { renderEvents } from "./pages/events.js?v=20260804-debug1";
 
 const page = document.getElementById("page");
 let projectStream = null;
@@ -53,10 +53,34 @@ function projectBundleSignature() {
   return JSON.stringify({
     project: state.project?.updated_at,
     messages: state.conversation.map((item) => [item.id, item.created_at]),
+    conversationStatus: [state.conversationStatus?.agent_state, state.conversationStatus?.job?.id, state.conversationStatus?.job?.updated_at],
     tasks: (state.board?.tasks || []).map((item) => [item.id, item.status, item.current_column, item.updated_at]),
     workflow: state.board?.workflow?.id,
     events: state.events.map((item) => item.id),
   });
+}
+
+function mergeConversationMessages(current, incoming) {
+  const messages = new Map(current.map((item) => [Number(item.id), item]));
+  for (const item of incoming) messages.set(Number(item.id), item);
+  return [...messages.values()].sort((left, right) => Number(left.id) - Number(right.id));
+}
+
+function lastConversationMessageId() {
+  return state.conversation.reduce((value, item) => Math.max(value, Number(item.id) || 0), 0);
+}
+
+async function refreshConversationMessages() {
+  const afterId = lastConversationMessageId();
+  const incoming = await api.get(`/projects/${state.projectId}/conversation?limit=150&after_id=${afterId}`);
+  state.conversation = mergeConversationMessages(state.conversation, incoming);
+  if (state.pendingMessage && incoming.some((item) => item.role === "user" && item.content === state.pendingMessage)) {
+    state.pendingMessage = "";
+  }
+}
+
+async function refreshConversationStatus() {
+  state.conversationStatus = await api.get(`/projects/${state.projectId}/conversation-state`);
 }
 
 function renderPage() {
@@ -85,6 +109,7 @@ function bindPageActions() {
   });
   const form = document.getElementById("conversation-form");
   if (form) form.addEventListener("submit", sendConversation);
+  document.querySelector("[data-load-older-messages]")?.addEventListener("click", loadOlderConversation);
 }
 
 async function boot() {
@@ -129,6 +154,8 @@ async function selectProject(projectId) {
   state.projectId = projectId;
   state.taskDetail = null;
   state.agentDetail = null;
+  state.conversationStatus = null;
+  state.conversationHasOlder = false;
   updateProjectUrl(location.pathname, projectId, true);
   const projectSearch = document.getElementById("project-search");
   if (projectSearch) projectSearch.value = "";
@@ -152,6 +179,8 @@ async function refreshBundle({ showLoading = false, background = false } = {}) {
     state.project = bundle.board.project;
     state.board = bundle.board;
     state.conversation = bundle.conversation;
+    state.conversationStatus = bundle.conversationStatus;
+    state.conversationHasOlder = bundle.conversation.length >= 150;
     state.events = bundle.events;
     state.error = null;
     setProjectContext(state.project, state.board.tasks || []);
@@ -211,8 +240,8 @@ async function sendConversation(event) {
   setBusy(true, "Conversation Agent 正在理解并安排工作…");
   try {
     await api.post(`/projects/${state.projectId}/conversation`, { message, start_task: true }, { timeout: 660_000 });
+    await Promise.all([refreshConversationMessages(), refreshConversationStatus()]);
     state.pendingMessage = "";
-    await refreshBundle();
     showToast("Conversation Agent 已接收并更新项目。", "success");
   } catch (error) {
     state.pendingMessage = "";
@@ -223,6 +252,24 @@ async function sendConversation(event) {
     state.sending = false;
     setBusy(false);
     renderPage();
+  }
+}
+
+async function loadOlderConversation() {
+  if (!state.projectId || !state.conversation.length) return;
+  const firstId = Math.min(...state.conversation.map((item) => Number(item.id)));
+  const container = document.getElementById("conversation-messages");
+  const oldHeight = container?.scrollHeight || 0;
+  const oldTop = container?.scrollTop || 0;
+  try {
+    const older = await api.get(`/projects/${state.projectId}/conversation?limit=150&before_id=${firstId}`);
+    state.conversation = mergeConversationMessages(older, state.conversation);
+    state.conversationHasOlder = older.length >= 150;
+    renderPage();
+    const next = document.getElementById("conversation-messages");
+    if (next) next.scrollTop = next.scrollHeight - oldHeight + oldTop;
+  } catch (error) {
+    showToast(error.message, "error");
   }
 }
 
@@ -250,9 +297,8 @@ async function applyProjectEvent(event) {
       state.board = { ...state.board, tasks: tasks.slice(0, 100), version: Math.max(state.board.version || 0, Number(event.id) || 0) };
     }
     setProjectContext(state.project, state.board.tasks || []);
-    if (event.type === "conversation.message" || event.type.startsWith("conversation.")) {
-      state.conversation = await api.get(`/projects/${state.projectId}/conversation?limit=150`);
-    }
+    if (event.type === "conversation.message") await refreshConversationMessages();
+    if (event.type.startsWith("conversation.")) await refreshConversationStatus();
     const editing = document.activeElement?.id === "message-input";
     if (!editing && !state.sending) renderPage();
     setConnection("online", "Runtime online");

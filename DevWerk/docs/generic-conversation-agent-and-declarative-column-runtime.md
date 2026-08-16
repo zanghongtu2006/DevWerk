@@ -125,7 +125,7 @@ Version 1 Conversation Capability 目录：
 - `task.create`
 - `task.list`
 - `task.inspect`
-- `task.pause` / `task.resume` / `task.retry` / `task.rerun` / `task.cancel` / `task.migrate`
+- `task.pause` / `task.resume` / `task.retry` / `task.reopen` / `task.rerun` / `task.cancel` / `task.migrate`
 - `intervention.record`
 - `supervision.review.schedule`
 - `run.inspect`
@@ -138,7 +138,7 @@ Conversation API 使用显式 `mutation_scope`：`observe` 只读，`govern` 允
 
 Conversation turn 的直接 write/process 使用有界预算。预算耗尽后返回结构化 `GovernanceDecisionRequired`；Conversation Agent 必须形成 `HOLD`、`QUEUE`、`SPLIT`、请求用户方向或 `DISPATCH` 决策。只有 Readiness 与当前 Workflow 适配均通过时才创建 Formal Task。一旦 `task.create` 成功，本轮进入 **delegated** 边界：Conversation Agent继续监督，但不再直接完成该 Formal Task。
 
-`task.retry` 只对尚未 terminal 的 Task 在当前 Column Run 创建新 Attempt；`done/failed` 绝不复活。`task.rerun` 为 terminal Task 原子创建 successor Task，记录 `rerun_of_task_id`、新的 readiness/scheduling fact 与固定 Workflow revision，原 Task 保持不可变。
+`task.retry` 只对尚未 terminal 的 Task 在当前 Column Run 创建新 Attempt。`done` 保持不可变。`task.reopen` 对可恢复的 `failed` Task 保留原 ID、历史、产物和逻辑 Agent session，创建新的 pending Column Run 并从 Workflow entry 或指定非终态 Column 重新调度；失败事件仍作为不可变历史保留。需要独立交付世代时，`task.rerun` 为 terminal Task 创建 successor Task并记录 `rerun_of_task_id`。
 
 ### 5.4 监督职责
 
@@ -439,7 +439,7 @@ Column Run 代表一次 visit；它在 retry budget 内顺序拥有一个或多�
 
 ### 9.2 非终态停滞硬期限
 
-Version 1 不允许 Formal Task 依赖无限期人工唤醒。Task 创建时必须持久化 `pending_deadline_at`；每次 pause 必须持久化 `pause_deadline_at`；Column Run 创建时必须持久化 `claim_deadline_at`。期限可由 Conversation Agent 根据任务性质选择，但创建后不延期。期限前，Conversation Agent 可以补充输入、调整依赖、恢复或取消；期限到达仍未推进时，Supervisor 以确定性 transaction 将 Task 置为 `failed`，写入对应 failure code、terminal event 与 Project mailbox。需要继续时创建 successor Task，不复活原 Task。
+Version 1 不允许 Formal Task 依赖无限期人工唤醒。Task 创建时必须持久化 `pending_deadline_at`；每次 pause 必须持久化 `pause_deadline_at`；Column Run 创建时必须持久化 `claim_deadline_at`。期限可由 Conversation Agent 根据任务性质选择，但创建后不延期。期限前，Conversation Agent 可以补充输入、调整依赖、恢复或取消；期限到达仍未推进时，Supervisor 以确定性 transaction 将 Task 置为 `failed`，写入对应 failure code、terminal event 与 Project mailbox。需要继续时，由 Conversation Agent 根据恢复语义选择 reopen 原 Task 或创建独立 successor Task。
 
 ### 9.3 长等待分类
 

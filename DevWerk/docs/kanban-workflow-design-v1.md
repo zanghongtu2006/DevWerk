@@ -477,7 +477,7 @@ Conversation Agent 在终态后异步观察和汇报。需要项目级复核的 
 
 取消原子进入 `failed`，并额外记录 `failure_code=cancelled`、`task.cancelled` event、failure artifact 与 Project mailbox 通知。
 
-`task.retry` 只在 Task 非终态时为当前 Run 创建新 Attempt。终态 Task 重做使用 `task.rerun` 创建带 `rerun_of_task_id` 的 successor Task；原 Task、Run、Attempt 和终态事件保持不可变。
+`task.retry` 只在 Task 非终态时为当前 Run 创建新 Attempt。可恢复的 `failed` Task 使用 `task.reopen` 保留原 Task ID、Run/Attempt、产物、失败事件和逻辑 Agent session，并创建新的 pending Column Run；`done` 不可 reopen。需要独立交付世代时使用 `task.rerun` 创建带 `rerun_of_task_id` 的 successor Task。
 
 ### Revision 迁移
 

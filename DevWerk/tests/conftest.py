@@ -7,6 +7,9 @@ import pytest
 
 from app.core.config import reload_settings
 from app.v1.store import V1Store
+from app.v1.capabilities import build_core_registry
+from app.v1.policy import PlatformPolicyLoader
+from pathlib import Path
 
 
 os.environ.setdefault("APP_ENV", "test")
@@ -22,7 +25,7 @@ def isolated_settings(tmp_path, monkeypatch):
                 "api": "anthropic",
                 "base_url": "https://provider.invalid/anthropic",
                 "api_key": "test-token",
-                "models": {"model": {"model": "test-model", "max_tokens": 1024}},
+                "models": {"model": {"model": "test-model", "temperature": 0.2, "thinking_mode": "balanced", "max_tokens": 65535}},
             }
         },
     }
@@ -36,4 +39,6 @@ def isolated_settings(tmp_path, monkeypatch):
 
 @pytest.fixture
 def store(tmp_path) -> V1Store:
-    return V1Store(str(tmp_path / "store.db"))
+    value = V1Store(str(tmp_path / "store.db"), registry=build_core_registry())
+    value.register_platform_policy(PlatformPolicyLoader(Path(__file__).resolve().parents[1] / "DEVWERK.md").load())
+    return value

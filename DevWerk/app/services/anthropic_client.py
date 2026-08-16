@@ -3,33 +3,41 @@
 from __future__ import annotations
 
 import json
-import time
+import logging
 from typing import Any
 
 import requests as http_requests
 
-from app.services.provider_errors import raise_for_provider_payload, raise_for_provider_response
+from app.core.debug_trace import trace_json
+from app.services.provider_errors import provider_timeout_error, raise_for_provider_payload, raise_for_provider_response
+from app.v1.contracts import canonicalize_contract_value, provider_contract_schema
+
+
+_trace_log = logging.getLogger("devwerk.llm.provider.anthropic")
 
 
 class AnthropicClient:
     def __init__(self, config: dict[str, Any]):
         self.last_usage: dict[str, Any] | None = None
-        self.api_name = str(config.get("api_name") or "anthropic")
-        self.base_url = str(config.get("base_url") or "https://api.anthropic.com").rstrip("/")
+        self.api_name = str(config["api_name"])
+        self.base_url = str(config["base_url"]).rstrip("/")
         self.api_key = config.get("api_key")
-        self.model = str(config.get("model") or "claude-sonnet-4-5")
-        self.timeout = float(config.get("timeout") or 180)
-        self.temperature = float(config.get("temperature") or 0.2)
+        self.model = str(config["model"])
+        self.temperature = float(config["temperature"])
         self.top_p = config.get("top_p")
-        self.max_tokens = int(config.get("max_tokens") or 4096)
-        self.max_retries = max(0, int(config.get("max_retries") or 0))
+        self.max_tokens = int(config["max_tokens"])
+        self.request_timeout_seconds = float(config.get("request_timeout_seconds", 600.0))
+        if self.request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be positive")
+        if self.max_tokens < 65_535:
+            raise ValueError("Anthropic max_tokens must be explicitly configured to at least 65535")
         self.url = f"{self.base_url}/messages" if self.base_url.endswith("/v1") else f"{self.base_url}/v1/messages"
         self.session = http_requests.Session()
         self.session.trust_env = bool(config.get("trust_env_proxy", False))
         if not self.api_key:
             raise ValueError(f"api_key is not set for LLM provider {self.api_name!r}.")
 
-    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, *, trace_id: str | None = None, require_tool: bool = False) -> dict[str, Any]:
         system, provider_messages = self._to_provider_messages(messages)
         payload: dict[str, Any] = {
             "model": self.model,
@@ -45,26 +53,55 @@ class AnthropicClient:
                 {
                     "name": item["function"]["name"],
                     "description": item["function"].get("description", ""),
-                    "input_schema": item["function"].get("parameters") or {"type": "object"},
+                    "input_schema": provider_contract_schema(
+                        item["function"].get("parameters") or {"type": "object"}
+                    ),
                 }
                 for item in tools
             ]
+            if require_tool:
+                payload["tool_choice"] = {"type": "any"}
         headers = {
             "x-api-key": str(self.api_key),
             "authorization": f"Bearer {self.api_key}",
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
-        response = None
-        for attempt in range(self.max_retries + 1):
-            try:
-                response = self.session.post(self.url, json=payload, headers=headers, timeout=self.timeout)
-                break
-            except http_requests.exceptions.ReadTimeout:
-                if attempt >= self.max_retries:
-                    raise
-                time.sleep(min(2 ** (attempt + 1), 8))
-        assert response is not None
+        trace_json(
+            _trace_log,
+            "llm.provider_request",
+            trace_id=trace_id,
+            provider="anthropic",
+            api_name=self.api_name,
+            model=self.model,
+            url=self.url,
+            payload=payload,
+        )
+        try:
+            response = self.session.post(
+                self.url,
+                json=payload,
+                headers=headers,
+                timeout=self.request_timeout_seconds,
+            )
+        except http_requests.Timeout as exc:
+            raise provider_timeout_error(
+                exc,
+                provider="anthropic",
+                api_name=self.api_name,
+                timeout_seconds=self.request_timeout_seconds,
+            ) from exc
+        trace_json(
+            _trace_log,
+            "llm.provider_response",
+            trace_id=trace_id,
+            provider="anthropic",
+            api_name=self.api_name,
+            model=self.model,
+            status_code=response.status_code,
+            response_headers=dict(response.headers),
+            body=response.text,
+        )
         raise_for_provider_response(response, provider="anthropic", api_name=self.api_name)
         data = response.json()
         raise_for_provider_payload(
@@ -77,6 +114,10 @@ class AnthropicClient:
         self.last_usage = _usage(data.get("usage"))
         text: list[str] = []
         calls: list[dict[str, Any]] = []
+        tool_schemas = {
+            str(item.get("function", {}).get("name") or ""): item.get("function", {}).get("parameters") or {}
+            for item in tools or []
+        }
         for item in data.get("content") or []:
             if not isinstance(item, dict):
                 continue
@@ -86,7 +127,9 @@ class AnthropicClient:
                 arguments = item.get("input") or {}
                 if not isinstance(arguments, dict):
                     raise ValueError("tool_use input must be a JSON object")
-                calls.append({"id": str(item.get("id") or ""), "name": str(item.get("name") or ""), "arguments": arguments})
+                name = str(item.get("name") or "")
+                arguments = canonicalize_contract_value(arguments, tool_schemas.get(name, {}))
+                calls.append({"id": str(item.get("id") or ""), "name": name, "arguments": arguments})
         return {"text": "\n".join(text).strip(), "tool_calls": calls, "usage": self.last_usage}
 
     @staticmethod

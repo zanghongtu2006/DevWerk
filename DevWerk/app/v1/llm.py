@@ -13,8 +13,14 @@ def complete(
     project_id: str,
     task_id: str | None = None,
     agent: str = "project",
-    timeout_seconds: float | None = None,
+    require_tool: bool = False,
 ) -> AgentModelResponse:
-    client = get_llm_client(agent, timeout_seconds)
-    result = client.complete(messages, tools, project_id=project_id, task_id=task_id)
+    client = get_llm_client(agent)
+    result = client.complete(
+        messages,
+        tools,
+        project_id=project_id,
+        task_id=task_id,
+        require_tool=require_tool,
+    )
     return AgentModelResponse.model_validate(result)

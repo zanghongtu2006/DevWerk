@@ -1,76 +1,58 @@
 from __future__ import annotations
 
-from app.v1.agent import AgentCore
-from app.v1.capabilities import build_core_registry
+import json
+import threading
+
+import pytest
+
+from app.v1.agent import AgentCore, AgentRunSpec
+from app.v1.capabilities import CapabilityContext, CapabilityEntry, build_core_registry
 from app.v1.conversation import ConversationAgent
 from app.v1.domain import AgentModelResponse, AgentToolCall
-from tests.helpers import sequence_workflow, readiness
+from tests.helpers import (
+    create_planned_task,
+    orchestration_plan,
+    publish_planned_workflow,
+    readiness,
+    sequence_workflow,
+)
 
 
-def test_conversation_agent_publishes_data_defined_workflow_then_creates_task(store, tmp_path):
+def test_conversation_publishes_workflow_creates_task_and_finishes_with_plain_text(store, tmp_path):
     project = store.create_project("conversation", "", str(tmp_path / "project"), "project instruction")
-    workflow = sequence_workflow(name="generated in conversation").model_dump(mode="json")
-    responses = iter(
-        [
-            AgentModelResponse(tool_calls=[AgentToolCall(id="wf", name="workflow.publish", arguments={"workflow": workflow})]),
-            AgentModelResponse(tool_calls=[AgentToolCall(id="task", name="task.create", arguments={"title": "formal", "brief": "deliver", "input": {}, "readiness": readiness()})]),
-            AgentModelResponse(text="Workflow and Task are now tracked."),
-        ]
-    )
-    registry = build_core_registry()
-    core = AgentCore(store, registry, lambda *_args, **_kwargs: next(responses))
+    definition = sequence_workflow(name="generated in conversation")
+    workflow = definition.model_dump(mode="json")
+    plan = orchestration_plan(definition).model_dump(mode="json")
+    calls = 0
+
+    def model(_messages, _tools, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return AgentModelResponse(tool_calls=[AgentToolCall(id="plan", name="orchestration.plan.save", arguments={"plan": plan})])
+        plan_id = store.list_orchestration_plans(project["id"])[0]["id"]
+        if calls == 2:
+            return AgentModelResponse(tool_calls=[AgentToolCall(id="wf", name="workflow.publish", arguments={"orchestration_plan_id": plan_id, "workflow": workflow})])
+        if calls == 3:
+            return AgentModelResponse(tool_calls=[AgentToolCall(id="task", name="task.create", arguments={"orchestration_plan_id": plan_id, "proposed_task_ref": "primary", "title": "formal", "brief": "deliver", "input": {}, "readiness": readiness()})])
+        return AgentModelResponse(text="Workflow and Task are now tracked.")
+
     wakes: list[bool] = []
-    agent = ConversationAgent(store, registry, on_task_created=lambda: wakes.append(True), workers=1, agent_core=core)
+    registry = build_core_registry()
+    agent = ConversationAgent(store, registry, on_task_created=lambda: wakes.append(True), workers=1, agent_core=AgentCore(store, registry, model))
     try:
         accepted = agent.submit(project["id"], "Please manage this delivery.", True)
-        assert accepted["status"] == "accepted"
         assert agent.wait_for_idle()
         job = store.get_conversation_job(accepted["job"]["id"])
         assert job["status"] == "succeeded"
-        assert job["agent_run_id"]
         assert job["result"]["reply"] == "Workflow and Task are now tracked."
-        assert job["result"]["task_ids"] == [job["task_id"]]
-        assert len(job["result"]["workflow_revision_ids"]) == 1
-        assert store.get_task(job["task_id"])["title"] == "formal"
-        assert store.get_workflow(project["id"])["definition"]["name"] == "generated in conversation"
+        assert len(job["result"]["task_ids"]) == 1
         assert wakes == [True]
-        assert [item["role"] for item in store.messages(project["id"])] == ["user", "assistant"]
     finally:
         agent.stop()
 
 
-def test_durable_delegation_succeeds_at_iteration_budget_boundary(store, tmp_path):
-    project = store.create_project("budget-boundary", "", str(tmp_path / "project"))
-    workflow = sequence_workflow(name="budget-boundary").model_dump(mode="json")
-    responses = iter(
-        [
-            AgentModelResponse(tool_calls=[AgentToolCall(id="wf", name="workflow.publish", arguments={"workflow": workflow})]),
-            AgentModelResponse(tool_calls=[AgentToolCall(id="task", name="task.create", arguments={"title": "formal", "brief": "deliver", "input": {}, "readiness": readiness()})]),
-        ]
-    )
-    registry = build_core_registry()
-    core = AgentCore(store, registry, lambda *_args, **_kwargs: next(responses))
-    original_run = core.run
-
-    def bounded_run(spec):
-        return original_run(spec.__class__(**{**spec.__dict__, "max_iterations": 2}))
-
-    core.run = bounded_run
-    agent = ConversationAgent(store, registry, workers=1, agent_core=core)
-    try:
-        accepted = agent.submit(project["id"], "Delegate this formal delivery.", True)
-        assert agent.wait_for_idle()
-        job = store.get_conversation_job(accepted["job"]["id"])
-        assert job["status"] == "succeeded"
-        assert job["task_id"]
-        assert job["result"]["task_ids"] == [job["task_id"]]
-        assert len(job["result"]["workflow_revision_ids"]) == 1
-        assert "delegation" in job["result"]["reply"].lower()
-    finally:
-        agent.stop()
-
-
-def test_start_task_false_removes_workflow_and_task_tools(store, tmp_path):
+def test_start_task_false_exposes_only_read_capabilities(store, tmp_path):
     project = store.create_project("discussion", "", str(tmp_path / "project"))
     exposed: list[set[str]] = []
 
@@ -84,90 +66,216 @@ def test_start_task_false_removes_workflow_and_task_tools(store, tmp_path):
         accepted = agent.submit(project["id"], "Only discuss this.", False)
         assert agent.wait_for_idle()
         assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
-        assert "workflow.publish" not in exposed[0]
-        assert "task.create" not in exposed[0]
-        assert store.list_tasks(project["id"]) == []
+        assert all(registry.side_effect_kind(item) in {"none", "read"} for item in exposed[0])
     finally:
         agent.stop()
 
 
-def test_tool_failure_is_returned_to_model_instead_of_crashing_turn(store, tmp_path):
-    project = store.create_project("recover-tool", "", str(tmp_path / "project"))
-    seen_messages = []
+def test_runtime_notifications_are_not_replayed_as_conversation_history(store, tmp_path):
+    project = store.create_project("clean history", "", str(tmp_path / "project"))
+    store.add_message(project["id"], "assistant", "automatic runtime report", {"kind": "notification", "status": "succeeded"})
 
     def model(messages, _tools, **_kwargs):
-        seen_messages.append(messages)
-        if len(seen_messages) == 1:
-            return AgentModelResponse(tool_calls=[AgentToolCall(id="read", name="project.files.read", arguments={"path": "missing.txt"})])
-        assert '"ok": false' in messages[-1]["content"]
-        return AgentModelResponse(text="The missing file was diagnosed.")
+        assert all("automatic runtime report" not in str(item.get("content") or "") for item in messages)
+        return AgentModelResponse(text="Discussion complete.")
 
     registry = build_core_registry()
     agent = ConversationAgent(store, registry, workers=1, agent_core=AgentCore(store, registry, model))
     try:
-        accepted = agent.submit(project["id"], "Diagnose the project.", False)
+        accepted = agent.submit(project["id"], "Discuss the current state.", False)
         assert agent.wait_for_idle()
         assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
     finally:
         agent.stop()
 
 
-def test_conversation_direct_effect_budget_forces_delegation_and_blocks_post_task_writes(store, tmp_path):
-    project = store.create_project("delegation-boundary", "", str(tmp_path / "project"))
-    workflow = sequence_workflow(name="delegated").model_dump(mode="json")
-    step = 0
+def test_executing_conversation_cannot_finish_with_unevidenced_prose(store, tmp_path):
+    project = store.create_project("evidenced execution", "", str(tmp_path / "project"))
+    turns = 0
+
+    def model(_messages, _tools, **_kwargs):
+        nonlocal turns
+        turns += 1
+        return AgentModelResponse(text="I inspected and changed the project.")
+
+    registry = build_core_registry()
+    agent = ConversationAgent(
+        store,
+        registry,
+        workers=1,
+        agent_core=AgentCore(store, registry, model),
+    )
+    try:
+        accepted = agent.submit(project["id"], "Inspect before acting.", True)
+        assert agent.wait_for_idle()
+        job = store.get_conversation_job(accepted["job"]["id"])
+        assert job["status"] == "failed"
+        assert turns == 1
+        assert job["result"]["action_ledger"] == []
+        assert store.conversation_agent(project["id"])["state"] == "attention"
+    finally:
+        agent.stop()
+
+
+def test_same_project_jobs_remain_ordered_with_multiple_workers(store, tmp_path):
+    project = store.create_project("ordered", "", str(tmp_path / "project"))
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    observed: list[str] = []
 
     def model(messages, _tools, **_kwargs):
-        nonlocal step
-        step += 1
-        if step <= 4:
-            return AgentModelResponse(
-                tool_calls=[
-                    AgentToolCall(
-                        id=f"write-{step}",
-                        name="project.files.write",
-                        arguments={"path": f"direct-{step}.txt", "content": str(step)},
-                    )
-                ]
-            )
-        if step == 5:
-            assert '"type": "DelegationRequired"' in messages[-1]["content"]
-            return AgentModelResponse(
-                tool_calls=[AgentToolCall(id="wf", name="workflow.publish", arguments={"workflow": workflow})]
-            )
-        if step == 6:
-            return AgentModelResponse(
-                tool_calls=[AgentToolCall(id="task", name="task.create", arguments={"title": "formal", "brief": "deliver", "readiness": readiness()})]
-            )
-        if step == 7:
-            return AgentModelResponse(
-                tool_calls=[
-                    AgentToolCall(
-                        id="post-task-write",
-                        name="project.files.write",
-                        arguments={"path": "post-task.txt", "content": "blocked"},
-                    )
-                ]
-            )
-        assert '"type": "DelegationBoundary"' in messages[-1]["content"]
-        return AgentModelResponse(text="Delegated and now supervising the tracked Task.")
+        current = json.loads(messages[0]["content"])["context"]["current_request"]["content"]
+        observed.append(current)
+        if current == "first":
+            first_entered.set()
+            assert release_first.wait(timeout=3)
+        return AgentModelResponse(text=f"Handled {current}.")
+
+    registry = build_core_registry()
+    agent = ConversationAgent(store, registry, workers=2, agent_core=AgentCore(store, registry, model))
+    try:
+        first = agent.submit(project["id"], "first", False)
+        assert first_entered.wait(timeout=3)
+        second = agent.submit(project["id"], "second", False)
+        release_first.set()
+        assert agent.wait_for_idle(timeout=10)
+        assert store.get_conversation_job(first["job"]["id"])["status"] == "succeeded"
+        assert store.get_conversation_job(second["job"]["id"])["status"] == "succeeded"
+        assert observed == ["first", "second"]
+    finally:
+        release_first.set()
+        agent.stop()
+
+
+def test_capability_validation_failure_is_returned_for_model_repair(store, tmp_path):
+    project = store.create_project("failure", "", str(tmp_path / "project"))
+    registry = build_core_registry()
+    registry.register(CapabilityEntry(
+        id="test.failure",
+        description="Raise an observable failure.",
+        input_schema={"type": "object", "additionalProperties": False},
+        output_schema={"type": "object"},
+        handler=lambda _args, _ctx: (_ for _ in ()).throw(ValueError("visible failure")),
+        side_effect_kind="read",
+    ))
+
+    calls = 0
+
+    def model(messages, _tools, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return AgentModelResponse(tool_calls=[AgentToolCall(id="fail", name="test.failure", arguments={})])
+        assert '"ok": false' in messages[-1]["content"]
+        assert "visible failure" in messages[-1]["content"]
+        return AgentModelResponse(text="The tool rejection was observed.")
+
+    result = AgentCore(store, registry, model).run(AgentRunSpec(
+        kind="conversation",
+        project=project,
+        instruction="",
+        instruction_revision=1,
+        context={},
+        capability_ids=["test.failure"],
+    ))
+    assert result.status == "succeeded"
+    run = store.agent_runs(project_id=project["id"])[0]
+    assert run["status"] == "succeeded"
+    invocation = store.tool_invocations(project["id"], run["id"])[0]
+    assert invocation["ok"] is False
+    assert invocation["result"]["error"]["message"] == "visible failure"
+
+
+def test_unavailable_capability_is_returned_for_model_repair(store, tmp_path):
+    project = store.create_project("unavailable-tool", "", str(tmp_path / "project"))
+    registry = build_core_registry()
+    calls = 0
+
+    def model(messages, _tools, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return AgentModelResponse(tool_calls=[
+                AgentToolCall(id="unknown", name="mailbox", arguments={"id": 12}),
+            ])
+        assert '"ok": false' in messages[-1]["content"]
+        assert "CapabilityUnavailable" in messages[-1]["content"]
+        assert "mailbox" in messages[-1]["content"]
+        return AgentModelResponse(text="The unavailable tool was observed and corrected.")
+
+    result = AgentCore(store, registry, model).run(AgentRunSpec(
+        kind="conversation",
+        project=project,
+        instruction="",
+        instruction_revision=1,
+        context={},
+        capability_ids=["system.noop"],
+    ))
+
+    assert result.status == "succeeded"
+    run = store.agent_runs(project_id=project["id"])[0]
+    invocation = store.tool_invocations(project["id"], run["id"])[0]
+    assert invocation["capability"] == "mailbox"
+    assert invocation["ok"] is False
+    assert invocation["result"]["error"]["type"] == "CapabilityUnavailable"
+
+
+def test_missing_project_file_is_returned_for_model_repair(store, tmp_path):
+    project = store.create_project("missing-file", "", str(tmp_path / "project"))
+    registry = build_core_registry()
+
+    result = registry.dispatch(
+        "project.files.read",
+        {"path": "guides/outline.md"},
+        CapabilityContext(project["id"], project, store, agent_run_id="arun_test"),
+    )
+
+    assert result.ok is False
+    assert result.error["type"] == "FileNotFoundError"
+    assert "outline.md" in result.error["message"]
+
+
+def test_current_request_is_authoritative_and_not_duplicated(store, tmp_path):
+    project = store.create_project("history", "", str(tmp_path / "project"))
+    captured: list[list[dict]] = []
+
+    def model(messages, _tools, **_kwargs):
+        captured.append(messages)
+        return AgentModelResponse(text="Acknowledged.")
 
     registry = build_core_registry()
     agent = ConversationAgent(store, registry, workers=1, agent_core=AgentCore(store, registry, model))
     try:
-        accepted = agent.submit(project["id"], "Manage a delivery.", True)
+        accepted = agent.submit(project["id"], "current instruction", False)
         assert agent.wait_for_idle()
-        job = store.get_conversation_job(accepted["job"]["id"])
-        assert job["status"] == "succeeded"
-        assert job["task_id"]
-        assert (tmp_path / "project" / "direct-1.txt").is_file()
-        assert (tmp_path / "project" / "direct-3.txt").is_file()
-        assert not (tmp_path / "project" / "direct-4.txt").exists()
-        assert not (tmp_path / "project" / "post-task.txt").exists()
-        failures = [item for item in store.tool_invocations(project["id"], job["agent_run_id"]) if not item["ok"]]
-        assert [item["result"]["error"]["type"] for item in failures] == [
-            "DelegationRequired",
-            "DelegationBoundary",
-        ]
+        assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
+        encoded = json.dumps(captured[0], ensure_ascii=False)
+        assert encoded.count("current instruction") == 2
+    finally:
+        agent.stop()
+
+
+def test_terminal_mailbox_turn_reports_model_text_to_user(store, tmp_path):
+    project = store.create_project("terminal", "", str(tmp_path / "project"))
+    publish_planned_workflow(store, project["id"], sequence_workflow())
+    task = create_planned_task(store, project["id"], "visible failure")
+    store.route_task_to_failed(task["id"], "synthetic terminal failure")
+    calls = 0
+
+    def model(_messages, _tools, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return AgentModelResponse(tool_calls=[AgentToolCall(id="inspect", name="task.inspect", arguments={"task_id": task["id"]})])
+        return AgentModelResponse(text="任务失败，原因已核实：synthetic terminal failure")
+
+    registry = build_core_registry()
+    agent = ConversationAgent(store, registry, workers=1, agent_core=AgentCore(store, registry, model))
+    try:
+        agent.wake()
+        assert agent.wait_for_idle(timeout=10)
+        assistant = [item for item in store.messages(project["id"]) if item["role"] == "assistant"]
+        assert assistant[-1]["content"] == "任务失败，原因已核实：synthetic terminal failure"
+        assert assistant[-1]["meta"]["subject_status"] == "failed"
     finally:
         agent.stop()

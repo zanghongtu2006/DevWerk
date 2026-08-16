@@ -7,41 +7,47 @@ import time
 from collections import defaultdict
 from typing import Any, Callable
 
-from app.v1.agent import AgentCore, AgentRunSpec
+from app.v1.agent import AgentCore, AgentRunSpec, ConversationEvidenceRequiredError, _ledger_entry
 from app.v1.capabilities import CapabilityRegistry
+from app.v1.domain import ToolResult
 from app.v1.store import V1Store
+from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, PlatformPolicySnapshot, V1RuntimePolicy
 
 
 log = logging.getLogger("devwerk.v1.conversation")
 
 
 class ConversationAgent:
-    """One durable logical Agent per Project, executed as serialized bounded turns."""
+    """One durable logical Agent per Project, without platform execution budgets."""
 
     def __init__(
         self,
         store: V1Store,
         registry: CapabilityRegistry,
         on_task_created: Callable[[], None] | None = None,
-        workers: int = 4,
+        workers: int | None = None,
         agent_core: AgentCore | None = None,
+        policy: V1RuntimePolicy | None = None,
+        platform_policy: PlatformPolicySnapshot | None = None,
     ):
         self.store = store
         self.registry = registry
-        self.agent_core = agent_core or AgentCore(store, registry)
+        self.policy = policy or DEFAULT_V1_RUNTIME_POLICY
+        self.platform_policy = platform_policy or store.latest_platform_policy()
+        self.agent_core = agent_core or AgentCore(store, registry, policy=self.policy, platform_policy=self.platform_policy)
         self._on_task_created = on_task_created
-        self._locks: defaultdict[str, threading.Lock] = defaultdict(threading.Lock)
+        self._locks: defaultdict[str, threading.RLock] = defaultdict(threading.RLock)
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._stop = threading.Event()
         self._workers = [
             threading.Thread(target=self._worker, name=f"conversation-agent-{index + 1}", daemon=True)
-            for index in range(max(1, workers))
+            for index in range(max(1, workers or self.policy.scheduling.conversation_workers))
         ]
         for worker in self._workers:
             worker.start()
         self._dispatcher = threading.Thread(target=self._dispatch_governance, name="conversation-governance-dispatcher", daemon=True)
         self._dispatcher.start()
-        for job in self.store.recover_conversation_jobs():
+        for job in self.store.startup_conversation_jobs():
             self._queue.put(job["id"])
 
     def submit(self, project_id: str, message: str, start_task: bool = True) -> dict[str, Any]:
@@ -69,11 +75,8 @@ class ConversationAgent:
             self._queue.put(job_id)
 
     def _dispatch_governance(self) -> None:
-        while not self._stop.wait(1.0):
-            try:
-                self.wake()
-            except Exception:  # noqa: BLE001
-                log.exception("conversation governance dispatch failed")
+        while not self._stop.wait(self.policy.service_limits.event_poll_interval_seconds):
+            self.wake()
 
     def wait_for_idle(self, timeout: float = 5.0) -> bool:
         deadline = time.monotonic() + timeout
@@ -87,20 +90,28 @@ class ConversationAgent:
         worker_id = threading.current_thread().name
         while not self._stop.is_set():
             job_id = self._queue.get()
-            try:
-                if job_id is None:
-                    return
+            if job_id is None:
+                self._queue.task_done()
+                return
+            queued = self.store.get_conversation_job(job_id)
+            claim_deferred = False
+            with self._locks[queued["project_id"]]:
                 job = self.store.claim_conversation_job(job_id, worker_id)
                 if job:
                     self._process(job)
-            except Exception:  # noqa: BLE001
-                log.exception("conversation worker failed job_id=%s", job_id)
-            finally:
-                self._queue.task_done()
+                elif self.store.get_conversation_job(job_id)["status"] == "queued":
+                    claim_deferred = True
+            if claim_deferred and not self._stop.wait(
+                self.policy.service_limits.event_poll_interval_seconds
+            ):
+                self._queue.put(job_id)
+            self._queue.task_done()
 
     def _process(self, job: dict[str, Any]) -> None:
         job_id = job["id"]
         project_id = job["project_id"]
+        action_ledger: list[dict[str, Any]] = []
+        mailbox: list[dict[str, Any]] = []
         lease_keeper = GovernanceLeaseKeeper(self.store, project_id, str(job.get("worker_id") or threading.current_thread().name))
         lease_keeper.start()
         try:
@@ -108,71 +119,142 @@ class ConversationAgent:
                 project = self.store.get_project(project_id)
                 identity = self.store.conversation_agent(project_id)
                 captured_ids = set(job.get("mailbox_ids") or [])
-                mailbox = [item for item in self.store.mailbox(project_id, state="pending", limit=100) if not captured_ids or item["id"] in captured_ids]
+                mailbox = [
+                    item
+                    for item in self.store.mailbox(project_id, state="claimed", limit=self.policy.context.mailbox_limit)
+                    if item["id"] in captured_ids
+                ]
+                mailbox_requires_user_update = _mailbox_requires_user_update(mailbox)
                 try:
                     workflow = self.store.get_workflow(project_id)
                 except KeyError:
                     workflow = None
                 capabilities = self.registry.all_ids()
                 if not job["start_task"]:
-                    capabilities = [item for item in capabilities if item not in {"workflow.publish", "task.create"}]
-                result = self.agent_core.run(
-                    AgentRunSpec(
-                        kind="conversation",
-                        project=project,
-                        instruction=str(identity.get("instruction") or ""),
-                        instruction_revision=int(identity.get("instruction_revision") or 1),
-                        context={
-                            "active_workflow": workflow,
-                            "tasks": self.store.task_summaries(project_id, 100),
-                            "mailbox": mailbox,
-                            "conversation_job": {"id": job_id, "start_task": bool(job["start_task"]), "trigger_kind": job.get("trigger_kind", "user"), "trigger": job.get("trigger", {})},
-                        },
-                        capability_ids=capabilities,
-                        history=_bounded_history(self.store.messages(project_id, 80)),
-                        start_task=bool(job["start_task"]),
-                        max_iterations=16,
-                        max_tool_calls=80,
-                        timeout_seconds=600,
+                    capabilities = [
+                        item
+                        for item in capabilities
+                        if self.registry.side_effect_kind(item) in {"none", "read"}
+                    ]
+                context = {
+                    "active_workflow": workflow,
+                    "workflow_templates": self.store.list_workflow_templates(limit=20),
+                    "orchestration_plans": self.store.list_orchestration_plans(project_id),
+                    "tasks": self.store.task_summaries(project_id, self.policy.context.task_summary_limit),
+                    "mailbox": mailbox,
+                    "conversation_job": {"id": job_id, "start_task": bool(job["start_task"]), "trigger_kind": job.get("trigger_kind", "user"), "trigger": job.get("trigger", {})},
+                    "current_request": {
+                        "message_id": job.get("user_message_id"),
+                        "content": str(job.get("message") or ""),
+                        "trigger_kind": job.get("trigger_kind", "user"),
+                        "trigger": job.get("trigger", {}),
+                        "job_id": job_id,
+                    },
+                }
+                history = [
+                    item
+                    for item in self.store.messages(project_id, limit=None)
+                    if item.get("id") != job.get("user_message_id")
+                    and not (
+                        item.get("role") == "assistant"
+                        and (item.get("meta") or {}).get("kind") == "notification"
                     )
+                    and not (
+                        item.get("role") == "assistant"
+                        and (item.get("meta") or {}).get("status") == "failed"
+                    )
+                ]
+                result = self.agent_core.run(AgentRunSpec(
+                    kind="conversation",
+                    project=project,
+                    instruction=str(identity.get("instruction") or ""),
+                    instruction_revision=int(identity.get("instruction_revision") or 1),
+                    context=context,
+                    capability_ids=capabilities,
+                    history=history,
+                    start_task=bool(job["start_task"]),
+                    conversation_job_id=job_id,
+                ))
+                run_ids = [result.agent_run_id]
+                invocations = self.store.tool_invocations(
+                    project_id,
+                    result.agent_run_id,
+                    hydrate_payloads=True,
                 )
+                all_invocations = list(invocations)
+                action_ledger = [
+                    _ledger_entry(
+                        result.agent_run_id,
+                        str(item["tool_call_id"]),
+                        str(item["capability"]),
+                        self.registry.side_effect_kind(str(item["capability"])),
+                        ToolResult.model_validate(item["result"]),
+                        arguments=dict(item.get("arguments") or {}),
+                    )
+                    for item in invocations
+                ]
+                runnable_mutation = any(
+                    item["ok"]
+                    and item["capability"] in {
+                        "task.create", "task.reopen", "task.rerun", "task.retry", "task.resume", "scheduling.decide", "workflow.template.apply"
+                    }
+                    for item in invocations
+                )
+                if runnable_mutation and self._on_task_created:
+                    self._on_task_created()
                 if result.status != "succeeded":
                     raise RuntimeError(result.error or "Conversation Agent failed")
 
-                invocations = self.store.tool_invocations(project_id, result.agent_run_id)
                 tasks = [
                     item["result"]["output"]
-                    for item in invocations
-                    if item["capability"] == "task.create"
+                    for item in all_invocations
+                    if item["capability"] in {"task.create", "task.rerun"}
                     and item["ok"]
                     and isinstance(item.get("result", {}).get("output"), dict)
                 ]
+                for item in all_invocations:
+                    if (
+                        item["capability"] == "workflow.template.apply"
+                        and item["ok"]
+                        and isinstance(item.get("result", {}).get("output"), dict)
+                    ):
+                        tasks.extend(item["result"]["output"].get("tasks") or [])
+                tasks = list({item["id"]: item for item in tasks if item.get("id")}.values())
                 workflow_publications = [
                     item["result"]["output"]
-                    for item in invocations
+                    for item in all_invocations
                     if item["capability"] == "workflow.publish"
                     and item["ok"]
                     and isinstance(item.get("result", {}).get("output"), dict)
                 ]
                 direct_artifact_ids = [
                     item["result"]["output"]["artifact"]["id"]
-                    for item in invocations
+                    for item in all_invocations
                     if item["ok"]
                     and isinstance(item.get("result", {}).get("output"), dict)
                     and isinstance(item["result"]["output"].get("artifact"), dict)
                     and item["result"]["output"]["artifact"].get("id")
                 ]
-                self.store.add_message(
-                    project_id,
-                    "assistant",
-                    result.text,
+                conversation_reply = result.text.strip()
+                trigger_kind = str(job.get("trigger_kind") or "user")
+                publish_reply = trigger_kind == "user" or mailbox_requires_user_update
+                notification = (
                     {
-                        "status": "succeeded",
-                        "job_id": job_id,
-                        "agent_run_id": result.agent_run_id,
-                        "task_ids": [task["id"] for task in tasks],
-                        "workflow_revision_ids": [item["id"] for item in workflow_publications],
-                    },
+                        "content": conversation_reply,
+                        "meta": {
+                            "status": "succeeded",
+                            "kind": "reply" if trigger_kind == "user" else "notification",
+                            "job_id": job_id,
+                            "agent_run_id": result.agent_run_id,
+                            "agent_run_ids": run_ids,
+                            "task_ids": [task["id"] for task in tasks],
+                            "workflow_revision_ids": [item["id"] for item in workflow_publications],
+                            "mailbox_ids": [item["id"] for item in mailbox],
+                            "subject_status": _mailbox_subject_status(mailbox),
+                        },
+                    }
+                    if publish_reply
+                    else None
                 )
                 first_task_id = tasks[0]["id"] if tasks else None
                 self.store.finish_conversation_job(
@@ -180,38 +262,87 @@ class ConversationAgent:
                     first_task_id,
                     result.agent_run_id,
                     {
-                        "reply": result.text,
+                        "reply": conversation_reply,
+                        "completion": result.completion or {},
+                        "agent_run_ids": run_ids,
+                        "action_ledger": action_ledger,
                         "workflow_revision_ids": [item["id"] for item in workflow_publications],
                         "task_ids": [task["id"] for task in tasks],
                         "direct_artifact_ids": direct_artifact_ids,
                     },
+                    notification=notification,
                 )
-                if tasks and self._on_task_created:
-                    self._on_task_created()
         except Exception as exc:  # noqa: BLE001
-            error = f"{type(exc).__name__}: {exc}"[:2000]
+            error = f"{type(exc).__name__}: {exc}"
             log.exception("conversation turn failed project_id=%s job_id=%s", project_id, job_id)
-            self.store.fail_conversation_job(job_id, error)
+            self.store.fail_conversation_job(
+                job_id,
+                error,
+                result={
+                    "error_code": "conversation_processing_failed",
+                    "action_ledger": action_ledger,
+                    "durable_progress": _has_durable_governance_progress(
+                        action_ledger
+                    ),
+                },
+                notification=None,
+                attention=isinstance(exc, ConversationEvidenceRequiredError),
+            )
+            if isinstance(exc, ConversationEvidenceRequiredError):
+                return
+            raise
         finally:
             lease_keeper.stop()
 
+_TASK_TERMINAL_EVENTS = {"task.done", "task.failed"}
+_USER_UPDATE_EVENTS = _TASK_TERMINAL_EVENTS | {"conversation.planning_failed"}
 
-def _bounded_history(messages: list[dict[str, Any]], max_bytes: int = 120_000) -> list[dict[str, Any]]:
-    """Keep newest complete messages under a byte budget; DB remains the source of truth."""
-    selected: list[dict[str, Any]] = []
-    used = 0
-    for message in reversed(messages):
-        size = len(str(message.get("content") or "").encode("utf-8")) + 512
-        if selected and used + size > max_bytes:
-            break
-        selected.append(message)
-        used += size
-    return list(reversed(selected))
+
+def _mailbox_requires_user_update(mailbox: list[dict[str, Any]]) -> bool:
+    return any(item.get("event_type") in _USER_UPDATE_EVENTS for item in mailbox)
+
+
+def _mailbox_subject_status(mailbox: list[dict[str, Any]]) -> str | None:
+    event_types = {str(item.get("event_type") or "") for item in mailbox}
+    if "task.failed" in event_types:
+        return "failed"
+    if "task.done" in event_types:
+        return "done"
+    if "conversation.planning_failed" in event_types:
+        return "supervision_failed"
+    return None
+
+
+def _has_durable_governance_progress(
+    action_ledger: list[dict[str, Any]],
+) -> bool:
+    """Recognize persisted delivery progress without trusting assistant prose."""
+    task_progress_controls = {
+        "task.cancel",
+        "task.create",
+        "task.fail",
+        "task.rerun",
+        "task.reopen",
+        "task.resume",
+        "task.retry",
+        "workflow.publish",
+        "workflow.template.apply",
+    }
+    return any(
+        item.get("ok")
+        and item.get("status") == "completed"
+        and (
+            item.get("effect_kind") in {"write", "process"}
+            or item.get("capability") in task_progress_controls
+        )
+        for item in action_ledger
+    )
 
 
 class GovernanceLeaseKeeper:
     def __init__(self, store: V1Store, project_id: str, worker_id: str):
         self.store, self.project_id, self.worker_id = store, project_id, worker_id
+        self.policy = store.policy
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name=f"governance-lease-{project_id[-8:]}", daemon=True)
 
@@ -222,6 +353,6 @@ class GovernanceLeaseKeeper:
         self._stop.set(); self._thread.join(timeout=2)
 
     def _loop(self) -> None:
-        while not self._stop.wait(60):
+        while not self._stop.wait(self.policy.scheduling.conversation_lease_renew_seconds):
             if not self.store.renew_conversation_lease(self.project_id, self.worker_id):
                 return

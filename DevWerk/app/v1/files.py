@@ -7,9 +7,12 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, V1RuntimePolicy
+
 
 class ProjectFiles:
-    def __init__(self, base_dir: str):
+    def __init__(self, base_dir: str, policy: V1RuntimePolicy | None = None):
+        self.policy = policy or DEFAULT_V1_RUNTIME_POLICY
         self.root = Path(base_dir).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
 
@@ -52,11 +55,12 @@ class ProjectFiles:
             matches.append((textual.resolve(), relative))
         return matches
 
-    def list_paths(self, pattern: str = "**/*", *, limit: int = 200) -> list[str]:
+    def list_paths(self, pattern: str = "**/*", *, limit: int | None = None) -> list[str]:
+        limit = limit or self.policy.service_limits.default_file_list_size
         paths: list[str] = []
         for _path, relative in self._matched_files(pattern):
             paths.append(relative.as_posix())
-            if len(paths) >= max(1, min(limit, 1000)):
+            if len(paths) >= max(1, min(limit, self.policy.service_limits.max_file_list_size)):
                 break
         return paths
 
@@ -80,55 +84,140 @@ class ProjectFiles:
             "sha256": hashlib.sha256(data).hexdigest(),
         }
 
-    def read_text(self, relative_path: str, max_chars: int = 100_000) -> str:
+    def read_text(self, relative_path: str, max_chars: int | None = None) -> str:
         text = self.resolve(relative_path).read_text(encoding="utf-8")
-        return text[:max_chars]
+        return text if max_chars is None else text[:max_chars]
 
-    def existing_texts(self, pattern: str, max_total_chars: int = 30_000) -> list[dict[str, str]]:
+    def measure_text(self, relative_path: str) -> dict[str, Any]:
+        target = self.resolve(relative_path)
+        data = target.read_bytes()
+        text = data.decode("utf-8")
+        return {
+            "path": target.relative_to(self.root).as_posix(),
+            "size_bytes": len(data),
+            "utf8_characters": len(text),
+            "non_whitespace_characters": sum(1 for character in text if not character.isspace()),
+            "line_count": len(text.splitlines()),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "modified_at_ns": target.stat().st_mtime_ns,
+        }
+
+    def verify_text(self, relative_path: str, expectations: dict[str, Any]) -> dict[str, Any]:
+        target = self.resolve(relative_path)
+        expectation_keys = (
+            "expected_content",
+            "expected_sha256",
+            "expected_size_bytes",
+            "expected_utf8_characters",
+            "expected_non_whitespace_characters",
+            "expected_line_count",
+            "expected_ends_with_newline",
+            "minimum_non_whitespace_characters",
+            "maximum_non_whitespace_characters",
+        )
+        declared = [key for key in expectation_keys if expectations.get(key) is not None]
+        if not declared:
+            raise ValueError("project.files.verify requires at least one explicit expectation")
+        if not target.exists():
+            checks = {key: False for key in declared}
+            return {
+                "outcome": "mismatch",
+                "matched": False,
+                "checks": checks,
+                "mismatches": sorted(checks),
+                "actual": {
+                    "path": target.relative_to(self.root).as_posix(),
+                    "exists": False,
+                },
+            }
+        data = target.read_bytes()
+        text = data.decode("utf-8")
+        actual = {
+            "path": target.relative_to(self.root).as_posix(),
+            "exists": True,
+            "size_bytes": len(data),
+            "utf8_characters": len(text),
+            "non_whitespace_characters": sum(
+                1 for character in text if not character.isspace()
+            ),
+            "line_count": len(text.splitlines()),
+            "ends_with_newline": text.endswith(("\n", "\r")),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "modified_at_ns": target.stat().st_mtime_ns,
+        }
+        checks: dict[str, bool] = {}
+        expected_content = expectations.get("expected_content")
+        if expected_content is not None:
+            checks["expected_content"] = text == str(expected_content)
+        scalar_fields = (
+            "expected_sha256",
+            "expected_size_bytes",
+            "expected_utf8_characters",
+            "expected_non_whitespace_characters",
+            "expected_line_count",
+            "expected_ends_with_newline",
+        )
+        actual_fields = (
+            "sha256",
+            "size_bytes",
+            "utf8_characters",
+            "non_whitespace_characters",
+            "line_count",
+            "ends_with_newline",
+        )
+        for expected_key, actual_key in zip(scalar_fields, actual_fields):
+            if expectations.get(expected_key) is not None:
+                checks[expected_key] = actual[actual_key] == expectations[expected_key]
+        minimum = expectations.get("minimum_non_whitespace_characters")
+        if minimum is not None:
+            checks["minimum_non_whitespace_characters"] = (
+                actual["non_whitespace_characters"] >= int(minimum)
+            )
+        maximum = expectations.get("maximum_non_whitespace_characters")
+        if maximum is not None:
+            checks["maximum_non_whitespace_characters"] = (
+                actual["non_whitespace_characters"] <= int(maximum)
+            )
+        mismatches = sorted(name for name, matched in checks.items() if not matched)
+        return {
+            "outcome": "matched" if not mismatches else "mismatch",
+            "matched": not mismatches,
+            "checks": checks,
+            "mismatches": mismatches,
+            "actual": actual,
+        }
+
+    def existing_texts(self, pattern: str, max_total_chars: int | None = None) -> list[dict[str, str]]:
         result: list[dict[str, str]] = []
         remaining = max_total_chars
         for path, relative in self._matched_files(pattern):
-            if remaining <= 0:
+            if remaining is not None and remaining <= 0:
                 continue
-            try:
-                text = path.read_text(encoding="utf-8")
-            except (UnicodeDecodeError, OSError):
+            text = path.read_text(encoding="utf-8")
+            if remaining is not None and len(text) > remaining:
                 continue
-            if len(text) > remaining:
-                continue
-            remaining -= len(text)
+            if remaining is not None:
+                remaining -= len(text)
             result.append({"path": relative.as_posix(), "content": text})
         return result
 
-    def run(self, argv: list[str], cwd: str = ".", timeout: int = 600) -> dict[str, Any]:
+    def run(self, argv: list[str], cwd: str = ".") -> dict[str, Any]:
         working_dir = self.resolve(cwd)
         working_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            process = subprocess.run(
-                argv,
-                cwd=working_dir,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
-                shell=False,
-                env=os.environ.copy(),
-            )
-            return {
-                "command": argv,
-                "cwd": str(working_dir.relative_to(self.root)),
-                "exit_code": process.returncode,
-                "stdout": process.stdout[-20_000:],
-                "stderr": process.stderr[-20_000:],
-            }
-        except FileNotFoundError as exc:
-            return {"command": argv, "cwd": cwd, "exit_code": 127, "stdout": "", "stderr": str(exc)}
-        except subprocess.TimeoutExpired as exc:
-            return {
-                "command": argv,
-                "cwd": cwd,
-                "exit_code": 124,
-                "stdout": str(exc.stdout or "")[-20_000:],
-                "stderr": f"command timed out after {timeout}s\n{exc.stderr or ''}"[-20_000:],
-            }
+        process = subprocess.run(
+            argv,
+            cwd=working_dir,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+            env=os.environ.copy(),
+        )
+        return {
+            "command": argv,
+            "cwd": str(working_dir.relative_to(self.root)),
+            "exit_code": process.returncode,
+            "stdout": process.stdout,
+            "stderr": process.stderr,
+        }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -13,22 +14,22 @@ from app.v1.domain import (
     AgentToolCall,
     ColumnDefinition,
     Transition,
-    WaitPolicy,
+    PollWaitPolicy,
     WorkflowDefinition,
 )
 from app.v1.files import ProjectFiles
 from app.v1.runtime import WorkflowRuntime
-from tests.helpers import readiness, terminals
+from tests.helpers import create_planned_task, publish_planned_workflow, readiness
 
 
 def test_readiness_is_a_required_dispatch_fact(store, tmp_path):
     project = store.create_project("readiness", "", str(tmp_path / "project"))
     from tests.helpers import sequence_workflow
 
-    store.publish_workflow(project["id"], sequence_workflow())
-    with pytest.raises(ValueError, match="dispatch readiness"):
-        store.create_task(project["id"], "held", "", {}, readiness(decision="hold"))
-    task = store.create_task(project["id"], "ready", "", {}, readiness())
+    publish_planned_workflow(store, project["id"], sequence_workflow())
+    with pytest.raises(ValueError, match="dispatch or queue"):
+        create_planned_task(store, project["id"], "held", readiness_data=readiness(decision="hold"))
+    task = create_planned_task(store, project["id"], "ready")
     assert task["readiness"]["decision"] == "dispatch"
     runs = store.runs(project["id"], task["id"])
     assert [(item["column_key"], item["status"]) for item in runs] == [("execute", "pending")]
@@ -51,25 +52,21 @@ def test_concrete_glob_match_cannot_escape_through_symlink(tmp_path):
         files.list_paths("**/*")
 
 
-def test_provider_transient_error_retries_inside_one_agent_run(store, tmp_path):
-    project = store.create_project("provider retry", "", str(tmp_path / "project"))
+def test_provider_error_surfaces_without_automatic_retry(store, tmp_path):
+    project = store.create_project("provider failure", "", str(tmp_path / "project"))
     attempts = 0
 
-    def model(*_args, **_kwargs):
+    def model(messages, *_args, **_kwargs):
         nonlocal attempts
         attempts += 1
-        if attempts < 3:
-            raise TimeoutError("temporary transport timeout")
-        return AgentModelResponse(text="recovered")
+        raise TimeoutError("temporary transport timeout")
 
-    result = AgentCore(store, build_core_registry(), model).run(
-        AgentRunSpec(
+    with pytest.raises(TimeoutError, match="temporary transport timeout"):
+        AgentCore(store, build_core_registry(), model).run(AgentRunSpec(
             kind="conversation", project=project, instruction="", instruction_revision=1,
-            context={}, capability_ids=[], provider_max_attempts=3,
-        )
-    )
-    assert result.status == "succeeded"
-    assert attempts == 3
+            context={}, capability_ids=[], start_task=False,
+        ))
+    assert attempts == 1
 
 
 def test_durable_await_handle_resumes_by_declared_outcome(store, tmp_path):
@@ -81,20 +78,30 @@ def test_durable_await_handle_resumes_by_declared_outcome(store, tmp_path):
         columns=[
             ColumnDefinition(
                 key="external", name="External", instruction="Start or poll external work.",
-                executor=AgentExecutor(capabilities=["project.files.read"], max_iterations=2, max_tool_calls=2),
-                wait_policy=WaitPolicy(timeout_seconds=60, heartbeat_seconds=5, stale_after_seconds=10),
+                executor=AgentExecutor(capabilities=["project.files.read"]),
+                wait_policy=PollWaitPolicy(poll_capability="project.files.read", poll_interval_seconds=5),
                 transitions=[Transition(outcome="success", target="done"), Transition(outcome="failure", target="failed")],
             ),
-            *terminals(),
         ],
     )
-    store.publish_workflow(project["id"], workflow)
-    task = store.create_task(project["id"], "external", "", {}, readiness())
+    publish_planned_workflow(store, project["id"], workflow)
+    task = create_planned_task(store, project["id"], "external")
 
-    model = lambda *_args, **_kwargs: AgentModelResponse(tool_calls=[AgentToolCall(
-        id="await", name="column.await",
-        arguments={"provider": "generic", "poll_capability": "project.files.read", "poll_arguments": {"path": "ready.txt"}, "next_check_seconds": 5},
-    )])
+    segments = 0
+
+    def model(messages, *_args, **_kwargs):
+        nonlocal segments
+        segments += 1
+        if segments == 1:
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id="await", name="column.await",
+                arguments={"provider": "generic", "poll_capability": "project.files.read", "poll_arguments": {"path": "ready.txt"}, "next_check_seconds": 5},
+            )])
+        evidence_id = json.loads(messages[0]["content"])["context"]["action_ledger"][0]["evidence_id"]
+        return AgentModelResponse(tool_calls=[AgentToolCall(
+            id="complete", name="column.complete",
+            arguments={"outcome": "success", "output": {"content": "ready"}, "summary": "external result accepted", "evidence_ids": [evidence_id]},
+        )])
     runtime = WorkflowRuntime(store, build_core_registry(), "test-worker", AgentCore(store, build_core_registry(), model))
     runtime.step(task["id"])
     assert store.get_task(task["id"])["status"] == "waiting"
@@ -102,25 +109,23 @@ def test_durable_await_handle_resumes_by_declared_outcome(store, tmp_path):
         db.execute("UPDATE v1_await_handles SET next_check_at=?", ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),))
     handle = store.due_await_handles()[0]
     runtime.reconcile_await(handle)
-    resumed = store.get_task(task["id"])
-    assert resumed["status"] == "pending"
-    assert resumed["current_column"] == "done"
-    runtime.step(task["id"])
     terminal = store.get_task(task["id"])
     assert terminal["status"] == "done"
+    assert segments == 2
     assert terminal["terminal_artifact_id"]
     assert terminal["notified_at"]
 
 
-def test_oversized_agent_payload_is_offloaded_from_sqlite(store, tmp_path):
+def test_agent_payload_is_persisted_without_hidden_projection(store, tmp_path):
     project = store.create_project("bounded", "", str(tmp_path / "project"))
     run = store.begin_agent_run(
         project_id=project["id"], kind="conversation", instruction_revision=1,
         instruction_snapshot="", context_snapshot={}, capabilities=[],
+        platform_policy=store.latest_platform_policy(), runtime_policy=store.policy,
     )
     store.add_agent_message(run["id"], "assistant", "x" * 200_000)
     message = store.agent_messages(project["id"], run["id"])[0]
-    assert "$artifact_ref" in message["content"]
+    assert message["content"] == "x" * 200_000
     with store.connect() as db:
         stored_size = db.execute("SELECT length(content) FROM v1_agent_messages WHERE agent_run_id=?", (run["id"],)).fetchone()[0]
-    assert stored_size < 1000
+    assert stored_size == 200_000

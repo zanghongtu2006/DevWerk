@@ -8,23 +8,26 @@ from typing import Any
 
 import requests as http_requests
 
-from app.services.provider_errors import raise_for_provider_payload, raise_for_provider_response
+from app.core.debug_trace import trace_json
+from app.services.provider_errors import provider_timeout_error, raise_for_provider_payload, raise_for_provider_response
 
 
 _log = logging.getLogger("devwerk.llm.openai")
+_trace_log = logging.getLogger("devwerk.llm.provider.openai")
 
 
 class OpenAIClient:
     def __init__(self, config: dict[str, Any]):
         self.last_usage: dict[str, Any] | None = None
-        self.api_name = str(config.get("api_name") or "openai")
-        self.base_url = str(config.get("base_url") or "https://api.openai.com/v1").rstrip("/")
+        self.api_name = str(config["api_name"])
+        self.base_url = str(config["base_url"]).rstrip("/")
         self.api_key = config.get("api_key")
-        self.model = str(config.get("model") or "gpt-4o-mini")
-        self.timeout = float(config.get("timeout") or 180)
-        self.temperature = float(config.get("temperature") or 0.2)
+        self.model = str(config["model"])
+        self.temperature = float(config["temperature"])
         self.top_p = config.get("top_p")
-        self.max_tokens = config.get("max_tokens")
+        self.request_timeout_seconds = float(config.get("request_timeout_seconds", 600.0))
+        if self.request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be positive")
         if not self.base_url.endswith("/v1"):
             self.base_url += "/v1"
         self.url = f"{self.base_url}/chat/completions"
@@ -33,23 +36,50 @@ class OpenAIClient:
         if not self.api_key:
             raise ValueError(f"api_key is not set for LLM provider {self.api_name!r}.")
 
-    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, *, trace_id: str | None = None, require_tool: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
         }
         if tools:
-            payload.update({"tools": tools, "tool_choice": "auto"})
+            payload.update({"tools": tools, "tool_choice": "required" if require_tool else "auto"})
         if self.top_p is not None:
             payload["top_p"] = float(self.top_p)
-        if self.max_tokens:
-            payload["max_tokens"] = int(self.max_tokens)
-        response = self.session.post(
-            self.url,
-            json=payload,
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-            timeout=self.timeout,
+        trace_json(
+            _trace_log,
+            "llm.provider_request",
+            trace_id=trace_id,
+            provider="openai",
+            api_name=self.api_name,
+            model=self.model,
+            url=self.url,
+            payload=payload,
+        )
+        try:
+            response = self.session.post(
+                self.url,
+                json=payload,
+                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                timeout=self.request_timeout_seconds,
+            )
+        except http_requests.Timeout as exc:
+            raise provider_timeout_error(
+                exc,
+                provider="openai",
+                api_name=self.api_name,
+                timeout_seconds=self.request_timeout_seconds,
+            ) from exc
+        trace_json(
+            _trace_log,
+            "llm.provider_response",
+            trace_id=trace_id,
+            provider="openai",
+            api_name=self.api_name,
+            model=self.model,
+            status_code=response.status_code,
+            response_headers=dict(response.headers),
+            body=response.text,
         )
         raise_for_provider_response(response, provider="openai", api_name=self.api_name)
         data = response.json()

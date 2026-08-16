@@ -1,4 +1,4 @@
-import { escapeHtml, formatDate, relativeTime, shortId, statusLabel, statusTone, truncate } from "../core/format.js";
+import { escapeHtml, formatDate, relativeTime, shortId, statusLabel, statusTone, truncate } from "../core/format.js?v=20260804-debug1";
 
 export function icon(name) {
   const paths = {
@@ -33,10 +33,11 @@ function skeletonLines(count) {
 export function workflowPipeline(workflow, tasks = []) {
   const columns = workflow?.definition?.columns || [];
   if (!columns.length) return '<div class="pipeline-empty">Conversation Agent 尚未发布正式 Workflow。</div>';
-  return `<div class="pipeline-scroll"><div class="pipeline" style="--columns:${columns.length}">${columns.map((column, index) => {
-    const count = tasks.filter((task) => task.current_column === column.key || (column.terminal && task.status === column.terminal)).length;
+  const nodes = [...columns, { key: "done", name: "Done", terminal: "done" }, { key: "failed", name: "Failed", terminal: "failed" }];
+  return `<div class="pipeline-scroll"><div class="pipeline" style="--columns:${nodes.length}">${nodes.map((column, index) => {
+    const count = tasks.filter((task) => column.terminal ? task.status === column.terminal : task.current_column === column.key).length;
     const mark = column.terminal === "done" ? "✓" : column.terminal === "failed" ? "!" : index + 1;
-    return `<div class="pipeline-stage ${column.terminal ? `terminal ${column.terminal}` : ""}"><span class="stage-index">${mark}</span><span><b>${escapeHtml(column.name)}</b><small>${escapeHtml(column.key)} · ${count} task${count === 1 ? "" : "s"}</small></span>${index < columns.length - 1 ? '<i class="stage-link"></i>' : ""}</div>`;
+    return `<div class="pipeline-stage ${column.terminal ? `terminal ${column.terminal}` : ""}"><span class="stage-index">${mark}</span><span><b>${escapeHtml(column.name)}</b><small>${escapeHtml(column.key)} · ${count} task${count === 1 ? "" : "s"}</small></span>${index < nodes.length - 1 ? '<i class="stage-link"></i>' : ""}</div>`;
   }).join("")}</div></div>`;
 }
 
@@ -50,7 +51,7 @@ export function eventRow(event) {
 
 function eventSummary(event) {
   const data = event.data || {};
-  return truncate(data.title || data.error || data.summary || data.column || data.path || "状态已由 Runtime 持久化", 150);
+  return truncate(data.title || data.error || data.summary || data.content || data.column || data.path || "状态已由 Runtime 持久化", 150);
 }
 
 export function metricCard(label, value, detail, tone = "blue") {

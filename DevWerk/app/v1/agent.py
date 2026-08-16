@@ -1,18 +1,26 @@
 from __future__ import annotations
 
+import hashlib
 import json
-import time
+import logging
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Literal
 
+from app.core.debug_trace import trace_json
 from app.v1.capabilities import CapabilityContext, CapabilityRegistry, tool_result_json
 from app.v1.contracts import validate_contract
 from app.v1.domain import AgentModelResponse, ToolResult
 from app.v1.llm import complete as provider_complete
-from app.services.provider_errors import is_retryable_llm_error, llm_error_code
+from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, PlatformPolicySnapshot, V1RuntimePolicy
 
 
 ModelComplete = Callable[..., AgentModelResponse]
+trace_log = logging.getLogger("devwerk.agent.trace")
+
+
+class ConversationEvidenceRequiredError(RuntimeError):
+    error_code = "conversation_evidence_required"
+    error_category = "protocol_error"
 
 
 @dataclass(frozen=True)
@@ -26,15 +34,15 @@ class AgentRunSpec:
     history: list[dict[str, Any]] = field(default_factory=list)
     task_id: str | None = None
     column_run_id: str | None = None
+    column_attempt_id: str | None = None
     start_task: bool = True
-    max_iterations: int = 12
-    max_tool_calls: int = 40
-    timeout_seconds: int = 900
     completion_outcomes: set[str] = field(default_factory=set)
     output_contract: dict[str, Any] = field(default_factory=dict)
-    direct_effect_limit: int = 3
-    provider_max_attempts: int = 3
     wait_config: dict[str, Any] = field(default_factory=dict)
+    conversation_job_id: str | None = None
+    completion_targets: dict[str, str] = field(default_factory=dict)
+    agent_session_id: str | None = None
+    writable_paths: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -48,24 +56,31 @@ class AgentRunResult:
     error: str | None = None
     error_category: str | None = None
     wait_request: dict[str, Any] | None = None
+    error_code: str | None = None
+    checkpoint: dict[str, Any] = field(default_factory=dict)
 
 
 class AgentCore:
     """Provider-independent tool loop shared by long-lived and ephemeral agents."""
 
-    def __init__(self, store: Any, registry: CapabilityRegistry, model_complete: ModelComplete | None = None):
+    def __init__(self, store: Any, registry: CapabilityRegistry, model_complete: ModelComplete | None = None, *, policy: V1RuntimePolicy | None = None, platform_policy: PlatformPolicySnapshot | None = None):
         self.store = store
         self.registry = registry
         self.model_complete = model_complete or provider_complete
+        self.policy = policy or DEFAULT_V1_RUNTIME_POLICY
+        self.platform_policy = platform_policy
 
     def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        platform_policy = self.platform_policy or self.store.latest_platform_policy()
         capability_context = CapabilityContext(
             project_id=spec.project["id"],
             project=spec.project,
             store=self.store,
             task_id=spec.task_id,
             column_run_id=spec.column_run_id,
+            column_attempt_id=spec.column_attempt_id,
             start_task=spec.start_task,
+            writable_paths=spec.writable_paths,
         )
         allowed = list(dict.fromkeys(spec.capability_ids))
         resolved_capabilities = self.registry.resolve(allowed, capability_context)
@@ -73,18 +88,27 @@ class AgentCore:
         tools = [item.tool_schema() for item in resolved_capabilities]
         if spec.kind == "column":
             tools.append(_column_complete_schema(spec.completion_outcomes, spec.output_contract))
-            tools.append(_column_await_schema(allowed))
-
-        envelope = self._envelope(spec)
+            if spec.wait_config:
+                tools.append(_column_await_schema(allowed, spec.wait_config))
+        envelope = self._envelope(spec, platform_policy)
         run = self.store.begin_agent_run(
             project_id=spec.project["id"],
             kind=spec.kind,
             instruction_revision=spec.instruction_revision,
             instruction_snapshot=spec.instruction,
             context_snapshot=envelope,
-            capabilities=allowed + (["column.complete"] if spec.kind == "column" else []),
+            capabilities=allowed + (
+                ["column.complete"]
+                if spec.kind == "column"
+                else []
+            ),
             task_id=spec.task_id,
             column_run_id=spec.column_run_id,
+            column_attempt_id=spec.column_attempt_id,
+            platform_policy=platform_policy,
+            runtime_policy=self.policy,
+            conversation_job_id=spec.conversation_job_id,
+            agent_session_id=spec.agent_session_id,
         )
         capability_context = CapabilityContext(
             project_id=spec.project["id"],
@@ -93,102 +117,196 @@ class AgentCore:
             agent_run_id=run["id"],
             task_id=spec.task_id,
             column_run_id=spec.column_run_id,
+            column_attempt_id=spec.column_attempt_id,
             start_task=spec.start_task,
+            writable_paths=spec.writable_paths,
         )
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": _stable_json(envelope)}]
         self.store.add_agent_message(run["id"], "system", messages[0]["content"], [])
+        if spec.agent_session_id:
+            history = self.store.agent_session_messages(spec.project["id"], spec.agent_session_id)
+            if history:
+                item = {
+                    "role": "user",
+                    "content": _stable_json({
+                        "logical_agent_session_history": history,
+                        "instruction": "Resume the same logical assignment; current context and review feedback are authoritative.",
+                    }),
+                }
+                messages.append(item)
+                self.store.add_agent_message(run["id"], "user", item["content"], [], emit_progress=False)
         for message in spec.history:
             if message.get("role") in {"user", "assistant"}:
                 item = {"role": message["role"], "content": str(message.get("content") or "")}
                 messages.append(item)
-                self.store.add_agent_message(run["id"], item["role"], item["content"], [])
+                self.store.add_agent_message(
+                    run["id"],
+                    item["role"],
+                    item["content"],
+                    [],
+                    emit_progress=False,
+                )
+        current_request = spec.context.get("current_request") if isinstance(spec.context, dict) else None
+        if isinstance(current_request, dict):
+            item = {
+                "role": "user",
+                "content": _stable_json(
+                    {
+                        "authoritative_current_request": current_request,
+                        "instruction": (
+                            "This immutable request created the current Conversation Job. "
+                            "It is authoritative over historical conversation instructions."
+                        ),
+                    }
+                ),
+            }
+            messages.append(item)
+            self.store.add_agent_message(run["id"], item["role"], item["content"], [])
 
         calls_used = 0
         direct_effect_calls = 0
-        delegated = False
+        logical_ledger = [
+            dict(item)
+            for item in (spec.context.get("action_ledger") or [])
+            if isinstance(item, dict)
+        ]
+        seen_tool_call_ids: set[str] = set()
         latest_text = ""
-        started = time.monotonic()
+        current_iteration = 0
         try:
-            for iteration in range(1, spec.max_iterations + 1):
-                remaining = spec.timeout_seconds - (time.monotonic() - started)
-                if remaining <= 0:
-                    raise TimeoutError(f"Agent Run exceeded {spec.timeout_seconds} seconds")
-                response = None
-                for provider_attempt in range(1, max(1, spec.provider_max_attempts) + 1):
-                    try:
-                        response = self.model_complete(
-                            messages,
-                            tools,
-                            project_id=spec.project["id"],
-                            task_id=spec.task_id,
-                            agent="conversation" if spec.kind == "conversation" else "column",
-                            timeout_seconds=remaining,
-                        )
-                        break
-                    except Exception as provider_error:  # noqa: BLE001
-                        if not is_retryable_llm_error(provider_error) or provider_attempt >= spec.provider_max_attempts:
-                            raise
-                        time.sleep(min(2 ** (provider_attempt - 1), 8))
-                assert response is not None
+            iteration = 0
+            while True:
+                iteration += 1
+                current_iteration = iteration
+                if spec.kind == "conversation":
+                    self.store.record_conversation_progress(
+                        run["id"],
+                        kind="provider_wait",
+                        content=f"第 {iteration} 轮：已向 LLM Provider 提交完整上下文，正在等待响应。",
+                        details={"iteration": iteration},
+                    )
+                trace_json(
+                    trace_log,
+                    "agent.model_input",
+                    agent_run_id=run["id"],
+                    conversation_job_id=spec.conversation_job_id,
+                    project_id=spec.project["id"],
+                    task_id=spec.task_id,
+                    column_run_id=spec.column_run_id,
+                    column_attempt_id=spec.column_attempt_id,
+                    agent_kind=spec.kind,
+                    iteration=iteration,
+                    messages=messages,
+                    tools=tools,
+                )
+                response = self.model_complete(
+                    messages,
+                    tools,
+                    project_id=spec.project["id"],
+                    task_id=spec.task_id,
+                    agent="conversation" if spec.kind == "conversation" else "column",
+                    require_tool=bool(
+                        spec.kind == "conversation"
+                        and spec.start_task
+                        and not logical_ledger
+                    ),
+                )
+                trace_json(
+                    trace_log,
+                    "agent.model_output",
+                    agent_run_id=run["id"],
+                    conversation_job_id=spec.conversation_job_id,
+                    project_id=spec.project["id"],
+                    task_id=spec.task_id,
+                    column_run_id=spec.column_run_id,
+                    column_attempt_id=spec.column_attempt_id,
+                    agent_kind=spec.kind,
+                    iteration=iteration,
+                    response=(response.model_dump(mode="json") if isinstance(response, AgentModelResponse) else response),
+                )
                 if not isinstance(response, AgentModelResponse):
                     response = AgentModelResponse.model_validate(response)
                 if response.text.strip():
                     latest_text = response.text.strip()
                 for index, call in enumerate(response.tool_calls):
-                    if not call.id:
-                        call.id = f"call-{iteration}-{index + 1}"
+                    provider_call_id = str(call.id or "").strip()
+                    if not provider_call_id:
+                        provider_call_id = f"{run['id']}-call-{iteration}-{index + 1}"
+                    candidate = provider_call_id
+                    duplicate = 1
+                    while candidate in seen_tool_call_ids:
+                        duplicate += 1
+                        candidate = f"{provider_call_id}-{iteration}-{index + 1}-{duplicate}"
+                    call.id = candidate
+                    seen_tool_call_ids.add(candidate)
                 assistant_message = _assistant_message(response)
                 messages.append(assistant_message)
-                self.store.add_agent_message(run["id"], "assistant", response.text, assistant_message.get("tool_calls") or [])
+                self.store.add_agent_message(
+                    run["id"],
+                    "assistant",
+                    response.text,
+                    assistant_message.get("tool_calls") or [],
+                    progress_details={"iteration": iteration},
+                )
 
                 if response.tool_calls:
                     calls_used += len(response.tool_calls)
-                    if calls_used > spec.max_tool_calls:
-                        raise RuntimeError(f"agent tool-call budget exceeded ({spec.max_tool_calls})")
                     completion: dict[str, Any] | None = None
                     wait_request: dict[str, Any] | None = None
-                    for call in response.tool_calls:
-                        if time.monotonic() - started >= spec.timeout_seconds:
-                            raise TimeoutError(f"Agent Run exceeded {spec.timeout_seconds} seconds")
+                    for call_index, call in enumerate(response.tool_calls):
                         if call.name == "column.complete":
-                            result, accepted = self._complete_column(call.arguments, spec)
+                            if call_index != len(response.tool_calls) - 1:
+                                raise RuntimeError("column.complete must be the final tool call in its model response")
+                            else:
+                                try:
+                                    result, accepted = self._complete_column(
+                                        call.arguments,
+                                        spec,
+                                        logical_ledger,
+                                    )
+                                except ValueError as exc:
+                                    result = ToolResult(
+                                        ok=False,
+                                        capability="column.complete",
+                                        error={"type": type(exc).__name__, "message": str(exc)},
+                                    )
+                                    accepted = False
                             if accepted:
                                 completion = call.arguments
                         elif call.name == "column.await":
-                            result, accepted = self._await_column(call.arguments, allowed)
+                            if not spec.wait_config:
+                                raise RuntimeError("Column has no declarative wait policy")
+                            else:
+                                result, accepted = self._await_column(call.arguments, allowed)
                             if accepted:
                                 wait_request = call.arguments
                         elif call.name not in allowed:
                             result = ToolResult(
                                 ok=False,
                                 capability=call.name,
-                                error={"type": "CapabilityDenied", "message": "capability is not available in this Agent Run"},
-                            )
-                        elif spec.kind == "conversation" and effect_kinds.get(call.name) in {"write", "process"} and delegated:
-                            result = ToolResult(
-                                ok=False,
-                                capability=call.name,
                                 error={
-                                    "type": "DelegationBoundary",
-                                    "message": "A formal Task was created in this turn; direct write/process execution is disabled. Continue with supervision or return the tracked Task status.",
+                                    "type": "CapabilityUnavailable",
+                                    "message": f"capability is not available in this Agent Run: {call.name}",
                                 },
-                            )
-                        elif (
-                            spec.kind == "conversation"
-                            and effect_kinds.get(call.name) in {"write", "process"}
-                            and direct_effect_calls >= spec.direct_effect_limit
-                        ):
-                            result = ToolResult(
-                                ok=False,
-                                capability=call.name,
-                                error={
-                                    "type": "DelegationRequired",
-                                    "message": "The bounded direct-execution budget is exhausted. Publish a declarative Workflow and create a formal Task instead of continuing project writes or commands.",
-                                },
+                                checkpoint={"failure_disposition": "rejected_before_effect"},
                             )
                         else:
                             result = self.registry.dispatch(call.name, call.arguments, replace(capability_context, execution_key=f"{run['id']}:{call.id}"))
+                            if spec.kind == "column" and result.status == "awaiting":
+                                if not spec.wait_config:
+                                    raise RuntimeError("Capability returned awaiting but the Column has no wait policy")
+                                else:
+                                    wait_request = {
+                                        **dict(result.await_handle_draft or {}),
+                                        "checkpoint": {
+                                            **dict(result.checkpoint or {}),
+                                            "execution_key": f"{run['id']}:{call.id}",
+                                            "capability_result": result.model_dump(mode="json"),
+                                        },
+                                        "source": "agent",
+                                        "capability": call.name,
+                                    }
                             if (
                                 spec.kind == "conversation"
                                 and result.ok
@@ -199,8 +317,6 @@ class AgentCore:
                                     spec.project["id"], "direct_execution", spec.task_id,
                                     "executed", {"agent_run_id": run["id"], "capability": call.name, "scope_index": direct_effect_calls},
                                 )
-                            if spec.kind == "conversation" and result.ok and call.name == "task.create":
-                                delegated = True
                         self.store.record_tool_invocation(
                             agent_run_id=run["id"],
                             tool_call_id=call.id,
@@ -209,17 +325,65 @@ class AgentCore:
                             result=result.model_dump(mode="json"),
                             ok=result.ok,
                         )
+                        ledger_item = _ledger_entry(
+                            run["id"],
+                            call.id,
+                            call.name,
+                            effect_kinds.get(call.name, "control"),
+                            result,
+                            arguments=call.arguments,
+                        )
+                        logical_ledger.append(ledger_item)
                         tool_message = {
                             "role": "tool",
                             "tool_call_id": call.id,
                             "name": call.name,
-                            "content": tool_result_json(result),
+                            "content": tool_result_json(
+                                result,
+                                None,
+                                reference={
+                                    "agent_run_id": run["id"],
+                                    "tool_call_id": call.id,
+                                    "evidence_id": _evidence_id(run["id"], call.id),
+                                    "capability": call.name,
+                                    "entity_ids": ledger_item["entity_ids"],
+                                    "entity_ids_truncated": ledger_item.get("entity_ids_truncated", False),
+                                    "entity_id_count": ledger_item.get(
+                                        "entity_id_count",
+                                        len(ledger_item["entity_ids"]),
+                                    ),
+                                    "entity_ids_sha256": ledger_item.get("entity_ids_sha256"),
+                                },
+                            ),
                         }
                         messages.append(tool_message)
-                        self.store.add_agent_message(run["id"], "tool", tool_message["content"], [], call.id)
+                        self.store.add_agent_message(
+                            run["id"],
+                            "tool",
+                            tool_message["content"],
+                            [],
+                            call.id,
+                            progress_details={"iteration": iteration, "capability": call.name},
+                        )
+                        if wait_request is not None:
+                            break
                     if completion is not None:
-                        self.store.finish_agent_run(run["id"], "succeeded", response.text, None, iteration, calls_used)
-                        return AgentRunResult(run["id"], "succeeded", response.text, completion, calls_used, iteration)
+                        completed_text = response.text
+                        self.store.finish_agent_run(run["id"], "succeeded", completed_text, None, iteration, calls_used)
+                        return AgentRunResult(
+                            run["id"],
+                            "succeeded",
+                            completed_text,
+                            completion,
+                            calls_used,
+                            iteration,
+                            checkpoint=self._checkpoint(
+                                iteration,
+                                calls_used,
+                                direct_effect_calls,
+                                completed_text,
+                            ),
+                        )
                     if wait_request is not None:
                         self.store.finish_agent_run(run["id"], "waiting", response.text, None, iteration, calls_used)
                         return AgentRunResult(run["id"], "waiting", response.text, None, calls_used, iteration, wait_request=wait_request)
@@ -230,21 +394,33 @@ class AgentCore:
                 text = response.text.strip()
                 if not text:
                     raise RuntimeError("Conversation Agent returned neither tools nor final text")
+                if spec.start_task and not logical_ledger:
+                    raise ConversationEvidenceRequiredError(
+                        "Conversation Agent returned an execution report without calling any project tool"
+                    )
                 self.store.finish_agent_run(run["id"], "succeeded", text, None, iteration, calls_used)
                 return AgentRunResult(run["id"], "succeeded", text, None, calls_used, iteration)
-            if spec.kind == "conversation" and delegated:
-                text = latest_text or "Durable task delegation was accepted and supervision will continue."
-                self.store.finish_agent_run(run["id"], "succeeded", text, None, spec.max_iterations, calls_used)
-                return AgentRunResult(run["id"], "succeeded", text, None, calls_used, spec.max_iterations)
-            raise RuntimeError(f"agent iteration budget exceeded ({spec.max_iterations})")
         except Exception as exc:  # noqa: BLE001
-            error = f"{type(exc).__name__}: {exc}"[:4000]
-            self.store.finish_agent_run(run["id"], "failed", "", error, spec.max_iterations, calls_used)
-            category = "provider_transient" if is_retryable_llm_error(exc) else ("provider_permanent" if llm_error_code(exc, "") else "runtime_permanent")
-            return AgentRunResult(run["id"], "failed", tool_calls=calls_used, iterations=spec.max_iterations, error=error, error_category=category)
+            error = f"{type(exc).__name__}: {exc}"
+            error_code = getattr(exc, "error_code", None)
+            checkpoint = self._checkpoint(current_iteration, calls_used, direct_effect_calls, latest_text)
+            actual_iterations = int(checkpoint.get("iterations_completed") or 0)
+            category = getattr(exc, "error_category", "runtime_permanent")
+            self.store.finish_agent_run(
+                run["id"],
+                "failed",
+                "",
+                error,
+                actual_iterations,
+                calls_used,
+                error_code=error_code,
+                error_category=category,
+                checkpoint=checkpoint,
+            )
+            raise
 
     @staticmethod
-    def _envelope(spec: AgentRunSpec) -> dict[str, Any]:
+    def _envelope(spec: AgentRunSpec, platform_policy: PlatformPolicySnapshot) -> dict[str, Any]:
         return {
             "protocol_version": "devwerk.agent.v1",
             "agent": {
@@ -253,6 +429,8 @@ class AgentCore:
                 "instruction_revision": spec.instruction_revision,
                 "task_id": spec.task_id,
                 "column_run_id": spec.column_run_id,
+                "column_attempt_id": spec.column_attempt_id,
+                "agent_session_id": spec.agent_session_id,
             },
             "project": {
                 "name": spec.project.get("name", ""),
@@ -260,54 +438,135 @@ class AgentCore:
                 "base_dir": spec.project.get("base_dir", ""),
             },
             "instruction": spec.instruction,
-            "context": spec.context,
-            "constraints": {
-                "kanban_user_access": "read_only",
-                "task_terminal_states": ["done", "failed"],
-                "default_execution": "delegate",
-                "direct_execution_scopes": ["small_task", "diagnostic", "recovery", "emergency"],
-                "responsibilities": [
-                    "general_purpose_agent",
-                    "project_manager",
-                    "agile_coach",
-                    "kanban_designer",
-                    "task_supervisor",
-                    "diagnostics_and_recovery",
-                ],
-                "workflow_source": "conversation_generated_project_data",
-                "business_templates_in_runtime": False,
-                "governance_protocol": {
-                    "dispatch_requires_readiness_fact": True,
-                    "terminal_mailbox_requires_observation": True,
-                    "terminal_follow_up_requires_explicit_intervention_fact": True,
-                    "scheduled_reviews_are_durable": True,
-                },
+            "platform_policy": {
+                "revision": platform_policy.revision,
+                "content_hash": platform_policy.content_hash,
+                **({"content": platform_policy.content} if spec.kind == "conversation" else {}),
             },
+            "context": spec.context,
         }
 
     @staticmethod
-    def _complete_column(arguments: dict[str, Any], spec: AgentRunSpec) -> tuple[ToolResult, bool]:
-        try:
-            outcome = str(arguments.get("outcome") or "")
-            if outcome not in spec.completion_outcomes:
-                raise ValueError(f"undeclared Column outcome: {outcome!r}")
-            output = arguments.get("output")
-            if not isinstance(output, dict):
-                raise ValueError("column.complete output must be an object")
-            validate_contract(output, spec.output_contract, label="Column output")
-            return ToolResult(ok=True, capability="column.complete", output={"accepted": True}), True
-        except Exception as exc:  # noqa: BLE001
-            return ToolResult(
-                ok=False,
-                capability="column.complete",
-                error={"type": type(exc).__name__, "message": str(exc)[:4000]},
-            ), False
+    def _checkpoint(
+        iterations: int,
+        tool_calls: int,
+        direct_effect_calls: int,
+        latest_text: str,
+    ) -> dict[str, Any]:
+        return {
+            "iterations_completed": iterations,
+            "tool_calls_completed": tool_calls,
+            "direct_effect_calls": direct_effect_calls,
+            "latest_text": latest_text,
+        }
+
+    @staticmethod
+    def _complete_column(
+        arguments: dict[str, Any],
+        spec: AgentRunSpec,
+        logical_ledger: list[dict[str, Any]],
+    ) -> tuple[ToolResult, bool]:
+        outcome = str(arguments.get("outcome") or "")
+        if outcome not in spec.completion_outcomes:
+            raise ValueError(f"undeclared Column outcome: {outcome!r}")
+        output = arguments.get("output")
+        if not isinstance(output, dict):
+            raise ValueError("column.complete output must be an object")
+        validate_contract(output, spec.output_contract, label="Column output")
+        evidence_ids = [str(item) for item in arguments.get("evidence_ids") or []]
+        if len(evidence_ids) != len(set(evidence_ids)):
+            raise ValueError("column.complete evidence references must be unique")
+        by_evidence = {
+            str(item.get("evidence_id")): item
+            for item in logical_ledger
+            if item.get("evidence_id")
+        }
+        target = spec.completion_targets.get(outcome)
+        success_completion = outcome == "success" or target == "done"
+        if success_completion:
+            if not evidence_ids:
+                raise ValueError("successful Column completion requires capability evidence")
+            referenced = []
+            for evidence_id in evidence_ids:
+                entry = by_evidence.get(evidence_id)
+                if entry is None:
+                    raise ValueError(f"unknown Column evidence: {evidence_id!r}")
+                if not entry.get("ok") or entry.get("status") != "completed":
+                    raise ValueError(f"successful Column completion referenced failed evidence: {evidence_id!r}")
+                referenced.append(entry)
+            referenced_ids = {str(item.get("evidence_id")) for item in referenced}
+            required_actions = {
+                str(item.get("evidence_id"))
+                for item in logical_ledger
+                if item.get("ok")
+                and item.get("status") == "completed"
+                and item.get("effect_kind") in {"write", "process", "control"}
+                and item.get("capability") not in {"column.complete", "column.await"}
+            }
+            if not required_actions.issubset(referenced_ids):
+                raise ValueError("successful Column completion omitted successful action evidence")
+            unresolved_failures: dict[str, dict[str, Any]] = {}
+            for item in logical_ledger:
+                if item.get("capability") in {"column.complete", "column.await"}:
+                    continue
+                if item.get("effect_kind") not in {"write", "process", "control"}:
+                    continue
+                if (
+                    (((item.get("facts") or {}).get("result") or {}).get("checkpoint") or {}).get(
+                        "failure_disposition"
+                    )
+                    == "rejected_before_effect"
+                ):
+                    continue
+                operation = str(item.get("operation_sha256") or "")
+                if not operation:
+                    continue
+                if item.get("ok") and item.get("status") == "completed":
+                    unresolved_failures.pop(operation, None)
+                else:
+                    unresolved_failures[operation] = item
+            if unresolved_failures:
+                failed = next(iter(unresolved_failures.values()))
+                message = str(
+                    ((failed.get("facts") or {}).get("result") or {}).get("error", {}).get("message")
+                    or "a failed Column action has not been repaired"
+                )
+                raise ValueError(message)
+        else:
+            unresolved_failures: dict[str, dict[str, Any]] = {}
+            for item in logical_ledger:
+                if item.get("capability") in {"column.complete", "column.await"}:
+                    continue
+                if item.get("effect_kind") not in {"write", "process", "control"}:
+                    continue
+                if (
+                    (((item.get("facts") or {}).get("result") or {}).get("checkpoint") or {}).get(
+                        "failure_disposition"
+                    )
+                    == "rejected_before_effect"
+                ):
+                    continue
+                operation = str(item.get("operation_sha256") or "")
+                if not operation:
+                    continue
+                if item.get("ok") and item.get("status") == "completed":
+                    unresolved_failures.pop(operation, None)
+                else:
+                    unresolved_failures[operation] = item
+            if unresolved_failures:
+                failed = next(iter(unresolved_failures.values()))
+                message = str(
+                    ((failed.get("facts") or {}).get("result") or {}).get("error", {}).get("message")
+                    or "a failed Column action has not been repaired"
+                )
+                raise RuntimeError(message)
+        return ToolResult(ok=True, capability="column.complete", output={"accepted": True}), True
 
     @staticmethod
     def _await_column(arguments: dict[str, Any], allowed: list[str]) -> tuple[ToolResult, bool]:
         capability = str(arguments.get("poll_capability") or "")
-        if capability not in allowed:
-            return ToolResult(ok=False, capability="column.await", error={"type": "CapabilityDenied", "message": "poll_capability must be selected by the Column"}), False
+        if capability and capability not in allowed:
+            raise PermissionError("poll_capability must be selected by the Column")
         return ToolResult(ok=True, capability="column.await", output={"accepted": True}), True
 
 
@@ -319,11 +578,20 @@ def _column_complete_schema(outcomes: set[str], output_contract: dict[str, Any])
             "description": "Finish this Column Run with one declared outcome and contract-valid structured output.",
             "parameters": {
                 "type": "object",
-                "required": ["outcome", "output", "summary"],
+                "required": ["outcome", "output", "summary", "evidence_ids"],
                 "properties": {
                     "outcome": {"type": "string", "enum": sorted(outcomes)},
                     "output": output_contract or {"type": "object"},
                     "summary": {"type": "string", "maxLength": 4000},
+                    "evidence_ids": {
+                        "type": "array",
+                        "maxItems": 500,
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Canonical evidence_id from a Column tool result.",
+                        },
+                    },
                 },
                 "additionalProperties": False,
             },
@@ -331,22 +599,87 @@ def _column_complete_schema(outcomes: set[str], output_contract: dict[str, Any])
     }
 
 
-def _column_await_schema(allowed: list[str]) -> dict[str, Any]:
+def _ledger_entry(
+    agent_run_id: str,
+    tool_call_id: str,
+    capability: str,
+    effect_kind: str,
+    result: ToolResult,
+    *,
+    arguments: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = result.model_dump(mode="json")
+    payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    operation_json = json.dumps(
+        {"capability": capability, "arguments": arguments or {}},
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    entity_ids = sorted(_entity_ids(payload))
+    entity_digest = hashlib.sha256(
+        json.dumps(entity_ids, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    entry: dict[str, Any] = {
+        "agent_run_id": agent_run_id,
+        "tool_call_id": tool_call_id,
+        "evidence_id": _evidence_id(agent_run_id, tool_call_id),
+        "capability": capability,
+        "effect_kind": effect_kind,
+        "ok": result.ok,
+        "status": result.status,
+        "operation_sha256": hashlib.sha256(operation_json.encode("utf-8")).hexdigest(),
+        "entity_ids": entity_ids,
+        "result_sha256": hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+    }
+    facts = {"arguments": arguments or {}, "result": payload}
+    entry["entity_id_count"] = len(entity_ids)
+    entry["entity_ids_sha256"] = entity_digest
+    entry["facts"] = facts
+    return entry
+
+
+def _evidence_id(agent_run_id: str, tool_call_id: str) -> str:
+    return f"{agent_run_id}:{tool_call_id}"
+
+
+def _entity_ids(value: Any) -> set[str]:
+    found: set[str] = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(item, str) and (key == "id" or key.endswith("_id")) and item:
+                found.add(item)
+            found.update(_entity_ids(item))
+    elif isinstance(value, list):
+        for item in value:
+            found.update(_entity_ids(item))
+    return found
+
+
+def _column_await_schema(allowed: list[str], wait_config: dict[str, Any]) -> dict[str, Any]:
+    kind = str(wait_config.get("kind") or "poll")
+    required = ["provider"]
+    properties: dict[str, Any] = {
+        "provider": {"type": "string", "minLength": 1, "maxLength": 200},
+        "token": {"type": ["string", "null"], "maxLength": 4000},
+        "checkpoint": {"type": "object"},
+    }
+    if kind == "poll":
+        required.extend(["poll_capability", "poll_arguments"])
+        properties.update({
+            "poll_capability": {"type": "string", "enum": sorted(allowed)},
+            "poll_arguments": {"type": "object"},
+            "next_check_seconds": {"type": "integer", "minimum": 1},
+        })
     return {
         "type": "function",
         "function": {
             "name": "column.await",
-            "description": "Suspend this Column Run for durable asynchronous polling instead of keeping an Agent alive.",
+            "description": f"Suspend this Column Run using its declared {kind} wait policy instead of keeping an Agent alive.",
             "parameters": {
                 "type": "object",
-                "required": ["provider", "poll_capability", "poll_arguments"],
-                "properties": {
-                    "provider": {"type": "string", "minLength": 1, "maxLength": 200},
-                    "token": {"type": ["string", "null"], "maxLength": 4000},
-                    "poll_capability": {"type": "string", "enum": sorted(allowed)},
-                    "poll_arguments": {"type": "object"},
-                    "next_check_seconds": {"type": "integer", "minimum": 5, "maximum": 3600},
-                },
+                "required": required,
+                "properties": properties,
                 "additionalProperties": False,
             },
         },

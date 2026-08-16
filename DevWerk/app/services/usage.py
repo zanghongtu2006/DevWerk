@@ -130,27 +130,24 @@ def start_request(
     if not _enabled():
         return ctx
 
-    try:
-        init_usage_db()
-        with _connect(_db_path()) as conn:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO api_requests (
-                    request_id, project_id, task_id, route, action, started_at, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (ctx.request_id, ctx.project_id, ctx.task_id, ctx.route, ctx.action, ctx.started_at, now),
-            )
-        _log.debug(
-            "usage request started request_id=%s project_id=%s task_id=%s route=%s action=%s",
-            ctx.request_id,
-            ctx.project_id,
-            ctx.task_id,
-            ctx.route,
-            ctx.action,
+    init_usage_db()
+    with _connect(_db_path()) as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO api_requests (
+                request_id, project_id, task_id, route, action, started_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (ctx.request_id, ctx.project_id, ctx.task_id, ctx.route, ctx.action, ctx.started_at, now),
         )
-    except Exception as exc:  # noqa: BLE001
-        _log.exception("failed to start usage request tracking: %s", exc)
+    _log.debug(
+        "usage request started request_id=%s project_id=%s task_id=%s route=%s action=%s",
+        ctx.request_id,
+        ctx.project_id,
+        ctx.task_id,
+        ctx.route,
+        ctx.action,
+    )
     return ctx
 
 
@@ -168,9 +165,8 @@ def finish_request(
 
     completed_at = _now()
     duration_ms = int((time.monotonic() - ctx.started_monotonic) * 1000)
-    try:
-        with _connect(_db_path()) as conn:
-            conn.execute(
+    with _connect(_db_path()) as conn:
+        conn.execute(
                 """
                 UPDATE api_requests
                    SET completed_at = ?,
@@ -188,17 +184,15 @@ def finish_request(
                     error_type,
                     ctx.request_id,
                 ),
-            )
-        _log.debug(
-            "usage request finished request_id=%s project_id=%s status=%s success=%s duration_ms=%s",
-            ctx.request_id,
-            ctx.project_id,
-            status_code,
-            success,
-            duration_ms,
         )
-    except Exception as exc:  # noqa: BLE001
-        _log.exception("failed to finish usage request tracking: %s", exc)
+    _log.debug(
+        "usage request finished request_id=%s project_id=%s status=%s success=%s duration_ms=%s",
+        ctx.request_id,
+        ctx.project_id,
+        status_code,
+        success,
+        duration_ms,
+    )
 
 
 def clear_request() -> None:
@@ -220,6 +214,7 @@ def record_llm_usage(
     error_type: str | None = None,
     project_id: str | None = None,
     task_id: str | None = None,
+    trace_id: str | None = None,
 ) -> None:
     if not _enabled():
         return
@@ -230,10 +225,9 @@ def record_llm_usage(
     request_id = ctx.request_id if ctx else None
     normalized = _normalize_usage(usage or {})
 
-    try:
-        init_usage_db()
-        with _connect(_db_path()) as conn:
-            conn.execute(
+    init_usage_db()
+    with _connect(_db_path()) as conn:
+        conn.execute(
                 """
                 INSERT INTO llm_usage (
                     request_id, project_id, task_id, agent_name, provider, model,
@@ -263,22 +257,21 @@ def record_llm_usage(
                     error_type,
                     _now(),
                 ),
-            )
-        _log.debug(
-            "llm usage recorded request_id=%s project_id=%s task_id=%s agent=%s provider=%s model=%s usage=%s duration_ms=%s success=%s error=%s",
-            request_id,
-            resolved_project_id,
-            resolved_task_id,
-            agent_name,
-            provider,
-            model,
-            normalized,
-            duration_ms,
-            success,
-            error_type,
         )
-    except Exception as exc:  # noqa: BLE001
-        _log.exception("failed to record llm usage: %s", exc)
+    _log.debug(
+        "llm usage recorded trace_id=%s request_id=%s project_id=%s task_id=%s agent=%s provider=%s model=%s usage=%s duration_ms=%s success=%s error=%s",
+        trace_id,
+        request_id,
+        resolved_project_id,
+        resolved_task_id,
+        agent_name,
+        provider,
+        model,
+        normalized,
+        duration_ms,
+        success,
+        error_type,
+    )
 
 
 def usage_summary(

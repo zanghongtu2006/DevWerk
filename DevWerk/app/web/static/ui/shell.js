@@ -1,5 +1,5 @@
-import { escapeHtml, shortId } from "../core/format.js";
-import { icon } from "./components.js";
+import { escapeHtml, shortId } from "../core/format.js?v=20260804-debug1";
+import { icon } from "./components.js?v=20260804-debug1";
 
 export function renderProjectRail(projects, selectedId, query = "") {
   const list = document.getElementById("project-list");

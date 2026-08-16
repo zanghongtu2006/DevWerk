@@ -1,4 +1,4 @@
-import { eventRow, noProjectState } from "../ui/components.js";
+import { eventRow, noProjectState } from "../ui/components.js?v=20260804-debug1";
 
 export function renderEvents(state) {
   if (!state.project) return noProjectState();

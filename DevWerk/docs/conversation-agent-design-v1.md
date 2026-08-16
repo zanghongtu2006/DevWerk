@@ -367,10 +367,11 @@ conversation-agent 不因单纯运行时间较长就中断 Column Attempt。它�
 - 唤醒 conversation-agent。
 - 记录 `notified_at`、`observed_at` 和 `acknowledged_at`。
 
-`failed` 是不可变终态。conversation-agent 可以：
+`failed` 是明确且可观察的失败状态。conversation-agent 可以：
 
 - 诊断并记录 Intervention Run
-- 通过 `task.rerun` 创建带 `rerun_of_task_id` 的 successor Task
+- 对可恢复失败执行 `task.reopen`，保留 Task ID、历史、产物和 Agent session，并从 Workflow entry 或指定非终态 Column 重新调度
+- 需要独立交付世代时，通过 `task.rerun` 创建带 `rerun_of_task_id` 的 successor Task
 - 为 successor 选择当前或新发布的 workflow revision
 - 调整后续 backlog、调度或 Project instruction
 - 向用户汇报并请求方向

@@ -12,6 +12,8 @@ export const state = {
   agentDetail: null,
   sending: false,
   pendingMessage: "",
+  conversationStatus: null,
+  conversationHasOlder: false,
   draftMessage: "",
   error: null,
 };
