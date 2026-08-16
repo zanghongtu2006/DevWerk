@@ -3,5 +3,7 @@ backend/
 dist/
 DevWerk/config/llm.json
 DevWerk/data/
+data/
+idea-plugin/.idea/misc.xml
 __pycache__/
 *.py[cod]
