@@ -19,15 +19,25 @@ os.environ.setdefault("ANTHROPIC_AUTH_TOKEN", "test-token")
 @pytest.fixture(autouse=True)
 def isolated_settings(tmp_path, monkeypatch):
     config = {
-        "routing": {"default": "test/model"},
-        "llms": {
+        "providers": {
             "test": {
-                "api": "anthropic",
+                "protocol": "anthropic",
                 "base_url": "https://provider.invalid/anthropic",
                 "api_key": "test-token",
-                "models": {"model": {"model": "test-model", "temperature": 0.2, "thinking_mode": "balanced", "max_tokens": 65535}},
             }
         },
+        "models": {
+            "main": {
+                "provider": "test",
+                "model": "test-model",
+                "request_timeout_seconds": 600,
+                "temperature": 0.2,
+                "thinking_mode": "balanced",
+                "max_tokens": 65535,
+            }
+        },
+        "routes": {"conversation": "main", "column": "main", "default": "main"},
+        "runtime": {"trust_env_proxy": False},
     }
     monkeypatch.setenv("APP_ENV", "test")
     monkeypatch.setenv("DEVWERK_DB_PATH", str(tmp_path / "devwerk.db"))

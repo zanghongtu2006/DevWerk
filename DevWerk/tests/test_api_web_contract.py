@@ -17,6 +17,11 @@ def client() -> TestClient:
 def test_web_routes_and_modular_assets_are_served():
     with client() as web:
         assert web.get("/v1/health").json()["status"] == "ok"
+        statuses = web.get("/v1/runtime-statuses").json()
+        assert "recovering" in statuses["task"]["values"]
+        assert set(statuses) == {
+            "task", "column_run", "attempt", "agent_run", "tool_invocation"
+        }
         for route in ("/", "/workbench", "/dashboard", "/kanban", "/tasks", "/events"):
             response = web.get(route)
             assert response.status_code == 200

@@ -528,24 +528,44 @@ def test_provider_reference_wrapper_is_normalized_only_as_an_exact_reserved_valu
 
 def test_settings_resolve_explicit_json_routing(monkeypatch, tmp_path):
     config = {
-        "routing": {"default": "provider/model-a", "workflow": "provider/model-b"},
-        "llms": {
+        "providers": {
             "provider": {
-                "api": "openai",
+                "protocol": "openai",
                 "base_url": "https://provider.invalid/v1",
                 "api_key": "secret",
-                "models": {
-                    "model-a": {"temperature": 0.2, "thinking_mode": "balanced", "max_tokens": 65535},
-                    "model-b": {"model": "provider-model-b", "temperature": 0.2, "thinking_mode": "balanced", "max_tokens": 65535},
-                },
             }
         },
+        "models": {
+            "model_a": {"provider": "provider", "model": "model-a", "request_timeout_seconds": 180, "temperature": 0.2, "thinking_mode": "balanced", "max_tokens": 65535},
+            "model_b": {"provider": "provider", "model": "provider-model-b", "request_timeout_seconds": 240, "temperature": 0.2, "thinking_mode": "balanced", "max_tokens": 65535},
+        },
+        "routes": {"conversation": "model_a", "column": "model_b", "default": "model_a"},
+        "runtime": {"trust_env_proxy": False},
     }
     monkeypatch.setenv("DEVWERK_LLM_CONFIG_PATH", str(tmp_path / "missing.json"))
     monkeypatch.setenv("DEVWERK_LLM_CONFIG_JSON", json.dumps(config))
     settings = reload_settings()
-    assert settings.get_llm_config("project")["model"] == "model-a"
-    assert settings.get_llm_config("workflow")["model"] == "provider-model-b"
+    assert settings.get_llm_config("conversation")["model"] == "model-a"
+    assert settings.get_llm_config("conversation")["request_timeout_seconds"] == 180
+    assert settings.get_llm_config("column")["model"] == "provider-model-b"
+    assert settings.get_llm_config("column")["request_timeout_seconds"] == 240
+
+
+def test_settings_reject_legacy_or_unknown_llm_fields(monkeypatch, tmp_path):
+    config = {
+        "routing": {"default": "provider/model-a"},
+        "llms": {},
+        "timeout": 180,
+    }
+    monkeypatch.setenv("DEVWERK_LLM_CONFIG_PATH", str(tmp_path / "missing.json"))
+    monkeypatch.setenv("DEVWERK_LLM_CONFIG_JSON", json.dumps(config))
+
+    with pytest.raises(ValueError, match="configuration schema") as captured:
+        reload_settings()
+
+    assert "routing" in str(captured.value)
+    assert "llms" in str(captured.value)
+    assert "timeout" in str(captured.value)
 
 
 def test_usage_wrapper_tracks_complete_and_logs_full_io(monkeypatch, caplog):

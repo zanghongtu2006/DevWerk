@@ -1,5 +1,6 @@
 import { api, loadProjectBundle, loadTaskDetail, openProjectStream } from "./core/api.js?v=20260804-debug1";
 import { routeFromPath, state, updateProjectUrl } from "./core/state.js?v=20260804-debug1";
+import { configureStatusCatalog } from "./core/format.js?v=20260804-debug1";
 import { pageSkeleton } from "./ui/components.js?v=20260804-debug1";
 import {
   closeProjectDialog,
@@ -118,9 +119,15 @@ async function boot() {
   setBusy(true, "正在连接 DevWerk…");
   renderLoading();
   try {
-    const [health, projects] = await Promise.all([api.get("/health"), api.get("/projects")]);
+    const [health, projects, statusCatalog] = await Promise.all([
+      api.get("/health"),
+      api.get("/projects"),
+      api.get("/runtime-statuses"),
+    ]);
     state.health = health;
     state.projects = projects;
+    state.statusCatalog = statusCatalog;
+    configureStatusCatalog(statusCatalog);
     setConnection("online", "Runtime online");
     const urlProject = new URL(location.href).searchParams.get("project_id");
     state.projectId = projects.some((item) => item.id === urlProject) ? urlProject : projects[0]?.id || null;

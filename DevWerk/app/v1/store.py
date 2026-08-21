@@ -27,6 +27,16 @@ from app.v1.capabilities import (
 from app.v1.files import ProjectFiles
 from app.v1.loops import LoopCatalog
 from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, PlatformPolicySnapshot, V1RuntimePolicy
+from app.v1.states import (
+    AGENT_RUN_STATE_MACHINE,
+    ATTEMPT_STATE_MACHINE,
+    COLUMN_RUN_STATE_MACHINE,
+    TASK_STATE_MACHINE,
+    AttemptStatus,
+    ColumnRunStatus,
+    TaskStatus,
+    ToolInvocationStatus,
+)
 
 
 def utcnow() -> str:
@@ -659,6 +669,31 @@ class V1Store:
             # after the new schema is ready; active Project Workflow revisions remain intact.
             db.execute("DROP TABLE IF EXISTS v1_project_template_applications")
             db.execute("DROP TABLE IF EXISTS v1_workflow_templates")
+            self._validate_persisted_runtime_statuses(db)
+
+    @staticmethod
+    def _validate_persisted_runtime_statuses(db: sqlite3.Connection) -> None:
+        definitions = (
+            ("v1_tasks", TASK_STATE_MACHINE),
+            ("v1_column_runs", COLUMN_RUN_STATE_MACHINE),
+            ("v1_column_attempts", ATTEMPT_STATE_MACHINE),
+            ("v1_agent_runs", AGENT_RUN_STATE_MACHINE),
+        )
+        for table, machine in definitions:
+            for row in db.execute(f"SELECT DISTINCT status FROM {table}").fetchall():
+                try:
+                    machine.parse(row[0])
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"{table} contains unknown Runtime status {row[0]!r}"
+                    ) from exc
+        invalid_tools = db.execute(
+            "SELECT DISTINCT ok FROM v1_tool_invocations WHERE ok NOT IN (0,1)"
+        ).fetchall()
+        if invalid_tools:
+            raise RuntimeError(
+                f"v1_tool_invocations contains invalid ok values: {[row[0] for row in invalid_tools]}"
+            )
 
     def list_loops(
         self,
@@ -1656,6 +1691,7 @@ class V1Store:
             row = self._dict(db.execute("SELECT * FROM v1_tasks WHERE id=?", (task_id,)).fetchone())
         if not row:
             raise KeyError(task_id)
+        TASK_STATE_MACHINE.parse(row["status"])
         return self._decode(row, "input_json", "context_json", "readiness_json", "conflict_domains_json")  # type: ignore[return-value]
 
     def get_project_task(self, project_id: str, task_id: str) -> dict[str, Any]:
@@ -1674,7 +1710,10 @@ class V1Store:
                     raise KeyError(cursor)
                 before = row[0]
             rows = db.execute("SELECT * FROM v1_tasks WHERE project_id=? AND created_at<? ORDER BY created_at DESC LIMIT ?", (project_id, before, min(max(limit, 1), self.policy.service_limits.max_page_size))).fetchall()
-        return [self._decode(dict(row), "input_json", "context_json", "readiness_json", "conflict_domains_json") for row in rows]  # type: ignore[misc]
+        result = [self._decode(dict(row), "input_json", "context_json", "readiness_json", "conflict_domains_json") for row in rows]
+        for item in result:
+            TASK_STATE_MACHINE.parse(item["status"])
+        return result  # type: ignore[return-value]
 
     def task_summaries(self, project_id: str, limit: int | None = None) -> list[dict[str, Any]]:
         limit = limit or self.policy.context.task_summary_limit
@@ -1915,6 +1954,7 @@ class V1Store:
             raise ValueError("terminal Tasks are immutable; use task.rerun to create a successor")
         if task["status"] == "running":
             raise ValueError("a running Task cannot be retried until its active Attempt stops")
+        TASK_STATE_MACHINE.require(task["status"], TaskStatus.PENDING)
         workflow = self.workflow_by_id(task["project_id"], task["workflow_revision_id"])
         target = column_key or workflow.entry
         if workflow.terminal_kind(target):
@@ -1936,6 +1976,7 @@ class V1Store:
         task = self.get_task(task_id)
         if task["status"] != "failed":
             raise ValueError("task.reopen requires a failed Task; review rejection follows Workflow transitions")
+        TASK_STATE_MACHINE.require(task["status"], TaskStatus.PENDING)
         workflow = self.workflow_by_id(task["project_id"], task["workflow_revision_id"])
         target = column_key or workflow.entry
         if workflow.terminal_kind(target):
@@ -2058,6 +2099,7 @@ class V1Store:
         return self.get_task(task_id)
 
     def fail_task_from_exception(self, task: dict[str, Any], run_id: str, error: str, terminal_artifact: dict[str, Any], *, checkpoint: dict[str, Any] | None = None) -> None:
+        TASK_STATE_MACHINE.require(task["status"], TaskStatus.FAILED)
         now = utcnow()
         with self.tx(immediate=True) as db:
             db.execute("UPDATE v1_column_runs SET status='failed',error=?,finished_at=? WHERE id=?", (error, now, run_id))
@@ -2086,6 +2128,7 @@ class V1Store:
         checkpoint: dict[str, Any] | None = None,
         agent_run_id: str | None = None,
     ) -> None:
+        TASK_STATE_MACHINE.require(task["status"], TaskStatus.RECOVERING)
         now = utcnow()
         next_retry_at = (
             datetime.now(timezone.utc)
@@ -2158,6 +2201,7 @@ class V1Store:
                 raise KeyError(task["id"])
             if current[0] in {"done", "failed"}:
                 return self.get_task(task["id"])
+            TASK_STATE_MACHINE.require(current[0], TaskStatus.FAILED)
             db.execute(
                 "UPDATE v1_column_runs SET status='failed',error=?,finished_at=? WHERE task_id=? AND status IN ('pending','running','waiting')",
                 (reason, now, task["id"]),
@@ -2200,6 +2244,9 @@ class V1Store:
             ).fetchone()
             if not requested_row:
                 return None
+            TASK_STATE_MACHINE.parse(requested_row[2])
+            if requested_row[2] in {TaskStatus.PENDING.value, TaskStatus.RECOVERING.value}:
+                TASK_STATE_MACHINE.require(requested_row[2], TaskStatus.RUNNING)
             requested = json.loads(requested_row[1] or "[]")
             held_rows = db.execute(
                 "SELECT s.resources_json FROM v1_tasks t JOIN v1_scheduling_entries s ON s.task_id=t.id AND s.project_id=t.project_id "
@@ -2385,6 +2432,10 @@ class V1Store:
             ).fetchone()
             if pending:
                 run_id, sequence = pending[0], pending[1]
+                current_run_status = db.execute(
+                    "SELECT status FROM v1_column_runs WHERE id=?", (run_id,)
+                ).fetchone()[0]
+                COLUMN_RUN_STATE_MACHINE.require(current_run_status, ColumnRunStatus.RUNNING)
                 db.execute(
                     "UPDATE v1_column_runs SET status='running',attempt=?,input_json=?,runtime_policy_revision=?,runtime_policy_hash=?,heartbeat_at=?,last_progress_at=?,started_at=COALESCE(started_at,?),finished_at=NULL WHERE id=?",
                     (task["attempt"] + 1, json.dumps(input_data, ensure_ascii=False), self.policy.revision, self.policy.policy_hash, now, now, now, run_id),
@@ -2466,6 +2517,13 @@ class V1Store:
             ).fetchone()
             if not attempt:
                 raise RuntimeError("Column Run has no active Attempt")
+            run_row = db.execute("SELECT status FROM v1_column_runs WHERE id=?", (run_id,)).fetchone()
+            attempt_row = db.execute("SELECT status FROM v1_column_attempts WHERE id=?", (attempt[0],)).fetchone()
+            if not run_row or not attempt_row:
+                raise RuntimeError("Column Run state disappeared while finishing")
+            COLUMN_RUN_STATE_MACHINE.require(run_row[0], run_status)
+            ATTEMPT_STATE_MACHINE.require(attempt_row[0], run_status)
+            TASK_STATE_MACHINE.require(task["status"], task_status)
             db.execute(
                 "UPDATE v1_column_attempts SET status=?,output_json=?,error=?,finished_at=? WHERE id=?",
                 (run_status, json.dumps(persisted_output, ensure_ascii=False), error, now, attempt[0]),
@@ -2550,6 +2608,7 @@ class V1Store:
         checkpoint: dict[str, Any] | None = None, event_type: str | None = None,
         correlation_key: str | None = None, resume_at: str | None = None,
     ) -> dict[str, Any]:
+        TASK_STATE_MACHINE.require(task["status"], TaskStatus.WAITING)
         handle_id, now = new_id("await"), utcnow()
         instant = datetime.now(timezone.utc)
         next_check = resume_at or (instant + timedelta(seconds=next_check_seconds)).isoformat(timespec="milliseconds")
@@ -2559,6 +2618,12 @@ class V1Store:
             ).fetchone()
             if not attempt:
                 raise RuntimeError("durable wait requires an active Column Attempt")
+            run_status = db.execute("SELECT status FROM v1_column_runs WHERE id=?", (run_id,)).fetchone()
+            attempt_status = db.execute("SELECT status FROM v1_column_attempts WHERE id=?", (attempt[0],)).fetchone()
+            if not run_status or not attempt_status:
+                raise RuntimeError("durable wait lost its active Runtime state")
+            COLUMN_RUN_STATE_MACHINE.require(run_status[0], ColumnRunStatus.WAITING)
+            ATTEMPT_STATE_MACHINE.require(attempt_status[0], AttemptStatus.WAITING)
             execution_key = str((checkpoint or {}).get("execution_key") or "")
             if execution_key:
                 changed = db.execute(
@@ -2634,7 +2699,10 @@ class V1Store:
         limit = limit or self.policy.service_limits.detail_page_size
         with self.connect() as db:
             rows = db.execute("SELECT * FROM v1_column_runs WHERE project_id=? AND task_id=? AND sequence>? ORDER BY sequence LIMIT ?", (project_id, task_id, after_sequence, min(max(limit, 1), self.policy.service_limits.max_page_size))).fetchall()
-        return [self._decode(dict(row), "input_json", "output_json") for row in rows]  # type: ignore[misc]
+        result = [self._decode(dict(row), "input_json", "output_json") for row in rows]
+        for item in result:
+            COLUMN_RUN_STATE_MACHINE.parse(item["status"])
+        return result  # type: ignore[return-value]
 
     def attempts(self, project_id: str, task_id: str, limit: int = 200) -> list[dict[str, Any]]:
         with self.connect() as db:
@@ -2642,7 +2710,10 @@ class V1Store:
                 "SELECT * FROM v1_column_attempts WHERE project_id=? AND task_id=? ORDER BY created_at,attempt_no LIMIT ?",
                 (project_id, task_id, min(max(limit, 1), self.policy.service_limits.max_page_size)),
             ).fetchall()
-        return [self._decode(dict(row), "input_json", "output_json", "checkpoint_json") for row in rows]  # type: ignore[misc]
+        result = [self._decode(dict(row), "input_json", "output_json", "checkpoint_json") for row in rows]
+        for item in result:
+            ATTEMPT_STATE_MACHINE.parse(item["status"])
+        return result  # type: ignore[return-value]
 
     def begin_agent_run(
         self,
@@ -2775,9 +2846,10 @@ class V1Store:
     ) -> dict[str, Any]:
         now = utcnow()
         with self.tx(immediate=True) as db:
-            row = db.execute("SELECT project_id,task_id,column_run_id,kind,started_at FROM v1_agent_runs WHERE id=?", (agent_run_id,)).fetchone()
+            row = db.execute("SELECT project_id,task_id,column_run_id,kind,started_at,status FROM v1_agent_runs WHERE id=?", (agent_run_id,)).fetchone()
             if not row:
                 raise KeyError(agent_run_id)
+            AGENT_RUN_STATE_MACHINE.require(row[5], status)
             db.execute(
                 "UPDATE v1_agent_runs SET status=?,final_text=?,error=?,error_code=?,error_category=?,checkpoint_json=?,iterations=?,tool_calls=?,duration_seconds=?,finished_at=? WHERE id=?",
                 (status, final_text, error, error_code, error_category, self._pack_json(checkpoint or {}), iterations, tool_calls, max(0.0, (datetime.fromisoformat(now) - datetime.fromisoformat(row[4])).total_seconds()), now, agent_run_id),
@@ -2790,6 +2862,7 @@ class V1Store:
             row = self._dict(db.execute("SELECT * FROM v1_agent_runs WHERE id=? AND project_id=?", (agent_run_id, project_id)).fetchone())
         if not row:
             raise KeyError(agent_run_id)
+        AGENT_RUN_STATE_MACHINE.parse(row["status"])
         return self._decode(row, "context_json", "capabilities_json", "checkpoint_json")  # type: ignore[return-value]
 
     def agent_runs(self, *, project_id: str, task_id: str | None = None, limit: int | None = None) -> list[dict[str, Any]]:
@@ -2803,7 +2876,10 @@ class V1Store:
         clause = f"WHERE {' AND '.join(where)}"
         with self.connect() as db:
             rows = db.execute(f"SELECT * FROM v1_agent_runs {clause} ORDER BY created_at DESC LIMIT ?", values).fetchall()
-        return [self._decode(dict(row), "context_json", "capabilities_json", "checkpoint_json") for row in rows]  # type: ignore[misc]
+        result = [self._decode(dict(row), "context_json", "capabilities_json", "checkpoint_json") for row in rows]
+        for item in result:
+            AGENT_RUN_STATE_MACHINE.parse(item["status"])
+        return result  # type: ignore[return-value]
 
     def conversation_job_agent_runs(self, project_id: str, job_id: str) -> list[dict[str, Any]]:
         with self.connect() as db:
@@ -2935,7 +3011,7 @@ class V1Store:
                 "INSERT INTO v1_tool_invocations(project_id,agent_run_id,sequence,tool_call_id,capability,arguments_json,result_json,ok,created_at) VALUES((SELECT project_id FROM v1_agent_runs WHERE id=?),?,?,?,?,?,?,?,?)",
                 (agent_run_id, agent_run_id, sequence, tool_call_id, capability, packed_arguments, packed_result, int(ok), now),
             )
-        return {"id": cursor.lastrowid, "agent_run_id": agent_run_id, "sequence": sequence, "tool_call_id": tool_call_id, "capability": capability, "arguments": arguments, "result": result, "ok": ok, "created_at": now}
+        return {"id": cursor.lastrowid, "agent_run_id": agent_run_id, "sequence": sequence, "tool_call_id": tool_call_id, "capability": capability, "arguments": arguments, "result": result, "ok": ok, "status": ToolInvocationStatus.SUCCEEDED.value if ok else ToolInvocationStatus.FAILED.value, "created_at": now}
 
     def tool_invocations(
         self,
@@ -2954,6 +3030,7 @@ class V1Store:
         for row in rows:
             item = self._decode(dict(row), "arguments_json", "result_json")
             item["ok"] = bool(item["ok"])
+            item["status"] = ToolInvocationStatus.SUCCEEDED.value if item["ok"] else ToolInvocationStatus.FAILED.value
             result.append(item)
         return result
 

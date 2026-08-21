@@ -16,6 +16,7 @@ from app.v1.capabilities import (
     CapabilityContext,
 )
 from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY
+from app.v1.states import runtime_status_catalog
 
 
 router = APIRouter()
@@ -23,6 +24,11 @@ _trace_log = logging.getLogger("devwerk.web.trace")
 DEFAULT_PAGE = DEFAULT_V1_RUNTIME_POLICY.service_limits.default_page_size
 DETAIL_PAGE = DEFAULT_V1_RUNTIME_POLICY.service_limits.detail_page_size
 MAX_PAGE = DEFAULT_V1_RUNTIME_POLICY.service_limits.max_page_size
+
+
+@router.get("/runtime-statuses")
+def runtime_statuses() -> dict[str, dict[str, object]]:
+    return runtime_status_catalog()
 
 
 def store(request: Request):

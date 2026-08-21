@@ -1,6 +1,7 @@
 export const state = {
   route: "overview",
   health: null,
+  statusCatalog: null,
   projects: [],
   projectId: null,
   project: null,

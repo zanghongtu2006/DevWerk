@@ -1,24 +1,15 @@
-"""
-DevWerk backend configuration.
-
-The backend owns model/provider selection. Capability providers only send context and execute granted operations.
-
-Configuration is split into:
-  - API profiles: protocol + base URL + auth + default model
-  - Route keys: which provider/model each project or dynamically spawned
-    workflow node agent should use
-"""
+"""Strict backend and LLM routing configuration."""
 
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
 from dotenv import load_dotenv
-from pydantic import Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,13 +25,71 @@ def _load_env_files(*, override: bool = False) -> None:
             load_dotenv(path, override=override)
 
 
+class LLMProviderConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    protocol: Literal["openai", "anthropic", "ollama"]
+    base_url: str = Field(min_length=1)
+    api_key: str | None = None
+    api_key_env: str | None = Field(default=None, pattern=r"^[A-Z][A-Z0-9_]*$")
+
+
+class LLMModelConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    request_timeout_seconds: float = Field(gt=0)
+    thinking_mode: str = Field(min_length=1)
+    temperature: float
+    top_p: float | None = Field(default=None, ge=0, le=1)
+    max_tokens: int = Field(gt=0)
+    effort_level: str | None = None
+
+
+class LLMRoutesConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    conversation: str = Field(min_length=1)
+    column: str = Field(min_length=1)
+    default: str = Field(min_length=1)
+
+
+class LLMRuntimeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    trust_env_proxy: bool = False
+
+
+class LLMCatalog(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    providers: dict[str, LLMProviderConfig] = Field(min_length=1)
+    models: dict[str, LLMModelConfig] = Field(min_length=1)
+    routes: LLMRoutesConfig
+    runtime: LLMRuntimeConfig
+
+    @model_validator(mode="after")
+    def validate_references(self) -> "LLMCatalog":
+        for name, model in self.models.items():
+            if model.provider not in self.providers:
+                raise ValueError(
+                    f"LLM model {name!r} references unknown provider {model.provider!r}"
+                )
+        for route, model_name in self.routes.model_dump().items():
+            if model_name not in self.models:
+                raise ValueError(
+                    f"LLM route {route!r} references unknown model {model_name!r}"
+                )
+        return self
+
+
 @dataclass(frozen=True)
 class ApiProfile:
     name: str
     protocol: Literal["openai", "anthropic", "ollama"]
     base_url: str
     api_key: str | None
-    model: str
     effort_level: str | None = None
     trust_env_proxy: bool = False
     request_timeout_seconds: float = 600.0
@@ -56,7 +105,7 @@ class AgentModelConfig:
     top_p: float | None
     max_tokens: int
 
-    def as_client_config(self) -> dict:
+    def as_client_config(self) -> dict[str, Any]:
         return {
             "agent": self.agent,
             "api_name": self.api.name,
@@ -82,7 +131,6 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Server
     app_env: str = Field(default="development")
     host: str = Field(default="0.0.0.0")
     port: int = Field(default=8000)
@@ -95,32 +143,13 @@ class Settings(BaseSettings):
     log_retention_days: int = Field(default=30)
     uvicorn_access_log: bool = Field(default=True)
 
-    # Persistent workflow supervision controls only the durable dispatcher.
     workflow_supervisor_enabled: bool = Field(default=True)
     workflow_supervisor_interval_seconds: float = Field(default=5.0)
-
-    # Local usage accounting.
     devwerk_usage_tracking: bool = Field(default=True)
     devwerk_db_path: str = Field(default="./data/devwerk.db")
 
-    # JSON LLM catalog and routing map. It is required and has no built-in fallback.
     devwerk_llm_config_path: str = Field(default="./config/llm.json")
     devwerk_llm_config_json: str | None = Field(default=None)
-
-    # Transport setting; it does not cap the Agent loop. Anthropic requires a numeric value.
-    devwerk_trust_env_proxy: bool = Field(default=False)
-
-    @field_validator(
-        "devwerk_llm_config_path",
-        "devwerk_llm_config_json",
-        mode="before",
-    )
-    @classmethod
-    def _empty_str_to_none(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        text = str(value).strip()
-        return text or None
 
     @property
     def is_production(self) -> bool:
@@ -130,193 +159,98 @@ class Settings(BaseSettings):
     def is_development(self) -> bool:
         return self.app_env.lower() in {"dev", "development", "local"}
 
-    def llm_config(self) -> dict[str, Any]:
+    def llm_config(self) -> LLMCatalog:
         path = _resolve_config_path(self.devwerk_llm_config_path)
+        source = None
+        label = ""
         if path.is_file():
-            try:
-                value = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(value, dict):
-                    return _normalize_llm_config(value)
-            except Exception as exc:  # noqa: BLE001
-                raise ValueError(f"LLM config file {path} is not valid JSON: {exc}") from exc
-        if self.devwerk_llm_config_json:
-            try:
-                value = json.loads(self.devwerk_llm_config_json)
-                if isinstance(value, dict):
-                    return _normalize_llm_config(value)
-            except Exception as exc:  # noqa: BLE001
-                raise ValueError(f"DEVWERK_LLM_CONFIG_JSON is not valid JSON: {exc}") from exc
-        raise ValueError(
-            f"LLM configuration is required: create {path} or set DEVWERK_LLM_CONFIG_JSON"
-        )
+            source = path.read_text(encoding="utf-8")
+            label = f"LLM config file {path}"
+        elif self.devwerk_llm_config_json:
+            source = self.devwerk_llm_config_json
+            label = "DEVWERK_LLM_CONFIG_JSON"
+        if source is None:
+            raise ValueError(
+                f"LLM configuration is required: create {path} or set DEVWERK_LLM_CONFIG_JSON"
+            )
+        try:
+            value = json.loads(source)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{label} is not valid JSON: {exc}") from exc
+        if not isinstance(value, dict):
+            raise ValueError(f"{label} must contain a JSON object")
+        try:
+            return LLMCatalog.model_validate(value)
+        except Exception as exc:  # Pydantic provides the exact unknown/missing field path.
+            raise ValueError(f"{label} does not match the LLM configuration schema: {exc}") from exc
 
     def api_profiles(self) -> dict[str, ApiProfile]:
-        llm_config = self.llm_config()
+        config = self.llm_config()
         profiles: dict[str, ApiProfile] = {}
-        for name, provider in (llm_config.get("llms") or {}).items():
-            if not isinstance(provider, dict):
-                continue
-            models = provider.get("models") or {}
-            if not isinstance(models, dict) or not models:
-                continue
-            first_model_id = next(iter(models))
-            model_settings = models.get(first_model_id) or {}
-            protocol = str(provider.get("api") or provider.get("protocol") or "").lower()
-            if protocol not in {"openai", "anthropic", "ollama"}:
-                raise ValueError(f"LLM provider {name!r} must declare api as openai, anthropic, or ollama")
-            profiles[str(name).lower()] = ApiProfile(
-                name=str(name).lower(),
-                protocol=protocol,  # type: ignore[arg-type]
-                base_url=str(provider.get("base_url") or provider.get("url") or "").rstrip("/"),
-                api_key=_none_if_empty(provider.get("api_key") or provider.get("key")),
-                model=str(model_settings.get("model") or first_model_id),
-                effort_level=_none_if_empty(model_settings.get("effort_level") or provider.get("effort_level")),
-                trust_env_proxy=bool(provider.get("trust_env_proxy", self.devwerk_trust_env_proxy)),
-                request_timeout_seconds=float(provider.get("request_timeout_seconds", 600.0)),
+        for model_name, model in config.models.items():
+            provider = config.providers[model.provider]
+            profiles[model_name] = _api_profile(
+                model.provider,
+                provider,
+                model,
+                config.runtime,
             )
         return profiles
 
     def agent_config(self, agent: str | None = None) -> AgentModelConfig:
         agent_name = (agent or "conversation").strip().lower()
-        llm_config = self.llm_config()
-        profile, model_key, model_settings = self._resolve_llm_ref(agent_name, llm_config)
+        config = self.llm_config()
+        route_name = (
+            config.routes.conversation
+            if agent_name == "conversation"
+            else config.routes.column
+            if agent_name == "column"
+            else config.routes.default
+        )
+        model = config.models[route_name]
+        provider = config.providers[model.provider]
         return AgentModelConfig(
             agent=agent_name,
-            api=profile,
-            model=str(model_settings.get("model") or model_key),
-            thinking_mode=str(model_settings["thinking_mode"]).strip().lower(),
-            temperature=float(model_settings["temperature"]),
-            top_p=model_settings.get("top_p"),
-            max_tokens=int(model_settings["max_tokens"]),
+            api=_api_profile(model.provider, provider, model, config.runtime),
+            model=model.model,
+            thinking_mode=model.thinking_mode.strip().lower(),
+            temperature=model.temperature,
+            top_p=model.top_p,
+            max_tokens=model.max_tokens,
         )
 
-    def _resolve_llm_ref(self, agent: str, llm_config: dict[str, Any]) -> tuple[ApiProfile, str, dict[str, Any]]:
-        routing = llm_config.get("routing") or {}
-        model_ref = None
-        if isinstance(routing, dict):
-            for key in _routing_keys(agent):
-                if routing.get(key):
-                    model_ref = routing[key]
-                    break
-            model_ref = model_ref or routing.get("default")
-        if isinstance(model_ref, dict):
-            model_ref = model_ref.get("primary") or model_ref.get("model")
-        if not model_ref:
-            raise ValueError(f"No LLM route configured for agent {agent!r}")
-
-        provider_name, model_key = _split_model_ref(str(model_ref))
-        providers = llm_config.get("llms") or {}
-        provider = providers.get(provider_name) if isinstance(providers, dict) else None
-        if not isinstance(provider, dict):
-            raise ValueError(f"Unknown LLM provider {provider_name!r} for model ref {model_ref!r}.")
-        models = provider.get("models") or {}
-        if not isinstance(models, dict):
-            models = {}
-        model_settings = models.get(model_key) or {"model": model_key}
-        if not isinstance(model_settings, dict):
-            model_settings = {"model": model_key}
-        missing_settings = sorted(
-            key for key in ("temperature", "thinking_mode", "max_tokens")
-            if key not in model_settings
-        )
-        if missing_settings:
-            raise ValueError(
-                f"LLM model {model_ref!r} must explicitly configure: {', '.join(missing_settings)}"
-            )
-        protocol = str(provider.get("api") or provider.get("protocol") or "").lower()
-        if protocol not in {"openai", "anthropic", "ollama"}:
-            raise ValueError(f"LLM provider {provider_name!r} must declare api as openai, anthropic, or ollama")
-        profile = ApiProfile(
-            name=provider_name,
-            protocol=protocol,  # type: ignore[arg-type]
-            base_url=str(provider.get("base_url") or provider.get("url") or "").rstrip("/"),
-            api_key=_none_if_empty(provider.get("api_key") or provider.get("key")),
-            model=str(model_settings.get("model") or model_key),
-            effort_level=_none_if_empty(model_settings.get("effort_level") or provider.get("effort_level")),
-            trust_env_proxy=bool(provider.get("trust_env_proxy", self.devwerk_trust_env_proxy)),
-            request_timeout_seconds=float(provider.get("request_timeout_seconds", 600.0)),
-        )
-        return profile, model_key, model_settings
-
-    def get_llm_config(self, agent: str | None = None) -> dict:
+    def get_llm_config(self, agent: str | None = None) -> dict[str, Any]:
         return self.agent_config(agent).as_client_config()
 
     def validate_provider(self, agent: str | None = None) -> None:
-        config = self.agent_config(agent)
-        if config.api.protocol in {"openai", "anthropic"} and not config.api.api_key:
-            raise ValueError(
-                f"api_key is not set for agent {config.agent!r} using LLM provider {config.api.name!r}."
-            )
+        agents = [agent] if agent else ["conversation", "column", "default"]
+        for route in agents:
+            config = self.agent_config(route)
+            if config.api.protocol in {"openai", "anthropic"} and not config.api.api_key:
+                raise ValueError(
+                    f"api_key is not set for route {route!r} using LLM provider "
+                    f"{config.api.name!r}"
+                )
 
 
-def _normalize_llm_config(value: dict[str, Any]) -> dict[str, Any]:
-    out = {
-        "routing": value.get("routing") if isinstance(value.get("routing"), dict) else {},
-        "llms": {},
-    }
-    providers = value.get("llms") or value.get("providers") or value.get("models")
-    if isinstance(providers, dict):
-        for name, raw in providers.items():
-            if not isinstance(raw, dict):
-                continue
-            provider = dict(raw)
-            provider["api"] = str(provider.get("api") or provider.get("protocol") or "").lower()
-            provider["base_url"] = str(provider.get("base_url") or provider.get("url") or "").rstrip("/")
-            if "api_key" not in provider and "key" in provider:
-                provider["api_key"] = provider.get("key")
-            models = provider.get("models") or {}
-            if isinstance(models, list):
-                provider["models"] = {str(item): {} for item in models}
-            elif isinstance(models, dict):
-                provider["models"] = models
-            else:
-                provider["models"] = {}
-            out["llms"][str(name).lower()] = provider
-    if not out["llms"]:
-        raise ValueError("llm.json must define at least one provider in llms")
-    _validate_llm_default_route(out)
-    return out
-
-
-def _validate_llm_default_route(config: dict[str, Any]) -> None:
-    routing = config.get("routing")
-    if not isinstance(routing, dict):
-        raise ValueError("llm.json must define routing.default")
-    default_ref = routing.get("default")
-    if isinstance(default_ref, dict):
-        default_ref = default_ref.get("primary") or default_ref.get("model")
-    if not str(default_ref or "").strip():
-        raise ValueError("llm.json must define routing.default")
-
-    provider_name, model_key = _split_model_ref(str(default_ref))
-    providers = config.get("llms")
-    if not isinstance(providers, dict):
-        raise ValueError("llm.json must define llms")
-    provider = providers.get(provider_name)
-    if not isinstance(provider, dict):
-        raise ValueError(f"llm.json routing.default references unknown provider {provider_name!r}")
-
-    models = provider.get("models")
-    if isinstance(models, dict) and models:
-        if model_key not in models:
-            raise ValueError(f"llm.json routing.default references unknown model {model_key!r}")
-    elif not str(provider.get("model") or model_key).strip():
-        raise ValueError(f"llm.json provider {provider_name!r} must define models or model")
-
-
-def _split_model_ref(model_ref: str) -> tuple[str, str]:
-    if "/" not in model_ref:
-        return "default", model_ref.strip().lower()
-    provider, model = model_ref.split("/", 1)
-    return provider.strip().lower(), model.strip()
-
-
-def _routing_keys(agent: str) -> list[str]:
-    aliases = {
-        "conversation": ["conversation", "default"],
-        "column": ["column", "default"],
-    }
-    return aliases.get(agent, [agent, "default"])
+def _api_profile(
+    provider_name: str,
+    provider: LLMProviderConfig,
+    model: LLMModelConfig,
+    runtime: LLMRuntimeConfig,
+) -> ApiProfile:
+    api_key = _none_if_empty(provider.api_key)
+    if not api_key and provider.api_key_env:
+        api_key = _none_if_empty(os.getenv(provider.api_key_env))
+    return ApiProfile(
+        name=provider_name,
+        protocol=provider.protocol,
+        base_url=provider.base_url.rstrip("/"),
+        api_key=api_key,
+        effort_level=_none_if_empty(model.effort_level),
+        trust_env_proxy=runtime.trust_env_proxy,
+        request_timeout_seconds=model.request_timeout_seconds,
+    )
 
 
 def _none_if_empty(value: Any) -> str | None:

@@ -158,7 +158,7 @@ The primary trace event names are `web.conversation_input`, `web.conversation_ou
 
 ## LLM Configuration
 
-Copy `config/llm.example.json` to the ignored `config/llm.json`, or set `DEVWERK_LLM_CONFIG_JSON`. Routing keys used by the V1 runtime are `conversation` and `column`; `default` is the route used when a specific route is not configured. Supported protocols are Anthropic-compatible Messages, OpenAI-compatible Chat Completions, and Ollama Chat.
+Copy `config/llm.example.json` to the ignored `config/llm.json`, or set `DEVWERK_LLM_CONFIG_JSON`. The strict configuration schema has four top-level sections: `providers`, `models`, `routes`, and `runtime`. Runtime routes are `conversation`, `column`, and `default`. Request timeouts belong to model entries as `request_timeout_seconds`; unknown or legacy fields fail startup validation instead of being ignored. Supported protocols are Anthropic-compatible Messages, OpenAI-compatible Chat Completions, and Ollama Chat.
 
 Do not commit provider credentials.
 

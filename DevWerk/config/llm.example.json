@@ -1,67 +1,66 @@
 {
-  "routing": {
-    "default": "minimax/m3",
-    "conversation": "minimax/m3",
-    "column": "minimax/m3"
-  },
-  "llms": {
+  "providers": {
     "minimax": {
-      "api": "anthropic",
+      "protocol": "anthropic",
       "base_url": "https://api.minimaxi.com/anthropic",
-      "api_key": "API_TOKEN",
-      "trust_env_proxy": false,
-      "request_timeout_seconds": 600,
-      "models": {
-        "m3": {
-          "model": "M3",
-          "temperature": 0.2,
-          "max_tokens": 65535,
-          "thinking_mode": "max",
-          "effort_level": "max"
-        }
-      }
+      "api_key_env": "DEVWERK_MINIMAX_API_KEY"
     },
     "deepseek": {
-      "api": "openai",
+      "protocol": "openai",
       "base_url": "https://api.deepseek.com/v1",
-      "api_key": "",
-      "trust_env_proxy": false,
-      "request_timeout_seconds": 600,
-      "models": {
-        "deepseek-chat": {
-          "temperature": 0.2,
-          "max_tokens": 65535,
-          "thinking_mode": "balanced"
-        }
-      }
+      "api_key_env": "DEVWERK_DEEPSEEK_API_KEY"
     },
     "openai": {
-      "api": "openai",
+      "protocol": "openai",
       "base_url": "https://api.openai.com/v1",
-      "api_key": "",
-      "trust_env_proxy": false,
-      "request_timeout_seconds": 600,
-      "models": {
-        "gpt-4o-mini": {
-          "temperature": 0.2,
-          "max_tokens": 65535,
-          "thinking_mode": "balanced"
-        }
-      }
+      "api_key_env": "DEVWERK_OPENAI_API_KEY"
     },
     "ollama": {
-      "api": "ollama",
-      "base_url": "http://127.0.0.1:11434",
-      "api_key": "",
-      "trust_env_proxy": false,
-      "request_timeout_seconds": 600,
-      "models": {
-        "deepseek-r1:32b": {
-          "temperature": 0.4,
-          "max_tokens": 65535,
-          "thinking_mode": "local"
-        }
-      }
+      "protocol": "ollama",
+      "base_url": "http://127.0.0.1:11434"
     }
+  },
+  "models": {
+    "main": {
+      "provider": "minimax",
+      "model": "M3",
+      "request_timeout_seconds": 600,
+      "temperature": 0.2,
+      "max_tokens": 65535,
+      "thinking_mode": "max",
+      "effort_level": "max"
+    },
+    "deepseek_chat": {
+      "provider": "deepseek",
+      "model": "deepseek-chat",
+      "request_timeout_seconds": 600,
+      "temperature": 0.2,
+      "max_tokens": 65535,
+      "thinking_mode": "balanced"
+    },
+    "openai_mini": {
+      "provider": "openai",
+      "model": "gpt-4o-mini",
+      "request_timeout_seconds": 600,
+      "temperature": 0.2,
+      "max_tokens": 65535,
+      "thinking_mode": "balanced"
+    },
+    "local": {
+      "provider": "ollama",
+      "model": "deepseek-r1:32b",
+      "request_timeout_seconds": 600,
+      "temperature": 0.4,
+      "max_tokens": 65535,
+      "thinking_mode": "local"
+    }
+  },
+  "routes": {
+    "conversation": "main",
+    "column": "main",
+    "default": "main"
+  },
+  "runtime": {
+    "trust_env_proxy": false
   }
 }

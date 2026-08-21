@@ -38,10 +38,20 @@ export function statusTone(status) {
 }
 
 export function statusLabel(status) {
-  return ({ pending: "Pending", running: "Running", waiting: "Waiting", recovering: "Recovering", done: "Done", failed: "Failed", succeeded: "Succeeded", interrupted: "Interrupted" })[status] || status || "Unknown";
+  if (!status) return "Unknown";
+  const value = String(status);
+  if (knownStatuses.size && !knownStatuses.has(value)) return `Unknown (${value})`;
+  return value.split("_").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" ");
 }
 
 export function truncate(value, length = 120) {
   const text = String(value || "");
   return text.length > length ? `${text.slice(0, length)}…` : text;
+}
+let knownStatuses = new Set();
+
+export function configureStatusCatalog(catalog) {
+  knownStatuses = new Set(
+    Object.values(catalog || {}).flatMap((group) => group?.values || [])
+  );
 }

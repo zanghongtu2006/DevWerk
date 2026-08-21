@@ -15,6 +15,31 @@ from app.v1.domain import (
     WorkflowDefinition,
 )
 from tests.helpers import orchestration_plan, sequence_workflow
+from app.v1.states import (
+    TASK_STATE_MACHINE,
+    TaskStatus,
+    runtime_status_catalog,
+)
+
+
+def test_runtime_status_catalog_is_the_single_public_status_definition():
+    catalog = runtime_status_catalog()
+
+    assert catalog["task"]["values"] == [
+        "pending", "running", "waiting", "recovering", "done", "failed"
+    ]
+    assert "recovering" in catalog["task"]["transitions"]["running"]
+    assert set(catalog) == {
+        "task", "column_run", "attempt", "agent_run", "tool_invocation"
+    }
+
+
+def test_task_state_machine_rejects_terminal_drift():
+    TASK_STATE_MACHINE.require(TaskStatus.RUNNING, TaskStatus.RECOVERING)
+    TASK_STATE_MACHINE.require(TaskStatus.FAILED, TaskStatus.PENDING)
+
+    with pytest.raises(ValueError, match="done -> running"):
+        TASK_STATE_MACHINE.require(TaskStatus.DONE, TaskStatus.RUNNING)
 
 
 def test_workflow_is_domain_agnostic_and_serializes_declarative_executor():

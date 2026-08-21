@@ -1,36 +1,19 @@
 from __future__ import annotations
 
 from datetime import datetime
-from enum import Enum
 from typing import Any, Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.v1.states import (
+    AgentRunStatus,
+    AttemptStatus,
+    ColumnRunStatus,
+    TaskStatus,
+    ToolInvocationStatus,
+)
+
 KEY_PATTERN = r"^[a-z][a-z0-9_.-]{0,127}$"
-
-
-class StringEnum(str, Enum):
-    """Python 3.10-compatible string enum."""
-
-    def __str__(self) -> str:
-        return self.value
-
-
-class TaskStatus(StringEnum):
-    PENDING = "pending"
-    RUNNING = "running"
-    WAITING = "waiting"
-    DONE = "done"
-    FAILED = "failed"
-
-
-class RunStatus(StringEnum):
-    PENDING = "pending"
-    RUNNING = "running"
-    WAITING = "waiting"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    INTERRUPTED = "interrupted"
 
 
 class Transition(BaseModel):
