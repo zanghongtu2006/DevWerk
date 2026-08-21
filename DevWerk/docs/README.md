@@ -13,7 +13,7 @@ Code and secondary documentation must remain consistent with all four.
 
 ## Implemented V1 extensions
 
-- [`workflow-template-runtime-v1.md`](workflow-template-runtime-v1.md): metadata-driven template selection, immutable materialization, directed rework, logical Writer sessions, and the bundled novel/DevOps templates.
+- [`loop-runtime-v1.md`](loop-runtime-v1.md): filesystem Loop discovery, initial Workflow materialization, directed rework, logical Writer sessions, and the bundled novel/DevOps Loops.
 - [`kanban-recovering-runtime-v1.md`](kanban-recovering-runtime-v1.md): same-Task recovery from structured temporary provider failures.
 - [`agent-tool-rejection-recovery-v1.md`](agent-tool-rejection-recovery-v1.md): distinction between rejection before effect and a failed execution effect.
 

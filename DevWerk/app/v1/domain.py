@@ -688,14 +688,13 @@ class OrchestrationPlanCreate(BaseModel):
     plan: OrchestrationPlan
 
 
-class WorkflowPublishRequest(BaseModel):
+class WorkflowRevisionPublishRequest(BaseModel):
     orchestration_plan_id: str = Field(min_length=1)
     workflow: WorkflowDefinition
 
 
-class WorkflowTemplateApplyRequest(BaseModel):
-    template_key: str = Field(pattern=KEY_PATTERN)
-    version: int | None = Field(default=None, ge=1)
+class LoopApplyRequest(BaseModel):
+    loop_key: str = Field(pattern=KEY_PATTERN)
     bindings: dict[str, Any] = Field(default_factory=dict)
 
 

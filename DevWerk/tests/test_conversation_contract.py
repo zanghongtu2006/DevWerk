@@ -11,30 +11,34 @@ from app.v1.conversation import ConversationAgent
 from app.v1.domain import AgentModelResponse, AgentToolCall
 from tests.helpers import (
     create_planned_task,
-    orchestration_plan,
     publish_planned_workflow,
-    readiness,
     sequence_workflow,
 )
 
 
-def test_conversation_publishes_workflow_creates_task_and_finishes_with_plain_text(store, tmp_path):
+def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text(store, tmp_path):
     project = store.create_project("conversation", "", str(tmp_path / "project"), "project instruction")
-    definition = sequence_workflow(name="generated in conversation")
-    workflow = definition.model_dump(mode="json")
-    plan = orchestration_plan(definition).model_dump(mode="json")
     calls = 0
 
     def model(_messages, _tools, **_kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:
-            return AgentModelResponse(tool_calls=[AgentToolCall(id="plan", name="orchestration.plan.save", arguments={"plan": plan})])
-        plan_id = store.list_orchestration_plans(project["id"])[0]["id"]
+            return AgentModelResponse(tool_calls=[AgentToolCall(id="loops", name="loop.list", arguments={"query": "GitLab software delivery"})])
         if calls == 2:
-            return AgentModelResponse(tool_calls=[AgentToolCall(id="wf", name="workflow.publish", arguments={"orchestration_plan_id": plan_id, "workflow": workflow})])
-        if calls == 3:
-            return AgentModelResponse(tool_calls=[AgentToolCall(id="task", name="task.create", arguments={"orchestration_plan_id": plan_id, "proposed_task_ref": "primary", "title": "formal", "brief": "deliver", "input": {}, "readiness": readiness()})])
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id="apply",
+                name="loop.apply",
+                arguments={
+                    "loop_key": "software.gitlab_devops",
+                    "bindings": {
+                        "product_name": "Managed delivery",
+                        "requirements_path": "docs/requirements.md",
+                        "requirements_confirmed": True,
+                        "gitlab_repository": "group/project",
+                    },
+                },
+            )])
         return AgentModelResponse(text="Workflow and Task are now tracked.")
 
     wakes: list[bool] = []

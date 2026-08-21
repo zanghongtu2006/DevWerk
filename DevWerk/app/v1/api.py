@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.core.debug_trace import trace_json
-from app.v1.domain import ConversationRequest, ExternalEventSignal, OrchestrationPlanCreate, ProjectCreate, TaskCreate, WorkflowPublishRequest, WorkflowTemplateApplyRequest
+from app.v1.domain import ConversationRequest, ExternalEventSignal, LoopApplyRequest, OrchestrationPlanCreate, ProjectCreate, TaskCreate, WorkflowRevisionPublishRequest
 from app.v1.capabilities import (
     CapabilityContext,
 )
@@ -142,9 +142,9 @@ def conversation_job(project_id: str, job_id: str, request: Request) -> dict[str
         raise not_found(exc) from exc
 
 
-@router.post("/projects/{project_id}/automation/workflow", status_code=201)
-def publish_workflow(project_id: str, payload: WorkflowPublishRequest, request: Request) -> dict[str, Any]:
-    """V1 automation endpoint; the customer Kanban remains read-only."""
+@router.post("/projects/{project_id}/automation/workflow-revisions", status_code=201)
+def publish_workflow_revision(project_id: str, payload: WorkflowRevisionPublishRequest, request: Request) -> dict[str, Any]:
+    """Revise an existing Loop-created Workflow; the customer Kanban remains read-only."""
     try:
         store(request).get_project(project_id)
         return store(request).publish_workflow(project_id, payload.workflow, payload.orchestration_plan_id)
@@ -162,29 +162,29 @@ def get_workflow(project_id: str, request: Request) -> dict[str, Any]:
         raise not_found(exc) from exc
 
 
-@router.get("/workflow-templates")
-def workflow_templates(
+@router.get("/loops")
+def loops(
     request: Request,
     category: str | None = None,
     tag: str | None = None,
     query: str | None = None,
     limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE),
 ) -> list[dict[str, Any]]:
-    return store(request).list_workflow_templates(category=category, tag=tag, query=query, limit=limit)
+    return store(request).list_loops(category=category, tag=tag, query=query, limit=limit)
 
 
-@router.get("/workflow-templates/{template_key}")
-def workflow_template(template_key: str, request: Request, version: int | None = Query(None, ge=1)) -> dict[str, Any]:
+@router.get("/loops/{loop_key}")
+def loop(loop_key: str, request: Request) -> dict[str, Any]:
     try:
-        return store(request).get_workflow_template(template_key, version)
+        return store(request).get_loop(loop_key)
     except KeyError as exc:
         raise not_found(exc) from exc
 
 
-@router.post("/projects/{project_id}/automation/workflow-template", status_code=201)
-def apply_workflow_template(project_id: str, payload: WorkflowTemplateApplyRequest, request: Request) -> dict[str, Any]:
+@router.post("/projects/{project_id}/automation/loop", status_code=201)
+def apply_loop(project_id: str, payload: LoopApplyRequest, request: Request) -> dict[str, Any]:
     try:
-        result = store(request).apply_workflow_template(project_id, payload.template_key, payload.bindings, payload.version)
+        result = store(request).apply_loop(project_id, payload.loop_key, payload.bindings)
         supervisor(request).wake()
         return result
     except KeyError as exc:

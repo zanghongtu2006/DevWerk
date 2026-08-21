@@ -18,6 +18,7 @@ from app.v1.runtime import WorkflowRuntime
 from tests.helpers import (
     create_planned_task,
     orchestration_plan,
+    publish_initial_workflow,
     publish_planned_workflow,
     readiness,
     sequence_workflow,
@@ -28,7 +29,7 @@ def test_workflow_and_task_require_persisted_orchestration(store, tmp_path):
     project = store.create_project("planned", "", str(tmp_path / "project"))
     workflow = sequence_workflow()
     plan = store.create_orchestration_plan(project["id"], orchestration_plan(workflow))
-    revision = store.publish_workflow(project["id"], workflow, plan["id"])
+    revision = publish_initial_workflow(store, project["id"], workflow, plan["id"])
     task = store.create_task(
         project["id"], "planned task", "", {}, readiness(),
         orchestration_plan_id=plan["id"], proposed_task_ref="primary",
@@ -57,7 +58,7 @@ def test_dependency_releases_only_after_predecessor_done(store, tmp_path):
         "task_portfolio": tasks,
         "representative_task_ref": "root",
     }))
-    store.publish_workflow(project["id"], workflow, plan["id"])
+    publish_initial_workflow(store, project["id"], workflow, plan["id"])
     root = store.create_task(
         project["id"], "root", "", {}, readiness(objective="Deliver root"),
         orchestration_plan_id=plan["id"], proposed_task_ref="root",
@@ -92,7 +93,7 @@ def test_failed_predecessor_requires_explicit_successor(store, tmp_path):
     ]
     base.representative_task_ref = "root"
     plan = store.create_orchestration_plan(project["id"], base)
-    store.publish_workflow(project["id"], workflow, plan["id"])
+    publish_initial_workflow(store, project["id"], workflow, plan["id"])
     root = store.create_task(
         project["id"], "root", "", {}, readiness(objective="Deliver root"),
         orchestration_plan_id=plan["id"], proposed_task_ref="root",
@@ -206,6 +207,7 @@ def test_platform_policy_is_compact_project_manager_identity(store):
     content = store.latest_platform_policy().content
     assert len(content) < 2_000
     assert "professional project manager and agile coach" in content
-    assert "Project and Kanban APIs" in content
+    assert "Discover filesystem Loops first" in content
+    assert "never invent an initial Workflow" in content
     assert "supervise them to `done` or `failed`" in content
     assert "Never describe an intended state change as completed" in content

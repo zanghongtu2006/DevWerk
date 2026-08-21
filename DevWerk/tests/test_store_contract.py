@@ -19,7 +19,7 @@ from app.v1.domain import (
     WorkflowDefinition,
 )
 from app.v1.runtime import WorkflowRuntime
-from tests.helpers import create_planned_task, publish_planned_workflow, sequence_workflow, readiness
+from tests.helpers import create_planned_task, publish_initial_workflow, publish_planned_workflow, sequence_workflow, readiness
 from tests.helpers import agent_workflow, orchestration_plan
 
 
@@ -85,7 +85,7 @@ def test_failed_conversation_job_releases_claimed_mailbox_for_redelivery(store, 
     assert replacement["mailbox_ids"] == [mailbox_id]
 
 
-def test_protocol_failed_conversation_requires_attention_without_automatic_redelivery(store, tmp_path):
+def test_protocol_failed_conversation_quarantines_trigger_without_blocking_later_mailbox(store, tmp_path):
     project = store.create_project("mailbox attention", "", str(tmp_path / "mailbox-attention"))
     with store.tx(immediate=True) as db:
         store._mailbox(db, project["id"], "task.failed", None, None, {"reason": "recovery needs evidence"})
@@ -95,9 +95,20 @@ def test_protocol_failed_conversation_requires_attention_without_automatic_redel
 
     store.fail_conversation_job(job["id"], "execution report had no evidence", attention=True)
 
-    assert [item["id"] for item in store.mailbox(project["id"], state="pending")] == [mailbox_id]
+    assert store.mailbox(project["id"], state="pending") == []
+    assert [item["id"] for item in store.mailbox(project["id"], state="attention")] == [mailbox_id]
     assert store.conversation_agent(project["id"])["state"] == "attention"
     assert store.enqueue_governance_jobs() == []
+
+    with store.tx(immediate=True) as db:
+        store._mailbox(db, project["id"], "task.done", None, None, {"result": "later terminal fact"})
+    later_mailbox_id = store.mailbox(project["id"], state="pending")[0]["id"]
+
+    replacement_jobs = store.enqueue_governance_jobs()
+    assert len(replacement_jobs) == 1
+    replacement = store.get_conversation_job(replacement_jobs[0])
+    assert replacement["trigger_kind"] == "mailbox"
+    assert replacement["mailbox_ids"] == [later_mailbox_id]
 
 
 def test_startup_releases_mailbox_claimed_by_interrupted_conversation(store, tmp_path):
@@ -128,7 +139,7 @@ def test_task_creation_materializes_plan_owned_readiness_fields(store, tmp_path)
         ConflictDomain(kind="workspace_path", identity="result.txt"),
     ]
     plan = store.create_orchestration_plan(project["id"], plan_definition)
-    store.publish_workflow(project["id"], workflow, plan["id"])
+    publish_initial_workflow(store, project["id"], workflow, plan["id"])
 
     registry = build_core_registry()
     authored_readiness = readiness()
@@ -184,7 +195,7 @@ def test_concurrent_initial_task_creation_materializes_once(store, tmp_path):
         project["id"],
         orchestration_plan(workflow),
     )
-    store.publish_workflow(project["id"], workflow, plan["id"])
+    publish_initial_workflow(store, project["id"], workflow, plan["id"])
     barrier = threading.Barrier(2)
 
     def create_once(index: int):
@@ -221,14 +232,14 @@ def test_workflow_publication_enforces_planned_task_agent_execution_policy(store
     required_plan.task_portfolio[0].agent_execution = "required"
     required = store.create_orchestration_plan(project["id"], required_plan)
     with pytest.raises(ValueError, match="requires a Task Agent Run"):
-        store.publish_workflow(project["id"], deterministic, required["id"])
+        publish_initial_workflow(store, project["id"], deterministic, required["id"])
 
     agent_based = agent_workflow()
     forbidden_plan = orchestration_plan(agent_based)
     forbidden_plan.task_portfolio[0].agent_execution = "forbidden"
     forbidden = store.create_orchestration_plan(project["id"], forbidden_plan)
     with pytest.raises(ValueError, match="forbids Task Agent Runs"):
-        store.publish_workflow(project["id"], agent_based, forbidden["id"])
+        publish_initial_workflow(store, project["id"], agent_based, forbidden["id"])
 
 
 def test_deterministic_workflow_must_consume_every_planned_exact_string_by_reference(store, tmp_path):
@@ -241,12 +252,12 @@ def test_deterministic_workflow_must_consume_every_planned_exact_string_by_refer
     plan = store.create_orchestration_plan(project["id"], plan_definition)
 
     with pytest.raises(ValueError, match="does not consume through Task-input \\$ref"):
-        store.publish_workflow(project["id"], workflow, plan["id"])
+        publish_initial_workflow(store, project["id"], workflow, plan["id"])
 
     workflow.columns[0].executor.steps[0].arguments["content"] = {
         "$ref": "/input/task/input/contract/content"
     }
-    published = store.publish_workflow(project["id"], workflow, plan["id"])
+    published = publish_initial_workflow(store, project["id"], workflow, plan["id"])
 
     assert published["definition"]["columns"][0]["executor"]["steps"][0]["arguments"]["content"] == {
         "$ref": "/input/task/input/contract/content"
@@ -391,7 +402,7 @@ def test_workflow_rejects_task_portfolio_mirrored_as_numbered_columns(store, tmp
     stored_plan = store.create_orchestration_plan(project["id"], plan)
 
     with pytest.raises(ValueError, match="mirror Task work-unit"):
-        store.publish_workflow(project["id"], workflow, stored_plan["id"])
+        publish_initial_workflow(store, project["id"], workflow, stored_plan["id"])
 
 
 def test_agent_run_messages_and_tool_invocations_are_auditable(store, tmp_path):

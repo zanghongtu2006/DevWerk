@@ -16,10 +16,10 @@ The complete `tests` directory protects the current Version 1 architecture. It i
 | `test_store_contract.py` | Project isolation, stable conversation messages, one logical Conversation Agent, immutable revisions, Task pinning, WAL/indexes, cursor events |
 | `test_files_contract.py` | canonical Project boundary, atomic write, hash/size metadata, bounded context reads |
 | `test_runtime_contract.py` | capability-sequence and shared-AgentCore Columns, logical Agent sessions, explicit done/failed, directed rework, recovering, and rejected-before-effect tool handling |
-| `test_conversation_contract.py` | persistent general Agent tool loop, platform policy preload, template application, conversation-published Workflow/Task, and automatic supervision |
+| `test_conversation_contract.py` | persistent general Agent tool loop, platform policy preload, Loop selection/application, conversation-published Workflow revisions/Tasks, and automatic supervision |
 | `test_api_web_contract.py` | mounted API, Project isolation, system automation path, Web routes/modules, read-only Kanban governance |
 | `test_provider_contract.py` | native OpenAI/Anthropic tool-call normalization, routing, usage attribution, retryable/non-retryable errors |
-| `test_workflow_template_contract.py` | persisted template discovery, schema-bound materialization, novel directed graph, DevOps requirement gate |
+| `test_loop_contract.py` | filesystem metadata discovery, schema-bound materialization, initial-Workflow admission, novel directed graph, DevOps requirement gate |
 | `test_orchestration_policy_contract.py` | centralized scheduling policy, absence of Agent execution budgets, versioned policy evidence |
 | `test_failure_transparency_contract.py` | original failure propagation, structured failure summaries, no silent fallback |
 | `test_logging_contract.py` | full V1 debug trace, fixed `devwerk.log` name, daily rotation, no queue wrapper |

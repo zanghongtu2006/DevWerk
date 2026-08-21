@@ -25,6 +25,7 @@ from app.v1.capabilities import (
     validate_workflow_capabilities,
 )
 from app.v1.files import ProjectFiles
+from app.v1.loops import LoopCatalog
 from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, PlatformPolicySnapshot, V1RuntimePolicy
 
 
@@ -66,17 +67,17 @@ def _numbered_unit_stem(value: str) -> str:
     return re.sub(r"(?:_\d+)+$", "", _normalized_unit_identifier(value))
 
 
-def _resolve_template_parameters(value: Any, parameters: dict[str, Any]) -> Any:
-    """Resolve exact template parameters without evaluating code or text templates."""
+def _resolve_loop_parameters(value: Any, parameters: dict[str, Any]) -> Any:
+    """Resolve exact Loop parameters without evaluating code or free-form expressions."""
     if isinstance(value, dict):
         if set(value) == {"$param"}:
             key = str(value["$param"])
             if key not in parameters:
-                raise ValueError(f"Workflow Template parameter {key!r} is missing")
+                raise ValueError(f"Loop parameter {key!r} is missing")
             return json.loads(json.dumps(parameters[key], ensure_ascii=False))
-        return {key: _resolve_template_parameters(item, parameters) for key, item in value.items()}
+        return {key: _resolve_loop_parameters(item, parameters) for key, item in value.items()}
     if isinstance(value, list):
-        return [_resolve_template_parameters(item, parameters) for item in value]
+        return [_resolve_loop_parameters(item, parameters) for item in value]
     return value
 
 
@@ -227,9 +228,16 @@ def _validate_deterministic_deliverable_coverage(
 
 
 class V1Store:
-    def __init__(self, db_path: str, policy: V1RuntimePolicy | None = None, *, registry: CapabilityRegistry):
+    def __init__(
+        self,
+        db_path: str,
+        policy: V1RuntimePolicy | None = None,
+        *,
+        registry: CapabilityRegistry,
+    ):
         self.policy = policy or DEFAULT_V1_RUNTIME_POLICY
         self.registry = registry
+        self.loops = LoopCatalog()
         self.path = Path(db_path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._schema_lock = threading.Lock()
@@ -305,31 +313,22 @@ class V1Store:
                 CREATE TABLE IF NOT EXISTS v1_workflows (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
                     active_revision_id TEXT, state_version INTEGER NOT NULL DEFAULT 0,
+                    source_loop_key TEXT, source_loop_version TEXT, source_loop_digest TEXT,
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                     FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
                 );
-                CREATE TABLE IF NOT EXISTS v1_workflow_templates (
-                    id TEXT PRIMARY KEY, template_key TEXT NOT NULL, version INTEGER NOT NULL,
-                    name TEXT NOT NULL, description TEXT NOT NULL, category TEXT NOT NULL,
-                    tags_json TEXT NOT NULL DEFAULT '[]', selection_guide TEXT NOT NULL,
-                    parameter_schema_json TEXT NOT NULL, bundle_json TEXT NOT NULL,
-                    active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL,
-                    UNIQUE(template_key, version)
-                );
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_v1_workflow_templates_active
-                    ON v1_workflow_templates(template_key) WHERE active=1;
-                CREATE INDEX IF NOT EXISTS idx_v1_workflow_templates_discovery
-                    ON v1_workflow_templates(active, category, template_key);
-                CREATE TABLE IF NOT EXISTS v1_project_template_applications (
-                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, template_id TEXT NOT NULL,
+                CREATE TABLE IF NOT EXISTS v1_loop_applications (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                    loop_key TEXT NOT NULL, loop_version TEXT NOT NULL, loop_digest TEXT NOT NULL,
                     bindings_json TEXT NOT NULL, orchestration_plan_id TEXT NOT NULL,
                     workflow_revision_id TEXT NOT NULL, task_ids_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
-                    FOREIGN KEY(template_id) REFERENCES v1_workflow_templates(id),
                     FOREIGN KEY(orchestration_plan_id) REFERENCES v1_orchestration_plans(id),
                     FOREIGN KEY(workflow_revision_id) REFERENCES v1_workflow_revisions(id)
                 );
+                CREATE INDEX IF NOT EXISTS idx_v1_loop_applications_project
+                    ON v1_loop_applications(project_id, created_at DESC);
                 CREATE TABLE IF NOT EXISTS v1_orchestration_plans (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL, schema_version TEXT NOT NULL,
                     plan_json TEXT NOT NULL, plan_hash TEXT NOT NULL, created_at TEXT NOT NULL,
@@ -604,6 +603,9 @@ class V1Store:
             self._ensure_column(db, "v1_project_mailbox", "reported_message_id", "INTEGER")
             self._ensure_column(db, "v1_project_mailbox", "reported_at", "TEXT")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_v1_mailbox_event ON v1_project_mailbox(event_id) WHERE event_id IS NOT NULL")
+            self._ensure_column(db, "v1_workflows", "source_loop_key", "TEXT")
+            self._ensure_column(db, "v1_workflows", "source_loop_version", "TEXT")
+            self._ensure_column(db, "v1_workflows", "source_loop_digest", "TEXT")
             self._ensure_column(db, "v1_workflow_revisions", "workflow_id", "TEXT")
             self._ensure_column(db, "v1_workflow_revisions", "revision_no", "INTEGER")
             self._ensure_column(db, "v1_workflow_revisions", "schema_version", "TEXT NOT NULL DEFAULT 'devwerk.workflow.v1'")
@@ -653,54 +655,12 @@ class V1Store:
             db.execute("UPDATE v1_agent_messages SET project_id=(SELECT project_id FROM v1_agent_runs WHERE id=v1_agent_messages.agent_run_id) WHERE project_id='' ")
             db.execute("UPDATE v1_tool_invocations SET project_id=(SELECT project_id FROM v1_agent_runs WHERE id=v1_tool_invocations.agent_run_id) WHERE project_id='' ")
             db.execute("UPDATE v1_await_handles SET project_id=(SELECT project_id FROM v1_tasks WHERE id=v1_await_handles.task_id) WHERE project_id='' ")
-            self._seed_workflow_templates(db)
+            # Preset definitions are filesystem Loops. Remove the obsolete SQLite copies
+            # after the new schema is ready; active Project Workflow revisions remain intact.
+            db.execute("DROP TABLE IF EXISTS v1_project_template_applications")
+            db.execute("DROP TABLE IF EXISTS v1_workflow_templates")
 
-    @staticmethod
-    def _seed_workflow_templates(db: sqlite3.Connection) -> None:
-        template_dir = Path(__file__).resolve().parents[2] / "config" / "workflow-templates"
-        if not template_dir.is_dir():
-            return
-        for path in sorted(template_dir.glob("*.json")):
-            record = json.loads(path.read_text(encoding="utf-8"))
-            key = str(record["template_key"])
-            version = int(record["version"])
-            template_id = str(record.get("id") or f"wftpl_{key}_v{version}")
-            check_schema(dict(record["parameter_schema"]), label=f"Workflow Template {key} parameters")
-            defaults = dict((record.get("bundle") or {}).get("defaults") or {})
-            if defaults:
-                validate_contract(defaults, dict(record["parameter_schema"]), label=f"Workflow Template {key} defaults")
-                materialized = _resolve_template_parameters(dict(record["bundle"]), defaults)
-                OrchestrationPlan.model_validate(materialized["orchestration_plan"])
-                WorkflowDefinition.model_validate(materialized["workflow"])
-            else:
-                # Required project bindings remain unresolved, but all static surrounding
-                # template structure must still be a complete plan and Workflow.
-                OrchestrationPlan.model_validate(record["bundle"]["orchestration_plan"])
-                WorkflowDefinition.model_validate(record["bundle"]["workflow"])
-            db.execute(
-                "UPDATE v1_workflow_templates SET active=0 WHERE template_key=? AND version<>?",
-                (key, version),
-            )
-            db.execute(
-                "INSERT OR IGNORE INTO v1_workflow_templates("
-                "id,template_key,version,name,description,category,tags_json,selection_guide,"
-                "parameter_schema_json,bundle_json,active,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,1,?)",
-                (
-                    template_id,
-                    key,
-                    version,
-                    str(record["name"]),
-                    str(record["description"]),
-                    str(record["category"]),
-                    json.dumps(record.get("tags") or [], ensure_ascii=False),
-                    str(record["selection_guide"]),
-                    json.dumps(record["parameter_schema"], ensure_ascii=False),
-                    json.dumps(record["bundle"], ensure_ascii=False),
-                    utcnow(),
-                ),
-            )
-
-    def list_workflow_templates(
+    def list_loops(
         self,
         *,
         category: str | None = None,
@@ -708,63 +668,33 @@ class V1Store:
         query: str | None = None,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        limit = min(max(limit or self.policy.service_limits.default_page_size, 1), self.policy.service_limits.max_page_size)
-        conditions = ["active=1"]
-        values: list[Any] = []
-        if category:
-            conditions.append("category=?")
-            values.append(category)
-        if tag:
-            conditions.append("EXISTS (SELECT 1 FROM json_each(tags_json) WHERE value=?)")
-            values.append(tag)
-        if query:
-            conditions.append("(name LIKE ? OR description LIKE ? OR selection_guide LIKE ? OR tags_json LIKE ?)")
-            needle = f"%{query}%"
-            values.extend([needle, needle, needle, needle])
-        values.append(limit)
-        with self.connect() as db:
-            rows = db.execute(
-                "SELECT id,template_key,version,name,description,category,tags_json,selection_guide,active,created_at "
-                f"FROM v1_workflow_templates WHERE {' AND '.join(conditions)} "
-                "ORDER BY category,template_key,version DESC LIMIT ?",
-                values,
-            ).fetchall()
-        result = []
-        for row in rows:
-            item = dict(row)
-            item["tags"] = json.loads(item.pop("tags_json") or "[]")
-            item["active"] = bool(item["active"])
-            result.append(item)
-        return result
+        page_limit = min(
+            max(limit or self.policy.service_limits.default_page_size, 1),
+            self.policy.service_limits.max_page_size,
+        )
+        return self.loops.list(category=category, tag=tag, query=query, limit=page_limit)
 
-    def get_workflow_template(self, template_key: str, version: int | None = None) -> dict[str, Any]:
-        with self.connect() as db:
-            if version is None:
-                row = db.execute(
-                    "SELECT * FROM v1_workflow_templates WHERE template_key=? AND active=1 "
-                    "ORDER BY version DESC LIMIT 1",
-                    (template_key,),
-                ).fetchone()
-            else:
-                row = db.execute(
-                    "SELECT * FROM v1_workflow_templates WHERE template_key=? AND version=?",
-                    (template_key, version),
-                ).fetchone()
-        if not row:
-            raise KeyError(f"workflow template {template_key!r} was not found")
-        item = dict(row)
-        item["tags"] = json.loads(item.pop("tags_json") or "[]")
-        item["parameter_schema"] = json.loads(item.pop("parameter_schema_json"))
-        item["bundle"] = json.loads(item.pop("bundle_json"))
-        item["active"] = bool(item["active"])
-        return item
+    def get_loop(self, loop_key: str) -> dict[str, Any]:
+        loop = self.loops.get(loop_key)
+        parameter_schema = dict(loop["parameter_schema"])
+        bundle = dict(loop["bundle"])
+        check_schema(parameter_schema, label=f"Loop {loop_key} parameters")
+        defaults = dict(bundle.get("defaults") or {})
+        if defaults:
+            validate_contract(defaults, parameter_schema, label=f"Loop {loop_key} defaults")
+            materialized = _resolve_loop_parameters(bundle, defaults)
+            OrchestrationPlan.model_validate(materialized["orchestration_plan"])
+            WorkflowDefinition.model_validate(materialized["workflow"])
+        else:
+            OrchestrationPlan.model_validate(bundle["orchestration_plan"])
+            WorkflowDefinition.model_validate(bundle["workflow"])
+        return loop
 
-    def apply_workflow_template(
+    def apply_loop(
         self,
         project_id: str,
-        template_key: str,
+        loop_key: str,
         bindings: dict[str, Any],
-        version: int | None = None,
     ) -> dict[str, Any]:
         self.get_project(project_id)
         try:
@@ -772,25 +702,29 @@ class V1Store:
         except KeyError:
             pass
         else:
-            if self.list_tasks(project_id, 1):
-                raise ValueError("a Workflow Template can be applied only before the Project has formal Tasks")
-        template = self.get_workflow_template(template_key, version)
-        bundle = dict(template["bundle"])
+            raise ValueError("a Loop can be applied only before the Project has a Workflow")
+        loop = self.get_loop(loop_key)
+        bundle = dict(loop["bundle"])
         parameters = canonicalize_contract_value(
             {**dict(bundle.get("defaults") or {}), **bindings},
-            template["parameter_schema"],
+            loop["parameter_schema"],
         )
-        validate_contract(parameters, template["parameter_schema"], label=f"Workflow Template {template_key} bindings")
-        materialized = _resolve_template_parameters(bundle, parameters)
+        validate_contract(parameters, loop["parameter_schema"], label=f"Loop {loop_key} bindings")
+        materialized = _resolve_loop_parameters(bundle, parameters)
         plan = OrchestrationPlan.model_validate(materialized["orchestration_plan"])
         workflow = WorkflowDefinition.model_validate(materialized["workflow"])
         task_specs = list(materialized.get("tasks") or [])
         if {item.proposed_task_ref for item in plan.task_portfolio} != {
             str(item.get("proposed_task_ref") or "") for item in task_specs
         }:
-            raise ValueError("Workflow Template tasks must exactly materialize the orchestration portfolio")
+            raise ValueError("Loop tasks must exactly materialize the orchestration portfolio")
         plan_row = self.create_orchestration_plan(project_id, plan)
-        workflow_row = self.publish_workflow(project_id, workflow, plan_row["id"])
+        workflow_row = self._publish_workflow_revision(
+            project_id,
+            workflow,
+            plan_row["id"],
+            initial_loop=loop,
+        )
         tasks: list[dict[str, Any]] = []
         for spec in task_specs:
             tasks.append(self.create_task(
@@ -802,16 +736,19 @@ class V1Store:
                 orchestration_plan_id=plan_row["id"],
                 proposed_task_ref=str(spec["proposed_task_ref"]),
             ))
-        application_id, now = new_id("wftapp"), utcnow()
+        application_id, now = new_id("loopapp"), utcnow()
         with self.tx(immediate=True) as db:
             db.execute(
-                "INSERT INTO v1_project_template_applications("
-                "id,project_id,template_id,bindings_json,orchestration_plan_id,workflow_revision_id,task_ids_json,created_at"
-                ") VALUES(?,?,?,?,?,?,?,?)",
+                "INSERT INTO v1_loop_applications("
+                "id,project_id,loop_key,loop_version,loop_digest,bindings_json,"
+                "orchestration_plan_id,workflow_revision_id,task_ids_json,created_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
                     application_id,
                     project_id,
-                    template["id"],
+                    loop["loop_key"],
+                    loop["version"],
+                    loop["digest"],
                     json.dumps(parameters, ensure_ascii=False),
                     plan_row["id"],
                     workflow_row["id"],
@@ -819,24 +756,28 @@ class V1Store:
                     now,
                 ),
             )
-            self._event(db, project_id, None, None, "workflow.template.applied", {
+            self._event(db, project_id, None, None, "workflow.loop.applied", {
                 "application_id": application_id,
-                "template_id": template["id"],
-                "template_key": template_key,
-                "template_version": template["version"],
+                "loop_key": loop["loop_key"],
+                "loop_version": loop["version"],
+                "loop_digest": loop["digest"],
                 "workflow_revision_id": workflow_row["id"],
                 "task_ids": [item["id"] for item in tasks],
             })
         return {
             "id": application_id,
             "project_id": project_id,
-            "template": {key: template[key] for key in ("id", "template_key", "version", "name", "category")},
+            "loop": {
+                key: loop[key]
+                for key in ("loop_key", "version", "digest", "name", "category", "directory")
+            },
             "bindings": parameters,
             "orchestration_plan": plan_row,
             "workflow": workflow_row,
             "tasks": tasks,
             "created_at": now,
         }
+
     @staticmethod
     def _ensure_column(db: sqlite3.Connection, table: str, column: str, definition: str) -> None:
         existing = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
@@ -1116,7 +1057,7 @@ class V1Store:
                 "SELECT DISTINCT p.id FROM v1_projects p JOIN v1_conversation_agents a ON a.project_id=p.id "
                 "LEFT JOIN v1_project_mailbox m ON m.project_id=p.id AND m.state='pending' "
                 "LEFT JOIN v1_scheduled_reviews s ON s.project_id=p.id AND s.state='pending' AND s.due_at<=? "
-                "WHERE a.state!='attention' AND (m.id IS NOT NULL OR s.id IS NOT NULL)",
+                "WHERE m.id IS NOT NULL OR s.id IS NOT NULL",
                 (now,),
             ).fetchall()
             for project in projects:
@@ -1383,12 +1324,18 @@ class V1Store:
             mailbox_ids = json.loads(row[2] or "[]")
             if mailbox_ids:
                 placeholders = ",".join("?" for _ in mailbox_ids)
+                mailbox_state = "attention" if attention else "pending"
                 db.execute(
-                    f"UPDATE v1_project_mailbox SET state='pending',claim_owner=NULL,claim_expires_at=NULL "
+                    f"UPDATE v1_project_mailbox SET state=?,claim_owner=NULL,claim_expires_at=NULL "
                     f"WHERE project_id=? AND state='claimed' AND claim_owner=? AND id IN ({placeholders})",
-                    [project_id, row[3], *mailbox_ids],
+                    [mailbox_state, project_id, row[3], *mailbox_ids],
                 )
             if attention:
+                if row[4]:
+                    db.execute(
+                        "UPDATE v1_scheduled_reviews SET state='attention' WHERE id=? AND state='pending'",
+                        (row[4],),
+                    )
                 db.execute(
                     "UPDATE v1_conversation_agents SET state='attention',updated_at=? WHERE project_id=?",
                     (now, project_id),
@@ -1442,6 +1389,20 @@ class V1Store:
         )
 
     def publish_workflow(self, project_id: str, workflow: WorkflowDefinition, orchestration_plan_id: str) -> dict[str, Any]:
+        try:
+            self.get_workflow(project_id)
+        except KeyError as exc:
+            raise ValueError("initial Workflow creation requires loop.apply") from exc
+        return self._publish_workflow_revision(project_id, workflow, orchestration_plan_id)
+
+    def _publish_workflow_revision(
+        self,
+        project_id: str,
+        workflow: WorkflowDefinition,
+        orchestration_plan_id: str,
+        *,
+        initial_loop: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         self.get_project(project_id)
         validate_workflow_capabilities(workflow, self.registry)
         plan_row = self.get_orchestration_plan(project_id, orchestration_plan_id)
@@ -1463,10 +1424,25 @@ class V1Store:
             identity = db.execute("SELECT id FROM v1_workflows WHERE project_id=?", (project_id,)).fetchone()
             workflow_id = identity[0] if identity else new_id("workflow")
             if not identity:
+                if initial_loop is None:
+                    raise ValueError("initial Workflow creation requires a filesystem Loop")
                 db.execute(
-                    "INSERT INTO v1_workflows(id,project_id,name,state_version,created_at,updated_at) VALUES(?,?,?,0,?,?)",
-                    (workflow_id, project_id, workflow.name, now, now),
+                    "INSERT INTO v1_workflows("
+                    "id,project_id,name,state_version,source_loop_key,source_loop_version,"
+                    "source_loop_digest,created_at,updated_at) VALUES(?,?,?,0,?,?,?,?,?)",
+                    (
+                        workflow_id,
+                        project_id,
+                        workflow.name,
+                        str(initial_loop["loop_key"]),
+                        str(initial_loop["version"]),
+                        str(initial_loop["digest"]),
+                        now,
+                        now,
+                    ),
                 )
+            elif initial_loop is not None:
+                raise ValueError("a Loop cannot replace an existing Project Workflow")
             current = int(db.execute(
                 "SELECT COALESCE(MAX(revision_no),0) FROM v1_workflow_revisions WHERE workflow_id=?", (workflow_id,)
             ).fetchone()[0])
@@ -1480,14 +1456,21 @@ class V1Store:
                 "UPDATE v1_workflows SET name=?,active_revision_id=?,state_version=state_version+1,updated_at=? WHERE id=?",
                 (workflow.name, revision_id, now, workflow_id),
             )
-            self._event(db, project_id, None, None, "workflow.published", {"workflow_id": workflow_id, "revision_id": revision_id, "revision": current + 1, "orchestration_plan_id": orchestration_plan_id})
+            self._event(db, project_id, None, None, "workflow.published", {
+                "workflow_id": workflow_id,
+                "revision_id": revision_id,
+                "revision": current + 1,
+                "orchestration_plan_id": orchestration_plan_id,
+                "source_loop_key": initial_loop["loop_key"] if initial_loop else None,
+            })
             self._refresh_projection(db, project_id)
         return self.get_workflow(project_id)
 
     def get_workflow(self, project_id: str) -> dict[str, Any]:
         with self.connect() as db:
             row = self._dict(db.execute(
-                "SELECT r.*,w.id AS workflow_identity_id,w.state_version AS workflow_state_version "
+                "SELECT r.*,w.id AS workflow_identity_id,w.state_version AS workflow_state_version,"
+                "w.source_loop_key,w.source_loop_version,w.source_loop_digest "
                 "FROM v1_workflows w JOIN v1_workflow_revisions r ON r.id=w.active_revision_id WHERE w.project_id=?", (project_id,)
             ).fetchone())
         if not row:

@@ -4,14 +4,18 @@ from app.v1.domain import WorkflowDefinition
 from tests.helpers import create_planned_task, publish_planned_workflow, sequence_workflow
 
 
-def test_seeded_templates_are_discoverable_and_novel_is_a_directed_graph(store):
-    templates = store.list_workflow_templates()
-    assert {item["template_key"] for item in templates} >= {
+def test_filesystem_loops_are_discoverable_and_novel_is_a_directed_graph(store):
+    loops = store.list_loops()
+    assert {item["loop_key"] for item in loops} >= {
         "novel.production",
         "software.gitlab_devops",
     }
 
-    novel = store.get_workflow_template("novel.production")
+    novel = store.get_loop("novel.production")
+    assert novel["directory"] == "novel-production"
+    assert novel["version"] == "1.0.0"
+    assert "independent-review" in novel["tags"]
+    assert "# Long-form Novel Production" in novel["meta"]
     workflow = WorkflowDefinition.model_validate(novel["bundle"]["workflow"])
     transitions = {
         (column.key, transition.outcome, transition.target)
@@ -30,9 +34,20 @@ def test_seeded_templates_are_discoverable_and_novel_is_a_directed_graph(store):
     ]
 
 
-def test_novel_template_application_materializes_serial_chapter_tasks(store, tmp_path):
+def test_preset_loop_definitions_are_not_stored_in_sqlite(store):
+    with store.connect() as db:
+        tables = {
+            row[0]
+            for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+    assert "v1_workflow_templates" not in tables
+    assert "v1_project_template_applications" not in tables
+    assert "v1_loop_applications" in tables
+
+
+def test_novel_loop_application_materializes_serial_chapter_tasks(store, tmp_path):
     project = store.create_project("novel", "", str(tmp_path / "novel"))
-    application = store.apply_workflow_template(
+    application = store.apply_loop(
         project["id"],
         "novel.production",
         {
@@ -56,12 +71,16 @@ def test_novel_template_application_materializes_serial_chapter_tasks(store, tmp
     )
     assert store.task_scheduling(project["id"], tasks["chapter_02"]["id"])["auto_admit"] is True
     assert tasks["chapter_10"]["input"]["is_final_chapter"] is True
+    active = store.get_workflow(project["id"])
+    assert active["source_loop_key"] == "novel.production"
+    assert active["source_loop_version"] == "1.0.0"
+    assert active["source_loop_digest"] == application["loop"]["digest"]
 
 
-def test_template_application_canonicalizes_provider_numeric_strings(store, tmp_path):
+def test_loop_application_canonicalizes_provider_numeric_strings(store, tmp_path):
     project = store.create_project("provider-shaped bindings", "", str(tmp_path / "provider-shaped"))
 
-    application = store.apply_workflow_template(
+    application = store.apply_loop(
         project["id"],
         "novel.production",
         {
@@ -97,7 +116,7 @@ def test_failed_task_reopen_reuses_identity_and_returns_to_graph_entry(store, tm
 
 def test_writer_rework_reuses_one_logical_agent_session(store, tmp_path):
     project = store.create_project("writer-session", "", str(tmp_path / "writer-session"))
-    application = store.apply_workflow_template(
+    application = store.apply_loop(
         project["id"],
         "novel.production",
         {

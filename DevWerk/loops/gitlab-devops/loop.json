@@ -1,12 +1,5 @@
 {
-  "id": "wftpl_gitlab_devops_v1",
-  "template_key": "software.gitlab_devops",
-  "version": 1,
-  "name": "已确认产品需求的 GitLab 软件交付",
-  "description": "在 Conversation Agent 已完成充分需求沟通并冻结需求基线后，驱动架构、文档、开发、构建测试、独立审查、GitLab/CI 和验收。",
-  "category": "software_delivery",
-  "tags": ["软件开发", "DevOps", "GitLab", "CI", "需求基线", "代码审查"],
-  "selection_guide": "仅当用户已明确确认 PRD/需求基线、验收标准和 GitLab 工程信息时应用。需求仍有开放问题时继续 Conversation，不得用模板替代沟通。",
+  "schema_version": "devwerk.loop.bundle.v1",
   "parameter_schema": {
     "type": "object",
     "required": ["product_name", "requirements_path", "requirements_confirmed", "gitlab_repository"],

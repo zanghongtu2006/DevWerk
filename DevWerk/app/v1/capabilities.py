@@ -466,8 +466,8 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         side_effect_kind="process",
     )
     add(
-        "workflow.template.list",
-        "Discover active persisted Workflow Templates by category, tag, or natural-language search text before designing a Workflow from scratch.",
+        "loop.list",
+        "Discover filesystem Loops by category, tag, or natural-language search text before creating a Project Workflow.",
         {
             "type": "object",
             "properties": {
@@ -478,7 +478,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
             },
             "additionalProperties": False,
         },
-        lambda args, ctx: ctx.store.list_workflow_templates(
+        lambda args, ctx: ctx.store.list_loops(
             category=str(args["category"]) if args.get("category") else None,
             tag=str(args["tag"]) if args.get("tag") else None,
             query=str(args["query"]) if args.get("query") else None,
@@ -488,46 +488,40 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         delegable_to_column=False,
     )
     add(
-        "workflow.template.inspect",
-        "Read one exact persisted Workflow Template, including its parameter contract, directed Column graph, Task portfolio, and selection guidance.",
+        "loop.inspect",
+        "Read one filesystem Loop card and executable bundle, including its parameter contract, directed Column graph, Task portfolio, and selection guidance.",
         {
             "type": "object",
-            "required": ["template_key"],
+            "required": ["loop_key"],
             "properties": {
-                "template_key": {"type": "string"},
-                "version": {"type": "integer", "minimum": 1},
+                "loop_key": {"type": "string"},
             },
             "additionalProperties": False,
         },
-        lambda args, ctx: ctx.store.get_workflow_template(
-            str(args["template_key"]),
-            int(args["version"]) if args.get("version") is not None else None,
-        ),
+        lambda args, ctx: ctx.store.get_loop(str(args["loop_key"])),
         side_effect_kind="read",
         delegable_to_column=False,
     )
     add(
-        "workflow.template.apply",
+        "loop.apply",
         (
-            "Apply one persisted Workflow Template to the current Project after inspecting it. "
-            "Bindings must satisfy the template parameter schema. Application atomically records the exact "
-            "template version and materializes its declarative plan, directed Workflow graph, and Task portfolio."
+            "Create the current Project's initial Workflow from one inspected filesystem Loop. "
+            "Bindings must satisfy the Loop parameter schema. Application records the exact Loop version and digest "
+            "and materializes its declarative plan, directed Workflow graph, and Task portfolio."
         ),
         {
             "type": "object",
-            "required": ["template_key", "bindings"],
+            "required": ["loop_key", "bindings"],
             "properties": {
-                "template_key": {"type": "string"},
-                "version": {"type": "integer", "minimum": 1},
+                "loop_key": {"type": "string"},
                 "bindings": {"type": "object"},
             },
             "additionalProperties": False,
         },
-        lambda args, ctx: ctx.store.apply_workflow_template(
+        lambda args, ctx: ctx.store.apply_loop(
             ctx.project_id,
-            str(args["template_key"]),
+            str(args["loop_key"]),
             dict(args.get("bindings") or {}),
-            int(args["version"]) if args.get("version") is not None else None,
         ),
         side_effect_kind="control",
         delegable_to_column=False,
@@ -566,7 +560,8 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     add(
         "workflow.publish",
         (
-            "Publish a complete declarative Workflow revision implementing the referenced plan. "
+            "Publish a revised declarative Workflow implementing the referenced plan. The Project must already "
+            "have an initial Workflow created by loop.apply; this capability cannot create one from scratch. "
             "Workflow column keys must exactly match the plan's process-stage column keys; work slices remain Tasks. "
             "The done and failed values are terminal targets, never Column definitions. Every Column must provide an "
             "executor and non-empty transitions; every declared outcome must have exactly one transition. "

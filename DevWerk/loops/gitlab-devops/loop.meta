@@ -1,0 +1,39 @@
+# GitLab Software Delivery
+
+## Description: <br>
+Deliver a confirmed product requirement through architecture and documentation, implementation, build and test, independent review, GitLab merge-request and CI work, and final acceptance with directed feedback to the original development context. <br>
+
+## Publisher: <br>
+DevWerk <br>
+
+## Category: <br>
+software_delivery <br>
+
+## Tags: <br>
+- software-development <br>
+- devops <br>
+- gitlab <br>
+- continuous-integration <br>
+- requirement-baseline <br>
+- code-review <br>
+
+## Use Case: <br>
+Use after the Conversation Agent has completed requirement discovery with the user and the product baseline, acceptance criteria, and GitLab repository are explicitly confirmed. <br>
+
+## Selection Guide: <br>
+Select only for a software delivery project with a frozen requirement baseline and GitLab delivery target. Continue requirement conversation instead when material questions remain open. <br>
+
+## Loop Input: <br>
+Product name, confirmed requirement document path, confirmation flag, and GitLab repository identity. <br>
+
+## Loop Output: <br>
+Versioned design documents, implementation, build and test evidence, independent review, GitLab merge-request and CI evidence, and final acceptance. <br>
+
+## Loop Version(s): <br>
+1.0.0 <br>
+
+## Loop Key: <br>
+software.gitlab_devops <br>
+
+## Reference(s): <br>
+- [Executable bundle](loop.json) <br>

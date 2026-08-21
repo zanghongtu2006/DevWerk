@@ -17,7 +17,7 @@ These four locked documents are equal architecture facts. When code, tests, or s
 
 Implemented V1 runtime extensions are specified by:
 
-- [`DevWerk/docs/workflow-template-runtime-v1.md`](DevWerk/docs/workflow-template-runtime-v1.md)
+- [`DevWerk/docs/loop-runtime-v1.md`](DevWerk/docs/loop-runtime-v1.md)
 - [`DevWerk/docs/kanban-recovering-runtime-v1.md`](DevWerk/docs/kanban-recovering-runtime-v1.md)
 - [`DevWerk/docs/agent-tool-rejection-recovery-v1.md`](DevWerk/docs/agent-tool-rejection-recovery-v1.md)
 - [`DevWerk/docs/v1-test-contract.md`](DevWerk/docs/v1-test-contract.md)
@@ -35,7 +35,8 @@ Implemented V1 runtime extensions are specified by:
 - A Task is pinned to the Workflow revision active when it is created.
 - Column Definitions declare repeatable process stages, context boundaries, execution, contracts, outcomes, transitions, and retry limits.
 - Conversation Agent and ephemeral Column Agents share one general-purpose AgentCore and Capability Registry.
-- Reusable business process knowledge lives in version-controlled declarative Workflow Template JSON and is persisted in SQLite; Python runtime code contains no domain-routing branch.
+- Reusable business process knowledge lives in version-controlled `loops/<name>/loop.meta` and `loop.json` files; SQLite stores only applied Project instances and source provenance, while Python runtime code contains no domain-routing branch.
+- A Project's initial Workflow can only be materialized by `loop.apply`; subsequent immutable revisions may be published through `workflow.publish`.
 - Columns select either a generic `agent` executor or a generic `capability_sequence` executor.
 - Every Column visit creates a Column Run; retry creates an immutable Attempt under that Run.
 - Runtime execution may be deterministic or use an ephemeral agent.
@@ -60,7 +61,8 @@ DevWerk/
     web/          modular native-ES-module Web workbench
   docs/           authoritative V1 design and test contract
   tests/          V1-only automated contract tests
-  config/         LLM routing and declarative Workflow Templates
+  config/         LLM routing
+  loops/          discoverable Loop cards and declarative Workflow bundles
   scripts/        current V1 operational helpers
   startup.bat     project-venv-only service launcher
 
@@ -95,7 +97,7 @@ cd D:\workspace\DevWerk\DevWerk
 .\venv\Scripts\python.exe -m compileall app tests
 ```
 
-The tests cover declarative graph validation, Workflow Template discovery/application, Capability Registry dispatch, Project isolation, persistent Conversation Agent identity, immutable Workflow revisions, shared AgentCore tool loops, deterministic and ephemeral-agent Columns, persistent Writer sessions, explicit terminal paths, Kanban recovery, rejected-before-effect tool handling, SQLite indexes, Artifact boundaries, provider error classification and tool-call normalization, full debug logging, API behavior, and the read-only Web governance boundary.
+The tests cover declarative graph validation, filesystem Loop discovery/application, initial-Workflow admission, Capability Registry dispatch, Project isolation, persistent Conversation Agent identity, immutable Workflow revisions, shared AgentCore tool loops, deterministic and ephemeral-agent Columns, persistent Writer sessions, explicit terminal paths, Kanban recovery, rejected-before-effect tool handling, SQLite indexes, Artifact boundaries, provider error classification and tool-call normalization, full debug logging, API behavior, and the read-only Web governance boundary.
 
 Conversation messages are stored with stable message IDs and timestamps and are rendered as normal user/Agent turns. Runtime status and tool audit evidence remain outside the human conversation bubbles and update over the Project SSE stream.
 

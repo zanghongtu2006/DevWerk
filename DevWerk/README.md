@@ -8,12 +8,12 @@ This directory contains the standalone DevWerk Version 1 service. It is a conver
 - [`docs/conversation-agent-design-v1.md`](docs/conversation-agent-design-v1.md)
 - [`docs/kanban-workflow-design-v1.md`](docs/kanban-workflow-design-v1.md)
 - [`docs/conversation-agent-orchestration-soul-p0-design.md`](docs/conversation-agent-orchestration-soul-p0-design.md)
-- [`docs/workflow-template-runtime-v1.md`](docs/workflow-template-runtime-v1.md)
+- [`docs/loop-runtime-v1.md`](docs/loop-runtime-v1.md)
 - [`docs/kanban-recovering-runtime-v1.md`](docs/kanban-recovering-runtime-v1.md)
 - [`docs/agent-tool-rejection-recovery-v1.md`](docs/agent-tool-rejection-recovery-v1.md)
 - [`docs/v1-test-contract.md`](docs/v1-test-contract.md)
 
-The first four documents are locked architecture facts. Workflow Template, Kanban recovery, rejected-tool recovery, and test-contract documents describe implemented V1 extensions that must remain consistent with those facts. The full `tests` directory protects the current V1 implementation and does not provide a compatibility contract for older designs.
+The first four documents are locked architecture facts. Loop Runtime, Kanban recovery, rejected-tool recovery, and test-contract documents describe implemented V1 extensions that must remain consistent with those facts. The full `tests` directory protects the current V1 implementation and does not provide a compatibility contract for older designs.
 
 ## Runtime Shape
 
@@ -88,7 +88,9 @@ Task creation pins the active revision and its OrchestrationPlan task reference.
 
 Every Column visit creates a Column Run; each retry creates a new immutable Attempt under the same Run. `capability_sequence` Columns execute declared capability steps without an LLM. `agent` Columns create an ephemeral Agent Run that shares the same iterative AgentCore as the Conversation Agent, but receives selected Project + Task + Column context and a declared tool allowlist.
 
-Python source contains no business Workflow factory, task-type route, domain prompt, directory layout rule, or Column-name executor branch. Reusable domain knowledge is stored as version-controlled declarative JSON under `config/workflow-templates`, seeded into SQLite, selected by metadata, and materialized as ordinary immutable OrchestrationPlan, Workflow revision, and Task data.
+Python source contains no business Workflow factory, task-type route, domain prompt, directory layout rule, or Column-name executor branch. Reusable domain knowledge is stored under `loops/<name>/` as a human-readable `loop.meta` card plus declarative `loop.json`. The catalog reads these files directly; SQLite stores only materialized OrchestrationPlan, Workflow, Task data, and source provenance.
+
+The first Workflow revision for a Project can only be created by applying a selected Loop. After materialization, the Conversation Agent may publish validated immutable revisions; it cannot create an unrelated initial graph through `workflow.publish`.
 
 Failed attempts remain immutable evidence. Non-recoverable runtime failures preserve their original exception details and set an explicit failed terminal. Structured temporary provider failures move the original Task to non-terminal `recovering`; after `next_retry_at`, Kanban reclaims the same Task and Column under the normal dependency, WIP, and conflict rules. Terminal and recovery events create durable Project mailbox entries for Conversation Agent observation.
 
@@ -115,9 +117,9 @@ Default endpoints:
 - `/v1/projects`
 - `/v1/projects/{project_id}/conversation`
 - `/v1/projects/{project_id}/conversation-jobs/{job_id}`
-- `/v1/workflow-templates`
-- `/v1/workflow-templates/{template_key}`
-- `/v1/projects/{project_id}/automation/workflow-template`
+- `/v1/loops`
+- `/v1/loops/{loop_key}`
+- `/v1/projects/{project_id}/automation/loop`
 - `/v1/projects/{project_id}/capabilities`
 - `/v1/projects/{project_id}/workflow`
 - `/v1/projects/{project_id}/orchestration-plans`
@@ -136,7 +138,7 @@ Default endpoints:
 - `/v1/projects/{project_id}/agent-runs/{agent_run_id}`
 - `/v1/projects/{project_id}/governance`
 
-V1 automation persists OrchestrationPlans at `/v1/projects/{project_id}/automation/orchestration-plans`, publishes Workflows at `/v1/projects/{project_id}/automation/workflow`, and creates readiness-approved Tasks at `/v1/projects/{project_id}/automation/tasks` without an authentication gate. This is an explicit low-cost V1 boundary; the customer Web Kanban remains read-only and does not expose mutation controls. Authentication and approval are deferred until after V1.
+V1 automation applies the initial Loop at `/v1/projects/{project_id}/automation/loop`, persists OrchestrationPlans at `/v1/projects/{project_id}/automation/orchestration-plans`, publishes later Workflow revisions at `/v1/projects/{project_id}/automation/workflow-revisions`, and creates readiness-approved Tasks at `/v1/projects/{project_id}/automation/tasks` without an authentication gate. This is an explicit low-cost V1 boundary; the customer Web Kanban remains read-only and does not expose mutation controls. Authentication and approval are deferred until after V1.
 
 ## Web Workbench
 

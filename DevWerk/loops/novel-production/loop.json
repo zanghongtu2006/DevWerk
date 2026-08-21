@@ -1,12 +1,5 @@
 {
-  "id": "wftpl_novel_production_v1",
-  "template_key": "novel.production",
-  "version": 1,
-  "name": "长篇小说创作与逐章审查",
-  "description": "先冻结十份创作基线，再让严格串行的章节 Task 经过历史回顾与提要、同一 Writer 写作/返修、独立 Reviewer 审查和交付。",
-  "category": "creative_writing",
-  "tags": ["小说", "长篇写作", "逐章", "前情提要", "独立审查", "返修"],
-  "selection_guide": "用户要求多章节连续小说、章节前回顾历史、独立写作与审查并保留可追溯产物时使用。若用户仅要求短篇、单段文字或无需项目流程，不应应用。",
+  "schema_version": "devwerk.loop.bundle.v1",
   "parameter_schema": {
     "type": "object",
     "required": ["project_title", "premise", "chapter_target_characters", "chapter_max_characters"],

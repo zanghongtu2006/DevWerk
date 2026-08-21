@@ -1,0 +1,39 @@
+# Long-form Novel Production
+
+## Description: <br>
+Create a continuous multi-chapter novel through a reusable directed lifecycle: establish the writing foundation, read accepted history and produce a recap, write or revise in one logical Writer session, run an independent review, and deliver accepted chapters. <br>
+
+## Publisher: <br>
+DevWerk <br>
+
+## Category: <br>
+creative_writing <br>
+
+## Tags: <br>
+- novel <br>
+- long-form-writing <br>
+- chapter-series <br>
+- historical-recap <br>
+- independent-review <br>
+- directed-rework <br>
+
+## Use Case: <br>
+Use when the user needs a continuous chapter-based novel whose chapters must read prior accepted material, preserve auditable recaps, receive independent review, and return targeted feedback to the same Writer context. <br>
+
+## Selection Guide: <br>
+Select for a managed long-form fiction project with repeated chapter Tasks and explicit review/rework. Do not select for a short standalone passage, a single unreviewed response, or non-fiction software delivery. <br>
+
+## Loop Input: <br>
+Project title, confirmed premise, target chapter length, and permissive maximum chapter length. <br>
+
+## Loop Output: <br>
+Frozen writing guides, serial chapter summaries and bodies, review evidence, index, final acceptance evidence, and explicit Task terminal states. <br>
+
+## Loop Version(s): <br>
+1.0.0 <br>
+
+## Loop Key: <br>
+novel.production <br>
+
+## Reference(s): <br>
+- [Executable bundle](loop.json) <br>

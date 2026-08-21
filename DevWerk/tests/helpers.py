@@ -174,9 +174,28 @@ def orchestration_plan(workflow: WorkflowDefinition, *, task_ref: str = "primary
     )
 
 
+def publish_initial_workflow(store, project_id: str, workflow: WorkflowDefinition, plan_id: str):
+    """Test-only initial publication with explicit Loop provenance."""
+    return store._publish_workflow_revision(
+        project_id,
+        workflow,
+        plan_id,
+        initial_loop={
+            "loop_key": "tests.dynamic",
+            "version": "1.0.0",
+            "digest": "0" * 64,
+        },
+    )
+
+
 def publish_planned_workflow(store, project_id: str, workflow: WorkflowDefinition):
     plan = store.create_orchestration_plan(project_id, orchestration_plan(workflow))
-    revision = store.publish_workflow(project_id, workflow, plan["id"])
+    try:
+        store.get_workflow(project_id)
+    except KeyError:
+        revision = publish_initial_workflow(store, project_id, workflow, plan["id"])
+    else:
+        revision = store.publish_workflow(project_id, workflow, plan["id"])
     return plan, revision
 
 

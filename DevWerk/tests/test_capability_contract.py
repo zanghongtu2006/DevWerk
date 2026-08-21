@@ -18,7 +18,7 @@ from app.v1.domain import (
     ExactTaskInputString,
     Transition,
 )
-from tests.helpers import agent_workflow, create_planned_task, orchestration_plan, publish_planned_workflow, sequence_workflow, readiness
+from tests.helpers import agent_workflow, create_planned_task, orchestration_plan, publish_initial_workflow, publish_planned_workflow, sequence_workflow, readiness
 
 
 def test_registry_dispatches_generic_file_capability_and_tracks_artifact(store, tmp_path):
@@ -130,20 +130,43 @@ def test_json_references_are_explicit_and_do_not_evaluate_templates():
     assert value == {"copied": "resolved", "literal": "${input.task.value}"}
 
 
-def test_workflow_publish_capability_persists_conversation_generated_data(store, tmp_path):
+def test_workflow_publish_capability_rejects_initial_creation_without_loop(store, tmp_path):
     project = store.create_project("workflow", "", str(tmp_path / "project"))
     registry = build_core_registry()
     context = CapabilityContext(project_id=project["id"], project=project, store=store, start_task=True)
     workflow = sequence_workflow(name="created during dialogue")
     planned = registry.dispatch("orchestration.plan.save", {"plan": orchestration_plan(workflow).model_dump(mode="json")}, context)
     assert planned.ok
+    with pytest.raises(ValueError, match="initial Workflow creation requires loop.apply"):
+        registry.dispatch(
+            "workflow.publish",
+            {"orchestration_plan_id": planned.output["id"], "workflow": workflow.model_dump(mode="json")},
+            context,
+        )
+
+
+def test_loop_apply_capability_creates_initial_workflow(store, tmp_path):
+    project = store.create_project("loop", "", str(tmp_path / "loop-project"))
+    registry = build_core_registry()
+    context = CapabilityContext(project_id=project["id"], project=project, store=store, start_task=True)
+
     result = registry.dispatch(
-        "workflow.publish",
-        {"orchestration_plan_id": planned.output["id"], "workflow": workflow.model_dump(mode="json")},
+        "loop.apply",
+        {
+            "loop_key": "software.gitlab_devops",
+            "bindings": {
+                "product_name": "Loop delivery",
+                "requirements_path": "docs/requirements.md",
+                "requirements_confirmed": True,
+                "gitlab_repository": "group/project",
+            },
+        },
         context,
     )
+
     assert result.ok
-    assert store.get_workflow(project["id"])["definition"]["name"] == "created during dialogue"
+    assert result.output["loop"]["loop_key"] == "software.gitlab_devops"
+    assert store.get_workflow(project["id"])["source_loop_key"] == "software.gitlab_devops"
 
 
 def test_workflow_rejects_inline_control_character_sensitive_capability_strings():
@@ -293,6 +316,7 @@ def test_workflow_publish_rejects_conversation_control_capability_for_column(sto
 
 def test_workflow_publish_rejects_invalid_literal_capability_arguments(store, tmp_path):
     project = store.create_project("literal-contract", "", str(tmp_path / "project"))
+    publish_planned_workflow(store, project["id"], sequence_workflow())
     registry = build_core_registry()
     context = CapabilityContext(project_id=project["id"], project=project, store=store)
     workflow = sequence_workflow()
@@ -325,11 +349,12 @@ def test_workflow_publish_rejects_invalid_structure_around_runtime_reference(sto
     planned = store.create_orchestration_plan(project["id"], orchestration_plan(workflow))
 
     with pytest.raises(ValueError, match="Additional properties are not allowed.*path"):
-        store.publish_workflow(project["id"], workflow, planned["id"])
+        publish_initial_workflow(store, project["id"], workflow, planned["id"])
 
 
 def test_workflow_publish_requires_registry_decision_outcome_provenance(store, tmp_path):
     project = store.create_project("decision provenance", "", str(tmp_path / "project"))
+    publish_planned_workflow(store, project["id"], sequence_workflow())
     registry = build_core_registry()
     context = CapabilityContext(project_id=project["id"], project=project, store=store)
     workflow = sequence_workflow()
@@ -395,6 +420,7 @@ def test_workflow_publish_rejects_outcome_pointer_not_proven_by_output_schema(
         "",
         str(tmp_path / capability.replace(".", "-")),
     )
+    publish_planned_workflow(store, project["id"], sequence_workflow())
     registry = build_core_registry()
     context = CapabilityContext(
         project_id=project["id"],
@@ -441,6 +467,7 @@ def test_workflow_publish_canonicalizes_exact_tagged_and_rejects_forward_runtime
         "",
         str(tmp_path / "tagged"),
     )
+    publish_planned_workflow(store, tagged_project["id"], sequence_workflow())
     tagged_context = CapabilityContext(
         project_id=tagged_project["id"],
         project=tagged_project,
@@ -471,6 +498,7 @@ def test_workflow_publish_canonicalizes_exact_tagged_and_rejects_forward_runtime
         "",
         str(tmp_path / "forward"),
     )
+    publish_planned_workflow(store, forward_project["id"], sequence_workflow())
     forward_context = CapabilityContext(
         project_id=forward_project["id"],
         project=forward_project,
@@ -697,7 +725,7 @@ def test_task_create_persists_the_plan_materialized_exact_string(store, tmp_path
         ),
     ]
     stored_plan = store.create_orchestration_plan(project["id"], planned)
-    store.publish_workflow(project["id"], workflow, stored_plan["id"])
+    publish_initial_workflow(store, project["id"], workflow, stored_plan["id"])
 
     created = registry.dispatch(
         "task.create",

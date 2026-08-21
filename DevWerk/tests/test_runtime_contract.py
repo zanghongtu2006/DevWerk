@@ -25,7 +25,7 @@ from app.v1.domain import (
     WorkflowDefinition,
 )
 from app.v1.runtime import RuntimeExecutionError, WorkflowRuntime
-from tests.helpers import agent_workflow, create_planned_task, orchestration_plan, publish_planned_workflow, sequence_workflow, readiness
+from tests.helpers import agent_workflow, create_planned_task, orchestration_plan, publish_initial_workflow, publish_planned_workflow, sequence_workflow, readiness
 
 
 def test_capability_sequence_reaches_done_without_calling_llm(store, tmp_path):
@@ -291,7 +291,7 @@ def test_capability_sequence_routes_file_assertion_mismatch_from_evidence(store,
         project["id"],
         plan_model.model_copy(update={"task_portfolio": [planned_task]}),
     )
-    store.publish_workflow(project["id"], workflow, plan["id"])
+    publish_initial_workflow(store, project["id"], workflow, plan["id"])
     task = create_planned_task(store, project["id"], "must reject false success")
 
     WorkflowRuntime(store, build_core_registry(), "worker").step(task["id"])
@@ -357,7 +357,7 @@ def test_task_owned_exact_text_survives_reference_write_and_verification(store, 
         project["id"],
         plan_model.model_copy(update={"task_portfolio": [planned_task]}),
     )
-    store.publish_workflow(project["id"], workflow, plan["id"])
+    publish_initial_workflow(store, project["id"], workflow, plan["id"])
     task = create_planned_task(
         store,
         project["id"],
@@ -436,7 +436,7 @@ def test_unknown_capability_is_rejected_before_execution(store, tmp_path):
     plan = store.create_orchestration_plan(project["id"], orchestration_plan(workflow))
 
     with pytest.raises(ValueError, match="unknown or non-delegable capabilities"):
-        store.publish_workflow(project["id"], workflow, plan["id"])
+        publish_initial_workflow(store, project["id"], workflow, plan["id"])
 
     assert store.list_tasks(project["id"]) == []
 

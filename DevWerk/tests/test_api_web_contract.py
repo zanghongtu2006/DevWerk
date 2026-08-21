@@ -5,7 +5,7 @@ import time
 from fastapi.testclient import TestClient
 
 from app.v1.domain import AgentModelResponse
-from tests.helpers import orchestration_plan, sequence_workflow, readiness
+from tests.helpers import orchestration_plan, publish_initial_workflow, sequence_workflow, readiness
 
 
 def client() -> TestClient:
@@ -72,6 +72,59 @@ def test_web_routes_and_modular_assets_are_served():
         assert "task.error" in tasks
 
 
+def test_loop_api_is_the_only_initial_workflow_creation_path(tmp_path):
+    with client() as web:
+        loops = web.get("/v1/loops")
+        assert loops.status_code == 200
+        assert {item["loop_key"] for item in loops.json()} >= {
+            "novel.production",
+            "software.gitlab_devops",
+        }
+        assert web.get("/v1/workflow-templates").status_code == 404
+
+        project = web.post(
+            "/v1/projects",
+            json={"name": "loop-api", "description": "", "base_dir": str(tmp_path / "loop-api")},
+        ).json()
+        applied = web.post(
+            f"/v1/projects/{project['id']}/automation/loop",
+            json={
+                "loop_key": "software.gitlab_devops",
+                "bindings": {
+                    "product_name": "API product",
+                    "requirements_path": "docs/requirements.md",
+                    "requirements_confirmed": True,
+                    "gitlab_repository": "group/project",
+                },
+            },
+        )
+        assert applied.status_code == 201
+        assert applied.json()["loop"]["loop_key"] == "software.gitlab_devops"
+
+        second = web.post(
+            f"/v1/projects/{project['id']}/automation/loop",
+            json={"loop_key": "software.gitlab_devops", "bindings": {}},
+        )
+        assert second.status_code == 422
+        assert "only before the Project has a Workflow" in second.json()["detail"]
+
+        fresh = web.post(
+            "/v1/projects",
+            json={"name": "no-loop", "description": "", "base_dir": str(tmp_path / "no-loop")},
+        ).json()
+        definition = sequence_workflow()
+        plan = web.post(
+            f"/v1/projects/{fresh['id']}/automation/orchestration-plans",
+            json={"plan": orchestration_plan(definition).model_dump(mode="json")},
+        ).json()
+        rejected = web.post(
+            f"/v1/projects/{fresh['id']}/automation/workflow-revisions",
+            json={"orchestration_plan_id": plan["id"], "workflow": definition.model_dump(mode="json")},
+        )
+        assert rejected.status_code == 422
+        assert "initial Workflow creation requires loop.apply" in rejected.json()["detail"]
+
+
 def test_declarative_api_workflow_reaches_done_without_llm(tmp_path, monkeypatch):
     model_turn = 0
 
@@ -98,7 +151,8 @@ def test_declarative_api_workflow_reaches_done_without_llm(tmp_path, monkeypatch
         definition = sequence_workflow(content="api done")
         plan = web.post(f"/v1/projects/{project['id']}/automation/orchestration-plans", json={"plan": orchestration_plan(definition).model_dump(mode="json")}).json()
         workflow = definition.model_dump(mode="json")
-        published = web.post(f"/v1/projects/{project['id']}/automation/workflow", json={"orchestration_plan_id": plan["id"], "workflow": workflow})
+        publish_initial_workflow(web.app.state.v1_store, project["id"], definition, plan["id"])
+        published = web.post(f"/v1/projects/{project['id']}/automation/workflow-revisions", json={"orchestration_plan_id": plan["id"], "workflow": workflow})
         assert published.status_code == 201
         task = web.post(
             f"/v1/projects/{project['id']}/automation/tasks",
@@ -125,9 +179,10 @@ def test_api_rejects_unknown_declared_capability(tmp_path):
         ).json()
         definition = sequence_workflow()
         plan = web.post(f"/v1/projects/{project['id']}/automation/orchestration-plans", json={"plan": orchestration_plan(definition).model_dump(mode="json")}).json()
+        publish_initial_workflow(web.app.state.v1_store, project["id"], definition, plan["id"])
         workflow = definition.model_dump(mode="json")
         workflow["columns"][0]["executor"]["steps"][0]["capability"] = "not.registered"
-        response = web.post(f"/v1/projects/{project['id']}/automation/workflow", json={"orchestration_plan_id": plan["id"], "workflow": workflow})
+        response = web.post(f"/v1/projects/{project['id']}/automation/workflow-revisions", json={"orchestration_plan_id": plan["id"], "workflow": workflow})
         assert response.status_code == 422
         assert "unknown or non-delegable capabilities" in response.json()["detail"]
 

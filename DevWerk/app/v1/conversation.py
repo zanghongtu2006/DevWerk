@@ -138,7 +138,7 @@ class ConversationAgent:
                     ]
                 context = {
                     "active_workflow": workflow,
-                    "workflow_templates": self.store.list_workflow_templates(limit=20),
+                    "loops": self.store.list_loops(limit=20),
                     "orchestration_plans": self.store.list_orchestration_plans(project_id),
                     "tasks": self.store.task_summaries(project_id, self.policy.context.task_summary_limit),
                     "mailbox": mailbox,
@@ -196,7 +196,7 @@ class ConversationAgent:
                 runnable_mutation = any(
                     item["ok"]
                     and item["capability"] in {
-                        "task.create", "task.reopen", "task.rerun", "task.retry", "task.resume", "scheduling.decide", "workflow.template.apply"
+                        "task.create", "task.reopen", "task.rerun", "task.retry", "task.resume", "scheduling.decide", "loop.apply"
                     }
                     for item in invocations
                 )
@@ -214,7 +214,7 @@ class ConversationAgent:
                 ]
                 for item in all_invocations:
                     if (
-                        item["capability"] == "workflow.template.apply"
+                        item["capability"] == "loop.apply"
                         and item["ok"]
                         and isinstance(item.get("result", {}).get("output"), dict)
                     ):
@@ -227,6 +227,14 @@ class ConversationAgent:
                     and item["ok"]
                     and isinstance(item.get("result", {}).get("output"), dict)
                 ]
+                workflow_publications.extend(
+                    item["result"]["output"]["workflow"]
+                    for item in all_invocations
+                    if item["capability"] == "loop.apply"
+                    and item["ok"]
+                    and isinstance(item.get("result", {}).get("output"), dict)
+                    and isinstance(item["result"]["output"].get("workflow"), dict)
+                )
                 direct_artifact_ids = [
                     item["result"]["output"]["artifact"]["id"]
                     for item in all_invocations
@@ -326,7 +334,7 @@ def _has_durable_governance_progress(
         "task.resume",
         "task.retry",
         "workflow.publish",
-        "workflow.template.apply",
+        "loop.apply",
     }
     return any(
         item.get("ok")

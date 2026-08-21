@@ -23,7 +23,7 @@ Version 1 以最低合理成本打通核心闭环。允许遗留不阻断主线�
 7. Workflow 必须包含且只能包含一个 `done` 和一个 `failed` terminal sentinel；sentinel 没有 executor，也不创建 Column Run。任何非终态 Column 都必须存在到 sentinel 的可达路径。
 8. done/failed 必须形成事件并进入 Conversation Agent mailbox，不允许默认静默。
 9. 源码只承载跨领域通用的 Agent 协议、能力契约和运行时机制。
-10. Prompt、Workflow、Column 指令、输入输出约束和能力选择均由 Conversation Agent 在对话中生成、发布和修改，并作为 Project 数据持久化。
+10. 初始 Workflow、Column 指令、输入输出约束和能力选择来自 `loops/` 中被 Conversation Agent 选中的声明式 Loop；应用后，Conversation Agent 可根据对话事实发布后续 revision，并作为 Project 数据持久化。
 11. Runtime 依据类型化定义和持久化状态执行，不依据自然语言内容或领域语义选择执行路径。
 12. Runtime 统一提供状态机、能力调用、契约校验、租约、等待、恢复、审计和终态保证。
 
@@ -118,8 +118,11 @@ Version 1 Conversation Capability 目录：
 - `project.files.search`
 - `project.command.run`
 - `artifact.inspect` / `artifact.read`
+- `loop.list`
+- `loop.inspect`
+- `loop.apply`
 - `workflow.inspect`
-- `workflow.publish`
+- `workflow.publish`（仅发布已有 Workflow 的后续 revision）
 - `backlog.record` / `backlog.inspect` / `backlog.list`
 - `scheduling.decide` / `scheduling.inspect`
 - `task.create`
@@ -258,10 +261,10 @@ Version 1 不以安全防护或安全检查作为交付门槛。`project.command
 Version 1 Capability 绑定不变量：
 
 - 每个非终点 `AgentExecutor` 必须显式声明至少一个 capability；空列表和省略字段均拒绝发布；
-- `workflow.publish` 的工具 JSON Schema 从当前 Capability Registry 动态注入合法 capability ID 枚举，Conversation Agent 不得发明能力名；
+- `loop.apply` 是初始 Workflow 的唯一创建入口；`workflow.publish` 只发布已有 Workflow 的后续 revision。两者的工具 JSON Schema 均从当前 Capability Registry 动态注入合法 capability ID 枚举，Conversation Agent 不得发明能力名；
 - `CapabilitySequenceExecutor.steps[].capability` 使用同一动态枚举；
 - Workflow 发布仍由 Registry 二次校验，防止绕过工具 schema 的 API 请求引用未知能力；
-- Registry 以 `delegable_to_column` 元数据区分项目级控制能力与可委派执行能力；`workflow.publish`、`task.create`、Task 控制能力和 `agent.instruction.update` 不进入 Column 枚举。Task 数量与调度只由 Conversation Agent 决定，Column Agent 不得递归创建或重排 Task；
+- Registry 以 `delegable_to_column` 元数据区分项目级控制能力与可委派执行能力；`loop.apply`、`workflow.publish`、`task.create`、Task 控制能力和 `agent.instruction.update` 不进入 Column 枚举。Task 数量与调度只由 Conversation Agent 决定，Column Agent 不得递归创建或重排 Task；
 - `artifact.inspect/read` 是可委派只读能力；Context Compiler 预取与 Column Agent 按需读取均经过相同 Artifact Repository scope/size/hash 校验；
 - 能力目录只表达通用工具事实，不根据 Column instruction、Task 领域、文件名或用户关键词推断、补齐或替换能力。
 
@@ -274,8 +277,8 @@ Version 1 Capability 绑定不变量：
 ```json
 {
   "schema_version": "devwerk.workflow.v1",
-  "name": "由 Conversation Agent 生成",
-  "description": "由 Conversation Agent 生成",
+  "name": "由 Loop 实例化或由 Conversation Agent 修订",
+  "description": "由 Loop 实例化或由 Conversation Agent 修订",
   "entry": "column-key",
   "terminals": {"success": "done", "failure": "failed"},
   "columns": []
@@ -286,15 +289,15 @@ Version 1 Capability 绑定不变量：
 
 发布时执行结构与 liveness 校验：Column key 唯一、entry 存在、每个 `(column,outcome)` 只有一个 target、target 是 Column key 或 terminal sentinel、所有 Column 可达、每个 Column 均有到 sentinel 的受限路径；`runtime_outcomes` 与 wait success/timeout value 均映射到已声明 transition；每个循环有 `max_visits`。Version 1 transition 不支持 guard 或 priority，业务分支由 executor 提交不同的枚举 outcome。取消具备独立的原子 failed 终态、清理与通知协议。校验不理解业务内容。
 
-Version 1 只在 `workflow.publish` 完整校验成功后插入 published immutable revision，并以 `expected_workflow_state_version` CAS 更新 `v1_workflows.active_revision_id`。草拟内容属于 conversation/backlog working data，不写 revision；旧 revision 不退休、不删除，并继续服务已固定它的 Task。
+Version 1 只在 `loop.apply` 完成初始实例化，或 `workflow.publish` 完成后续 revision 校验后，插入 published immutable revision，并以 `expected_workflow_state_version` CAS 更新 `v1_workflows.active_revision_id`。草拟内容属于 conversation/backlog working data，不写 revision；旧 revision 不退休、不删除，并继续服务已固定它的 Task。
 
 ### 8.2 Column Schema
 
 ```json
 {
   "key": "draft",
-  "name": "由 Conversation Agent 生成",
-  "instruction": "由 Conversation Agent 生成并持久化",
+  "name": "由 Loop 实例化或由 Conversation Agent 修订",
+  "instruction": "由 Loop 实例化或由 Conversation Agent 修订并持久化",
   "executor": {
     "kind": "agent",
     "capabilities": ["project.files.read", "project.files.write"],

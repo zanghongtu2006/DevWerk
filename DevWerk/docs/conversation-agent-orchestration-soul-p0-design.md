@@ -62,7 +62,7 @@ DevWerk 的 Conversation Agent 不是只会调用通用工具的聊天 Agent。�
 - 发现 Workflow 不适配时停止继续派发，先修订工作方式；
 - 对用户和系统事实保持诚实，依据验收证据声明工作状态。
 
-`DEVWERK.md` 保持跨领域和方法级表达；具体 Column、Workflow、任务内容及领域判断由 Conversation Agent 针对当前 Project 形成并作为 Project 数据持久化。
+`DEVWERK.md` 保持跨领域和方法级表达；具体初始 Column、Workflow 与领域执行知识来自 Conversation Agent 为当前 Project 选择的 Loop，绑定后的任务内容及后续修订作为 Project 数据持久化。
 
 ### 3.4 性格与决策风格
 
@@ -130,7 +130,7 @@ Task 是可独立调度、监督、复核、失败和 rerun 的工作实例。Ta
 
 ## 5. Conversation Agent 编排循环
 
-Conversation Agent 在发布 Workflow 或创建 Formal Task 前，执行以下治理循环：
+Conversation Agent 在选择并应用初始 Loop、修订 Workflow 或创建 Formal Task 前，执行以下治理循环：
 
 ```text
 理解目标与完成定义
@@ -141,7 +141,7 @@ Conversation Agent 在发布 Workflow 或创建 Formal Task 前，执行以下�
 → 评估资源冲突与 WIP
 → 形成可审计 Orchestration Plan
 → 自检 Workflow 与 Task 适配
-→ 发布 Workflow revision
+→ 选择并应用初始 Loop，或发布后续 Workflow revision
 → 准入、排队或暂缓 Task
 → 持续监督与复盘
 ```
@@ -152,7 +152,7 @@ Conversation Agent 在发布 Workflow 或创建 Formal Task 前，执行以下�
 
 ### 6.1 定位
 
-Conversation Agent 在调用 `workflow.publish` 或批量调用 `task.create` 前，必须先形成并持久化一个紧凑、结构化、可审计的 `OrchestrationPlan`。它是治理决定，不是模型思维链。
+Conversation Agent 在调用 `loop.apply`、`workflow.publish` 或批量调用 `task.create` 前，必须先确认或形成紧凑、结构化、可审计的 `OrchestrationPlan`。初始 plan 由 Loop 绑定 Project 事实后实例化；后续 revision 可由 Conversation Agent 修订。它是治理决定，不是模型思维链。
 
 ### 6.2 最小内容
 
@@ -202,9 +202,9 @@ orchestration_plan:
 
 ### 6.3 发布顺序
 
-1. Conversation Agent 保存 Orchestration Plan。
+1. Conversation Agent 通过元数据选择 Loop，确认绑定参数并调用 `loop.apply`；该操作保存初始 Orchestration Plan、Workflow revision 和 Task portfolio。
 2. 确定性 Validator 校验结构、引用、资源声明和自检字段完整性。
-3. `workflow.publish` 引用 plan ID/hash，并验证 Column 与 plan 中的责任、contract、transition 一致。
+3. 已有 Workflow 需要调整时，`workflow.publish` 引用 plan ID/hash，并验证 Column 与 plan 中的责任、contract、transition 一致。
 4. `task.create` 引用同一 plan 并验证 Task 的 workflow fit 与 dependency；后续 scheduling decision 引用 Task 和 plan 中的 conflict domains。
 5. 任一检查不通过时不创建半成品 Workflow/Task，错误作为结构化事实返回 Conversation Agent 修订。
 
@@ -465,7 +465,7 @@ DevWerk 在通用 AgentCore 之上增加以下产品治理能力：
 设计实施后至少满足：
 
 1. Conversation Agent 每次治理 Run 都加载同一可审计 `DEVWERK.md` revision。
-2. 未形成 Orchestration Plan 时不能发布 Workflow 或批量派发 Task。
+2. 初始 Workflow 只能由 `loop.apply` 创建；未形成 Orchestration Plan 时不能发布后续 Workflow revision 或批量派发 Task。
 3. Workflow 的 Column 表达处理阶段和上下文边界，不表达具体工作切片。
 4. 每个 Task 在创建前证明适配 entry 和每个可达 Column。
 5. Task 的依赖、conflict domains 和并发决定可查询，并由 dispatch guard 执行。
@@ -474,7 +474,7 @@ DevWerk 在通用 AgentCore 之上增加以下产品治理能力：
 8. 每个 Column Run 使用独立最小上下文，连续性通过 artifact/dependency 传递。
 9. review、rework、retry、rerun 和 bugfix 均有通用、可解释的编排入口。
 10. 自动恢复仍运行时，系统和 tester 不生成过早的最终结论。
-11. 核心源码只包含跨领域治理协议，具体 prompt、Workflow 和领域判断作为 Project 数据产生。
+11. 核心源码只包含跨领域治理协议；具体初始 prompt、Workflow 和领域判断来自版本化 Loop，应用后成为可修订的 Project 数据。
 12. 所有行为数值的默认值与平台边界从 `V1RuntimePolicy` 解析，Run 保存 policy revision 与有效运行预算快照。
 13. Conversation 与 Column 的预算耗尽均形成结构化结果、checkpoint 和明确后续决定。
 14. 三份已锁定核心设计继续有效，新增实现与其状态机和通用 Runtime 原则一致。
