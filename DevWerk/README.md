@@ -9,11 +9,12 @@ This directory contains the standalone DevWerk Version 1 service. It is a conver
 - [`docs/kanban-workflow-design-v1.md`](docs/kanban-workflow-design-v1.md)
 - [`docs/conversation-agent-orchestration-soul-p0-design.md`](docs/conversation-agent-orchestration-soul-p0-design.md)
 - [`docs/loop-runtime-v1.md`](docs/loop-runtime-v1.md)
+- [`docs/loop-task-plan-decoupling-v1.md`](docs/loop-task-plan-decoupling-v1.md)
 - [`docs/kanban-recovering-runtime-v1.md`](docs/kanban-recovering-runtime-v1.md)
 - [`docs/agent-tool-rejection-recovery-v1.md`](docs/agent-tool-rejection-recovery-v1.md)
 - [`docs/v1-test-contract.md`](docs/v1-test-contract.md)
 
-The first four documents are locked architecture facts. Loop Runtime, Kanban recovery, rejected-tool recovery, and test-contract documents describe implemented V1 extensions that must remain consistent with those facts. The full `tests` directory protects the current V1 implementation and does not provide a compatibility contract for older designs.
+The first four documents are locked architecture facts for the general Agent and Kanban Runtime. `loop-task-plan-decoupling-v1.md` is the approved authority for planning ownership and naming. Loop Runtime, Kanban recovery, rejected-tool recovery, and test-contract documents describe implemented V1 extensions. The full `tests` directory protects the current V1 implementation and does not provide a compatibility contract for older designs.
 
 ## Runtime Shape
 
@@ -21,9 +22,13 @@ The first four documents are locked architecture facts. Loop Runtime, Kanban rec
 flowchart LR
     U["User / Web"] --> C["Project Conversation Agent"]
     P["DEVWERK.md Platform Policy"] --> C
-    C --> O["Immutable Orchestration Plan"]
-    O --> W["Immutable Workflow Revision"]
-    W --> S["Runtime Supervisor"]
+    C --> L["Loop selection"]
+    L --> P["Immutable Workflow Plan"]
+    P --> W["Immutable Workflow Revision"]
+    C --> TP["Immutable Task Plan"]
+    W --> TP
+    TP --> TSK["Materialized Tasks"]
+    TSK --> S["Runtime Supervisor"]
     S --> R["Column Run / Attempt"]
     R --> D["Deterministic Runtime"]
     R --> A["Ephemeral Agent"]
@@ -49,6 +54,7 @@ app/v1/storage_support.py
 app/v1/repositories/base.py
 app/v1/repositories/schema_repository.py
 app/v1/repositories/project_repository.py
+app/v1/repositories/planning_repository.py
 app/v1/repositories/artifact_repository.py
 app/v1/repositories/event_repository.py
 app/v1/services/scheduler.py
@@ -78,11 +84,11 @@ Anything outside this list must have a current, explicit reason to exist before 
 
 Project is the isolation boundary. Each Project persists exactly one logical Conversation Agent identity, a canonical and unique `base_dir`, its conversation, Workflow revisions, Tasks, Runs, Events, Artifacts, and mailbox notifications.
 
-The Conversation Agent is a general-purpose tool-using Agent with Project-manager, Agile-coach, Kanban and recovery responsibilities. Every governance Run preloads the versioned `DEVWERK.md` platform policy. It has no task-type classifier. It may answer or directly execute bounded work, or persist an OrchestrationPlan, publish its Workflow revision and create formal Tasks through capabilities. Same-Project turns are serialized.
+The Conversation Agent is a general-purpose tool-using Agent with Project-manager, Agile-coach, Kanban and recovery responsibilities. Every governance Run preloads the versioned `DEVWERK.md` platform policy. It has no task-type classifier. It may answer or directly execute bounded work, select a Loop, persist a Task Plan for the current objective, and materialize formal Tasks through capabilities. Same-Project turns are serialized.
 
 ### Workflow and Task
 
-A valid Workflow is bound to an immutable OrchestrationPlan and:
+A valid Workflow Revision is bound to an immutable Workflow Plan and:
 
 - has unique Column keys;
 - reserves `done` and `failed` as non-executable terminal sentinels;
@@ -90,13 +96,13 @@ A valid Workflow is bound to an immutable OrchestrationPlan and:
 - gives every non-terminal Column an explicit transition path to a terminal;
 - rejects duplicate outcomes and unknown transition targets.
 
-Task creation pins the active revision and its OrchestrationPlan task reference. Publishing a new revision never rewrites an existing Task. Dependencies and conflict domains are declared in the plan and rechecked atomically before dispatch.
+The Workflow Plan describes the reusable method and Task Contract but contains no concrete Task list. A Task Plan binds one user objective to an immutable Workflow Revision and owns concrete Task inputs, dependencies, conflict domains, readiness, and Agent policy. `task.create` accepts only a Task Plan ID and item reference, so Provider calls cannot restate or drift those facts. Publishing a new Workflow Revision never rewrites an existing Task or Task Plan.
 
 ### Runtime and Evidence
 
 Every Column visit creates a Column Run; each retry creates a new immutable Attempt under the same Run. `capability_sequence` Columns execute declared capability steps without an LLM. `agent` Columns create an ephemeral Agent Run that shares the same iterative AgentCore as the Conversation Agent, but receives selected Project + Task + Column context and a declared tool allowlist.
 
-Python source contains no business Workflow factory, task-type route, domain prompt, directory layout rule, or Column-name executor branch. Reusable domain knowledge is stored under `loops/<name>/` as a human-readable `loop.meta` card plus declarative `loop.json`. The catalog reads these files directly; SQLite stores only materialized OrchestrationPlan, Workflow, Task data, and source provenance.
+Python source contains no business Workflow factory, task-type route, domain prompt, directory layout rule, or Column-name executor branch. Reusable domain knowledge is stored under `loops/<name>/` as a human-readable `loop.meta` card plus declarative `loop.json`. The catalog reads these files directly; SQLite stores only materialized Workflow Plans, Workflow Revisions, Task Plans, Tasks, and source provenance.
 
 The first Workflow revision for a Project can only be created by applying a selected Loop. After materialization, the Conversation Agent may publish validated immutable revisions; it cannot create an unrelated initial graph through `workflow.publish`.
 
@@ -132,7 +138,8 @@ Default endpoints:
 - `/v1/projects/{project_id}/automation/loop`
 - `/v1/projects/{project_id}/capabilities`
 - `/v1/projects/{project_id}/workflow`
-- `/v1/projects/{project_id}/orchestration-plans`
+- `/v1/projects/{project_id}/workflow-plans`
+- `/v1/projects/{project_id}/task-plans`
 - `/v1/projects/{project_id}/quiescence`
 - `/v1/projects/{project_id}/board`
 - `/v1/projects/{project_id}/projection`
@@ -148,7 +155,7 @@ Default endpoints:
 - `/v1/projects/{project_id}/agent-runs/{agent_run_id}`
 - `/v1/projects/{project_id}/governance`
 
-V1 automation applies the initial Loop at `/v1/projects/{project_id}/automation/loop`, persists OrchestrationPlans at `/v1/projects/{project_id}/automation/orchestration-plans`, publishes later Workflow revisions at `/v1/projects/{project_id}/automation/workflow-revisions`, and creates readiness-approved Tasks at `/v1/projects/{project_id}/automation/tasks` without an authentication gate. This is an explicit low-cost V1 boundary; the customer Web Kanban remains read-only and does not expose mutation controls. Authentication and approval are deferred until after V1.
+V1 automation applies the initial Loop at `/v1/projects/{project_id}/automation/loop`, persists reusable Workflow Plans at `/v1/projects/{project_id}/automation/workflow-plans`, publishes Workflow Revisions at `/v1/projects/{project_id}/automation/workflow-revisions`, persists objective-specific Task Plans at `/v1/projects/{project_id}/automation/task-plans`, and materializes their Tasks at `/v1/projects/{project_id}/automation/tasks`. Loop application itself creates no Tasks. This is an explicit low-cost V1 boundary; the customer Web Kanban remains read-only and does not expose mutation controls. Authentication and approval are deferred until after V1.
 
 ## Web Workbench
 

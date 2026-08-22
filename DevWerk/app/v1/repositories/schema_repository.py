@@ -66,37 +66,50 @@ class SchemaRepository:
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                     FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
                 );
-                CREATE TABLE IF NOT EXISTS v1_loop_applications (
+                CREATE TABLE IF NOT EXISTS v1_project_loop_bindings (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
                     loop_key TEXT NOT NULL, loop_version TEXT NOT NULL, loop_digest TEXT NOT NULL,
-                    bindings_json TEXT NOT NULL, orchestration_plan_id TEXT NOT NULL,
-                    workflow_revision_id TEXT NOT NULL, task_ids_json TEXT NOT NULL,
+                    bindings_json TEXT NOT NULL, workflow_plan_id TEXT NOT NULL,
+                    workflow_revision_id TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
-                    FOREIGN KEY(orchestration_plan_id) REFERENCES v1_orchestration_plans(id),
+                    FOREIGN KEY(workflow_plan_id) REFERENCES v1_workflow_plans(id),
                     FOREIGN KEY(workflow_revision_id) REFERENCES v1_workflow_revisions(id)
                 );
-                CREATE INDEX IF NOT EXISTS idx_v1_loop_applications_project
-                    ON v1_loop_applications(project_id, created_at DESC);
-                CREATE TABLE IF NOT EXISTS v1_orchestration_plans (
+                CREATE INDEX IF NOT EXISTS idx_v1_project_loop_bindings_project
+                    ON v1_project_loop_bindings(project_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS v1_workflow_plans (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL, schema_version TEXT NOT NULL,
                     plan_json TEXT NOT NULL, plan_hash TEXT NOT NULL, created_at TEXT NOT NULL,
                     UNIQUE(project_id, plan_hash),
                     FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
                 );
-                CREATE INDEX IF NOT EXISTS idx_v1_orchestration_plans_project
-                    ON v1_orchestration_plans(project_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_v1_workflow_plans_project
+                    ON v1_workflow_plans(project_id, created_at DESC);
                 CREATE TABLE IF NOT EXISTS v1_workflow_revisions (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL, revision INTEGER NOT NULL,
                     definition_json TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL,
+                    workflow_plan_id TEXT, created_at TEXT NOT NULL,
                     UNIQUE(project_id, revision),
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
+                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
+                    FOREIGN KEY(workflow_plan_id) REFERENCES v1_workflow_plans(id)
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_v1_workflow_active
                     ON v1_workflow_revisions(project_id) WHERE active=1;
+                CREATE TABLE IF NOT EXISTS v1_task_plans (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                    workflow_revision_id TEXT NOT NULL, schema_version TEXT NOT NULL,
+                    objective TEXT NOT NULL, plan_json TEXT NOT NULL,
+                    plan_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                    UNIQUE(project_id, plan_hash),
+                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
+                    FOREIGN KEY(workflow_revision_id) REFERENCES v1_workflow_revisions(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_v1_task_plans_project
+                    ON v1_task_plans(project_id, created_at DESC);
                 CREATE TABLE IF NOT EXISTS v1_tasks (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL, workflow_revision_id TEXT NOT NULL,
+                    task_plan_id TEXT NOT NULL, proposed_task_ref TEXT NOT NULL,
                     title TEXT NOT NULL, brief TEXT NOT NULL, input_json TEXT NOT NULL DEFAULT '{}',
                     context_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL,
                     control_state TEXT NOT NULL DEFAULT 'active',
@@ -105,7 +118,8 @@ class SchemaRepository:
                     lease_owner TEXT, lease_until TEXT, error TEXT, created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL, finished_at TEXT,
                     FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
-                    FOREIGN KEY(workflow_revision_id) REFERENCES v1_workflow_revisions(id)
+                    FOREIGN KEY(workflow_revision_id) REFERENCES v1_workflow_revisions(id),
+                    FOREIGN KEY(task_plan_id) REFERENCES v1_task_plans(id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_v1_tasks_dispatch
                     ON v1_tasks(status, updated_at);
@@ -305,7 +319,7 @@ class SchemaRepository:
             self._ensure_column(db, "v1_tasks", "control_state", "TEXT NOT NULL DEFAULT 'active'")
             self._ensure_column(db, "v1_tasks", "rerun_of_task_id", "TEXT")
             self._ensure_column(db, "v1_tasks", "resolved_by_task_id", "TEXT")
-            self._ensure_column(db, "v1_tasks", "orchestration_plan_id", "TEXT")
+            self._ensure_column(db, "v1_tasks", "task_plan_id", "TEXT")
             self._ensure_column(db, "v1_tasks", "proposed_task_ref", "TEXT")
             self._ensure_column(db, "v1_tasks", "conflict_domains_json", "TEXT NOT NULL DEFAULT '[]'")
             self._ensure_column(db, "v1_scheduling_entries", "auto_admit", "INTEGER NOT NULL DEFAULT 0")
@@ -359,7 +373,7 @@ class SchemaRepository:
             self._ensure_column(db, "v1_workflow_revisions", "revision_no", "INTEGER")
             self._ensure_column(db, "v1_workflow_revisions", "schema_version", "TEXT NOT NULL DEFAULT 'devwerk.workflow.v1'")
             self._ensure_column(db, "v1_workflow_revisions", "definition_hash", "TEXT")
-            self._ensure_column(db, "v1_workflow_revisions", "orchestration_plan_id", "TEXT")
+            self._ensure_column(db, "v1_workflow_revisions", "workflow_plan_id", "TEXT")
             self._ensure_column(db, "v1_agent_runs", "platform_policy_revision", "INTEGER")
             self._ensure_column(db, "v1_agent_runs", "platform_policy_hash", "TEXT")
             self._ensure_column(db, "v1_agent_runs", "runtime_policy_revision", "INTEGER")

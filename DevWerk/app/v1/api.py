@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.core.debug_trace import trace_json
-from app.v1.domain import ConversationRequest, ExternalEventSignal, LoopApplyRequest, OrchestrationPlanCreate, ProjectCreate, TaskCreate, WorkflowRevisionPublishRequest
+from app.v1.domain import ConversationRequest, ExternalEventSignal, LoopApplyRequest, ProjectCreate, TaskCreate, TaskPlanCreate, WorkflowPlanCreate, WorkflowRevisionPublishRequest
 from app.v1.capabilities import (
     CapabilityContext,
 )
@@ -153,7 +153,7 @@ def publish_workflow_revision(project_id: str, payload: WorkflowRevisionPublishR
     """Revise an existing Loop-created Workflow; the customer Kanban remains read-only."""
     try:
         store(request).get_project(project_id)
-        return store(request).publish_workflow(project_id, payload.workflow, payload.orchestration_plan_id)
+        return store(request).publish_workflow(project_id, payload.workflow, payload.workflow_plan_id)
     except KeyError as exc:
         raise not_found(exc) from exc
     except ValueError as exc:
@@ -199,21 +199,40 @@ def apply_loop(project_id: str, payload: LoopApplyRequest, request: Request) -> 
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/projects/{project_id}/automation/orchestration-plans", status_code=201)
-def create_orchestration_plan(project_id: str, payload: OrchestrationPlanCreate, request: Request) -> dict[str, Any]:
+@router.post("/projects/{project_id}/automation/workflow-plans", status_code=201)
+def create_workflow_plan(project_id: str, payload: WorkflowPlanCreate, request: Request) -> dict[str, Any]:
     try:
-        return store(request).create_orchestration_plan(project_id, payload.plan)
+        return store(request).create_workflow_plan(project_id, payload.plan)
     except KeyError as exc:
         raise not_found(exc) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.get("/projects/{project_id}/orchestration-plans")
-def list_orchestration_plans(project_id: str, request: Request, limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> list[dict[str, Any]]:
+@router.get("/projects/{project_id}/workflow-plans")
+def list_workflow_plans(project_id: str, request: Request, limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> list[dict[str, Any]]:
     try:
         store(request).get_project(project_id)
-        return store(request).list_orchestration_plans(project_id, limit)
+        return store(request).list_workflow_plans(project_id, limit)
+    except KeyError as exc:
+        raise not_found(exc) from exc
+
+
+@router.post("/projects/{project_id}/automation/task-plans", status_code=201)
+def create_task_plan(project_id: str, payload: TaskPlanCreate, request: Request) -> dict[str, Any]:
+    try:
+        return store(request).create_task_plan(project_id, payload.plan)
+    except KeyError as exc:
+        raise not_found(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/projects/{project_id}/task-plans")
+def list_task_plans(project_id: str, request: Request, limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> list[dict[str, Any]]:
+    try:
+        store(request).get_project(project_id)
+        return store(request).list_task_plans(project_id, limit)
     except KeyError as exc:
         raise not_found(exc) from exc
 
@@ -223,11 +242,7 @@ def create_task(project_id: str, payload: TaskCreate, request: Request) -> dict[
     try:
         task = store(request).create_task(
             project_id,
-            payload.title,
-            payload.brief,
-            payload.input,
-            payload.readiness.model_dump(mode="json"),
-            orchestration_plan_id=payload.orchestration_plan_id,
+            task_plan_id=payload.task_plan_id,
             proposed_task_ref=payload.proposed_task_ref,
         )
         supervisor(request).wake()

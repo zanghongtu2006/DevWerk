@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from pydantic import ValidationError
 
 from app.v1.capabilities import CapabilityContext, build_core_registry
 from app.v1.domain import (
@@ -14,13 +15,14 @@ from app.v1.domain import (
     ColumnDefinition,
     ConflictDomain,
     ExactTaskInputString,
-    OrchestrationTaskPlan,
+    TaskPlanItem,
     Transition,
     WorkflowDefinition,
+    WorkflowPlan,
 )
 from app.v1.runtime import WorkflowRuntime
 from tests.helpers import create_planned_task, publish_initial_workflow, publish_planned_workflow, sequence_workflow, readiness
-from tests.helpers import agent_workflow, orchestration_plan
+from tests.helpers import agent_workflow, task_plan, workflow_plan
 
 
 def test_project_has_one_persistent_agent_and_versioned_instruction(store, tmp_path):
@@ -132,29 +134,24 @@ def test_task_creation_materializes_plan_owned_readiness_fields(store, tmp_path)
         str(tmp_path / "project"),
     )
     workflow = sequence_workflow()
-    plan_definition = orchestration_plan(workflow)
-    planned_task = plan_definition.task_portfolio[0]
-    planned_task.objective = "Deliver the canonical planned objective."
-    planned_task.conflict_domains = [
+    workflow_plan_record = store.create_workflow_plan(project["id"], workflow_plan(workflow))
+    revision = publish_initial_workflow(store, project["id"], workflow, workflow_plan_record["id"])
+    plan_definition = task_plan(revision["id"], workflow)
+    planned_task = plan_definition.tasks[0].model_copy(update={
+        "objective": "Deliver the canonical planned objective.",
+        "conflict_domains": [
         ConflictDomain(kind="workspace_path", identity="result.txt"),
-    ]
-    plan = store.create_orchestration_plan(project["id"], plan_definition)
-    publish_initial_workflow(store, project["id"], workflow, plan["id"])
+        ],
+    })
+    plan_definition = plan_definition.model_copy(update={"tasks": [planned_task]})
+    plan = store.create_task_plan(project["id"], plan_definition)
 
     registry = build_core_registry()
-    authored_readiness = readiness()
-    authored_readiness.pop("objective")
-    authored_readiness["dependencies"] = "lossy-provider-copy"
-    authored_readiness["conflict_domains"] = 42
     result = registry.dispatch(
         "task.create",
         {
-            "orchestration_plan_id": plan["id"],
+            "task_plan_id": plan["id"],
             "proposed_task_ref": planned_task.proposed_task_ref,
-            "title": "provider copy differs",
-            "brief": "",
-            "input": {},
-            "readiness": authored_readiness,
         },
         CapabilityContext(
             project_id=project["id"],
@@ -174,11 +171,7 @@ def test_task_creation_materializes_plan_owned_readiness_fields(store, tmp_path)
     with pytest.raises(ValueError, match="already materialized"):
         store.create_task(
             project["id"],
-            "duplicate provider attempt",
-            "",
-            {},
-            readiness(),
-            orchestration_plan_id=plan["id"],
+            task_plan_id=plan["id"],
             proposed_task_ref=planned_task.proposed_task_ref,
         )
     assert len(store.list_tasks(project["id"])) == 1
@@ -191,11 +184,9 @@ def test_concurrent_initial_task_creation_materializes_once(store, tmp_path):
         str(tmp_path / "project"),
     )
     workflow = sequence_workflow()
-    plan = store.create_orchestration_plan(
-        project["id"],
-        orchestration_plan(workflow),
-    )
-    publish_initial_workflow(store, project["id"], workflow, plan["id"])
+    workflow_plan_record = store.create_workflow_plan(project["id"], workflow_plan(workflow))
+    revision = publish_initial_workflow(store, project["id"], workflow, workflow_plan_record["id"])
+    plan = store.create_task_plan(project["id"], task_plan(revision["id"], workflow))
     barrier = threading.Barrier(2)
 
     def create_once(index: int):
@@ -203,11 +194,7 @@ def test_concurrent_initial_task_creation_materializes_once(store, tmp_path):
         try:
             task = store.create_task(
                 project["id"],
-                f"concurrent attempt {index}",
-                "",
-                {},
-                readiness(),
-                orchestration_plan_id=plan["id"],
+                task_plan_id=plan["id"],
                 proposed_task_ref="primary",
             )
             return "created", task["id"]
@@ -224,44 +211,63 @@ def test_concurrent_initial_task_creation_materializes_once(store, tmp_path):
     assert len(store.list_tasks(project["id"])) == 1
 
 
-def test_workflow_publication_enforces_planned_task_agent_execution_policy(store, tmp_path):
+def test_task_plan_save_enforces_task_agent_execution_policy(store, tmp_path):
     project = store.create_project("agent execution policy", "", str(tmp_path / "project"))
 
     deterministic = sequence_workflow()
-    required_plan = orchestration_plan(deterministic)
-    required_plan.task_portfolio[0].agent_execution = "required"
-    required = store.create_orchestration_plan(project["id"], required_plan)
+    _, deterministic_revision = publish_planned_workflow(store, project["id"], deterministic)
     with pytest.raises(ValueError, match="requires a Task Agent Run"):
-        publish_initial_workflow(store, project["id"], deterministic, required["id"])
+        store.create_task_plan(
+            project["id"],
+            task_plan(deterministic_revision["id"], deterministic, agent_execution="required"),
+        )
 
     agent_based = agent_workflow()
-    forbidden_plan = orchestration_plan(agent_based)
-    forbidden_plan.task_portfolio[0].agent_execution = "forbidden"
-    forbidden = store.create_orchestration_plan(project["id"], forbidden_plan)
+    _, agent_revision = publish_planned_workflow(store, project["id"], agent_based)
     with pytest.raises(ValueError, match="forbids Task Agent Runs"):
-        publish_initial_workflow(store, project["id"], agent_based, forbidden["id"])
+        store.create_task_plan(
+            project["id"],
+            task_plan(agent_revision["id"], agent_based, agent_execution="forbidden"),
+        )
 
 
-def test_deterministic_workflow_must_consume_every_planned_exact_string_by_reference(store, tmp_path):
+def test_task_plan_must_bind_every_exact_string_to_fixed_workflow_revision(store, tmp_path):
     project = store.create_project("exact workflow binding", "", str(tmp_path / "project"))
     workflow = sequence_workflow()
-    plan_definition = orchestration_plan(workflow)
-    plan_definition.task_portfolio[0].exact_input_strings = [
+    exact_strings = [
         ExactTaskInputString(pointer="/contract/content", escaped_value="done"),
     ]
-    plan = store.create_orchestration_plan(project["id"], plan_definition)
+    _, literal_revision = publish_planned_workflow(store, project["id"], workflow)
 
     with pytest.raises(ValueError, match="does not consume through Task-input \\$ref"):
-        publish_initial_workflow(store, project["id"], workflow, plan["id"])
+        store.create_task_plan(
+            project["id"],
+            task_plan(
+                literal_revision["id"],
+                workflow,
+                input_data={"contract": {"content": "done"}},
+                exact_input_strings=exact_strings,
+            ),
+        )
 
     workflow.columns[0].executor.steps[0].arguments["content"] = {
         "$ref": "/input/task/input/contract/content"
     }
-    published = publish_initial_workflow(store, project["id"], workflow, plan["id"])
+    _, published = publish_planned_workflow(store, project["id"], workflow)
+    stored_task_plan = store.create_task_plan(
+        project["id"],
+        task_plan(
+            published["id"],
+            workflow,
+            input_data={"contract": {"content": "done"}},
+            exact_input_strings=exact_strings,
+        ),
+    )
 
     assert published["definition"]["columns"][0]["executor"]["steps"][0]["arguments"]["content"] == {
         "$ref": "/input/task/input/contract/content"
     }
+    assert stored_task_plan["workflow_revision_id"] == published["id"]
 
 
 def test_successful_task_successor_resolves_failed_lineage_without_erasing_history(
@@ -269,7 +275,7 @@ def test_successful_task_successor_resolves_failed_lineage_without_erasing_histo
     tmp_path,
 ):
     project = store.create_project("task lineage", "", str(tmp_path / "project"))
-    plan, _revision = publish_planned_workflow(
+    _plan, _revision = publish_planned_workflow(
         store,
         project["id"],
         sequence_workflow(content="resolved"),
@@ -278,7 +284,6 @@ def test_successful_task_successor_resolves_failed_lineage_without_erasing_histo
         store,
         project["id"],
         "first execution",
-        plan_id=plan["id"],
     )
     store.route_task_to_failed(failed["id"], "frozen revision could not deliver")
     failed_mailbox = store.mailbox(project["id"])
@@ -307,12 +312,7 @@ def test_successful_task_successor_resolves_failed_lineage_without_erasing_histo
     assert unresolved_quiescence["unresolved_failures"]["tasks"] == 1
     assert unresolved_quiescence["governance_outcome"] == "attention_required"
 
-    successor = create_planned_task(
-        store,
-        project["id"],
-        "replacement execution",
-        plan_id=plan["id"],
-    )
+    successor = store.rerun_task(failed["id"])
     assert successor["rerun_of_task_id"] == failed["id"]
 
     WorkflowRuntime(
@@ -354,55 +354,12 @@ def test_workflow_revisions_are_immutable_and_tasks_remain_pinned(store, tmp_pat
     assert store.workflow_by_id(project["id"], first["id"]).name == "one"
 
 
-def test_workflow_rejects_task_portfolio_mirrored_as_numbered_columns(store, tmp_path):
-    project = store.create_project("stage-alignment", "", str(tmp_path / "project"))
-    workflow = WorkflowDefinition(
-        name="invalid work slices",
-        entry="unit_01",
-        columns=[
-            ColumnDefinition(
-                key="unit_01",
-                name="Unit 01",
-                executor=CapabilitySequenceExecutor(
-                    steps=[CapabilityStep(capability="system.noop")]
-                ),
-                transitions=[
-                    Transition(outcome="success", target="unit_02"),
-                    Transition(outcome="failure", target="failed"),
-                ],
-            ),
-            ColumnDefinition(
-                key="unit_02",
-                name="Unit 02",
-                executor=CapabilitySequenceExecutor(
-                    steps=[CapabilityStep(capability="system.noop")]
-                ),
-                transitions=[
-                    Transition(outcome="success", target="done"),
-                    Transition(outcome="failure", target="failed"),
-                ],
-            ),
-        ],
-    )
-    from tests.helpers import orchestration_plan
+def test_workflow_plan_rejects_concrete_task_inventory():
+    payload = workflow_plan(sequence_workflow()).model_dump(mode="json")
+    payload["tasks"] = [{"proposed_task_ref": "unit_01"}]
 
-    plan = orchestration_plan(workflow)
-    template = plan.task_portfolio[0]
-    plan.task_portfolio = [
-        OrchestrationTaskPlan(
-            **{
-                **template.model_dump(mode="json"),
-                "proposed_task_ref": f"t_unit_0{index}",
-                "objective": f"Deliver unit 0{index}",
-            }
-        )
-        for index in (1, 2)
-    ]
-    plan.representative_task_ref = "t_unit_01"
-    stored_plan = store.create_orchestration_plan(project["id"], plan)
-
-    with pytest.raises(ValueError, match="mirror Task work-unit"):
-        publish_initial_workflow(store, project["id"], workflow, stored_plan["id"])
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        WorkflowPlan.model_validate(payload)
 
 
 def test_agent_run_messages_and_tool_invocations_are_auditable(store, tmp_path):

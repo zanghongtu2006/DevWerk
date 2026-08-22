@@ -9,12 +9,13 @@ from app.v1.domain import (
     CapabilityStep,
     ColumnDefinition,
     ExactTaskInputString,
-    OrchestrationPlan,
-    OrchestrationTaskPlan,
+    TaskPlan,
+    TaskPlanItem,
+    TaskPlanReadiness,
     Transition,
     WorkflowDefinition,
 )
-from tests.helpers import orchestration_plan, sequence_workflow
+from tests.helpers import sequence_workflow, task_plan
 from app.v1.states import (
     TASK_STATE_MACHINE,
     TaskStatus,
@@ -163,22 +164,22 @@ def test_agent_executor_requires_explicit_non_empty_capability_allowlist():
         AgentExecutor(capabilities=[])
 
 
-def test_orchestration_plan_dependencies_are_an_acyclic_graph():
-    base = orchestration_plan(sequence_workflow()).model_dump(mode="json")
-    base["task_portfolio"][0]["dependencies"] = ["primary"]
+def test_task_plan_dependencies_are_an_acyclic_graph():
+    workflow = sequence_workflow()
+    base = task_plan("wfrev_test", workflow).model_dump(mode="json")
+    base["tasks"][0]["dependencies"] = ["primary"]
     with pytest.raises(ValidationError, match="cannot depend on itself"):
-        OrchestrationPlan.model_validate(base)
+        TaskPlan.model_validate(base)
 
-    first = dict(base["task_portfolio"][0])
+    first = dict(base["tasks"][0])
     first["proposed_task_ref"] = "first"
     first["dependencies"] = ["second"]
     second = dict(first)
     second["proposed_task_ref"] = "second"
     second["dependencies"] = ["first"]
-    base["task_portfolio"] = [first, second]
-    base["representative_task_ref"] = "first"
+    base["tasks"] = [first, second]
     with pytest.raises(ValidationError, match="dependencies contain a cycle"):
-        OrchestrationPlan.model_validate(base)
+        TaskPlan.model_validate(base)
 
 
 def test_sequence_can_declare_business_outcomes_without_runtime_failure_policy():
@@ -272,14 +273,23 @@ def test_exact_task_input_string_decodes_transport_safe_escapes():
     ).value == '目录\\file"name'
 
     with pytest.raises(ValidationError, match="pointers must be unique"):
-        OrchestrationTaskPlan(
+        TaskPlanItem(
             proposed_task_ref="primary",
+            title="exact input",
+            input={},
             objective="Deliver exact input.",
             workflow_fit="Every process stage applies.",
             agent_execution="forbidden",
             exact_input_strings=[exact, exact],
             review_scope="Review exact delivery.",
             retry_scope="Retry the failed stage.",
+            readiness=TaskPlanReadiness(
+                decision="dispatch",
+                deliverables=["result"],
+                acceptance_criteria=["exact value preserved"],
+                dependencies_checked=True,
+                reason_summary="ready",
+            ),
         )
 
 

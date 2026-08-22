@@ -63,12 +63,12 @@ class SchedulerService:
             canonical_dependencies: list[str] = []
             dependencies_changed = False
             for dependency in original_dependencies:
-                if not isinstance(dependency, str) or not dependency.startswith("plan:"):
+                if not isinstance(dependency, str) or not dependency.startswith("task-plan:"):
                     canonical_dependencies.append(dependency)
                     continue
                 _, plan_id, task_ref = dependency.split(":", 2)
                 match = db.execute(
-                    "SELECT id FROM v1_tasks WHERE project_id=? AND orchestration_plan_id=? "
+                    "SELECT id FROM v1_tasks WHERE project_id=? AND task_plan_id=? "
                     "AND proposed_task_ref=? AND status='done' "
                     "ORDER BY finished_at DESC,created_at DESC LIMIT 1",
                     (project_id, plan_id, task_ref),
@@ -77,7 +77,7 @@ class SchedulerService:
                     match = db.execute(
                         "SELECT successor.id FROM v1_tasks predecessor "
                         "JOIN v1_tasks successor ON successor.id=predecessor.resolved_by_task_id "
-                        "WHERE predecessor.project_id=? AND predecessor.orchestration_plan_id=? "
+                        "WHERE predecessor.project_id=? AND predecessor.task_plan_id=? "
                         "AND predecessor.proposed_task_ref=? AND predecessor.status='failed' "
                         "AND successor.project_id=predecessor.project_id AND successor.status='done' "
                         "ORDER BY successor.finished_at DESC,successor.created_at DESC LIMIT 1",
@@ -104,9 +104,9 @@ class SchedulerService:
             and set(dependencies) != set(original_dependencies)
             and set(dependencies) != set(canonical_dependencies)
         ):
-            raise ValueError("scheduling dependencies must preserve the Task's orchestration-plan dependencies")
+            raise ValueError("scheduling dependencies must preserve the Task Plan dependencies")
         if resources is not None and set(resources) != set(canonical_resources):
-            raise ValueError("scheduling resources must preserve the Task's orchestration-plan conflict domains")
+            raise ValueError("scheduling resources must preserve the Task Plan conflict domains")
         dependencies = canonical_dependencies
         resources = canonical_resources
         auto_admit = int(bool(existing[4]) and state == "queued")
@@ -116,7 +116,7 @@ class SchedulerService:
                     dependency
                     for dependency in dependencies
                     if not isinstance(dependency, str)
-                    or dependency.startswith("plan:")
+                    or dependency.startswith("task-plan:")
                     or not (
                         (row := db.execute(
                             "SELECT status FROM v1_tasks WHERE id=? AND project_id=?",
@@ -126,7 +126,7 @@ class SchedulerService:
                     )
                 ]
             if unsatisfied:
-                raise ValueError("dependency_unsatisfied: Task cannot be admitted until all orchestration-plan dependencies are done")
+                raise ValueError("dependency_unsatisfied: Task cannot be admitted until all Task Plan dependencies are done")
         with self.store.tx(immediate=True) as db:
             db.execute(
                 "INSERT INTO v1_scheduling_entries(task_id,project_id,state,priority,wip_group,wip_limit,dependencies_json,resources_json,created_at,updated_at,auto_admit) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
@@ -152,11 +152,11 @@ class SchedulerService:
             dependencies = json.loads(row.pop("dependencies_json") or "[]")
             dependency_facts: list[dict[str, Any]] = []
             for dependency in dependencies:
-                if isinstance(dependency, str) and dependency.startswith("plan:"):
+                if isinstance(dependency, str) and dependency.startswith("task-plan:"):
                     _, plan_id, task_ref = dependency.split(":", 2)
                     latest = db.execute(
                         "SELECT id,status,resolved_by_task_id FROM v1_tasks "
-                        "WHERE project_id=? AND orchestration_plan_id=? AND proposed_task_ref=? "
+                        "WHERE project_id=? AND task_plan_id=? AND proposed_task_ref=? "
                         "ORDER BY created_at DESC LIMIT 1",
                         (project_id, plan_id, task_ref),
                     ).fetchone()
@@ -346,7 +346,7 @@ class SchedulerService:
             return False
         dependencies = json.loads(row[6] or "[]")
         for dependency in dependencies:
-            if not isinstance(dependency, str) or dependency.startswith("plan:"):
+            if not isinstance(dependency, str) or dependency.startswith("task-plan:"):
                 return False
             dependency_row = db.execute(
                 "SELECT status FROM v1_tasks WHERE id=? AND project_id=?",
@@ -383,12 +383,12 @@ class SchedulerService:
                 resolved: list[str] = []
                 changed = False
                 for value in dependencies:
-                    if not isinstance(value, str) or not value.startswith("plan:"):
+                    if not isinstance(value, str) or not value.startswith("task-plan:"):
                         resolved.append(value)
                         continue
                     _, plan_id, task_ref = value.split(":", 2)
                     match = db.execute(
-                        "SELECT id FROM v1_tasks WHERE project_id=? AND orchestration_plan_id=? AND proposed_task_ref=? AND status='done' "
+                        "SELECT id FROM v1_tasks WHERE project_id=? AND task_plan_id=? AND proposed_task_ref=? AND status='done' "
                         "ORDER BY finished_at DESC,created_at DESC LIMIT 1",
                         (row[1], plan_id, task_ref),
                     ).fetchone()
@@ -396,7 +396,7 @@ class SchedulerService:
                         match = db.execute(
                             "SELECT successor.id FROM v1_tasks predecessor "
                             "JOIN v1_tasks successor ON successor.id=predecessor.resolved_by_task_id "
-                            "WHERE predecessor.project_id=? AND predecessor.orchestration_plan_id=? "
+                            "WHERE predecessor.project_id=? AND predecessor.task_plan_id=? "
                             "AND predecessor.proposed_task_ref=? AND predecessor.status='failed' "
                             "AND successor.project_id=predecessor.project_id AND successor.status='done' "
                             "ORDER BY successor.finished_at DESC,successor.created_at DESC LIMIT 1",
@@ -417,7 +417,7 @@ class SchedulerService:
                         "UPDATE v1_scheduling_entries SET dependencies_json=?,updated_at=? WHERE task_id=?",
                         (json.dumps(resolved), now, row[0]),
                     )
-                if resolved and all(not value.startswith("plan:") for value in resolved):
+                if resolved and all(not value.startswith("task-plan:") for value in resolved):
                     admitted = db.execute(
                         "UPDATE v1_scheduling_entries SET state='admitted',auto_admit=0,updated_at=? "
                         "WHERE task_id=? AND state='queued' AND auto_admit=1",

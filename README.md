@@ -13,11 +13,12 @@ The following documents define the product and runtime contract:
 - [`DevWerk/docs/kanban-workflow-design-v1.md`](DevWerk/docs/kanban-workflow-design-v1.md)
 - [`DevWerk/docs/conversation-agent-orchestration-soul-p0-design.md`](DevWerk/docs/conversation-agent-orchestration-soul-p0-design.md)
 
-These four locked documents are equal architecture facts. When code, tests, or secondary documentation conflict with them, treat that as a defect. Do not restore an older API or behavior through compatibility patches.
+These four locked documents remain equal architecture facts for the general Agent and Kanban Runtime. The approved planning-ownership refinement in `loop-task-plan-decoupling-v1.md` is authoritative for Loop, Workflow Plan, Workflow Revision, Task Plan, and Task boundaries. When code, tests, or secondary documentation conflict with the applicable authority, treat that as a defect. Do not restore an older API or behavior through compatibility patches.
 
 Implemented V1 runtime extensions are specified by:
 
 - [`DevWerk/docs/loop-runtime-v1.md`](DevWerk/docs/loop-runtime-v1.md)
+- [`DevWerk/docs/loop-task-plan-decoupling-v1.md`](DevWerk/docs/loop-task-plan-decoupling-v1.md)
 - [`DevWerk/docs/kanban-recovering-runtime-v1.md`](DevWerk/docs/kanban-recovering-runtime-v1.md)
 - [`DevWerk/docs/agent-tool-rejection-recovery-v1.md`](DevWerk/docs/agent-tool-rejection-recovery-v1.md)
 - [`DevWerk/docs/v1-test-contract.md`](DevWerk/docs/v1-test-contract.md)
@@ -31,8 +32,9 @@ Implemented V1 runtime extensions are specified by:
 - Kanban, Task, Run, Event, and Artifact views are read-only to the user.
 - A Project isolates structured facts by `project_id` and files by canonical `base_dir`.
 - One active Workflow per Project, with immutable revisions.
-- A persisted OrchestrationPlan is required before Workflow publication and Task admission.
-- A Task is pinned to the Workflow revision active when it is created.
+- A reusable Workflow Plan is required before Workflow publication; it contains method and Task Contract facts, never a concrete Task inventory.
+- A user objective becomes an immutable Task Plan that selects a Workflow Revision and owns concrete Task inputs, dependencies, conflicts, readiness, and Agent policy.
+- A Task is materialized only from `task_plan_id + proposed_task_ref` and remains pinned to that Task Plan's Workflow Revision.
 - Column Definitions declare repeatable process stages, context boundaries, execution, contracts, outcomes, transitions, and retry limits.
 - Conversation Agent and ephemeral Column Agents share one general-purpose AgentCore and Capability Registry.
 - Reusable business process knowledge lives in version-controlled `loops/<name>/loop.meta` and `loop.json` files; SQLite stores only applied Project instances and source provenance, while Python runtime code contains no domain-routing branch.
@@ -97,7 +99,7 @@ cd D:\workspace\DevWerk\DevWerk
 .\venv\Scripts\python.exe -m compileall app tests
 ```
 
-The tests cover declarative graph validation, filesystem Loop discovery/application, initial-Workflow admission, Capability Registry dispatch, Project isolation, persistent Conversation Agent identity, immutable Workflow revisions, shared AgentCore tool loops, deterministic and ephemeral-agent Columns, persistent Writer sessions, explicit terminal paths, Kanban recovery, rejected-before-effect tool handling, SQLite indexes, Artifact boundaries, provider error classification and tool-call normalization, full debug logging, API behavior, and the read-only Web governance boundary.
+The tests cover declarative graph validation, filesystem Loop discovery/application without implicit Task creation, separate immutable Workflow Plan and Task Plan persistence, Task materialization from plan references, initial-Workflow admission, Capability Registry dispatch, Project isolation, persistent Conversation Agent identity, immutable Workflow revisions, shared AgentCore tool loops, deterministic and ephemeral-agent Columns, persistent Writer sessions, explicit terminal paths, Kanban recovery, rejected-before-effect tool handling, SQLite indexes, Artifact boundaries, provider error classification and tool-call normalization, full debug logging, API behavior, and the read-only Web governance boundary.
 
 Conversation messages are stored with stable message IDs and timestamps and are rendered as normal user/Agent turns. Runtime status and tool audit evidence remain outside the human conversation bubbles and update over the Project SSE stream.
 

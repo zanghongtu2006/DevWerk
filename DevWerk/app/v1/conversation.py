@@ -130,16 +130,7 @@ class ConversationAgent:
                 except KeyError:
                     workflow = None
                 capabilities = self.registry.all_ids()
-                if workflow is None:
-                    capabilities = [
-                        item for item in capabilities
-                        if item not in {
-                            "orchestration.plan.save",
-                            "workflow.publish",
-                            "task.create",
-                        }
-                    ]
-                else:
+                if workflow is not None:
                     capabilities = [item for item in capabilities if item != "loop.apply"]
                 if not job["start_task"]:
                     capabilities = [
@@ -150,7 +141,8 @@ class ConversationAgent:
                 context = {
                     "active_workflow": workflow,
                     "loops": self.store.list_loops(limit=20),
-                    "orchestration_plans": self.store.list_orchestration_plans(project_id),
+                    "workflow_plans": self.store.list_workflow_plans(project_id),
+                    "task_plans": self.store.list_task_plans(project_id),
                     "tasks": self.store.task_summaries(project_id, self.policy.context.task_summary_limit),
                     "mailbox": mailbox,
                     "conversation_job": {"id": job_id, "start_task": bool(job["start_task"]), "trigger_kind": job.get("trigger_kind", "user"), "trigger": job.get("trigger", {})},
@@ -207,7 +199,7 @@ class ConversationAgent:
                 runnable_mutation = any(
                     item["ok"]
                     and item["capability"] in {
-                        "task.create", "task.reopen", "task.rerun", "task.retry", "task.resume", "scheduling.decide", "loop.apply"
+                        "task.create", "task.reopen", "task.rerun", "task.retry", "task.resume", "scheduling.decide"
                     }
                     for item in invocations
                 )
@@ -223,13 +215,6 @@ class ConversationAgent:
                     and item["ok"]
                     and isinstance(item.get("result", {}).get("output"), dict)
                 ]
-                for item in all_invocations:
-                    if (
-                        item["capability"] == "loop.apply"
-                        and item["ok"]
-                        and isinstance(item.get("result", {}).get("output"), dict)
-                    ):
-                        tasks.extend(item["result"]["output"].get("tasks") or [])
                 tasks = list({item["id"]: item for item in tasks if item.get("id")}.values())
                 workflow_publications = [
                     item["result"]["output"]
@@ -344,6 +329,8 @@ def _has_durable_governance_progress(
         "task.reopen",
         "task.resume",
         "task.retry",
+        "task.plan.save",
+        "workflow.plan.save",
         "workflow.publish",
         "loop.apply",
     }

@@ -26,7 +26,7 @@ from app.v1.domain import (
     ColumnDefinition,
     EventWaitPolicy,
     PollWaitPolicy,
-    OrchestrationPlan,
+    TaskPlan,
     TimerWaitPolicy,
     ToolResult,
     WorkflowDefinition,
@@ -191,15 +191,20 @@ class WorkflowRuntime:
     ) -> dict[str, Any]:
         project = self.store.get_project(task["project_id"])
         data: dict[str, Any] = {"column": {"key": column.key, "name": column.name}}
-        plan_row = self.store.get_orchestration_plan(task["project_id"], task["orchestration_plan_id"])
-        plan = dict(plan_row["plan"])
-        column_plan = next(item for item in plan["columns"] if item["key"] == column.key)
-        task_plan = next(item for item in plan["task_portfolio"] if item["proposed_task_ref"] == task["proposed_task_ref"])
-        data["orchestration"] = {
-            "plan_id": plan_row["id"],
-            "plan_hash": plan_row["plan_hash"],
+        revision = self.store.get_workflow_revision(task["project_id"], task["workflow_revision_id"])
+        workflow_plan_row = self.store.get_workflow_plan(task["project_id"], revision["workflow_plan_id"])
+        task_plan_row = self.store.get_task_plan(task["project_id"], task["task_plan_id"])
+        workflow_plan = dict(workflow_plan_row["plan"])
+        task_plan = dict(task_plan_row["plan"])
+        column_plan = next(item for item in workflow_plan["columns"] if item["key"] == column.key)
+        planned_task = next(item for item in task_plan["tasks"] if item["proposed_task_ref"] == task["proposed_task_ref"])
+        data["planning"] = {
+            "workflow_plan_id": workflow_plan_row["id"],
+            "workflow_plan_hash": workflow_plan_row["plan_hash"],
+            "task_plan_id": task_plan_row["id"],
+            "task_plan_hash": task_plan_row["plan_hash"],
             "column": column_plan,
-            "task": task_plan,
+            "task": planned_task,
         }
         data["dependencies"] = self.store.task_dependency_context(
             task["project_id"],
@@ -607,15 +612,15 @@ class WorkflowRuntime:
     def _validate_task_agent_terminal(self, task: dict[str, Any], terminal: str) -> None:
         if terminal != "done":
             return
-        plan = OrchestrationPlan.model_validate(
-            self.store.get_orchestration_plan(
+        plan = TaskPlan.model_validate(
+            self.store.get_task_plan(
                 task["project_id"],
-                task["orchestration_plan_id"],
+                task["task_plan_id"],
             )["plan"]
         )
         proposed = next(
             item
-            for item in plan.task_portfolio
+            for item in plan.tasks
             if item.proposed_task_ref == task["proposed_task_ref"]
         )
         agent_run_count = len(

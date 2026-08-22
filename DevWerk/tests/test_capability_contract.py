@@ -18,7 +18,7 @@ from app.v1.domain import (
     ExactTaskInputString,
     Transition,
 )
-from tests.helpers import agent_workflow, create_planned_task, orchestration_plan, publish_initial_workflow, publish_planned_workflow, sequence_workflow, readiness
+from tests.helpers import agent_workflow, create_planned_task, publish_initial_workflow, publish_planned_workflow, sequence_workflow, task_plan, workflow_plan
 
 
 def test_registry_dispatches_generic_file_capability_and_tracks_artifact(store, tmp_path):
@@ -135,12 +135,12 @@ def test_workflow_publish_capability_rejects_initial_creation_without_loop(store
     registry = build_core_registry()
     context = CapabilityContext(project_id=project["id"], project=project, store=store, start_task=True)
     workflow = sequence_workflow(name="created during dialogue")
-    planned = registry.dispatch("orchestration.plan.save", {"plan": orchestration_plan(workflow).model_dump(mode="json")}, context)
+    planned = registry.dispatch("workflow.plan.save", {"plan": workflow_plan(workflow).model_dump(mode="json")}, context)
     assert planned.ok
     with pytest.raises(ValueError, match="initial Workflow creation requires loop.apply"):
         registry.dispatch(
             "workflow.publish",
-            {"orchestration_plan_id": planned.output["id"], "workflow": workflow.model_dump(mode="json")},
+            {"workflow_plan_id": planned.output["id"], "workflow": workflow.model_dump(mode="json")},
             context,
         )
 
@@ -253,12 +253,12 @@ def test_workflow_publish_schema_exposes_live_capability_catalog(store, tmp_path
     assert "root-level contract" in input_contract_description
 
 
-def test_orchestration_plan_schema_uses_the_compact_governance_self_check(store, tmp_path):
+def test_workflow_plan_schema_uses_the_compact_governance_self_check(store, tmp_path):
     project = store.create_project("compact plan", "", str(tmp_path / "project"))
     registry = build_core_registry()
     context = CapabilityContext(project_id=project["id"], project=project, store=store)
-    schema = registry.schemas(["orchestration.plan.save"], context)[0]["function"]["parameters"]
-    self_check = schema["$defs"]["OrchestrationSelfCheck"]
+    schema = registry.schemas(["workflow.plan.save"], context)[0]["function"]["parameters"]
+    self_check = schema["$defs"]["WorkflowPlanSelfCheck"]
 
     expected = {
         "every_task_can_start_at_entry",
@@ -277,12 +277,12 @@ def test_orchestration_plan_schema_uses_the_compact_governance_self_check(store,
     plan_schema = schema["properties"]["plan"]
     assert {
         "flow_unit",
-        "representative_task_ref",
-        "representative_task_walkthrough",
+        "task_contract",
+        "lifecycle_walkthrough",
         "wip_group",
         "wip_limit",
     }.issubset(plan_schema["required"])
-    assert "execution_mode" in schema["$defs"]["OrchestrationColumnPlan"]["required"]
+    assert "execution_mode" in schema["$defs"]["WorkflowColumnPlan"]["required"]
 
 
 def test_project_column_catalog_exposes_only_delegable_contracts(store, tmp_path):
@@ -303,13 +303,13 @@ def test_workflow_publish_rejects_conversation_control_capability_for_column(sto
     registry = build_core_registry()
     context = CapabilityContext(project_id=project["id"], project=project, store=store)
     workflow = agent_workflow()
-    planned = store.create_orchestration_plan(project["id"], orchestration_plan(workflow))
+    planned = store.create_workflow_plan(project["id"], workflow_plan(workflow))
     workflow.columns[0].executor.capabilities = ["task.create"]
 
     with pytest.raises(ContractError, match="input rejected"):
         registry.dispatch(
             "workflow.publish",
-            {"orchestration_plan_id": planned["id"], "workflow": workflow.model_dump(mode="json")},
+            {"workflow_plan_id": planned["id"], "workflow": workflow.model_dump(mode="json")},
             context,
         )
 
@@ -321,13 +321,13 @@ def test_workflow_publish_rejects_invalid_literal_capability_arguments(store, tm
     context = CapabilityContext(project_id=project["id"], project=project, store=store)
     workflow = sequence_workflow()
     workflow.columns[0].executor.steps[0].arguments["append"] = True
-    planned = store.create_orchestration_plan(project["id"], orchestration_plan(workflow))
+    planned = store.create_workflow_plan(project["id"], workflow_plan(workflow))
 
     with pytest.raises(ContractError, match="Additional properties are not allowed"):
         registry.dispatch(
             "workflow.publish",
             {
-                "orchestration_plan_id": planned["id"],
+                "workflow_plan_id": planned["id"],
                 "workflow": workflow.model_dump(mode="json"),
             },
             context,
@@ -346,7 +346,7 @@ def test_workflow_publish_rejects_invalid_structure_around_runtime_reference(sto
             },
         )
     ]
-    planned = store.create_orchestration_plan(project["id"], orchestration_plan(workflow))
+    planned = store.create_workflow_plan(project["id"], workflow_plan(workflow))
 
     with pytest.raises(ValueError, match="Additional properties are not allowed.*path"):
         publish_initial_workflow(store, project["id"], workflow, planned["id"])
@@ -375,13 +375,13 @@ def test_workflow_publish_requires_registry_decision_outcome_provenance(store, t
         Transition(outcome="matched", target="done"),
         Transition(outcome="failure", target="failed"),
     ]
-    planned = store.create_orchestration_plan(project["id"], orchestration_plan(workflow))
+    planned = store.create_workflow_plan(project["id"], workflow_plan(workflow))
 
     with pytest.raises(ValueError, match="must derive its sequence outcome"):
         registry.dispatch(
             "workflow.publish",
             {
-                "orchestration_plan_id": planned["id"],
+                "workflow_plan_id": planned["id"],
                 "workflow": workflow.model_dump(mode="json"),
             },
             context,
@@ -393,7 +393,7 @@ def test_workflow_publish_requires_registry_decision_outcome_provenance(store, t
     accepted = registry.dispatch(
         "workflow.publish",
         {
-            "orchestration_plan_id": planned["id"],
+            "workflow_plan_id": planned["id"],
             "workflow": workflow.model_dump(mode="json"),
         },
         context,
@@ -443,16 +443,16 @@ def test_workflow_publish_rejects_outcome_pointer_not_proven_by_output_schema(
     ]
     column.executor.completed_outcome = None
     column.executor.outcome_from = f"/steps/{save_as}/output/outcome"
-    planned = store.create_orchestration_plan(
+    planned = store.create_workflow_plan(
         project["id"],
-        orchestration_plan(workflow),
+        workflow_plan(workflow),
     )
 
     with pytest.raises(ValueError, match="does not exist in the Capability output schema"):
         registry.dispatch(
             "workflow.publish",
             {
-                "orchestration_plan_id": planned["id"],
+                "workflow_plan_id": planned["id"],
                 "workflow": workflow.model_dump(mode="json"),
             },
             context,
@@ -477,14 +477,14 @@ def test_workflow_publish_canonicalizes_exact_tagged_and_rejects_forward_runtime
     tagged.columns[0].executor.steps[0].arguments["path"] = (
         "<$ref>/input/task/input/contract/path</$ref>"
     )
-    tagged_plan = store.create_orchestration_plan(
+    tagged_plan = store.create_workflow_plan(
         tagged_project["id"],
-        orchestration_plan(tagged),
+        workflow_plan(tagged),
     )
     tagged_result = registry.dispatch(
         "workflow.publish",
         {
-            "orchestration_plan_id": tagged_plan["id"],
+            "workflow_plan_id": tagged_plan["id"],
             "workflow": tagged.model_dump(mode="json"),
         },
         tagged_context,
@@ -528,15 +528,15 @@ def test_workflow_publish_canonicalizes_exact_tagged_and_rejects_forward_runtime
         Transition(outcome="mismatch", target="failed"),
         Transition(outcome="failure", target="failed"),
     ]
-    forward_plan = store.create_orchestration_plan(
+    forward_plan = store.create_workflow_plan(
         forward_project["id"],
-        orchestration_plan(forward),
+        workflow_plan(forward),
     )
     with pytest.raises(ValueError, match="must select an earlier saved step"):
         registry.dispatch(
             "workflow.publish",
             {
-                "orchestration_plan_id": forward_plan["id"],
+                "workflow_plan_id": forward_plan["id"],
                 "workflow": forward.model_dump(mode="json"),
             },
             forward_context,
@@ -713,8 +713,9 @@ def test_task_create_persists_the_plan_materialized_exact_string(store, tmp_path
         Transition(outcome="mismatch", target="failed"),
         Transition(outcome="failure", target="failed"),
     ]
-    planned = orchestration_plan(workflow)
-    planned.task_portfolio[0].exact_input_strings = [
+    stored_plan = store.create_workflow_plan(project["id"], workflow_plan(workflow))
+    revision = publish_initial_workflow(store, project["id"], workflow, stored_plan["id"])
+    exact_strings = [
         ExactTaskInputString(
             pointer="/contract/path",
             escaped_value="acceptance.txt",
@@ -724,22 +725,22 @@ def test_task_create_persists_the_plan_materialized_exact_string(store, tmp_path
             escaped_value=r"ROUND9_A_OK\n",
         ),
     ]
-    stored_plan = store.create_orchestration_plan(project["id"], planned)
-    publish_initial_workflow(store, project["id"], workflow, stored_plan["id"])
+    planned_tasks = store.create_task_plan(
+        project["id"],
+        task_plan(
+            revision["id"],
+            workflow,
+            title="materialize exact string",
+            input_data={"contract": {"path": "acceptance.txt", "content": "ROUND9_A_OK"}},
+            exact_input_strings=exact_strings,
+        ),
+    )
 
     created = registry.dispatch(
         "task.create",
         {
-            "orchestration_plan_id": stored_plan["id"],
+            "task_plan_id": planned_tasks["id"],
             "proposed_task_ref": "primary",
-            "title": "materialize exact string",
-            "input": {
-                "contract": {
-                    "path": "acceptance.txt",
-                    "content": "ROUND9_A_OK",
-                }
-            },
-            "readiness": readiness(objective=planned.task_portfolio[0].objective),
         },
         context,
     )

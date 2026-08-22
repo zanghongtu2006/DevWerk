@@ -8,11 +8,12 @@ import pytest
 from app.v1.agent import AgentCore, AgentRunSpec
 from app.v1.capabilities import CapabilityContext, CapabilityEntry, build_core_registry
 from app.v1.conversation import ConversationAgent
-from app.v1.domain import AgentModelResponse, AgentToolCall
+from app.v1.domain import AgentModelResponse, AgentToolCall, WorkflowDefinition
 from tests.helpers import (
     create_planned_task,
     publish_planned_workflow,
     sequence_workflow,
+    task_plan,
 )
 
 
@@ -25,9 +26,9 @@ def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text
         calls += 1
         exposed = {item["function"]["name"] for item in tools}
         assert "loop.apply" in exposed
-        assert "workflow.publish" not in exposed
-        assert "orchestration.plan.save" not in exposed
-        assert "task.create" not in exposed
+        assert "workflow.plan.save" in exposed
+        assert "task.plan.save" in exposed
+        assert "task.create" in exposed
         if calls == 1:
             return AgentModelResponse(tool_calls=[AgentToolCall(id="loops", name="loop.list", arguments={"query": "GitLab software delivery"})])
         if calls == 2:
@@ -43,6 +44,32 @@ def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text
                         "gitlab_repository": "group/project",
                     },
                 },
+            )])
+        if calls == 3:
+            active = store.get_workflow(project["id"])
+            definition = WorkflowDefinition.model_validate(active["definition"])
+            planned = task_plan(
+                active["id"],
+                definition,
+                title="Deliver the managed product",
+                input_data={
+                    "product_name": "Managed delivery",
+                    "requirements_path": "docs/requirements.md",
+                    "requirements_confirmed": True,
+                    "gitlab_repository": "group/project",
+                },
+            )
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id="task-plan",
+                name="task.plan.save",
+                arguments={"plan": planned.model_dump(mode="json")},
+            )])
+        if calls == 4:
+            planned = store.list_task_plans(project["id"])[0]
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id="task",
+                name="task.create",
+                arguments={"task_plan_id": planned["id"], "proposed_task_ref": "primary"},
             )])
         return AgentModelResponse(text="Workflow and Task are now tracked.")
 
@@ -81,7 +108,8 @@ def test_conversation_with_loop_workflow_can_revise_but_cannot_reapply_loop(stor
         calls += 1
         exposed.append({item["function"]["name"] for item in tools})
         assert "workflow.publish" in exposed[-1]
-        assert "orchestration.plan.save" in exposed[-1]
+        assert "workflow.plan.save" in exposed[-1]
+        assert "task.plan.save" in exposed[-1]
         assert "task.create" in exposed[-1]
         if calls == 1:
             return AgentModelResponse(tool_calls=[AgentToolCall(

@@ -13,10 +13,10 @@ The complete `tests` directory protects the current Version 1 architecture. It i
 | --- | --- |
 | `test_domain_contract.py` | unified statuses, explicit terminals, deterministic transition graph, required Project path |
 | `test_capability_contract.py` | Registry dispatch, JSON Schema boundaries, explicit JSON references, conversation-published Workflow data |
-| `test_store_contract.py` | Project isolation, stable conversation messages, one logical Conversation Agent, immutable revisions, Task pinning, WAL/indexes, cursor events |
+| `test_store_contract.py` | Project isolation, stable conversation messages, one logical Conversation Agent, immutable Workflow/Task plans and revisions, Task pinning, WAL/indexes, cursor events |
 | `test_files_contract.py` | canonical Project boundary, atomic write, hash/size metadata, bounded context reads |
 | `test_runtime_contract.py` | capability-sequence and shared-AgentCore Columns, logical Agent sessions, explicit done/failed, directed rework, recovering, and rejected-before-effect tool handling |
-| `test_conversation_contract.py` | persistent general Agent tool loop, platform policy preload, Loop selection/application, conversation-published Workflow revisions/Tasks, and automatic supervision |
+| `test_conversation_contract.py` | persistent general Agent tool loop, platform policy preload, Loop selection/application without implicit Tasks, conversation-published Task Plans/Tasks, and automatic supervision |
 | `test_api_web_contract.py` | mounted API, Project isolation, system automation path, Web routes/modules, read-only Kanban governance |
 | `test_provider_contract.py` | native OpenAI/Anthropic tool-call normalization, routing, usage attribution, retryable/non-retryable errors |
 | `test_loop_contract.py` | filesystem metadata discovery, schema-bound materialization, initial-Workflow admission, novel directed graph, DevOps requirement gate |

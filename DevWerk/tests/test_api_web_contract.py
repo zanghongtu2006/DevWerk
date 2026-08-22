@@ -5,7 +5,7 @@ import time
 from fastapi.testclient import TestClient
 
 from app.v1.domain import AgentModelResponse
-from tests.helpers import orchestration_plan, publish_initial_workflow, sequence_workflow, readiness
+from tests.helpers import publish_initial_workflow, sequence_workflow, task_plan, workflow_plan
 
 
 def client() -> TestClient:
@@ -119,12 +119,12 @@ def test_loop_api_is_the_only_initial_workflow_creation_path(tmp_path):
         ).json()
         definition = sequence_workflow()
         plan = web.post(
-            f"/v1/projects/{fresh['id']}/automation/orchestration-plans",
-            json={"plan": orchestration_plan(definition).model_dump(mode="json")},
+            f"/v1/projects/{fresh['id']}/automation/workflow-plans",
+            json={"plan": workflow_plan(definition).model_dump(mode="json")},
         ).json()
         rejected = web.post(
             f"/v1/projects/{fresh['id']}/automation/workflow-revisions",
-            json={"orchestration_plan_id": plan["id"], "workflow": definition.model_dump(mode="json")},
+            json={"workflow_plan_id": plan["id"], "workflow": definition.model_dump(mode="json")},
         )
         assert rejected.status_code == 422
         assert "initial Workflow creation requires loop.apply" in rejected.json()["detail"]
@@ -154,14 +154,18 @@ def test_declarative_api_workflow_reaches_done_without_llm(tmp_path, monkeypatch
         assert "project.files.write" in catalog
         assert "task.create" not in catalog
         definition = sequence_workflow(content="api done")
-        plan = web.post(f"/v1/projects/{project['id']}/automation/orchestration-plans", json={"plan": orchestration_plan(definition).model_dump(mode="json")}).json()
+        plan = web.post(f"/v1/projects/{project['id']}/automation/workflow-plans", json={"plan": workflow_plan(definition).model_dump(mode="json")}).json()
         workflow = definition.model_dump(mode="json")
         publish_initial_workflow(web.app.state.v1_store, project["id"], definition, plan["id"])
-        published = web.post(f"/v1/projects/{project['id']}/automation/workflow-revisions", json={"orchestration_plan_id": plan["id"], "workflow": workflow})
+        published = web.post(f"/v1/projects/{project['id']}/automation/workflow-revisions", json={"workflow_plan_id": plan["id"], "workflow": workflow})
         assert published.status_code == 201
+        tasks = web.post(
+            f"/v1/projects/{project['id']}/automation/task-plans",
+            json={"plan": task_plan(published.json()["id"], definition, title="deterministic").model_dump(mode="json")},
+        ).json()
         task = web.post(
             f"/v1/projects/{project['id']}/automation/tasks",
-            json={"orchestration_plan_id": plan["id"], "proposed_task_ref": "primary", "title": "deterministic", "brief": "", "input": {}, "readiness": readiness()},
+            json={"task_plan_id": tasks["id"], "proposed_task_ref": "primary"},
         ).json()
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
@@ -183,11 +187,11 @@ def test_api_rejects_unknown_declared_capability(tmp_path):
             json={"name": "invalid", "description": "", "base_dir": str(tmp_path / "project")},
         ).json()
         definition = sequence_workflow()
-        plan = web.post(f"/v1/projects/{project['id']}/automation/orchestration-plans", json={"plan": orchestration_plan(definition).model_dump(mode="json")}).json()
+        plan = web.post(f"/v1/projects/{project['id']}/automation/workflow-plans", json={"plan": workflow_plan(definition).model_dump(mode="json")}).json()
         publish_initial_workflow(web.app.state.v1_store, project["id"], definition, plan["id"])
         workflow = definition.model_dump(mode="json")
         workflow["columns"][0]["executor"]["steps"][0]["capability"] = "not.registered"
-        response = web.post(f"/v1/projects/{project['id']}/automation/workflow-revisions", json={"orchestration_plan_id": plan["id"], "workflow": workflow})
+        response = web.post(f"/v1/projects/{project['id']}/automation/workflow-revisions", json={"workflow_plan_id": plan["id"], "workflow": workflow})
         assert response.status_code == 422
         assert "unknown or non-delegable capabilities" in response.json()["detail"]
 

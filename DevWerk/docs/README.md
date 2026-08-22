@@ -9,11 +9,12 @@ These documents define the locked V1 product and runtime direction:
 3. [`kanban-workflow-design-v1.md`](kanban-workflow-design-v1.md)
 4. [`conversation-agent-orchestration-soul-p0-design.md`](conversation-agent-orchestration-soul-p0-design.md)
 
-Code and secondary documentation must remain consistent with all four.
+Code and secondary documentation must remain consistent with all four. For Loop, Workflow Plan, Workflow Revision, Task Plan, and Task ownership, the approved refinement below is authoritative.
 
 ## Implemented V1 extensions
 
 - [`loop-runtime-v1.md`](loop-runtime-v1.md): filesystem Loop discovery, initial Workflow materialization, directed rework, logical Writer sessions, and the bundled novel/DevOps Loops.
+- [`loop-task-plan-decoupling-v1.md`](loop-task-plan-decoupling-v1.md): separates reusable Workflow Plans from objective-specific Task Plans and defines Task materialization.
 - [`kanban-recovering-runtime-v1.md`](kanban-recovering-runtime-v1.md): same-Task recovery from structured temporary provider failures.
 - [`agent-tool-rejection-recovery-v1.md`](agent-tool-rejection-recovery-v1.md): distinction between rejection before effect and a failed execution effect.
 

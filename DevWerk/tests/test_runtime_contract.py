@@ -25,7 +25,7 @@ from app.v1.domain import (
     WorkflowDefinition,
 )
 from app.v1.runtime import RuntimeExecutionError, WorkflowRuntime
-from tests.helpers import agent_workflow, create_planned_task, orchestration_plan, publish_initial_workflow, publish_planned_workflow, sequence_workflow, readiness
+from tests.helpers import agent_workflow, create_planned_task, publish_initial_workflow, publish_planned_workflow, sequence_workflow, task_plan, workflow_plan
 
 
 def test_capability_sequence_reaches_done_without_calling_llm(store, tmp_path):
@@ -222,7 +222,7 @@ def test_task_admission_rejects_missing_dynamic_reference_before_runtime(
 
 def test_terminal_guard_enforces_immutable_task_agent_execution_policy(store, tmp_path, monkeypatch):
     project = store.create_project("terminal agent policy", "", str(tmp_path / "project"))
-    plan_row, _revision = publish_planned_workflow(store, project["id"], sequence_workflow())
+    _plan_row, _revision = publish_planned_workflow(store, project["id"], sequence_workflow())
     task = create_planned_task(store, project["id"], "task")
     runtime = WorkflowRuntime(store, build_core_registry(), "worker")
 
@@ -233,16 +233,22 @@ def test_terminal_guard_enforces_immutable_task_agent_execution_policy(store, tm
     with pytest.raises(ValueError, match="forbidden"):
         runtime._validate_task_agent_terminal(task, "done")
 
-    required_plan = dict(plan_row["plan"])
-    required_plan["task_portfolio"] = [
-        {**item, "agent_execution": "required"}
-        for item in required_plan["task_portfolio"]
-    ]
-    original_get_plan = store.get_orchestration_plan
+    original_get_plan = store.get_task_plan
+    required_plan = original_get_plan(project["id"], task["task_plan_id"])
+    required_plan = {
+        **required_plan,
+        "plan": {
+            **required_plan["plan"],
+            "tasks": [
+                {**item, "agent_execution": "required"}
+                for item in required_plan["plan"]["tasks"]
+            ],
+        },
+    }
     monkeypatch.setattr(
         store,
-        "get_orchestration_plan",
-        lambda *_args, **_kwargs: {**original_get_plan(project["id"], plan_row["id"]), "plan": required_plan},
+        "get_task_plan",
+        lambda *_args, **_kwargs: required_plan,
     )
     monkeypatch.setattr(store, "agent_runs", lambda **_kwargs: [])
     with pytest.raises(ValueError, match="required"):
@@ -278,21 +284,29 @@ def test_capability_sequence_routes_file_assertion_mismatch_from_evidence(store,
         ),
         workflow.columns[0].transitions[1],
     ]
-    plan_model = orchestration_plan(workflow)
-    planned_task = plan_model.task_portfolio[0].model_copy(update={
-        "exact_input_strings": [
+    workflow_plan_record = store.create_workflow_plan(project["id"], workflow_plan(workflow))
+    revision = publish_initial_workflow(store, project["id"], workflow, workflow_plan_record["id"])
+    planned_tasks = store.create_task_plan(
+        project["id"],
+        task_plan(
+            revision["id"],
+            workflow,
+            title="must reject false success",
+            input_data={"contract": {"expected_content": "DEVWERK_CASE_A_OK\n"}},
+            exact_input_strings=[
             ExactTaskInputString(
                 pointer="/contract/expected_content",
                 escaped_value="DEVWERK_CASE_A_OK\\n",
             )
-        ]
-    })
-    plan = store.create_orchestration_plan(
-        project["id"],
-        plan_model.model_copy(update={"task_portfolio": [planned_task]}),
+            ],
+        ),
     )
-    publish_initial_workflow(store, project["id"], workflow, plan["id"])
-    task = create_planned_task(store, project["id"], "must reject false success")
+    task = create_planned_task(
+        store,
+        project["id"],
+        "must reject false success",
+        plan_id=planned_tasks["id"],
+    )
 
     WorkflowRuntime(store, build_core_registry(), "worker").step(task["id"])
 
@@ -345,31 +359,34 @@ def test_task_owned_exact_text_survives_reference_write_and_verification(store, 
     ]
     exact_content = "LOSSLESS\n"
     exact_digest = hashlib.sha256(exact_content.encode("utf-8")).hexdigest()
-    plan_model = orchestration_plan(workflow)
-    planned_task = plan_model.task_portfolio[0].model_copy(update={
-        "exact_input_strings": [
+    workflow_plan_record = store.create_workflow_plan(project["id"], workflow_plan(workflow))
+    revision = publish_initial_workflow(store, project["id"], workflow, workflow_plan_record["id"])
+    planned_tasks = store.create_task_plan(
+        project["id"],
+        task_plan(
+            revision["id"],
+            workflow,
+            title="preserve exact task input",
+            input_data={
+                "contract": {
+                    "path": "exact/result.txt",
+                    "content": exact_content,
+                    "sha256": exact_digest,
+                    "ends_with_newline": True,
+                }
+            },
+            exact_input_strings=[
             ExactTaskInputString(pointer="/contract/path", escaped_value="exact/result.txt"),
             ExactTaskInputString(pointer="/contract/content", escaped_value="LOSSLESS\\n"),
             ExactTaskInputString(pointer="/contract/sha256", escaped_value=exact_digest),
-        ]
-    })
-    plan = store.create_orchestration_plan(
-        project["id"],
-        plan_model.model_copy(update={"task_portfolio": [planned_task]}),
+            ],
+        ),
     )
-    publish_initial_workflow(store, project["id"], workflow, plan["id"])
     task = create_planned_task(
         store,
         project["id"],
         "preserve exact task input",
-        input_data={
-            "contract": {
-                "path": "exact/result.txt",
-                "content": exact_content,
-                "sha256": exact_digest,
-                "ends_with_newline": True,
-            }
-        },
+        plan_id=planned_tasks["id"],
     )
 
     WorkflowRuntime(store, build_core_registry(), "worker").step(task["id"])
@@ -433,7 +450,7 @@ def test_unknown_capability_is_rejected_before_execution(store, tmp_path):
     project = store.create_project("invalid", "", str(tmp_path / "project"))
     workflow = sequence_workflow()
     workflow.columns[0].executor.steps[0].capability = "unknown.capability"
-    plan = store.create_orchestration_plan(project["id"], orchestration_plan(workflow))
+    plan = store.create_workflow_plan(project["id"], workflow_plan(workflow))
 
     with pytest.raises(ValueError, match="unknown or non-delegable capabilities"):
         publish_initial_workflow(store, project["id"], workflow, plan["id"])

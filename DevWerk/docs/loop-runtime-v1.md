@@ -2,7 +2,7 @@
 
 ## Purpose
 
-DevWerk stores reusable project-delivery knowledge as version-controlled Loops. The Conversation Agent discovers a suitable Loop from human-readable metadata, binds confirmed Project facts, and applies it. Application creates an ordinary immutable OrchestrationPlan, initial Workflow revision, and Task portfolio. The Kanban Runtime remains a domain-neutral interpreter of the resulting declarative directed graph.
+DevWerk stores reusable project-delivery knowledge as version-controlled Loops. The Conversation Agent discovers a suitable Loop from human-readable metadata, binds confirmed Project facts, and applies it. Application creates an immutable Workflow Plan and initial Workflow Revision, but no concrete Tasks. A later Task Plan expresses the current user objective and is the only source from which Tasks are materialized. The Kanban Runtime remains a domain-neutral interpreter of the resulting declarative directed graph.
 
 ## Filesystem contract
 
@@ -17,7 +17,7 @@ loops/
 
 `loop.meta` is a Skill Card-style Markdown document intended for discovery and human review. It declares the title, description, publisher, category, tags, use case, selection guide, input, output, semantic version, Loop key, and references. Listing and filtering read only this compact metadata.
 
-`loop.json` is the executable declarative bundle. It contains `schema_version=devwerk.loop.bundle.v1`, a parameter schema, an OrchestrationPlan, a Workflow graph, and Task definitions. Inspecting or applying a Loop loads and validates this file. A digest over both files identifies the exact source used for materialization.
+`loop.json` is the executable declarative bundle. It contains `schema_version=devwerk.loop.bundle.v1`, a parameter schema, defaults, a reusable Workflow Plan, and a Workflow graph. It contains no concrete Task definitions or fixed Task portfolio. Inspecting or applying a Loop loads and validates this file. A digest over both files identifies the exact source used for materialization.
 
 Loop discovery scans the filesystem on each request so edits become visible without copying definitions into SQLite or restarting the service. The directory is the sole source of bundled initial Workflow definitions.
 
@@ -27,15 +27,15 @@ The Conversation Agent uses three generic capabilities:
 
 - `loop.list`: search Loop metadata by category, tag, or text.
 - `loop.inspect`: load one Loop card, parameter contract, and executable bundle.
-- `loop.apply`: validate bindings and materialize the plan, initial Workflow revision, and Tasks.
+- `loop.apply`: validate bindings and materialize the Workflow Plan, initial Workflow Revision, and source binding record. It creates no Tasks.
 
 The Agent selects by the documented use case and tags. If no Loop fits, it continues requirement discussion instead of inventing an initial Workflow.
 
-A Project without a Workflow can create its first revision only through `loop.apply`. Once the Workflow exists, `workflow.publish` may publish validated immutable revisions against its OrchestrationPlan. Applying a second initial Loop to the same Project is rejected.
+A Project without a Workflow can create its first revision only through `loop.apply`. Once the Workflow exists, `workflow.publish` may publish validated immutable revisions against a Workflow Plan. Applying a second initial Loop to the same Project is rejected. For each current user objective, the Conversation Agent saves a Task Plan bound to one immutable Workflow Revision, then calls `task.create` with only `task_plan_id` and `proposed_task_ref`.
 
 ## Persistence
 
-SQLite stores Project runtime instances: the materialized OrchestrationPlan, Workflow revisions, Tasks, Runs, Events, Artifacts, and a compact Loop-application record. The application record contains the Loop key, version, source digest, bindings, and created entity IDs. SQLite does not store or serve preset Loop definitions.
+SQLite stores Project runtime instances: materialized Workflow Plans, Workflow Revisions, Task Plans, Tasks, Runs, Events, Artifacts, and a compact Loop-binding record. The binding record contains the Loop key, version, source digest, bindings, and created method entity IDs. SQLite does not store or serve preset Loop definitions.
 
 Each Workflow revision created by Loop application retains source Loop key, version, and digest as provenance. Later revisions remain ordinary Project data and do not modify the source files.
 
@@ -76,6 +76,6 @@ A non-recoverable execution failure transitions the Task to `failed`. When corre
 
 ## Bundled Loops
 
-`novel.production` creates ten strictly serialized chapter Tasks. The first Task authors and freezes the story foundation manuals. Each Recap Agent reads accepted history; Writer and Reviewer receive the manuals, recap, history, and Task contract. Reviewer feedback returns to the same logical Writer session.
+`novel.production` defines the reusable chapter lifecycle and chapter Task Contract. A concrete novel objective is represented later by a Task Plan, which may define ten strictly serialized chapter Tasks. The first planned chapter can author and freeze the story foundation manuals. Each Recap Agent reads accepted history; Writer and Reviewer receive the manuals, recap, history, and Task contract. Reviewer feedback returns to the same logical Writer session.
 
 `software.gitlab_devops` requires a confirmed requirement baseline. After that gate, its graph covers architecture, documentation, implementation, build and test, independent review with rework, GitLab delivery, CI feedback, and acceptance.

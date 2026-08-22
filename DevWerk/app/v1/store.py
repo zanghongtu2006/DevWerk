@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import hashlib
-import re
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -12,8 +11,9 @@ from typing import Any, Iterator
 
 from app.v1.domain import (
     CapabilitySequenceExecutor,
-    OrchestrationPlan,
     ReadinessDecision,
+    TaskPlan,
+    WorkflowPlan,
     WorkflowDefinition,
 )
 from app.v1.contracts import canonicalize_contract_value, check_schema, validate_contract
@@ -40,18 +40,10 @@ from app.v1.storage_support import new_id, utcnow
 from app.v1.repositories.artifact_repository import ArtifactRepository
 from app.v1.repositories.event_repository import EventRepository
 from app.v1.repositories.project_repository import ProjectRepository
+from app.v1.repositories.planning_repository import PlanningRepository
 from app.v1.repositories.schema_repository import SchemaRepository
 from app.v1.services.scheduler import SchedulerService
 from app.v1.services.recovery_manager import RecoveryManager
-
-
-def _normalized_unit_identifier(value: str) -> str:
-    normalized = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
-    return re.sub(r"^(?:task|t)_", "", normalized)
-
-
-def _numbered_unit_stem(value: str) -> str:
-    return re.sub(r"(?:_\d+)+$", "", _normalized_unit_identifier(value))
 
 
 def _resolve_loop_parameters(value: Any, parameters: dict[str, Any]) -> Any:
@@ -69,58 +61,24 @@ def _resolve_loop_parameters(value: Any, parameters: dict[str, Any]) -> Any:
 
 
 def _validate_process_stage_alignment(
-    plan: OrchestrationPlan,
+    plan: WorkflowPlan,
     workflow: WorkflowDefinition,
-    policy: V1RuntimePolicy,
 ) -> None:
-    """Reject the structural Task-as-Column shape without business semantics."""
-    column_ids = {_normalized_unit_identifier(column.key) for column in workflow.columns}
-    task_ids = {
-        _normalized_unit_identifier(task.proposed_task_ref)
-        for task in plan.task_portfolio
-    }
-    mirrored = sorted(column_ids & task_ids)
-    if len(mirrored) >= 2:
-        raise ValueError(
-            "Workflow Columns mirror Task work-unit identifiers "
-            f"{mirrored}; keep work units in Tasks and model reusable process stages as Columns"
-        )
-
-    column_stems: dict[str, int] = {}
-    task_stems: dict[str, int] = {}
-    for identifier in column_ids:
-        stem = _numbered_unit_stem(identifier)
-        column_stems[stem] = column_stems.get(stem, 0) + 1
-    for identifier in task_ids:
-        stem = _numbered_unit_stem(identifier)
-        task_stems[stem] = task_stems.get(stem, 0) + 1
-    repeated_mirrors = sorted(
-        stem
-        for stem in set(column_stems) & set(task_stems)
-        if column_stems[stem] >= 2 and task_stems[stem] >= 2
-    )
-    if repeated_mirrors:
-        raise ValueError(
-            "Workflow contains numbered Column families that mirror Task work-unit families "
-            f"{repeated_mirrors}; one reusable process Workflow must apply to every Task"
-        )
-
     workflow_columns = {column.key: column for column in workflow.columns}
     planned_columns = {column.key: column for column in plan.columns}
     if set(workflow_columns) != set(planned_columns):
-        raise ValueError("Workflow columns must exactly match the referenced orchestration plan")
+        raise ValueError("Workflow columns must exactly match the referenced Workflow Plan")
 
     for key, planned in planned_columns.items():
         actual_mode = workflow_columns[key].executor.kind
         if planned.execution_mode != actual_mode:
             raise ValueError(
                 f"Workflow Column {key!r} executor {actual_mode!r} does not match "
-                f"the orchestration plan execution_mode {planned.execution_mode!r}"
+                f"the Workflow Plan execution_mode {planned.execution_mode!r}"
             )
 
-    # The Workflow is the executable declaration. Derive the representative
-    # success route from that declaration instead of requiring the model to
-    # author a second field-for-field copy of it in the plan.
+    # The Workflow is the executable declaration. Derive its success route
+    # instead of requiring a second field-for-field copy in the method plan.
     pending = [workflow.entry]
     visited: set[str] = set()
     reaches_done = False
@@ -138,7 +96,7 @@ def _validate_process_stage_alignment(
 
     current = workflow.entry
     terminal: str | None = None
-    for index, step in enumerate(plan.representative_task_walkthrough):
+    for index, step in enumerate(plan.lifecycle_walkthrough):
         if step.column_key != current:
             raise ValueError(
                 "Representative Task walkthrough does not follow the Workflow graph: "
@@ -157,12 +115,12 @@ def _validate_process_stage_alignment(
         target = matches[0].target
         if target in {workflow.terminals.success, workflow.terminals.failure}:
             terminal = target
-            if index != len(plan.representative_task_walkthrough) - 1:
-                raise ValueError("Representative Task walkthrough continues after a terminal transition")
+            if index != len(plan.lifecycle_walkthrough) - 1:
+                raise ValueError("Lifecycle walkthrough continues after a terminal transition")
         else:
             current = target
     if terminal != workflow.terminals.success:
-        raise ValueError("Representative Task walkthrough must reach the Workflow success terminal")
+        raise ValueError("Lifecycle walkthrough must reach the Workflow success terminal")
 
 
 
@@ -226,6 +184,7 @@ class V1Store:
         self.registry = registry
         self.loops = LoopCatalog()
         self.projects = ProjectRepository(self)
+        self.planning = PlanningRepository(self)
         self.artifact_repository = ArtifactRepository(self)
         self.event_repository = EventRepository(self)
         self.scheduler = SchedulerService(self)
@@ -283,13 +242,21 @@ class V1Store:
         bundle = dict(loop["bundle"])
         check_schema(parameter_schema, label=f"Loop {loop_key} parameters")
         defaults = dict(bundle.get("defaults") or {})
+        expected_bundle_keys = {"defaults", "workflow_plan", "workflow"}
+        if set(bundle) != expected_bundle_keys:
+            raise ValueError(
+                f"Loop {loop_key} bundle must contain exactly "
+                "defaults, workflow_plan, and workflow"
+            )
         if defaults:
             validate_contract(defaults, parameter_schema, label=f"Loop {loop_key} defaults")
             materialized = _resolve_loop_parameters(bundle, defaults)
-            OrchestrationPlan.model_validate(materialized["orchestration_plan"])
+            workflow_plan = WorkflowPlan.model_validate(materialized["workflow_plan"])
+            check_schema(workflow_plan.task_contract.input_schema, label=f"Loop {loop_key} task input_schema")
             WorkflowDefinition.model_validate(materialized["workflow"])
         else:
-            OrchestrationPlan.model_validate(bundle["orchestration_plan"])
+            workflow_plan = WorkflowPlan.model_validate(bundle["workflow_plan"])
+            check_schema(workflow_plan.task_contract.input_schema, label=f"Loop {loop_key} task input_schema")
             WorkflowDefinition.model_validate(bundle["workflow"])
         return loop
 
@@ -314,38 +281,22 @@ class V1Store:
         )
         validate_contract(parameters, loop["parameter_schema"], label=f"Loop {loop_key} bindings")
         materialized = _resolve_loop_parameters(bundle, parameters)
-        plan = OrchestrationPlan.model_validate(materialized["orchestration_plan"])
+        plan = WorkflowPlan.model_validate(materialized["workflow_plan"])
         workflow = WorkflowDefinition.model_validate(materialized["workflow"])
-        task_specs = list(materialized.get("tasks") or [])
-        if {item.proposed_task_ref for item in plan.task_portfolio} != {
-            str(item.get("proposed_task_ref") or "") for item in task_specs
-        }:
-            raise ValueError("Loop tasks must exactly materialize the orchestration portfolio")
-        plan_row = self.create_orchestration_plan(project_id, plan)
+        plan_row = self.create_workflow_plan(project_id, plan)
         workflow_row = self._publish_workflow_revision(
             project_id,
             workflow,
             plan_row["id"],
             initial_loop=loop,
         )
-        tasks: list[dict[str, Any]] = []
-        for spec in task_specs:
-            tasks.append(self.create_task(
-                project_id,
-                str(spec["title"]),
-                str(spec.get("brief") or ""),
-                dict(spec.get("input") or {}),
-                dict(spec["readiness"]),
-                orchestration_plan_id=plan_row["id"],
-                proposed_task_ref=str(spec["proposed_task_ref"]),
-            ))
         application_id, now = new_id("loopapp"), utcnow()
         with self.tx(immediate=True) as db:
             db.execute(
-                "INSERT INTO v1_loop_applications("
+                "INSERT INTO v1_project_loop_bindings("
                 "id,project_id,loop_key,loop_version,loop_digest,bindings_json,"
-                "orchestration_plan_id,workflow_revision_id,task_ids_json,created_at"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "workflow_plan_id,workflow_revision_id,created_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?)",
                 (
                     application_id,
                     project_id,
@@ -355,7 +306,6 @@ class V1Store:
                     json.dumps(parameters, ensure_ascii=False),
                     plan_row["id"],
                     workflow_row["id"],
-                    json.dumps([item["id"] for item in tasks]),
                     now,
                 ),
             )
@@ -365,7 +315,7 @@ class V1Store:
                 "loop_version": loop["version"],
                 "loop_digest": loop["digest"],
                 "workflow_revision_id": workflow_row["id"],
-                "task_ids": [item["id"] for item in tasks],
+                "workflow_plan_id": plan_row["id"],
             })
         return {
             "id": application_id,
@@ -375,9 +325,8 @@ class V1Store:
                 for key in ("loop_key", "version", "digest", "name", "category", "directory")
             },
             "bindings": parameters,
-            "orchestration_plan": plan_row,
+            "workflow_plan": plan_row,
             "workflow": workflow_row,
-            "tasks": tasks,
             "created_at": now,
         }
 
@@ -429,47 +378,24 @@ class V1Store:
             raise KeyError("platform policy has not been registered")
         return PlatformPolicySnapshot(row[3], row[2], row[1], int(row[0]))
 
-    def create_orchestration_plan(self, project_id: str, plan: OrchestrationPlan) -> dict[str, Any]:
-        self.get_project(project_id)
-        payload = plan.model_dump_json()
-        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-        now = utcnow()
-        with self.tx(immediate=True) as db:
-            existing = db.execute(
-                "SELECT id FROM v1_orchestration_plans WHERE project_id=? AND plan_hash=?",
-                (project_id, digest),
-            ).fetchone()
-            plan_id = existing[0] if existing else new_id("oplan")
-            if not existing:
-                db.execute(
-                    "INSERT INTO v1_orchestration_plans(id,project_id,schema_version,plan_json,plan_hash,created_at) VALUES(?,?,?,?,?,?)",
-                    (plan_id, project_id, plan.schema_version, payload, digest, now),
-                )
-                self._event(db, project_id, None, None, "orchestration.plan_created", {"plan_id": plan_id, "plan_hash": digest})
-        return self.get_orchestration_plan(project_id, plan_id)
+    def create_workflow_plan(self, project_id: str, plan: WorkflowPlan) -> dict[str, Any]:
+        check_schema(plan.task_contract.input_schema, label="Workflow Plan task input_schema")
+        return self.planning.create_workflow_plan(project_id, plan)
 
-    def get_orchestration_plan(self, project_id: str, plan_id: str) -> dict[str, Any]:
-        with self.connect() as db:
-            row = self._dict(db.execute(
-                "SELECT * FROM v1_orchestration_plans WHERE id=? AND project_id=?", (plan_id, project_id)
-            ).fetchone())
-        if not row:
-            raise KeyError(plan_id)
-        row["plan"] = json.loads(row.pop("plan_json"))
-        return row
+    def get_workflow_plan(self, project_id: str, plan_id: str) -> dict[str, Any]:
+        return self.planning.get_workflow_plan(project_id, plan_id)
 
-    def list_orchestration_plans(self, project_id: str, limit: int = 20) -> list[dict[str, Any]]:
-        with self.connect() as db:
-            rows = db.execute(
-                "SELECT * FROM v1_orchestration_plans WHERE project_id=? ORDER BY created_at DESC LIMIT ?",
-                (project_id, min(max(limit, 1), self.policy.service_limits.max_page_size)),
-            ).fetchall()
-        result: list[dict[str, Any]] = []
-        for item in rows:
-            row = dict(item)
-            row["plan"] = json.loads(row.pop("plan_json"))
-            result.append(row)
-        return result
+    def list_workflow_plans(self, project_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        return self.planning.list_workflow_plans(project_id, limit)
+
+    def create_task_plan(self, project_id: str, plan: TaskPlan) -> dict[str, Any]:
+        return self.planning.create_task_plan(project_id, plan)
+
+    def get_task_plan(self, project_id: str, plan_id: str) -> dict[str, Any]:
+        return self.planning.get_task_plan(project_id, plan_id)
+
+    def list_task_plans(self, project_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        return self.planning.list_task_plans(project_id, limit)
 
     def create_project(self, name: str, description: str, base_dir: str, agent_instruction: str = "") -> dict[str, Any]:
         return self.projects.create_project(name, description, base_dir, agent_instruction)
@@ -954,7 +880,7 @@ class V1Store:
             ("planning" if pending else "idle", now, project_id),
         )
 
-    def publish_workflow(self, project_id: str, workflow: WorkflowDefinition, orchestration_plan_id: str) -> dict[str, Any]:
+    def publish_workflow(self, project_id: str, workflow: WorkflowDefinition, workflow_plan_id: str) -> dict[str, Any]:
         try:
             active = self.get_workflow(project_id)
         except KeyError as exc:
@@ -963,27 +889,24 @@ class V1Store:
             "source_loop_key", "source_loop_version", "source_loop_digest"
         )):
             raise ValueError("Workflow revisions require an existing filesystem Loop application")
-        return self._publish_workflow_revision(project_id, workflow, orchestration_plan_id)
+        return self._publish_workflow_revision(project_id, workflow, workflow_plan_id)
 
     def _publish_workflow_revision(
         self,
         project_id: str,
         workflow: WorkflowDefinition,
-        orchestration_plan_id: str,
+        workflow_plan_id: str,
         *,
         initial_loop: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.get_project(project_id)
         validate_workflow_capabilities(workflow, self.registry)
-        plan_row = self.get_orchestration_plan(project_id, orchestration_plan_id)
-        plan = OrchestrationPlan.model_validate(plan_row["plan"])
-        _validate_process_stage_alignment(plan, workflow, self.policy)
-        for proposed_task in plan.task_portfolio:
-            proposed_task.validate_agent_execution_workflow(workflow)
-            proposed_task.validate_exact_input_workflow(workflow)
+        plan_row = self.get_workflow_plan(project_id, workflow_plan_id)
+        plan = WorkflowPlan.model_validate(plan_row["plan"])
+        _validate_process_stage_alignment(plan, workflow)
         planned_columns = {item.key: item for item in plan.columns}
         if set(planned_columns) != {item.key for item in workflow.columns}:
-            raise ValueError("Workflow columns must exactly match the referenced orchestration plan")
+            raise ValueError("Workflow columns must exactly match the referenced Workflow Plan")
         for column in workflow.columns:
             check_schema(column.input_contract, label=f"Column {column.key} input_contract")
             check_schema(column.output_contract, label=f"Column {column.key} output_contract")
@@ -1018,9 +941,9 @@ class V1Store:
             ).fetchone()[0])
             db.execute("UPDATE v1_workflow_revisions SET active=0 WHERE project_id=?", (project_id,))
             db.execute(
-                "INSERT INTO v1_workflow_revisions(id,project_id,revision,definition_json,active,created_at,workflow_id,revision_no,schema_version,definition_hash,orchestration_plan_id) "
+                "INSERT INTO v1_workflow_revisions(id,project_id,revision,definition_json,active,created_at,workflow_id,revision_no,schema_version,definition_hash,workflow_plan_id) "
                 "VALUES(?,?,?,?,1,?,?,?,?,?,?)",
-                (revision_id, project_id, current + 1, payload, now, workflow_id, current + 1, workflow.schema_version, digest, orchestration_plan_id),
+                (revision_id, project_id, current + 1, payload, now, workflow_id, current + 1, workflow.schema_version, digest, workflow_plan_id),
             )
             db.execute(
                 "UPDATE v1_workflows SET name=?,active_revision_id=?,state_version=state_version+1,updated_at=? WHERE id=?",
@@ -1030,7 +953,7 @@ class V1Store:
                 "workflow_id": workflow_id,
                 "revision_id": revision_id,
                 "revision": current + 1,
-                "orchestration_plan_id": orchestration_plan_id,
+                "workflow_plan_id": workflow_plan_id,
                 "source_loop_key": initial_loop["loop_key"] if initial_loop else None,
             })
             self._refresh_projection(db, project_id)
@@ -1043,9 +966,15 @@ class V1Store:
                 "w.source_loop_key,w.source_loop_version,w.source_loop_digest "
                 "FROM v1_workflows w JOIN v1_workflow_revisions r ON r.id=w.active_revision_id WHERE w.project_id=?", (project_id,)
             ).fetchone())
+            binding = db.execute(
+                "SELECT bindings_json FROM v1_project_loop_bindings WHERE project_id=? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (project_id,),
+            ).fetchone()
         if not row:
             raise KeyError(f"no active workflow for {project_id}")
         row["definition"] = json.loads(row.pop("definition_json"))
+        row["loop_bindings"] = json.loads(binding[0]) if binding else {}
         return row
 
     def workflow_by_id(self, project_id: str, workflow_id: str) -> WorkflowDefinition:
@@ -1067,25 +996,24 @@ class V1Store:
     def create_task(
         self,
         project_id: str,
-        title: str,
-        brief: str,
-        input_data: dict[str, Any],
-        readiness: dict[str, Any],
         *,
-        orchestration_plan_id: str,
+        task_plan_id: str,
         proposed_task_ref: str,
         rerun_of_task_id: str | None = None,
     ) -> dict[str, Any]:
-        if readiness.get("decision") not in {"dispatch", "queue"}:
-            raise ValueError("Task creation requires an explicit dispatch or queue readiness decision")
-        workflow = self.get_workflow(project_id)
-        if workflow.get("orchestration_plan_id") != orchestration_plan_id:
-            raise ValueError("Task orchestration plan must match the active workflow revision")
-        plan = OrchestrationPlan.model_validate(self.get_orchestration_plan(project_id, orchestration_plan_id)["plan"])
-        proposed = next((item for item in plan.task_portfolio if item.proposed_task_ref == proposed_task_ref), None)
+        plan_row = self.get_task_plan(project_id, task_plan_id)
+        plan = TaskPlan.model_validate(plan_row["plan"])
+        proposed = next((item for item in plan.tasks if item.proposed_task_ref == proposed_task_ref), None)
         if proposed is None:
-            raise ValueError("Task must reference an entry in the orchestration plan portfolio")
+            raise ValueError("Task must reference an entry in the Task Plan")
+        workflow = self.get_workflow_revision(project_id, plan.workflow_revision_id)
         definition = WorkflowDefinition.model_validate(workflow["definition"])
+        workflow_plan = WorkflowPlan.model_validate(
+            self.get_workflow_plan(project_id, str(workflow["workflow_plan_id"]))["plan"]
+        )
+        title = proposed.title
+        brief = proposed.brief
+        input_data = dict(proposed.input)
         input_data = validate_task_capability_bindings(
             definition,
             self.registry,
@@ -1093,13 +1021,13 @@ class V1Store:
             exact_strings=task_binding_exact_strings(
                 self,
                 project_id,
-                orchestration_plan_id,
+                task_plan_id,
                 proposed_task_ref,
             ),
         )
         proposed.validate_agent_execution_workflow(definition)
         readiness = ReadinessDecision.model_validate({
-            **readiness,
+            **proposed.readiness.model_dump(mode="json"),
             "objective": proposed.objective,
             "dependencies": list(proposed.dependencies),
             "conflict_domains": [
@@ -1125,9 +1053,9 @@ class V1Store:
         with self.connect() as db:
             for ref in proposed.dependencies:
                 dependency = db.execute(
-                    "SELECT id FROM v1_tasks WHERE project_id=? AND orchestration_plan_id=? AND proposed_task_ref=? AND status='done' "
+                    "SELECT id FROM v1_tasks WHERE project_id=? AND task_plan_id=? AND proposed_task_ref=? AND status='done' "
                     "ORDER BY finished_at DESC,created_at DESC LIMIT 1",
-                    (project_id, orchestration_plan_id, ref),
+                    (project_id, task_plan_id, ref),
                 ).fetchone()
                 if dependency:
                     resolved_dependencies.append(dependency[0])
@@ -1136,8 +1064,9 @@ class V1Store:
         schedule_state = "admitted" if readiness.get("decision") == "dispatch" and not unresolved_dependencies else "queued"
         pending_deadline = None
         initial_context = {
-            "orchestration": {
-                "plan_id": orchestration_plan_id,
+            "planning": {
+                "task_plan_id": task_plan_id,
+                "workflow_plan_id": workflow["workflow_plan_id"],
                 "task_ref": proposed_task_ref,
                 "workflow_fit": proposed.workflow_fit,
                 "review_scope": proposed.review_scope,
@@ -1157,21 +1086,21 @@ class V1Store:
             else:
                 latest = db.execute(
                     "SELECT id,status,resolved_by_task_id FROM v1_tasks "
-                    "WHERE project_id=? AND orchestration_plan_id=? AND proposed_task_ref=? "
+                    "WHERE project_id=? AND task_plan_id=? AND proposed_task_ref=? "
                     "ORDER BY created_at DESC LIMIT 1",
-                    (project_id, orchestration_plan_id, proposed_task_ref),
+                    (project_id, task_plan_id, proposed_task_ref),
                 ).fetchone()
                 if latest and latest[1] == "failed" and not latest[2]:
                     rerun_of_task_id = str(latest[0])
                 elif latest:
                     raise ValueError(
-                        "The referenced orchestration plan Task is already materialized; "
+                        "The referenced Task Plan item is already materialized; "
                         "use task.rerun for an explicit terminal successor"
                     )
             db.execute(
-                "INSERT INTO v1_tasks(id,project_id,workflow_revision_id,orchestration_plan_id,proposed_task_ref,title,brief,input_json,context_json,readiness_json,conflict_domains_json,status,control_state,rerun_of_task_id,current_column,created_at,updated_at) "
+                "INSERT INTO v1_tasks(id,project_id,workflow_revision_id,task_plan_id,proposed_task_ref,title,brief,input_json,context_json,readiness_json,conflict_domains_json,status,control_state,rerun_of_task_id,current_column,created_at,updated_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,'pending','active',?,?,?,?)",
-                (task_id, project_id, workflow["id"], orchestration_plan_id, proposed_task_ref, title, brief, json.dumps(input_data, ensure_ascii=False), json.dumps(initial_context, ensure_ascii=False), json.dumps(readiness, ensure_ascii=False), json.dumps(conflict_domains, ensure_ascii=False), rerun_of_task_id, definition.entry, now, now),
+                (task_id, project_id, workflow["id"], task_plan_id, proposed_task_ref, title, brief, json.dumps(input_data, ensure_ascii=False), json.dumps(initial_context, ensure_ascii=False), json.dumps(readiness, ensure_ascii=False), json.dumps(conflict_domains, ensure_ascii=False), rerun_of_task_id, definition.entry, now, now),
             )
             run_id = new_id("run")
             db.execute(
@@ -1180,8 +1109,8 @@ class V1Store:
             )
             backlog_id = new_id("backlog")
             db.execute("INSERT INTO v1_backlog_items(id,project_id,title,brief,readiness_json,state,task_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (backlog_id, project_id, title, brief, json.dumps(readiness, ensure_ascii=False), "dispatched" if schedule_state == "admitted" else "queued", task_id, now, now))
-            dependency_tokens = resolved_dependencies + [f"plan:{orchestration_plan_id}:{ref}" for ref in unresolved_dependencies]
-            db.execute("INSERT INTO v1_scheduling_entries(task_id,project_id,state,priority,wip_group,wip_limit,dependencies_json,resources_json,created_at,updated_at,auto_admit) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (task_id, project_id, schedule_state, 0, plan.wip_group, plan.wip_limit, json.dumps(dependency_tokens), json.dumps(conflict_domains), now, now, int(readiness.get("decision") == "dispatch" and bool(unresolved_dependencies))))
+            dependency_tokens = resolved_dependencies + [f"task-plan:{task_plan_id}:{ref}" for ref in unresolved_dependencies]
+            db.execute("INSERT INTO v1_scheduling_entries(task_id,project_id,state,priority,wip_group,wip_limit,dependencies_json,resources_json,created_at,updated_at,auto_admit) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (task_id, project_id, schedule_state, 0, workflow_plan.wip_group, workflow_plan.wip_limit, json.dumps(dependency_tokens), json.dumps(conflict_domains), now, now, int(readiness.get("decision") == "dispatch" and bool(unresolved_dependencies))))
             for dependency_id in resolved_dependencies:
                 db.execute(
                     "INSERT INTO v1_task_dependencies(task_id,depends_on_task_id,project_id,required_terminal,created_at) VALUES(?,?,?,'done',?)",
@@ -1201,7 +1130,7 @@ class V1Store:
                     "title": title,
                     "entry": definition.entry,
                     "schedule_state": schedule_state,
-                    "orchestration_plan_id": orchestration_plan_id,
+                    "task_plan_id": task_plan_id,
                     "proposed_task_ref": proposed_task_ref,
                     "rerun_of_task_id": rerun_of_task_id,
                 },

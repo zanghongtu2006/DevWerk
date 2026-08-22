@@ -463,7 +463,7 @@ def test_real_workflow_publish_provider_schema_keeps_executor_fields_visible(sto
     assert "without completed_outcome" in executor["properties"]["outcome_from"]["description"]
 
 
-def test_real_orchestration_provider_schema_exposes_flat_exact_string_transport(store, tmp_path):
+def test_real_task_plan_provider_schema_exposes_flat_exact_string_transport(store, tmp_path):
     project = store.create_project("provider exact strings", "", str(tmp_path / "project"))
     registry = build_core_registry(store.policy)
     context = CapabilityContext(
@@ -472,15 +472,13 @@ def test_real_orchestration_provider_schema_exposes_flat_exact_string_transport(
         store=store,
         start_task=True,
     )
-    strict_schema = registry.schemas(["orchestration.plan.save"], context)[0]["function"]["parameters"]
-    exact_strings = strict_schema["$defs"]["OrchestrationTaskPlan"]["properties"]["exact_input_strings"]
+    strict_schema = registry.schemas(["task.plan.save"], context)[0]["function"]["parameters"]
+    exact_strings = strict_schema["$defs"]["TaskPlanItem"]["properties"]["exact_input_strings"]
     assert "generated helper-program bodies" in exact_strings["description"]
     assert "must not be inlined" in exact_strings["description"]
     provider_schema = provider_contract_schema(strict_schema)
-    task_plan = (
-        provider_schema["properties"]["plan"]["properties"]["task_portfolio"]["items"]
-    )
-    exact_strings = task_plan["properties"]["exact_input_strings"]
+    task_item = provider_schema["properties"]["plan"]["properties"]["tasks"]["items"]
+    exact_strings = task_item["properties"]["exact_input_strings"]
     escaped_value = exact_strings["items"]["properties"]["escaped_value"]
 
     assert escaped_value["type"] == "string"
@@ -488,7 +486,7 @@ def test_real_orchestration_provider_schema_exposes_flat_exact_string_transport(
     assert "numbers or booleans" in exact_strings["description"]
 
 
-def test_real_orchestration_provider_schema_requires_task_agent_execution_policy(store, tmp_path):
+def test_real_task_plan_provider_schema_requires_task_agent_execution_policy(store, tmp_path):
     project = store.create_project("provider agent policy", "", str(tmp_path / "project"))
     registry = build_core_registry(store.policy)
     context = CapabilityContext(
@@ -497,9 +495,9 @@ def test_real_orchestration_provider_schema_requires_task_agent_execution_policy
         store=store,
         start_task=True,
     )
-    strict_schema = registry.schemas(["orchestration.plan.save"], context)[0]["function"]["parameters"]
+    strict_schema = registry.schemas(["task.plan.save"], context)[0]["function"]["parameters"]
     provider_schema = provider_contract_schema(strict_schema)
-    task_plan = provider_schema["properties"]["plan"]["properties"]["task_portfolio"]["items"]
+    task_plan = provider_schema["properties"]["plan"]["properties"]["tasks"]["items"]
 
     assert "agent_execution" in task_plan["required"]
     assert set(task_plan["properties"]["agent_execution"]["enum"]) == {

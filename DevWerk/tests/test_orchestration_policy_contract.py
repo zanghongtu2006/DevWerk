@@ -8,7 +8,6 @@ from app.v1.domain import (
     CapabilitySequenceExecutor,
     CapabilityStep,
     ColumnDefinition,
-    OrchestrationTaskPlan,
     PollWaitPolicy,
     ToolResult,
     Transition,
@@ -17,56 +16,38 @@ from app.v1.domain import (
 from app.v1.runtime import WorkflowRuntime
 from tests.helpers import (
     create_planned_task,
-    orchestration_plan,
     publish_initial_workflow,
     publish_planned_workflow,
     readiness,
     sequence_workflow,
+    task_plan,
+    workflow_plan,
 )
 
 
-def test_workflow_and_task_require_persisted_orchestration(store, tmp_path):
+def test_workflow_and_task_use_separate_persisted_plans(store, tmp_path):
     project = store.create_project("planned", "", str(tmp_path / "project"))
     workflow = sequence_workflow()
-    plan = store.create_orchestration_plan(project["id"], orchestration_plan(workflow))
+    plan = store.create_workflow_plan(project["id"], workflow_plan(workflow))
     revision = publish_initial_workflow(store, project["id"], workflow, plan["id"])
+    concrete = store.create_task_plan(project["id"], task_plan(revision["id"], workflow))
     task = store.create_task(
-        project["id"], "planned task", "", {}, readiness(),
-        orchestration_plan_id=plan["id"], proposed_task_ref="primary",
+        project["id"], task_plan_id=concrete["id"], proposed_task_ref="primary",
     )
-    assert revision["orchestration_plan_id"] == plan["id"]
-    assert task["orchestration_plan_id"] == plan["id"]
+    assert revision["workflow_plan_id"] == plan["id"]
+    assert task["task_plan_id"] == concrete["id"]
 
 
 def test_dependency_releases_only_after_predecessor_done(store, tmp_path):
     project = store.create_project("dependency", "", str(tmp_path / "project"))
     workflow = sequence_workflow()
-    base = orchestration_plan(workflow)
-    tasks = [
-        OrchestrationTaskPlan(
-            proposed_task_ref="root", objective="Deliver root",
-            workflow_fit="Every process column applies.", agent_execution="forbidden",
-            review_scope="Review root.", retry_scope="Retry root.",
-        ),
-        OrchestrationTaskPlan(
-            proposed_task_ref="child", objective="Deliver child",
-            workflow_fit="Every process column applies.", agent_execution="forbidden",
-            dependencies=["root"], review_scope="Review child.", retry_scope="Retry child.",
-        ),
-    ]
-    plan = store.create_orchestration_plan(project["id"], base.model_copy(update={
-        "task_portfolio": tasks,
-        "representative_task_ref": "root",
-    }))
-    publish_initial_workflow(store, project["id"], workflow, plan["id"])
-    root = store.create_task(
-        project["id"], "root", "", {}, readiness(objective="Deliver root"),
-        orchestration_plan_id=plan["id"], proposed_task_ref="root",
-    )
-    child = store.create_task(
-        project["id"], "child", "", {}, readiness(objective="Deliver child", dependencies=["root"]),
-        orchestration_plan_id=plan["id"], proposed_task_ref="child",
-    )
+    method = store.create_workflow_plan(project["id"], workflow_plan(workflow))
+    revision = publish_initial_workflow(store, project["id"], workflow, method["id"])
+    base = task_plan(revision["id"], workflow, task_ref="root", title="root")
+    child_item = base.tasks[0].model_copy(update={"proposed_task_ref": "child", "title": "child", "dependencies": ["root"]})
+    concrete = store.create_task_plan(project["id"], base.model_copy(update={"tasks": [base.tasks[0], child_item]}))
+    root = store.create_task(project["id"], task_plan_id=concrete["id"], proposed_task_ref="root")
+    child = store.create_task(project["id"], task_plan_id=concrete["id"], proposed_task_ref="child")
     assert child["id"] not in store.runnable_task_ids()
     WorkflowRuntime(store, build_core_registry(store.policy), "root-worker").step(root["id"])
     assert store.get_task(root["id"])["status"] == "done"
@@ -78,30 +59,13 @@ def test_dependency_releases_only_after_predecessor_done(store, tmp_path):
 def test_failed_predecessor_requires_explicit_successor(store, tmp_path):
     project = store.create_project("failed dependency", "", str(tmp_path / "project"))
     workflow = sequence_workflow()
-    base = orchestration_plan(workflow)
-    base.task_portfolio = [
-        OrchestrationTaskPlan(
-            proposed_task_ref="root", objective="Deliver root",
-            workflow_fit="Every process column applies.", agent_execution="forbidden",
-            review_scope="Review root.", retry_scope="Retry root.",
-        ),
-        OrchestrationTaskPlan(
-            proposed_task_ref="child", objective="Deliver child",
-            workflow_fit="Every process column applies.", agent_execution="forbidden",
-            dependencies=["root"], review_scope="Review child.", retry_scope="Retry child.",
-        ),
-    ]
-    base.representative_task_ref = "root"
-    plan = store.create_orchestration_plan(project["id"], base)
-    publish_initial_workflow(store, project["id"], workflow, plan["id"])
-    root = store.create_task(
-        project["id"], "root", "", {}, readiness(objective="Deliver root"),
-        orchestration_plan_id=plan["id"], proposed_task_ref="root",
-    )
-    child = store.create_task(
-        project["id"], "child", "", {}, readiness(objective="Deliver child"),
-        orchestration_plan_id=plan["id"], proposed_task_ref="child",
-    )
+    method = store.create_workflow_plan(project["id"], workflow_plan(workflow))
+    revision = publish_initial_workflow(store, project["id"], workflow, method["id"])
+    base = task_plan(revision["id"], workflow, task_ref="root", title="root")
+    child_item = base.tasks[0].model_copy(update={"proposed_task_ref": "child", "title": "child", "dependencies": ["root"]})
+    concrete = store.create_task_plan(project["id"], base.model_copy(update={"tasks": [base.tasks[0], child_item]}))
+    root = store.create_task(project["id"], task_plan_id=concrete["id"], proposed_task_ref="root")
+    child = store.create_task(project["id"], task_plan_id=concrete["id"], proposed_task_ref="child")
     store.route_task_to_failed(root["id"], "visible predecessor failure")
     assert child["id"] not in store.runnable_task_ids()
     successor = store.rerun_task(root["id"])
@@ -113,11 +77,9 @@ def test_failed_predecessor_requires_explicit_successor(store, tmp_path):
 def test_explicit_queue_is_not_auto_admitted(store, tmp_path):
     project = store.create_project("queue", "", str(tmp_path / "project"))
     workflow = sequence_workflow()
-    plan, _revision = publish_planned_workflow(store, project["id"], workflow)
-    task = store.create_task(
-        project["id"], "queued", "", {}, readiness(decision="queue"),
-        orchestration_plan_id=plan["id"], proposed_task_ref="primary",
-    )
+    _plan, revision = publish_planned_workflow(store, project["id"], workflow)
+    concrete = store.create_task_plan(project["id"], task_plan(revision["id"], workflow, title="queued", readiness_data=readiness(decision="queue")))
+    task = store.create_task(project["id"], task_plan_id=concrete["id"], proposed_task_ref="primary")
     assert task["id"] not in store.runnable_task_ids()
     assert store.claim_task(task["id"], "worker") is None
 

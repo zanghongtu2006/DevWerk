@@ -27,7 +27,7 @@ def test_readiness_is_a_required_dispatch_fact(store, tmp_path):
     from tests.helpers import sequence_workflow
 
     publish_planned_workflow(store, project["id"], sequence_workflow())
-    with pytest.raises(ValueError, match="dispatch or queue"):
+    with pytest.raises(ValueError, match="dispatch.*queue"):
         create_planned_task(store, project["id"], "held", readiness_data=readiness(decision="hold"))
     task = create_planned_task(store, project["id"], "ready")
     assert task["readiness"]["decision"] == "dispatch"

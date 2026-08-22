@@ -13,14 +13,30 @@
   },
   "bundle": {
     "defaults": {},
-    "orchestration_plan": {
-      "schema_version": "devwerk.orchestration-plan.v1",
+    "workflow_plan": {
+      "schema_version": "devwerk.workflow-plan.v1",
       "intent_summary": "把用户明确确认的产品需求交付为经过构建、测试、审查和 GitLab CI 验证的软件。",
       "completion_definition": "设计文档、实现、构建测试证据、独立审查、GitLab 分支/MR/CI 证据和最终验收均完整，Task 到达 done。",
       "flow_unit": "一个具备明确验收标准的软件交付范围。",
       "lifecycle_summary": "确认冻结需求后完成架构设计、实现、自检、独立审查；审查或 CI 不通过时带着反馈返回原开发会话。",
       "entry_meaning": "需求已经过充分用户沟通并明确确认。",
       "terminal_meaning": "done 表示交付验收；failed 表示明确执行失败，可 reopen 原 Task。",
+      "task_contract": {
+        "input_schema": {
+          "type": "object",
+          "required": ["product_name", "requirements_path", "requirements_confirmed", "gitlab_repository"],
+          "properties": {
+            "product_name": {"type": "string", "minLength": 1},
+            "requirements_path": {"type": "string", "minLength": 1},
+            "requirements_confirmed": {"const": true},
+            "gitlab_repository": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        },
+        "required_context": ["冻结需求文件", "项目源码", "GitLab repository"],
+        "expected_outputs": ["设计文档", "源码", "测试证据", "独立审查", "GitLab MR 与 CI 证据", "最终验收"],
+        "acceptance_contract": ["冻结需求全部满足", "构建测试通过", "独立审查接受", "GitLab CI 成功"]
+      },
       "columns": [
         {"key":"design","responsibility":"基于冻结需求完成架构、接口、数据和交付设计。","execution_mode":"agent","entry_evidence":["用户确认的需求文件","验收标准","GitLab 工程信息"],"exit_evidence":["版本化设计文档"],"context_boundary":"不得猜测或修改冻结需求。","review_or_rework_role":"发现关键需求缺口时返回需求沟通而不是继续开发。"},
         {"key":"implement","responsibility":"在原开发会话中实现或按反馈修改代码。","execution_mode":"agent","entry_evidence":["冻结需求","设计文档","审查或CI反馈"],"exit_evidence":["源码与变更说明"],"context_boundary":"只修改当前交付范围。","review_or_rework_role":"审查和CI退回时恢复同一开发会话。"},
@@ -29,11 +45,7 @@
         {"key":"gitlab","responsibility":"执行 GitLab 分支、提交、MR 与 CI 工作流。","execution_mode":"agent","entry_evidence":["已审查实现","GitLab repository"],"exit_evidence":["commit、MR和CI证据"],"context_boundary":"使用项目声明的 GitLab 工作流。","review_or_rework_role":"CI失败携带日志返回 implement。"},
         {"key":"accept","responsibility":"根据冻结验收标准完成最终验收。","execution_mode":"agent","entry_evidence":["需求基线","审查接受","CI成功"],"exit_evidence":["最终验收报告"],"context_boundary":"不得降低用户验收标准。","review_or_rework_role":"验收不通过返回 implement。"}
       ],
-      "task_portfolio":[
-        {"proposed_task_ref":"product_delivery","objective":"交付已确认需求的软件产品。","workflow_fit":"一个软件交付范围经过完整 DevOps 生命周期。","agent_execution":"required","dependencies":[],"conflict_domains":[{"kind":"logical","identity":"product_delivery"},{"kind":"external_resource","identity":"gitlab_repository"}],"exact_input_strings":[],"review_scope":"独立审查需求覆盖、代码质量和测试证据。","retry_scope":"业务反馈沿图回到同一开发会话；执行失败 reopen 原 Task。"}
-      ],
-      "representative_task_ref":"product_delivery",
-      "representative_task_walkthrough":[
+      "lifecycle_walkthrough":[
         {"column_key":"design","receives":["已确认需求"],"action":"完成架构和交付设计。","produces":["设计文档"],"completion_evidence":["设计覆盖验收标准"],"outcome":"designed"},
         {"column_key":"implement","receives":["需求与设计"],"action":"实现软件。","produces":["源代码"],"completion_evidence":["变更可构建"],"outcome":"implemented"},
         {"column_key":"verify","receives":["源代码"],"action":"运行构建和测试。","produces":["验证证据"],"completion_evidence":["命令成功"],"outcome":"verified"},
@@ -59,9 +71,6 @@
         {"key":"gitlab","name":"GitLab 与 CI","instruction":"使用 Task 中的 gitlab_repository 和项目既定工作流完成分支、提交、MR及CI检查，记录实体ID和日志。CI通过 complete ci_passed；CI或合并前问题 complete ci_failed 返回开发；执行失败 complete execution_failed。","executor":{"kind":"agent","capabilities":["project.files.list","project.files.read","project.files.write","project.command.run"]},"context":{"include_project":true,"include_task":true,"upstream_outputs":["review"],"artifact_globs":["**/*"]},"input_contract":{},"output_contract":{"type":"object","additionalProperties":true},"transitions":[{"outcome":"ci_passed","target":"accept"},{"outcome":"ci_failed","target":"implement"},{"outcome":"execution_failed","target":"failed"}],"metadata":{"purpose":"完成GitLab提交、MR和CI闭环","derives_agent":true}},
         {"key":"accept","name":"最终验收","instruction":"对照 requirements_path 的冻结验收标准检查设计、实现、测试、审查与CI证据，写 FINAL_ACCEPTANCE.md。全部通过 complete delivered；产品问题 complete acceptance_failed 返回开发；执行失败 complete execution_failed。","executor":{"kind":"agent","capabilities":["project.files.list","project.files.read","project.files.write","project.command.run"]},"context":{"include_project":true,"include_task":true,"upstream_outputs":["design","verify","review","gitlab"],"artifact_globs":["**/*"]},"input_contract":{},"output_contract":{"type":"object","additionalProperties":true},"transitions":[{"outcome":"delivered","target":"done"},{"outcome":"acceptance_failed","target":"implement"},{"outcome":"execution_failed","target":"failed"}],"metadata":{"purpose":"依据冻结需求完成最终验收","derives_agent":true}}
       ]
-    },
-    "tasks":[
-      {"proposed_task_ref":"product_delivery","title":{"$param":"product_name"},"brief":"交付用户已确认需求的软件产品。","input":{"product_name":{"$param":"product_name"},"requirements_path":{"$param":"requirements_path"},"requirements_confirmed":{"$param":"requirements_confirmed"},"gitlab_repository":{"$param":"gitlab_repository"}},"readiness":{"decision":"dispatch","scope":["冻结需求定义的产品交付"],"non_scope":[],"deliverables":["设计文档","源代码","测试证据","审查报告","GitLab MR与CI证据","FINAL_ACCEPTANCE.md"],"acceptance_criteria":["冻结需求全部满足","构建测试通过","独立审查接受","GitLab CI成功"],"dependencies_checked":true,"risks":[],"reason_summary":"用户已明确确认需求基线，可以启动正式开发。"}}
-    ]
+    }
   }
 }

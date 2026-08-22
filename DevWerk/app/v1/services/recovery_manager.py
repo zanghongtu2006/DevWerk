@@ -77,7 +77,7 @@ class RecoveryManager:
             ).fetchone()[0] or "[]")
             eligible = all(
                 isinstance(dependency, str)
-                and not dependency.startswith("plan:")
+                and not dependency.startswith("task-plan:")
                 and (
                     (row := db.execute(
                         "SELECT status FROM v1_tasks WHERE id=? AND project_id=?",
@@ -119,17 +119,9 @@ class RecoveryManager:
         task = self.store.get_task(task_id)
         if task["status"] not in {"done", "failed"}:
             raise ValueError("task.rerun requires an immutable terminal Task")
-        workflow = self.store.get_workflow(task["project_id"])
-        orchestration_plan_id = str(
-            workflow.get("orchestration_plan_id") or task["orchestration_plan_id"]
-        )
         return self.store.create_task(
             task["project_id"],
-            task["title"],
-            task["brief"],
-            task["input"],
-            task["readiness"],
-            orchestration_plan_id=orchestration_plan_id,
+            task_plan_id=task["task_plan_id"],
             proposed_task_ref=task["proposed_task_ref"],
             rerun_of_task_id=task["id"],
         )

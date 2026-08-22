@@ -12,7 +12,7 @@ from typing import Any, Callable, Iterable, Literal
 
 from app.core.debug_trace import trace_json
 from app.v1.contracts import canonicalize_contract_value, validate_contract, validate_contract_template
-from app.v1.domain import OrchestrationPlan, PollWaitPolicy, TaskCreate, ToolResult, WorkflowDefinition
+from app.v1.domain import PollWaitPolicy, TaskCreate, TaskPlan, ToolResult, WorkflowDefinition, WorkflowPlan
 from app.v1.files import ProjectFiles
 from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, V1RuntimePolicy
 
@@ -269,9 +269,12 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     registry = CapabilityRegistry(policy)
     workflow_schema = WorkflowDefinition.model_json_schema()
     workflow_defs = workflow_schema.pop("$defs", {})
-    orchestration_schema = OrchestrationPlan.model_json_schema()
-    orchestration_defs = orchestration_schema.pop("$defs", {})
-    _bind_orchestration_authoring_contract(orchestration_defs)
+    workflow_plan_schema = WorkflowPlan.model_json_schema()
+    workflow_plan_defs = workflow_plan_schema.pop("$defs", {})
+    _bind_workflow_plan_authoring_contract(workflow_plan_defs)
+    task_plan_schema = TaskPlan.model_json_schema()
+    task_plan_defs = task_plan_schema.pop("$defs", {})
+    _bind_task_plan_authoring_contract(task_plan_defs)
     task_schema = TaskCreate.model_json_schema()
     task_defs = task_schema.pop("$defs", {})
 
@@ -489,7 +492,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     )
     add(
         "loop.inspect",
-        "Read one filesystem Loop card and executable bundle, including its parameter contract, directed Column graph, Task portfolio, and selection guidance.",
+        "Read one filesystem Loop card and reusable method bundle, including its parameter contract, Workflow Plan, directed Column graph, and selection guidance.",
         {
             "type": "object",
             "required": ["loop_key"],
@@ -507,7 +510,8 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         (
             "Create the current Project's initial Workflow from one inspected filesystem Loop. "
             "Bindings must satisfy the Loop parameter schema. Application records the exact Loop version and digest "
-            "and materializes its declarative plan, directed Workflow graph, and Task portfolio."
+            "and materializes its reusable Workflow Plan and initial directed Workflow revision. It creates no Tasks; "
+            "save a Task Plan for the user's concrete objective afterward."
         ),
         {
             "type": "object",
@@ -527,26 +531,44 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         delegable_to_column=False,
     )
     add(
-        "orchestration.plan.save",
+        "workflow.plan.save",
         (
-            "Persist a complete project orchestration plan before publishing the Workflow that implements it. "
+            "Persist a reusable Workflow Plan before publishing a revised Workflow that implements it. "
             "First identify the reusable flow_unit; derive lifecycle Columns from that unit instead of from a "
-            "work-item list; choose agent or capability_sequence execution for each Column; then simulate one "
-            "representative Task from entry to terminal with explicit receives, action, produces, completion "
-            "evidence, and transition outcome. Declare the default wip_group and wip_limit as structured scheduling "
-            "facts. Task dependencies reference other proposed_task_ref values only, must form an acyclic graph, "
-            "and are released only by successful predecessor Tasks."
+            "work-item list; choose agent or capability_sequence execution for each Column; then simulate the "
+            "lifecycle from entry to terminal with explicit receives, action, produces, completion evidence, and "
+            "transition outcome. Declare the Task Contract and default WIP facts. Never include concrete Tasks."
         ),
-        {"type": "object", "required": ["plan"], "properties": {"plan": orchestration_schema}, "additionalProperties": False, "$defs": orchestration_defs},
-        _orchestration_plan_save,
+        {"type": "object", "required": ["plan"], "properties": {"plan": workflow_plan_schema}, "additionalProperties": False, "$defs": workflow_plan_defs},
+        _workflow_plan_save,
         side_effect_kind="control",
         delegable_to_column=False,
     )
     add(
-        "orchestration.plan.list",
-        "Read immutable orchestration plans for the current Project.",
+        "workflow.plan.list",
+        "Read immutable reusable Workflow Plans for the current Project.",
         {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": policy.service_limits.max_page_size}}, "additionalProperties": False},
-        lambda args, ctx: ctx.store.list_orchestration_plans(ctx.project_id, int(args.get("limit") or policy.service_limits.default_page_size)),
+        lambda args, ctx: ctx.store.list_workflow_plans(ctx.project_id, int(args.get("limit") or policy.service_limits.default_page_size)),
+        side_effect_kind="read",
+        delegable_to_column=False,
+    )
+    add(
+        "task.plan.save",
+        (
+            "Persist one immutable concrete Task Plan for an existing Workflow Revision. The plan owns every Task's "
+            "title, input, readiness, dependencies, conflict domains, acceptance facts, and Agent-use policy. "
+            "Dependencies reference Task refs in the same plan and must be acyclic. Saving the plan creates no Tasks."
+        ),
+        {"type": "object", "required": ["plan"], "properties": {"plan": task_plan_schema}, "additionalProperties": False, "$defs": task_plan_defs},
+        _task_plan_save,
+        side_effect_kind="control",
+        delegable_to_column=False,
+    )
+    add(
+        "task.plan.list",
+        "Read immutable Task Plans for the current Project.",
+        {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": policy.service_limits.max_page_size}}, "additionalProperties": False},
+        lambda args, ctx: ctx.store.list_task_plans(ctx.project_id, int(args.get("limit") or policy.service_limits.default_page_size)),
         side_effect_kind="read",
         delegable_to_column=False,
     )
@@ -560,9 +582,9 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     add(
         "workflow.publish",
         (
-            "Publish a revised declarative Workflow implementing the referenced plan. The Project must already "
+            "Publish a revised declarative Workflow implementing the referenced Workflow Plan. The Project must already "
             "have an initial Workflow created by loop.apply; this capability cannot create one from scratch. "
-            "Workflow column keys must exactly match the plan's process-stage column keys; work slices remain Tasks. "
+            "Workflow column keys must exactly match the Workflow Plan process-stage keys; work slices remain Tasks. "
             "The done and failed values are terminal targets, never Column definitions. Every Column must provide an "
             "executor and non-empty transitions; every declared outcome must have exactly one transition. "
             "A capability_sequence selects exactly one of completed_outcome or outcome_from. A capability whose "
@@ -578,8 +600,8 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         ),
         {
             "type": "object",
-            "required": ["orchestration_plan_id", "workflow"],
-            "properties": {"orchestration_plan_id": {"type": "string", "minLength": 1}, "workflow": workflow_schema},
+            "required": ["workflow_plan_id", "workflow"],
+            "properties": {"workflow_plan_id": {"type": "string", "minLength": 1}, "workflow": workflow_schema},
             "additionalProperties": False,
             "$defs": workflow_defs,
         },
@@ -590,14 +612,9 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     add(
         "task.create",
         (
-            "Create a formal Task on the active Workflow after a complete readiness decision concludes dispatch. "
-            "The referenced orchestration task is authoritative for objective, dependencies, and conflict domains; "
-            "Task creation materializes those plan-owned fields instead of trusting Provider copies. "
-            "The referenced orchestration task exact_input_strings is the authoritative source for every string "
-            "consumed through deterministic Task-input $ref objects. Task creation decodes each escaped_value and "
-            "materializes it into input before validation and persistence, replacing lossy Provider copies. "
-            "Other Task-owned paths, lengths, flags, and acceptance values remain in input so reusable Workflow "
-            "steps can consume the complete contract losslessly."
+            "Instantiate one formal Task from an immutable Task Plan item. Supply only task_plan_id and "
+            "proposed_task_ref; DevWerk materializes the authoritative title, input, readiness, dependencies, "
+            "conflict domains, exact strings, and fixed Workflow Revision from that plan."
         ),
         {**task_schema, "$defs": task_defs},
         lambda args, ctx: _task_create(args, ctx, registry),
@@ -614,7 +631,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     add(
         "scheduling.decide",
         "Persist Task admission, priority, and WIP policy. Dependencies and resources are optional assertions: "
-        "omit them to preserve the Task's orchestration-plan facts, or provide the exact current values. "
+        "omit them to preserve the Task Plan facts, or provide the exact current values. "
         "An admitted decision is rejected while any declared dependency is unresolved or not done. "
         "An explicit queued decision remains queued until a later scheduling decision.",
         {"type": "object", "required": ["task_id", "state"], "properties": {"task_id": {"type": "string"}, "state": {"type": "string", "enum": ["admitted", "queued", "hold", "cancelled"]}, "priority": {"type": "integer", "minimum": -1000, "maximum": 1000}, "wip_group": {"type": "string", "minLength": 1, "maxLength": 200}, "wip_limit": {"type": "integer", "minimum": 1, "maximum": 100}, "dependencies": {"type": "array", "items": {"type": "string"}, "maxItems": 200}, "resources": {"type": "array", "items": {"type": "string"}, "maxItems": 200}}, "additionalProperties": False},
@@ -682,7 +699,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     )
     add(
         "task.rerun",
-        "Create a successor Task for an immutable done/failed Task. Orchestration-plan dependencies are satisfied "
+        "Create a successor Task for an immutable done/failed Task. Task Plan dependencies are satisfied "
         "only by successful predecessor Tasks; otherwise the successor remains dependency-queued until one succeeds.",
         {
             "type": "object",
@@ -806,7 +823,7 @@ def _bind_workflow_capability_catalog(schema_defs: dict[str, Any], capability_id
         "not references. XML-like or tagged $ref strings are invalid rather than executable references. "
         "Preserve Task-owned exact values through references instead of copying or weakening them. "
         "Generated helper programs, command fragments, sentinel content, verifier literals, and every multiline "
-        "or escape-sensitive string are exact Task inputs: declare them in orchestration exact_input_strings and "
+        "or escape-sensitive string are exact Task inputs: declare them in the Task Plan exact_input_strings and "
         "reference them here. Never inline those strings in a Workflow capability argument."
     )
 
@@ -830,7 +847,7 @@ def _bind_workflow_authoring_contract(workflow_schema: dict[str, Any], schema_de
     if isinstance(properties.get("input_contract"), dict):
         properties["input_contract"]["description"] = (
             "JSON Schema for the selected Runtime input envelope. Root keys always include "
-            "column and orchestration; project and task are present when selected by context; "
+            "column and planning; project and task are present when selected by context; "
             "upstream_outputs and artifacts are present only when their selectors are non-empty. "
             "Task-owned input is nested at task.input, so a Task contract is task.input.contract, "
             "never a root-level contract property."
@@ -857,18 +874,32 @@ def _bind_workflow_authoring_contract(workflow_schema: dict[str, Any], schema_de
     entry = workflow_schema.get("properties", {}).get("entry")
     if isinstance(entry, dict):
         entry["description"] = (
-            "Common entry process stage applicable to every Task in the referenced orchestration plan."
+            "Common entry process stage applicable to every Task Plan item using this Workflow Revision."
         )
 
 
-def _bind_orchestration_authoring_contract(schema_defs: dict[str, Any]) -> None:
-    column_plan = schema_defs.get("OrchestrationColumnPlan", {})
+def _bind_workflow_plan_authoring_contract(schema_defs: dict[str, Any]) -> None:
+    column_plan = schema_defs.get("WorkflowColumnPlan", {})
     column_plan["description"] = (
         "One reusable lifecycle stage, not a Task, batch, numbered work unit, file group, or deliverable slice. "
         "The execution_mode is a deliberate project-management choice: agent creates a fresh stage-scoped Agent; "
         "capability_sequence performs declared deterministic operations without an Agent."
     )
-    task_plan = schema_defs.get("OrchestrationTaskPlan", {})
+    self_check = schema_defs.get("WorkflowPlanSelfCheck", {})
+    self_check["description"] = (
+        "Seven required governance assertions from the V1 workflow policy. "
+        "Every value must be true before publication; the service derives graph, "
+        "executor, context, transition, and capability facts from the actual Workflow."
+    )
+    walkthrough = schema_defs.get("WorkflowWalkthroughStep", {})
+    walkthrough["description"] = (
+        "One observable step in the reusable lifecycle simulation. Its column_key and outcome are validated "
+        "against the subsequently published Workflow; this is governance evidence, not private reasoning."
+    )
+
+
+def _bind_task_plan_authoring_contract(schema_defs: dict[str, Any]) -> None:
+    task_plan = schema_defs.get("TaskPlanItem", {})
     dependencies = task_plan.get("properties", {}).get("dependencies")
     if isinstance(dependencies, dict):
         dependencies["description"] = (
@@ -890,18 +921,6 @@ def _bind_orchestration_authoring_contract(schema_defs: dict[str, Any]) -> None:
             "Generated execution literals define the process; never place a producer's requested derived "
             "result here merely because it can be calculated during planning."
         )
-    self_check = schema_defs.get("OrchestrationSelfCheck", {})
-    self_check["description"] = (
-        "Seven required governance assertions from the V1 orchestration policy. "
-        "Every value must be true before publication; the service derives graph, "
-        "executor, context, transition, and capability facts from the "
-        "actual Workflow rather than asking for a duplicate walkthrough."
-    )
-    walkthrough = schema_defs.get("OrchestrationWalkthroughStep", {})
-    walkthrough["description"] = (
-        "One observable step in the representative Task simulation. Its column_key and outcome are validated "
-        "against the subsequently published Workflow; this is governance evidence, not private reasoning."
-    )
 
 
 def validate_workflow_capabilities(workflow: WorkflowDefinition, registry: CapabilityRegistry) -> None:
@@ -1064,7 +1083,7 @@ def _validate_sequence_argument_references(
             raise ValueError(
                 f"column {column_key!r} capability step {current_index} contains an inline "
                 "control-character-sensitive string; declare the complete exact value in "
-                "orchestration exact_input_strings and consume it through a Task-input $ref"
+                "Task Plan exact_input_strings and consume it through a Task-input $ref"
             )
         return
     if isinstance(value, list):
@@ -1230,12 +1249,12 @@ def validate_task_capability_bindings(
                 if planned is None:
                     raise ValueError(
                         f"deterministic Task input string at {string_pointer!r} must be "
-                        "declared in the immutable orchestration task exact_input_strings"
+                        "declared in the immutable Task Plan exact_input_strings"
                     )
                 if planned != string_value:
                     raise ValueError(
                         f"deterministic Task input string at {string_pointer!r} does not "
-                        "match its immutable orchestration task exact_input_strings value"
+                        "match its immutable Task Plan exact_input_strings value"
                     )
     return normalized_input
 
@@ -1325,22 +1344,22 @@ def _set_json_pointer(document: dict[str, Any], pointer: str, value: str) -> Non
 def task_binding_exact_strings(
     store: Any,
     project_id: str,
-    orchestration_plan_id: str,
+    task_plan_id: str,
     proposed_task_ref: str,
 ) -> dict[str, str]:
-    plan = OrchestrationPlan.model_validate(
-        store.get_orchestration_plan(project_id, orchestration_plan_id)["plan"]
+    plan = TaskPlan.model_validate(
+        store.get_task_plan(project_id, task_plan_id)["plan"]
     )
     proposed = next(
         (
             item
-            for item in plan.task_portfolio
+            for item in plan.tasks
             if item.proposed_task_ref == proposed_task_ref
         ),
         None,
     )
     if proposed is None:
-        raise ValueError("Task must reference an entry in the orchestration plan portfolio")
+        raise ValueError("Task must reference an entry in the Task Plan")
     return {
         item.pointer: item.value
         for item in proposed.exact_input_strings
@@ -1490,10 +1509,16 @@ def _workflow_inspect(_args: dict[str, Any], ctx: CapabilityContext) -> dict[str
         return None
 
 
-def _orchestration_plan_save(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
+def _workflow_plan_save(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
     if not ctx.start_task:
-        raise PermissionError("orchestration.plan.save is disabled for this conversation turn")
-    return ctx.store.create_orchestration_plan(ctx.project_id, OrchestrationPlan.model_validate(args["plan"]))
+        raise PermissionError("workflow.plan.save is disabled for this conversation turn")
+    return ctx.store.create_workflow_plan(ctx.project_id, WorkflowPlan.model_validate(args["plan"]))
+
+
+def _task_plan_save(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
+    if not ctx.start_task:
+        raise PermissionError("task.plan.save is disabled for this conversation turn")
+    return ctx.store.create_task_plan(ctx.project_id, TaskPlan.model_validate(args["plan"]))
 
 
 def _workflow_publish(args: dict[str, Any], ctx: CapabilityContext, registry: CapabilityRegistry) -> dict[str, Any]:
@@ -1502,7 +1527,7 @@ def _workflow_publish(args: dict[str, Any], ctx: CapabilityContext, registry: Ca
     workflow = WorkflowDefinition.model_validate(
         canonicalize_workflow_capability_arguments(args["workflow"], registry)
     )
-    return ctx.store.publish_workflow(ctx.project_id, workflow, str(args["orchestration_plan_id"]))
+    return ctx.store.publish_workflow(ctx.project_id, workflow, str(args["workflow_plan_id"]))
 
 
 def _task_create(
@@ -1514,11 +1539,7 @@ def _task_create(
         raise PermissionError("task.create is disabled for this conversation turn")
     return ctx.store.create_task(
         ctx.project_id,
-        str(args["title"]),
-        str(args.get("brief") or ""),
-        dict(args.get("input") or {}),
-        dict(args["readiness"]),
-        orchestration_plan_id=str(args["orchestration_plan_id"]),
+        task_plan_id=str(args["task_plan_id"]),
         proposed_task_ref=str(args["proposed_task_ref"]),
     )
 

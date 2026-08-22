@@ -169,7 +169,7 @@ class ColumnDefinition(BaseModel):
                     )
         required_roots = self.input_contract.get("required")
         if isinstance(required_roots, list):
-            available_roots = {"column", "orchestration"}
+            available_roots = {"column", "planning"}
             if self.context.include_project:
                 available_roots.add("project")
             if self.context.include_task:
@@ -303,7 +303,7 @@ class ExternalEventSignal(BaseModel):
     output: dict[str, Any] = Field(default_factory=dict)
 
 
-class OrchestrationColumnPlan(BaseModel):
+class WorkflowColumnPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
     key: str = Field(pattern=KEY_PATTERN)
     responsibility: str = Field(min_length=1, max_length=4_000)
@@ -335,6 +335,37 @@ class ConflictDomain(BaseModel):
         else:
             identity = identity.casefold()
         return f"{self.kind}:{identity}"
+
+
+class ReadinessDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    decision: Literal["dispatch", "queue", "hold", "merge", "split", "cancel"]
+    objective: str = Field(min_length=1, max_length=4000)
+    scope: list[str] = Field(default_factory=list, max_length=200)
+    non_scope: list[str] = Field(default_factory=list, max_length=200)
+    deliverables: list[str] = Field(min_length=1, max_length=200)
+    acceptance_criteria: list[str] = Field(min_length=1, max_length=200)
+    dependencies_checked: bool
+    dependencies: list[str] = Field(default_factory=list, max_length=200)
+    conflict_domains: list[ConflictDomain] = Field(default_factory=list, max_length=200)
+    risks: list[str] = Field(default_factory=list, max_length=200)
+    reason_summary: str = Field(min_length=1, max_length=4000)
+    next_review_at: str | None = None
+
+
+class TaskPlanReadiness(BaseModel):
+    """Readiness facts authored once in a Task Plan and materialized into a Task."""
+
+    model_config = ConfigDict(extra="forbid")
+    decision: Literal["dispatch", "queue"]
+    scope: list[str] = Field(default_factory=list, max_length=200)
+    non_scope: list[str] = Field(default_factory=list, max_length=200)
+    deliverables: list[str] = Field(min_length=1, max_length=200)
+    acceptance_criteria: list[str] = Field(min_length=1, max_length=200)
+    dependencies_checked: bool
+    risks: list[str] = Field(default_factory=list, max_length=200)
+    reason_summary: str = Field(min_length=1, max_length=4_000)
+    next_review_at: str | None = None
 
 
 class ExactTaskInputString(BaseModel):
@@ -426,9 +457,12 @@ def _decode_exact_escaped_value(value: str) -> str:
     return "".join(decoded)
 
 
-class OrchestrationTaskPlan(BaseModel):
+class TaskPlanItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
     proposed_task_ref: str = Field(pattern=KEY_PATTERN)
+    title: str = Field(min_length=1, max_length=200)
+    brief: str = Field(default="", max_length=30_000)
+    input: dict[str, Any] = Field(default_factory=dict)
     objective: str = Field(min_length=1, max_length=4_000)
     workflow_fit: str = Field(min_length=1, max_length=4_000)
     agent_execution: Literal["forbidden", "required", "allowed"] = Field(
@@ -450,9 +484,10 @@ class OrchestrationTaskPlan(BaseModel):
     )
     review_scope: str = Field(min_length=1, max_length=4_000)
     retry_scope: str = Field(min_length=1, max_length=4_000)
+    readiness: TaskPlanReadiness
 
     @model_validator(mode="after")
-    def require_unique_exact_input_pointers(self) -> "OrchestrationTaskPlan":
+    def require_unique_exact_input_pointers(self) -> "TaskPlanItem":
         pointers = [item.pointer for item in self.exact_input_strings]
         if len(pointers) != len(set(pointers)):
             raise ValueError("exact_input_strings pointers must be unique within a planned Task")
@@ -523,7 +558,7 @@ def _workflow_task_input_references(value: Any) -> set[str]:
     return set()
 
 
-class OrchestrationSelfCheck(BaseModel):
+class WorkflowPlanSelfCheck(BaseModel):
     model_config = ConfigDict(extra="forbid")
     every_task_can_start_at_entry: Literal[True]
     every_column_applies_to_every_task: Literal[True]
@@ -534,7 +569,7 @@ class OrchestrationSelfCheck(BaseModel):
     terminal_and_rework_paths_are_explicit: Literal[True]
 
 
-class OrchestrationWalkthroughStep(BaseModel):
+class WorkflowWalkthroughStep(BaseModel):
     model_config = ConfigDict(extra="forbid")
     column_key: str = Field(pattern=KEY_PATTERN)
     receives: list[str] = Field(
@@ -545,7 +580,7 @@ class OrchestrationWalkthroughStep(BaseModel):
     action: str = Field(
         min_length=1,
         max_length=4_000,
-        description="Concrete stage action for the representative Task, without changing the reusable Column responsibility.",
+        description="Concrete stage action in the reusable lifecycle example.",
     )
     produces: list[str] = Field(
         min_length=1,
@@ -564,9 +599,17 @@ class OrchestrationWalkthroughStep(BaseModel):
     )
 
 
-class OrchestrationPlan(BaseModel):
+class TaskContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    schema_version: Literal["devwerk.orchestration-plan.v1"] = "devwerk.orchestration-plan.v1"
+    input_schema: dict[str, Any] = Field(default_factory=dict)
+    required_context: list[str] = Field(default_factory=list, max_length=200)
+    expected_outputs: list[str] = Field(min_length=1, max_length=200)
+    acceptance_contract: list[str] = Field(min_length=1, max_length=200)
+
+
+class WorkflowPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    schema_version: Literal["devwerk.workflow-plan.v1"] = "devwerk.workflow-plan.v1"
     intent_summary: str = Field(min_length=1, max_length=10_000)
     completion_definition: str = Field(min_length=1, max_length=10_000)
     flow_unit: str = Field(
@@ -580,17 +623,13 @@ class OrchestrationPlan(BaseModel):
     lifecycle_summary: str = Field(min_length=1, max_length=10_000)
     entry_meaning: str = Field(min_length=1, max_length=4_000)
     terminal_meaning: str = Field(min_length=1, max_length=4_000)
-    columns: list[OrchestrationColumnPlan] = Field(min_length=1, max_length=200)
-    task_portfolio: list[OrchestrationTaskPlan] = Field(min_length=1, max_length=200)
-    representative_task_ref: str = Field(
-        pattern=KEY_PATTERN,
-        description="One proposed_task_ref used to simulate the Workflow before publication.",
-    )
-    representative_task_walkthrough: list[OrchestrationWalkthroughStep] = Field(
+    task_contract: TaskContract
+    columns: list[WorkflowColumnPlan] = Field(min_length=1, max_length=200)
+    lifecycle_walkthrough: list[WorkflowWalkthroughStep] = Field(
         min_length=1,
         max_length=1_000,
         description=(
-            "Ordered entry-to-terminal simulation for the representative Task. Each step states "
+            "Ordered entry-to-terminal lifecycle simulation. Each step states "
             "what a Column receives, does, produces, proves, and which transition outcome it emits."
         ),
     )
@@ -610,42 +649,49 @@ class OrchestrationPlan(BaseModel):
     progress_evidence: list[str] = Field(min_length=1, max_length=200)
     review_points: list[str] = Field(default_factory=list, max_length=200)
     intervention_conditions: list[str] = Field(min_length=1, max_length=200)
-    self_check: OrchestrationSelfCheck
+    self_check: WorkflowPlanSelfCheck
 
     @model_validator(mode="after")
-    def validate_references(self) -> "OrchestrationPlan":
+    def validate_references(self) -> "WorkflowPlan":
         column_keys = [item.key for item in self.columns]
         if len(column_keys) != len(set(column_keys)):
-            raise ValueError("orchestration plan column keys must be unique")
-        task_refs = [item.proposed_task_ref for item in self.task_portfolio]
-        if len(task_refs) != len(set(task_refs)):
-            raise ValueError("orchestration plan task references must be unique")
-        known_tasks = set(task_refs)
-        if self.representative_task_ref not in known_tasks:
-            raise ValueError("representative_task_ref must reference a task_portfolio item")
+            raise ValueError("workflow plan column keys must be unique")
         known_columns = set(column_keys)
         unknown_walkthrough_columns = sorted({
             step.column_key
-            for step in self.representative_task_walkthrough
+            for step in self.lifecycle_walkthrough
             if step.column_key not in known_columns
         })
         if unknown_walkthrough_columns:
             raise ValueError(
-                "representative task walkthrough references unknown columns: "
+                "lifecycle walkthrough references unknown columns: "
                 f"{unknown_walkthrough_columns}"
             )
-        for task in self.task_portfolio:
+        return self
+
+
+class TaskPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    schema_version: Literal["devwerk.task-plan.v1"] = "devwerk.task-plan.v1"
+    objective: str = Field(min_length=1, max_length=10_000)
+    workflow_revision_id: str = Field(min_length=1)
+    tasks: list[TaskPlanItem] = Field(min_length=1, max_length=200)
+
+    @model_validator(mode="after")
+    def validate_dependencies(self) -> "TaskPlan":
+        task_refs = [item.proposed_task_ref for item in self.tasks]
+        if len(task_refs) != len(set(task_refs)):
+            raise ValueError("task plan references must be unique")
+        known_tasks = set(task_refs)
+        for task in self.tasks:
             if len(task.dependencies) != len(set(task.dependencies)):
-                raise ValueError(f"task {task.proposed_task_ref!r} has duplicate plan dependencies")
+                raise ValueError(f"task {task.proposed_task_ref!r} has duplicate dependencies")
             if task.proposed_task_ref in task.dependencies:
                 raise ValueError(f"task {task.proposed_task_ref!r} cannot depend on itself")
             unknown = sorted(set(task.dependencies) - known_tasks)
             if unknown:
-                raise ValueError(f"task {task.proposed_task_ref!r} has unknown plan dependencies: {unknown}")
-        dependency_graph = {
-            task.proposed_task_ref: set(task.dependencies)
-            for task in self.task_portfolio
-        }
+                raise ValueError(f"task {task.proposed_task_ref!r} has unknown dependencies: {unknown}")
+        dependency_graph = {task.proposed_task_ref: set(task.dependencies) for task in self.tasks}
         visiting: set[str] = set()
         visited: set[str] = set()
 
@@ -653,7 +699,7 @@ class OrchestrationPlan(BaseModel):
             if task_ref in visiting:
                 cycle_start = trail.index(task_ref)
                 cycle = (*trail[cycle_start:], task_ref)
-                raise ValueError(f"orchestration plan task dependencies contain a cycle: {' -> '.join(cycle)}")
+                raise ValueError(f"task plan dependencies contain a cycle: {' -> '.join(cycle)}")
             if task_ref in visited:
                 return
             visiting.add(task_ref)
@@ -667,12 +713,16 @@ class OrchestrationPlan(BaseModel):
         return self
 
 
-class OrchestrationPlanCreate(BaseModel):
-    plan: OrchestrationPlan
+class WorkflowPlanCreate(BaseModel):
+    plan: WorkflowPlan
+
+
+class TaskPlanCreate(BaseModel):
+    plan: TaskPlan
 
 
 class WorkflowRevisionPublishRequest(BaseModel):
-    orchestration_plan_id: str = Field(min_length=1)
+    workflow_plan_id: str = Field(min_length=1)
     workflow: WorkflowDefinition
 
 
@@ -681,52 +731,9 @@ class LoopApplyRequest(BaseModel):
     bindings: dict[str, Any] = Field(default_factory=dict)
 
 
-class ReadinessDecision(BaseModel):
-    decision: Literal["dispatch", "queue", "hold", "merge", "split", "cancel"]
-    objective: str = Field(min_length=1, max_length=4000)
-    scope: list[str] = Field(default_factory=list, max_length=200)
-    non_scope: list[str] = Field(default_factory=list, max_length=200)
-    deliverables: list[str] = Field(min_length=1, max_length=200)
-    acceptance_criteria: list[str] = Field(min_length=1, max_length=200)
-    dependencies_checked: bool
-    dependencies: list[str] = Field(default_factory=list, max_length=200)
-    conflict_domains: list[ConflictDomain] = Field(default_factory=list, max_length=200)
-    risks: list[str] = Field(default_factory=list, max_length=200)
-    reason_summary: str = Field(min_length=1, max_length=4000)
-    next_review_at: str | None = None
-
-
-class TaskReadinessInput(BaseModel):
-    """Provider authoring shape; plan-owned fields are materialized by Store."""
-
-    model_config = ConfigDict(extra="forbid")
-    decision: Literal["dispatch", "queue", "hold", "merge", "split", "cancel"]
-    objective: Any = None
-    scope: list[str] = Field(default_factory=list, max_length=200)
-    non_scope: list[str] = Field(default_factory=list, max_length=200)
-    deliverables: list[str] = Field(min_length=1, max_length=200)
-    acceptance_criteria: list[str] = Field(min_length=1, max_length=200)
-    dependencies_checked: bool
-    dependencies: Any = None
-    conflict_domains: Any = None
-    risks: list[str] = Field(default_factory=list, max_length=200)
-    reason_summary: str = Field(min_length=1, max_length=4_000)
-    next_review_at: str | None = None
-
-
 class TaskCreate(BaseModel):
-    orchestration_plan_id: str = Field(min_length=1)
+    task_plan_id: str = Field(min_length=1)
     proposed_task_ref: str = Field(pattern=KEY_PATTERN)
-    title: str = Field(min_length=1, max_length=200)
-    brief: str = Field(default="", max_length=30_000)
-    input: dict[str, Any] = Field(default_factory=dict)
-    readiness: TaskReadinessInput
-
-    @model_validator(mode="after")
-    def require_dispatch(self) -> "TaskCreate":
-        if self.readiness.decision not in {"dispatch", "queue"}:
-            raise ValueError("a Task may be created only from a dispatch or queue readiness decision")
-        return self
 
 
 class AgentToolCall(BaseModel):
