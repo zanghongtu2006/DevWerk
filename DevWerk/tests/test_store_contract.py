@@ -525,7 +525,7 @@ def test_large_tool_result_is_persisted_and_returned_in_full(store, tmp_path):
     assert internal["result"] == logical_result
 
 
-def test_late_executor_failure_cannot_reopen_an_externally_failed_task(store, tmp_path):
+def test_running_task_cannot_be_failed_while_column_attempt_is_active(store, tmp_path):
     project = store.create_project("terminal-race", "", str(tmp_path / "project"))
     publish_planned_workflow(store, project["id"], sequence_workflow())
     task = create_planned_task(store, project["id"], "work")
@@ -533,17 +533,11 @@ def test_late_executor_failure_cannot_reopen_an_externally_failed_task(store, tm
     assert claimed is not None
     run = store.begin_run(claimed, {"task": claimed, "column": "execute"})
 
-    terminal = store.route_task_to_failed(task["id"], "operator stopped obsolete execution")
-    assert terminal["status"] == "failed"
-    assert terminal["current_column"] == "failed"
+    with pytest.raises(ValueError, match="active Attempt"):
+        store.route_task_to_failed(task["id"], "incorrect supervision intervention")
 
-    final = store.get_task(task["id"])
-    assert final["status"] == "failed"
-    assert final["current_column"] == "failed"
-    assert store.claim_task(task["id"], "another-worker") is None
-    assert not [
-        item
-        for item in store.runs(project["id"], task["id"])
-        if item["column_key"] == "failed" and item["status"] in {"pending", "running"}
-    ]
-    assert store.events(project["id"], task["id"])[-1]["type"] == "task.failed"
+    current = store.get_task(task["id"])
+    assert current["status"] == "running"
+    attempts = store.attempts(project["id"], task["id"])
+    assert attempts[-1]["id"] == run["attempt_id"]
+    assert attempts[-1]["status"] == "running"

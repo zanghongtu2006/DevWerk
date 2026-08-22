@@ -130,6 +130,17 @@ class ConversationAgent:
                 except KeyError:
                     workflow = None
                 capabilities = self.registry.all_ids()
+                if workflow is None:
+                    capabilities = [
+                        item for item in capabilities
+                        if item not in {
+                            "orchestration.plan.save",
+                            "workflow.publish",
+                            "task.create",
+                        }
+                    ]
+                else:
+                    capabilities = [item for item in capabilities if item != "loop.apply"]
                 if not job["start_task"]:
                     capabilities = [
                         item

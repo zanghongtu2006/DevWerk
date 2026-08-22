@@ -45,6 +45,14 @@ app/core/debug_trace.py
 app/v1/domain.py
 app/v1/policy.py
 app/v1/store.py
+app/v1/storage_support.py
+app/v1/repositories/base.py
+app/v1/repositories/schema_repository.py
+app/v1/repositories/project_repository.py
+app/v1/repositories/artifact_repository.py
+app/v1/repositories/event_repository.py
+app/v1/services/scheduler.py
+app/v1/services/recovery_manager.py
 app/v1/files.py
 app/v1/contracts.py
 app/v1/capabilities.py
@@ -101,6 +109,8 @@ Execution leases are renewable ownership coordination. They do not substitute re
 ### SQLite and Files
 
 SQLite uses WAL, `busy_timeout`, short explicit transactions, Project-scoped query indexes, and no network/LLM/file work inside transactions. Project files use canonical containment checks and atomic replace writes. Artifact records contain path, type, size, and SHA-256 rather than large file bodies.
+
+`V1Store` is a compatibility facade and SQLite transaction owner. Schema migration, Project, Artifact, and Event persistence live in explicit repositories; scheduling and recovery decisions live in domain services. Existing callers keep the Store API while further data families migrate incrementally. See `docs/store-decomposition-v1.md`.
 
 ## Run
 

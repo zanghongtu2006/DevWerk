@@ -5,7 +5,6 @@ import hashlib
 import re
 import sqlite3
 import threading
-import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -37,35 +36,13 @@ from app.v1.states import (
     TaskStatus,
     ToolInvocationStatus,
 )
-
-
-def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-
-
-def new_id(prefix: str) -> str:
-    return f"{prefix}_{uuid.uuid4().hex}"
-
-
-def _resource_domains_overlap(left: list[Any], right: list[Any]) -> bool:
-    """Conservative V1 overlap check for normalized scheduling conflict domains."""
-    for first in left:
-        for second in right:
-            if not isinstance(first, str) or not isinstance(second, str) or ":" not in first or ":" not in second:
-                return True
-            first_kind, first_identity = first.split(":", 1)
-            second_kind, second_identity = second.split(":", 1)
-            if first_kind != second_kind:
-                continue
-            if not first_identity or not second_identity:
-                return True
-            if first_kind == "workspace_path":
-                a, b = first_identity.rstrip("/"), second_identity.rstrip("/")
-                if a == b or a.startswith(f"{b}/") or b.startswith(f"{a}/"):
-                    return True
-            elif first_identity == second_identity:
-                return True
-    return False
+from app.v1.storage_support import new_id, utcnow
+from app.v1.repositories.artifact_repository import ArtifactRepository
+from app.v1.repositories.event_repository import EventRepository
+from app.v1.repositories.project_repository import ProjectRepository
+from app.v1.repositories.schema_repository import SchemaRepository
+from app.v1.services.scheduler import SchedulerService
+from app.v1.services.recovery_manager import RecoveryManager
 
 
 def _normalized_unit_identifier(value: str) -> str:
@@ -248,6 +225,12 @@ class V1Store:
         self.policy = policy or DEFAULT_V1_RUNTIME_POLICY
         self.registry = registry
         self.loops = LoopCatalog()
+        self.projects = ProjectRepository(self)
+        self.artifact_repository = ArtifactRepository(self)
+        self.event_repository = EventRepository(self)
+        self.scheduler = SchedulerService(self)
+        self.recovery_manager = RecoveryManager(self)
+        self.schema_repository = SchemaRepository(self)
         self.path = Path(db_path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._schema_lock = threading.Lock()
@@ -275,425 +258,10 @@ class V1Store:
             connection.close()
 
     def init_schema(self) -> None:
-        with self._schema_lock, self.connect() as db:
-            db.execute("PRAGMA journal_mode=WAL")
-            db.execute("PRAGMA synchronous=NORMAL")
-            db.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS v1_projects (
-                    id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL,
-                    base_dir TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-                );
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_v1_projects_base_dir_nocase
-                    ON v1_projects(base_dir COLLATE NOCASE);
-                CREATE TABLE IF NOT EXISTS v1_conversation_agents (
-                    project_id TEXT PRIMARY KEY, logical_id TEXT NOT NULL UNIQUE,
-                    state TEXT NOT NULL, instruction TEXT NOT NULL DEFAULT '',
-                    instruction_revision INTEGER NOT NULL DEFAULT 1,
-                    last_observed_event_id INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
-                );
-                CREATE TABLE IF NOT EXISTS v1_platform_policy_revisions (
-                    revision INTEGER PRIMARY KEY, content_hash TEXT NOT NULL UNIQUE,
-                    content TEXT NOT NULL, source_path TEXT NOT NULL, created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS v1_conversations (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL,
-                    role TEXT NOT NULL, content TEXT NOT NULL, meta_json TEXT NOT NULL DEFAULT '{}',
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_v1_conversation_project_id
-                    ON v1_conversations(project_id, id DESC);
-                CREATE TABLE IF NOT EXISTS v1_conversation_jobs (
-                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
-                    user_message_id INTEGER NOT NULL, message TEXT NOT NULL,
-                    start_task INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL,
-                    task_id TEXT, agent_run_id TEXT, error TEXT, resolved_by_job_id TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL, finished_at TEXT,
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
-                    FOREIGN KEY(user_message_id) REFERENCES v1_conversations(id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_v1_conversation_jobs_dispatch
-                    ON v1_conversation_jobs(status, created_at);
-                CREATE INDEX IF NOT EXISTS idx_v1_conversation_jobs_project
-                    ON v1_conversation_jobs(project_id, created_at DESC);
-                CREATE TABLE IF NOT EXISTS v1_workflows (
-                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
-                    active_revision_id TEXT, state_version INTEGER NOT NULL DEFAULT 0,
-                    source_loop_key TEXT, source_loop_version TEXT, source_loop_digest TEXT,
-                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
-                );
-                CREATE TABLE IF NOT EXISTS v1_loop_applications (
-                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
-                    loop_key TEXT NOT NULL, loop_version TEXT NOT NULL, loop_digest TEXT NOT NULL,
-                    bindings_json TEXT NOT NULL, orchestration_plan_id TEXT NOT NULL,
-                    workflow_revision_id TEXT NOT NULL, task_ids_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
-                    FOREIGN KEY(orchestration_plan_id) REFERENCES v1_orchestration_plans(id),
-                    FOREIGN KEY(workflow_revision_id) REFERENCES v1_workflow_revisions(id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_v1_loop_applications_project
-                    ON v1_loop_applications(project_id, created_at DESC);
-                CREATE TABLE IF NOT EXISTS v1_orchestration_plans (
-                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, schema_version TEXT NOT NULL,
-                    plan_json TEXT NOT NULL, plan_hash TEXT NOT NULL, created_at TEXT NOT NULL,
-                    UNIQUE(project_id, plan_hash),
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_v1_orchestration_plans_project
-                    ON v1_orchestration_plans(project_id, created_at DESC);
-                CREATE TABLE IF NOT EXISTS v1_workflow_revisions (
-                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, revision INTEGER NOT NULL,
-                    definition_json TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL,
-                    UNIQUE(project_id, revision),
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
-                );
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_v1_workflow_active
-                    ON v1_workflow_revisions(project_id) WHERE active=1;
-                CREATE TABLE IF NOT EXISTS v1_tasks (
-                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, workflow_revision_id TEXT NOT NULL,
-                    title TEXT NOT NULL, brief TEXT NOT NULL, input_json TEXT NOT NULL DEFAULT '{}',
-                    context_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL,
-                    control_state TEXT NOT NULL DEFAULT 'active',
-                    rerun_of_task_id TEXT, resolved_by_task_id TEXT,
-                    current_column TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0,
-                    lease_owner TEXT, lease_until TEXT, error TEXT, created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL, finished_at TEXT,
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
-                    FOREIGN KEY(workflow_revision_id) REFERENCES v1_workflow_revisions(id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_v1_tasks_dispatch
-                    ON v1_tasks(status, updated_at);
-                CREATE INDEX IF NOT EXISTS idx_v1_tasks_project
-                    ON v1_tasks(project_id, created_at DESC);
-                CREATE TABLE IF NOT EXISTS v1_column_runs (
-                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task_id TEXT NOT NULL, column_key TEXT NOT NULL,
-                    sequence INTEGER NOT NULL, status TEXT NOT NULL, attempt INTEGER NOT NULL,
-                    input_json TEXT NOT NULL DEFAULT '{}', output_json TEXT NOT NULL DEFAULT '{}',
-                    agent_run_id TEXT, error TEXT, failure_fingerprint TEXT,
-                    heartbeat_at TEXT, last_progress_at TEXT,
-                    started_at TEXT, finished_at TEXT, created_at TEXT NOT NULL,
-                    UNIQUE(task_id, sequence),
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
-                    FOREIGN KEY(task_id) REFERENCES v1_tasks(id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_v1_runs_task ON v1_column_runs(task_id, sequence);
-                CREATE TABLE IF NOT EXISTS v1_column_attempts (
-                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task_id TEXT NOT NULL,
-                    column_run_id TEXT NOT NULL, attempt_no INTEGER NOT NULL, status TEXT NOT NULL,
-                    input_json TEXT NOT NULL DEFAULT '{}', output_json TEXT NOT NULL DEFAULT '{}',
-                    checkpoint_json TEXT NOT NULL DEFAULT '{}', error TEXT, error_category TEXT,
-                    failure_fingerprint TEXT, runtime_policy_revision INTEGER NOT NULL,
-                    runtime_policy_hash TEXT NOT NULL,
-                    started_at TEXT NOT NULL, finished_at TEXT, created_at TEXT NOT NULL,
-                    UNIQUE(column_run_id, attempt_no),
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
-                    FOREIGN KEY(task_id) REFERENCES v1_tasks(id) ON DELETE CASCADE,
-                    FOREIGN KEY(column_run_id) REFERENCES v1_column_runs(id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_v1_attempts_run
-                    ON v1_column_attempts(column_run_id, attempt_no);
-                CREATE TABLE IF NOT EXISTS v1_agent_runs (
-                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task_id TEXT, column_run_id TEXT,
-                    conversation_job_id TEXT,
-                    kind TEXT NOT NULL, status TEXT NOT NULL,
-                    instruction_revision INTEGER NOT NULL, instruction_snapshot TEXT NOT NULL,
-                    context_json TEXT NOT NULL, capabilities_json TEXT NOT NULL,
-                    iterations INTEGER NOT NULL DEFAULT 0, tool_calls INTEGER NOT NULL DEFAULT 0,
-                    final_text TEXT NOT NULL DEFAULT '', error TEXT, error_category TEXT,
-                    created_at TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
-                );
-                CREATE TABLE IF NOT EXISTS v1_agent_sessions (
-                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task_id TEXT NOT NULL,
-                    session_key TEXT NOT NULL, state TEXT NOT NULL,
-                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                    UNIQUE(task_id, session_key),
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
-                    FOREIGN KEY(task_id) REFERENCES v1_tasks(id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_v1_agent_runs_project
-                    ON v1_agent_runs(project_id, created_at DESC);
-                CREATE INDEX IF NOT EXISTS idx_v1_agent_runs_task
-                    ON v1_agent_runs(task_id, created_at);
-                CREATE TABLE IF NOT EXISTS v1_agent_messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, agent_run_id TEXT NOT NULL,
-                    sequence INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
-                    tool_calls_json TEXT NOT NULL DEFAULT '[]', tool_call_id TEXT,
-                    created_at TEXT NOT NULL,
-                    UNIQUE(agent_run_id, sequence),
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
-                    FOREIGN KEY(agent_run_id) REFERENCES v1_agent_runs(id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_v1_agent_messages_run
-                    ON v1_agent_messages(agent_run_id, sequence);
-                CREATE TABLE IF NOT EXISTS v1_tool_invocations (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, agent_run_id TEXT NOT NULL,
-                    sequence INTEGER NOT NULL, tool_call_id TEXT NOT NULL,
-                    capability TEXT NOT NULL, arguments_json TEXT NOT NULL,
-                    result_json TEXT NOT NULL, ok INTEGER NOT NULL, created_at TEXT NOT NULL,
-                    UNIQUE(agent_run_id, tool_call_id),
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
-                    FOREIGN KEY(agent_run_id) REFERENCES v1_agent_runs(id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_v1_tool_invocations_run
-                    ON v1_tool_invocations(agent_run_id, sequence);
-                CREATE TABLE IF NOT EXISTS v1_await_handles (
-                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task_id TEXT NOT NULL, run_id TEXT NOT NULL,
-                    provider TEXT NOT NULL, token TEXT, status TEXT NOT NULL,
-                    next_check_at TEXT NOT NULL,
-                    progress_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
-                    FOREIGN KEY(task_id) REFERENCES v1_tasks(id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_v1_await_due ON v1_await_handles(status, next_check_at);
-                CREATE TABLE IF NOT EXISTS v1_artifacts (
-                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task_id TEXT,
-                    run_id TEXT, kind TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT,
-                    size INTEGER NOT NULL DEFAULT 0, meta_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
-                    UNIQUE(project_id, path),
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_v1_artifacts_task ON v1_artifacts(task_id, created_at);
-                CREATE TABLE IF NOT EXISTS v1_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, task_id TEXT,
-                    run_id TEXT, type TEXT NOT NULL, data_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_v1_events_project ON v1_events(project_id, id);
-                CREATE INDEX IF NOT EXISTS idx_v1_events_task ON v1_events(task_id, id);
-                CREATE TABLE IF NOT EXISTS v1_project_mailbox (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL,
-                    event_type TEXT NOT NULL, task_id TEXT, run_id TEXT,
-                    payload_json TEXT NOT NULL DEFAULT '{}', state TEXT NOT NULL DEFAULT 'pending',
-                    created_at TEXT NOT NULL, observed_at TEXT,
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_v1_mailbox_pending
-                    ON v1_project_mailbox(project_id, state, id);
-                CREATE TABLE IF NOT EXISTS v1_governance_decisions (
-                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, kind TEXT NOT NULL,
-                    subject_id TEXT, decision TEXT NOT NULL, data_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_v1_governance_project
-                    ON v1_governance_decisions(project_id, created_at DESC);
-                CREATE TABLE IF NOT EXISTS v1_scheduled_reviews (
-                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, reason TEXT NOT NULL,
-                    due_at TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
-                    created_at TEXT NOT NULL, observed_at TEXT,
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_v1_scheduled_reviews_due
-                    ON v1_scheduled_reviews(state, due_at);
-                CREATE TABLE IF NOT EXISTS v1_kanban_projection (
-                    project_id TEXT PRIMARY KEY, version INTEGER NOT NULL,
-                    projection_json TEXT NOT NULL, updated_at TEXT NOT NULL,
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
-                );
-                CREATE TABLE IF NOT EXISTS v1_backlog_items (
-                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, title TEXT NOT NULL, brief TEXT NOT NULL,
-                    readiness_json TEXT NOT NULL, state TEXT NOT NULL, task_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_v1_backlog_project ON v1_backlog_items(project_id,state,updated_at);
-                CREATE TABLE IF NOT EXISTS v1_scheduling_entries (
-                    task_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, state TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0,
-                    wip_group TEXT NOT NULL DEFAULT 'default', wip_limit INTEGER NOT NULL DEFAULT 4,
-                    dependencies_json TEXT NOT NULL DEFAULT '[]', resources_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
-                    FOREIGN KEY(task_id) REFERENCES v1_tasks(id) ON DELETE CASCADE
-                );
-                CREATE TABLE IF NOT EXISTS v1_task_dependencies (
-                    task_id TEXT NOT NULL, depends_on_task_id TEXT NOT NULL,
-                    project_id TEXT NOT NULL, required_terminal TEXT NOT NULL DEFAULT 'done', created_at TEXT NOT NULL,
-                    PRIMARY KEY(task_id, depends_on_task_id),
-                    FOREIGN KEY(task_id) REFERENCES v1_tasks(id) ON DELETE CASCADE,
-                    FOREIGN KEY(depends_on_task_id) REFERENCES v1_tasks(id) ON DELETE CASCADE,
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_v1_task_dependencies_project
-                    ON v1_task_dependencies(project_id, task_id);
-                CREATE TABLE IF NOT EXISTS v1_execution_receipts (
-                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, execution_key TEXT NOT NULL, capability TEXT NOT NULL,
-                    status TEXT NOT NULL, arguments_json TEXT NOT NULL, result_json TEXT, error TEXT, started_at TEXT NOT NULL, finished_at TEXT,
-                    UNIQUE(project_id,execution_key), FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
-                );
-                CREATE TABLE IF NOT EXISTS v1_direct_runs (
-                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, agent_run_id TEXT, capability TEXT NOT NULL,
-                    decision TEXT NOT NULL, data_json TEXT NOT NULL, created_at TEXT NOT NULL,
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
-                );
-                CREATE TABLE IF NOT EXISTS v1_intervention_runs (
-                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task_id TEXT, decision TEXT NOT NULL,
-                    data_json TEXT NOT NULL, created_at TEXT NOT NULL,
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
-                );
-                """
-            )
-            self._ensure_column(db, "v1_conversation_agents", "instruction", "TEXT NOT NULL DEFAULT ''")
-            self._ensure_column(db, "v1_conversation_agents", "instruction_revision", "INTEGER NOT NULL DEFAULT 1")
-            self._ensure_column(db, "v1_conversation_agents", "last_observed_event_id", "INTEGER NOT NULL DEFAULT 0")
-            self._ensure_column(db, "v1_conversation_jobs", "agent_run_id", "TEXT")
-            self._ensure_column(db, "v1_column_runs", "agent_run_id", "TEXT")
-            self._ensure_column(db, "v1_column_runs", "failure_fingerprint", "TEXT")
-            self._ensure_column(db, "v1_column_runs", "heartbeat_at", "TEXT")
-            self._ensure_column(db, "v1_column_runs", "last_progress_at", "TEXT")
-            self._ensure_column(db, "v1_projects", "state_version", "INTEGER NOT NULL DEFAULT 0")
-            self._ensure_column(db, "v1_conversation_agents", "lease_owner", "TEXT")
-            self._ensure_column(db, "v1_conversation_agents", "lease_until", "TEXT")
-            self._ensure_column(db, "v1_conversation_jobs", "trigger_kind", "TEXT NOT NULL DEFAULT 'user'")
-            self._ensure_column(db, "v1_conversation_jobs", "trigger_json", "TEXT NOT NULL DEFAULT '{}'")
-            self._ensure_column(db, "v1_conversation_jobs", "mailbox_ids_json", "TEXT NOT NULL DEFAULT '[]'")
-            self._ensure_column(db, "v1_conversation_jobs", "scheduled_review_id", "TEXT")
-            self._ensure_column(db, "v1_conversation_jobs", "worker_id", "TEXT")
-            self._ensure_column(db, "v1_conversation_jobs", "result_json", "TEXT NOT NULL DEFAULT '{}'")
-            self._ensure_column(db, "v1_conversation_jobs", "resolved_by_job_id", "TEXT")
-            self._ensure_column(db, "v1_tasks", "readiness_json", "TEXT NOT NULL DEFAULT '{}'")
-            self._ensure_column(db, "v1_tasks", "state_version", "INTEGER NOT NULL DEFAULT 1")
-            self._ensure_column(db, "v1_tasks", "terminal_artifact_id", "TEXT")
-            self._ensure_column(db, "v1_tasks", "terminal_event_id", "INTEGER")
-            self._ensure_column(db, "v1_tasks", "notified_at", "TEXT")
-            self._ensure_column(db, "v1_tasks", "observed_at", "TEXT")
-            self._ensure_column(db, "v1_tasks", "supervision_action", "TEXT")
-            self._ensure_column(db, "v1_tasks", "next_retry_at", "TEXT")
-            self._ensure_column(db, "v1_tasks", "control_state", "TEXT NOT NULL DEFAULT 'active'")
-            self._ensure_column(db, "v1_tasks", "rerun_of_task_id", "TEXT")
-            self._ensure_column(db, "v1_tasks", "resolved_by_task_id", "TEXT")
-            self._ensure_column(db, "v1_tasks", "orchestration_plan_id", "TEXT")
-            self._ensure_column(db, "v1_tasks", "proposed_task_ref", "TEXT")
-            self._ensure_column(db, "v1_tasks", "conflict_domains_json", "TEXT NOT NULL DEFAULT '[]'")
-            self._ensure_column(db, "v1_scheduling_entries", "auto_admit", "INTEGER NOT NULL DEFAULT 0")
-            self._ensure_column(db, "v1_task_dependencies", "required_terminal", "TEXT NOT NULL DEFAULT 'done'")
-            self._ensure_column(db, "v1_column_runs", "error_category", "TEXT")
-            self._ensure_column(db, "v1_column_runs", "runtime_policy_revision", "INTEGER")
-            self._ensure_column(db, "v1_column_runs", "runtime_policy_hash", "TEXT")
-            self._ensure_column(db, "v1_column_attempts", "error_code", "TEXT")
-            self._ensure_column(db, "v1_column_attempts", "agent_run_id", "TEXT")
-            self._ensure_column(db, "v1_column_attempts", "partial_artifacts_json", "TEXT NOT NULL DEFAULT '[]'")
-            self._ensure_column(db, "v1_await_handles", "column_key", "TEXT")
-            self._ensure_column(db, "v1_await_handles", "column_attempt_id", "TEXT")
-            self._ensure_column(db, "v1_await_handles", "poll_capability", "TEXT")
-            self._ensure_column(db, "v1_await_handles", "poll_arguments_json", "TEXT NOT NULL DEFAULT '{}'")
-            self._ensure_column(db, "v1_await_handles", "success_outcome", "TEXT NOT NULL DEFAULT 'success'")
-            self._ensure_column(db, "v1_await_handles", "result_json", "TEXT NOT NULL DEFAULT '{}'")
-            db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_v1_tasks_unresolved_failure "
-                "ON v1_tasks(project_id,status,resolved_by_task_id)"
-            )
-            db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_v1_conversation_jobs_unresolved_failure "
-                "ON v1_conversation_jobs(project_id,status,resolved_by_job_id)"
-            )
-            for table in ("v1_column_runs", "v1_agent_messages", "v1_tool_invocations", "v1_await_handles"):
-                self._ensure_column(db, table, "project_id", "TEXT NOT NULL DEFAULT ''")
-            self._ensure_column(db, "v1_await_handles", "waiting_kind", "TEXT NOT NULL DEFAULT 'external'")
-            self._ensure_column(db, "v1_await_handles", "health", "TEXT NOT NULL DEFAULT 'healthy'")
-            self._ensure_column(db, "v1_await_handles", "resume_condition_json", "TEXT NOT NULL DEFAULT '{}'")
-            self._ensure_column(db, "v1_await_handles", "cancel_capability", "TEXT")
-            self._ensure_column(db, "v1_await_handles", "cancel_arguments_json", "TEXT NOT NULL DEFAULT '{}'")
-            self._ensure_column(db, "v1_await_handles", "cleanup_capability", "TEXT")
-            self._ensure_column(db, "v1_await_handles", "cleanup_arguments_json", "TEXT NOT NULL DEFAULT '{}'")
-            self._ensure_column(db, "v1_await_handles", "idempotency_key", "TEXT")
-            self._ensure_column(db, "v1_await_handles", "checkpoint_json", "TEXT NOT NULL DEFAULT '{}'")
-            self._ensure_column(db, "v1_await_handles", "event_type", "TEXT")
-            self._ensure_column(db, "v1_await_handles", "correlation_key", "TEXT")
-            self._ensure_column(db, "v1_await_handles", "resume_at", "TEXT")
-            self._ensure_column(db, "v1_project_mailbox", "claim_owner", "TEXT")
-            self._ensure_column(db, "v1_project_mailbox", "claim_expires_at", "TEXT")
-            self._ensure_column(db, "v1_project_mailbox", "acknowledged_at", "TEXT")
-            self._ensure_column(db, "v1_project_mailbox", "governance_decision_id", "TEXT")
-            self._ensure_column(db, "v1_project_mailbox", "event_id", "INTEGER")
-            self._ensure_column(db, "v1_project_mailbox", "reported_message_id", "INTEGER")
-            self._ensure_column(db, "v1_project_mailbox", "reported_at", "TEXT")
-            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_v1_mailbox_event ON v1_project_mailbox(event_id) WHERE event_id IS NOT NULL")
-            self._ensure_column(db, "v1_workflows", "source_loop_key", "TEXT")
-            self._ensure_column(db, "v1_workflows", "source_loop_version", "TEXT")
-            self._ensure_column(db, "v1_workflows", "source_loop_digest", "TEXT")
-            self._ensure_column(db, "v1_workflow_revisions", "workflow_id", "TEXT")
-            self._ensure_column(db, "v1_workflow_revisions", "revision_no", "INTEGER")
-            self._ensure_column(db, "v1_workflow_revisions", "schema_version", "TEXT NOT NULL DEFAULT 'devwerk.workflow.v1'")
-            self._ensure_column(db, "v1_workflow_revisions", "definition_hash", "TEXT")
-            self._ensure_column(db, "v1_workflow_revisions", "orchestration_plan_id", "TEXT")
-            self._ensure_column(db, "v1_agent_runs", "platform_policy_revision", "INTEGER")
-            self._ensure_column(db, "v1_agent_runs", "platform_policy_hash", "TEXT")
-            self._ensure_column(db, "v1_agent_runs", "runtime_policy_revision", "INTEGER")
-            self._ensure_column(db, "v1_agent_runs", "runtime_policy_hash", "TEXT")
-            self._ensure_column(db, "v1_agent_runs", "checkpoint_json", "TEXT NOT NULL DEFAULT '{}'")
-            self._ensure_column(db, "v1_agent_runs", "agent_session_id", "TEXT")
-            db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_v1_agent_runs_session "
-                "ON v1_agent_runs(agent_session_id, created_at)"
-            )
-            self._ensure_column(db, "v1_agent_runs", "error_code", "TEXT")
-            self._ensure_column(db, "v1_agent_runs", "error_category", "TEXT")
-            self._ensure_column(db, "v1_agent_runs", "duration_seconds", "REAL")
-            self._ensure_column(db, "v1_agent_runs", "column_attempt_id", "TEXT")
-            self._ensure_column(db, "v1_agent_runs", "conversation_job_id", "TEXT")
-            db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_v1_agent_runs_conversation_job "
-                "ON v1_agent_runs(conversation_job_id, created_at)"
-            )
-            for row in db.execute(
-                "SELECT id,project_id,revision,definition_json,active,created_at FROM v1_workflow_revisions"
-            ).fetchall():
-                definition_hash = hashlib.sha256(str(row[3]).encode("utf-8")).hexdigest()
-                workflow_row = db.execute("SELECT id FROM v1_workflows WHERE project_id=?", (row[1],)).fetchone()
-                workflow_id = workflow_row[0] if workflow_row else new_id("workflow")
-                if not workflow_row:
-                    name = str(json.loads(row[3])["name"])
-                    db.execute(
-                        "INSERT INTO v1_workflows(id,project_id,name,active_revision_id,state_version,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-                        (workflow_id, row[1], name, row[0] if row[4] else None, 1, row[5], row[5]),
-                    )
-                elif row[4]:
-                    db.execute(
-                        "UPDATE v1_workflows SET active_revision_id=?,updated_at=? WHERE id=?",
-                        (row[0], row[5], workflow_id),
-                    )
-                db.execute(
-                    "UPDATE v1_workflow_revisions SET workflow_id=COALESCE(workflow_id,?),revision_no=COALESCE(revision_no,revision),definition_hash=COALESCE(definition_hash,?) WHERE id=?",
-                    (workflow_id, definition_hash, row[0]),
-                )
-            db.execute("UPDATE v1_column_runs SET project_id=(SELECT project_id FROM v1_tasks WHERE id=v1_column_runs.task_id) WHERE project_id='' ")
-            db.execute("UPDATE v1_agent_messages SET project_id=(SELECT project_id FROM v1_agent_runs WHERE id=v1_agent_messages.agent_run_id) WHERE project_id='' ")
-            db.execute("UPDATE v1_tool_invocations SET project_id=(SELECT project_id FROM v1_agent_runs WHERE id=v1_tool_invocations.agent_run_id) WHERE project_id='' ")
-            db.execute("UPDATE v1_await_handles SET project_id=(SELECT project_id FROM v1_tasks WHERE id=v1_await_handles.task_id) WHERE project_id='' ")
-            # Preset definitions are filesystem Loops. Remove the obsolete SQLite copies
-            # after the new schema is ready; active Project Workflow revisions remain intact.
-            db.execute("DROP TABLE IF EXISTS v1_project_template_applications")
-            db.execute("DROP TABLE IF EXISTS v1_workflow_templates")
-            self._validate_persisted_runtime_statuses(db)
+        self.schema_repository.init_schema()
 
-    @staticmethod
-    def _validate_persisted_runtime_statuses(db: sqlite3.Connection) -> None:
-        definitions = (
-            ("v1_tasks", TASK_STATE_MACHINE),
-            ("v1_column_runs", COLUMN_RUN_STATE_MACHINE),
-            ("v1_column_attempts", ATTEMPT_STATE_MACHINE),
-            ("v1_agent_runs", AGENT_RUN_STATE_MACHINE),
-        )
-        for table, machine in definitions:
-            for row in db.execute(f"SELECT DISTINCT status FROM {table}").fetchall():
-                try:
-                    machine.parse(row[0])
-                except ValueError as exc:
-                    raise RuntimeError(
-                        f"{table} contains unknown Runtime status {row[0]!r}"
-                    ) from exc
-        invalid_tools = db.execute(
-            "SELECT DISTINCT ok FROM v1_tool_invocations WHERE ok NOT IN (0,1)"
-        ).fetchall()
-        if invalid_tools:
-            raise RuntimeError(
-                f"v1_tool_invocations contains invalid ok values: {[row[0] for row in invalid_tools]}"
-            )
+    def _validate_persisted_runtime_statuses(self, db: sqlite3.Connection) -> None:
+        self.schema_repository._validate_persisted_runtime_statuses(db)
 
     def list_loops(
         self,
@@ -813,11 +381,8 @@ class V1Store:
             "created_at": now,
         }
 
-    @staticmethod
-    def _ensure_column(db: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-        existing = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
-        if column not in existing:
-            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+    def _ensure_column(self, db: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        self.schema_repository._ensure_column(db, table, column, definition)
 
     @staticmethod
     def _dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -907,53 +472,19 @@ class V1Store:
         return result
 
     def create_project(self, name: str, description: str, base_dir: str, agent_instruction: str = "") -> dict[str, Any]:
-        project_id, now = new_id("prj"), utcnow()
-        canonical_base_dir = str(Path(base_dir).expanduser().resolve())
-        Path(canonical_base_dir).mkdir(parents=True, exist_ok=True)
-        with self.tx(immediate=True) as db:
-            db.execute(
-                "INSERT INTO v1_projects(id,name,description,base_dir,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-                (project_id, name, description, canonical_base_dir, now, now),
-            )
-            db.execute(
-                "INSERT INTO v1_conversation_agents(project_id,logical_id,state,instruction,instruction_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-                (project_id, new_id("ca"), "idle", agent_instruction, 1, now, now),
-            )
-            self._event(db, project_id, None, None, "project.created", {"name": name})
-            self._refresh_projection(db, project_id)
-        return self.get_project(project_id)
+        return self.projects.create_project(name, description, base_dir, agent_instruction)
 
     def conversation_agent(self, project_id: str) -> dict[str, Any]:
-        with self.connect() as db:
-            row = self._dict(db.execute(
-                "SELECT * FROM v1_conversation_agents WHERE project_id=?", (project_id,)
-            ).fetchone())
-        if not row:
-            raise KeyError(project_id)
-        return row
+        return self.projects.conversation_agent(project_id)
 
     def update_conversation_instruction(self, project_id: str, instruction: str) -> dict[str, Any]:
-        now = utcnow()
-        with self.tx(immediate=True) as db:
-            changed = db.execute(
-                "UPDATE v1_conversation_agents SET instruction=?,instruction_revision=instruction_revision+1,updated_at=? WHERE project_id=?",
-                (instruction, now, project_id),
-            ).rowcount
-            if changed != 1:
-                raise KeyError(project_id)
-            self._event(db, project_id, None, None, "agent.instruction_updated", {})
-        return self.conversation_agent(project_id)
+        return self.projects.update_conversation_instruction(project_id, instruction)
 
     def list_projects(self) -> list[dict[str, Any]]:
-        with self.connect() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM v1_projects ORDER BY created_at DESC")]
+        return self.projects.list_projects()
 
     def get_project(self, project_id: str) -> dict[str, Any]:
-        with self.connect() as db:
-            row = self._dict(db.execute("SELECT * FROM v1_projects WHERE id=?", (project_id,)).fetchone())
-        if not row:
-            raise KeyError(project_id)
-        return row
+        return self.projects.get_project(project_id)
 
     def add_message(self, project_id: str, role: str, content: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
         now = utcnow()
@@ -1425,9 +956,13 @@ class V1Store:
 
     def publish_workflow(self, project_id: str, workflow: WorkflowDefinition, orchestration_plan_id: str) -> dict[str, Any]:
         try:
-            self.get_workflow(project_id)
+            active = self.get_workflow(project_id)
         except KeyError as exc:
             raise ValueError("initial Workflow creation requires loop.apply") from exc
+        if not all(active.get(field) for field in (
+            "source_loop_key", "source_loop_version", "source_loop_digest"
+        )):
+            raise ValueError("Workflow revisions require an existing filesystem Loop application")
         return self._publish_workflow_revision(project_id, workflow, orchestration_plan_id)
 
     def _publish_workflow_revision(
@@ -1737,691 +1272,56 @@ class V1Store:
             self._event(db, project_id, None, None, "backlog.recorded", {"backlog_id": backlog_id, "decision": decision})
         return {"id": backlog_id, "project_id": project_id, "title": title, "brief": brief, "readiness": readiness, "state": decision, "created_at": now, "updated_at": now}
 
-    def schedule_task(
-        self,
-        project_id: str,
-        task_id: str,
-        state: str,
-        priority: int,
-        wip_group: str | None,
-        wip_limit: int | None,
-        dependencies: list[str] | None,
-        resources: list[str] | None,
-    ) -> dict[str, Any]:
-        task = self.get_project_task(project_id, task_id)
-        if state not in {"admitted", "queued", "hold", "cancelled"}:
-            raise ValueError("invalid scheduling state")
-        now = utcnow()
-        with self.tx(immediate=True) as db:
-            existing = db.execute(
-                "SELECT dependencies_json,resources_json,wip_group,wip_limit,auto_admit FROM v1_scheduling_entries WHERE task_id=? AND project_id=?",
-                (task_id, project_id),
-            ).fetchone()
-            if not existing:
-                raise ValueError("Task has no scheduling entry")
-            if wip_group is None:
-                wip_group = str(existing[2])
-            if wip_limit is None:
-                wip_limit = int(existing[3])
-            original_dependencies = list(json.loads(existing[0] or "[]"))
-            canonical_dependencies: list[str] = []
-            dependencies_changed = False
-            for dependency in original_dependencies:
-                if not isinstance(dependency, str) or not dependency.startswith("plan:"):
-                    canonical_dependencies.append(dependency)
-                    continue
-                _, plan_id, task_ref = dependency.split(":", 2)
-                match = db.execute(
-                    "SELECT id FROM v1_tasks WHERE project_id=? AND orchestration_plan_id=? "
-                    "AND proposed_task_ref=? AND status='done' "
-                    "ORDER BY finished_at DESC,created_at DESC LIMIT 1",
-                    (project_id, plan_id, task_ref),
-                ).fetchone()
-                if not match:
-                    match = db.execute(
-                        "SELECT successor.id FROM v1_tasks predecessor "
-                        "JOIN v1_tasks successor ON successor.id=predecessor.resolved_by_task_id "
-                        "WHERE predecessor.project_id=? AND predecessor.orchestration_plan_id=? "
-                        "AND predecessor.proposed_task_ref=? AND predecessor.status='failed' "
-                        "AND successor.project_id=predecessor.project_id AND successor.status='done' "
-                        "ORDER BY successor.finished_at DESC,successor.created_at DESC LIMIT 1",
-                        (project_id, plan_id, task_ref),
-                    ).fetchone()
-                if not match:
-                    canonical_dependencies.append(dependency)
-                    continue
-                dependency_id = str(match[0])
-                canonical_dependencies.append(dependency_id)
-                db.execute(
-                    "INSERT OR IGNORE INTO v1_task_dependencies(task_id,depends_on_task_id,project_id,required_terminal,created_at) VALUES(?,?,?,'done',?)",
-                    (task_id, dependency_id, project_id, now),
-                )
-                dependencies_changed = True
-            if dependencies_changed:
-                db.execute(
-                    "UPDATE v1_scheduling_entries SET dependencies_json=?,updated_at=? WHERE task_id=? AND project_id=?",
-                    (json.dumps(canonical_dependencies), now, task_id, project_id),
-                )
-        canonical_resources = list(task["conflict_domains"])
-        if (
-            dependencies is not None
-            and set(dependencies) != set(original_dependencies)
-            and set(dependencies) != set(canonical_dependencies)
-        ):
-            raise ValueError("scheduling dependencies must preserve the Task's orchestration-plan dependencies")
-        if resources is not None and set(resources) != set(canonical_resources):
-            raise ValueError("scheduling resources must preserve the Task's orchestration-plan conflict domains")
-        dependencies = canonical_dependencies
-        resources = canonical_resources
-        auto_admit = int(bool(existing[4]) and state == "queued")
-        if state == "admitted":
-            with self.connect() as db:
-                unsatisfied = [
-                    dependency
-                    for dependency in dependencies
-                    if not isinstance(dependency, str)
-                    or dependency.startswith("plan:")
-                    or not (
-                        (row := db.execute(
-                            "SELECT status FROM v1_tasks WHERE id=? AND project_id=?",
-                            (dependency, project_id),
-                        ).fetchone())
-                        and row[0] == "done"
-                    )
-                ]
-            if unsatisfied:
-                raise ValueError("dependency_unsatisfied: Task cannot be admitted until all orchestration-plan dependencies are done")
-        with self.tx(immediate=True) as db:
-            db.execute(
-                "INSERT INTO v1_scheduling_entries(task_id,project_id,state,priority,wip_group,wip_limit,dependencies_json,resources_json,created_at,updated_at,auto_admit) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(task_id) DO UPDATE SET state=excluded.state,priority=excluded.priority,wip_group=excluded.wip_group,wip_limit=excluded.wip_limit,dependencies_json=excluded.dependencies_json,resources_json=excluded.resources_json,auto_admit=excluded.auto_admit,updated_at=excluded.updated_at",
-                (task_id, project_id, state, priority, wip_group, wip_limit, json.dumps(dependencies), json.dumps(resources), now, now, auto_admit),
-            )
-            db.execute("UPDATE v1_tasks SET updated_at=? WHERE id=?", (now, task_id))
-            self._event(db, project_id, task_id, None, "scheduling.decided", {"state": state, "priority": priority, "wip_group": wip_group, "wip_limit": wip_limit, "dependencies": dependencies, "resources": resources})
-        return {"project_id": project_id, "task_id": task_id, "state": state, "priority": priority, "wip_group": wip_group, "wip_limit": wip_limit, "dependencies": dependencies, "resources": resources, "updated_at": now}
+    def schedule_task(self, project_id: str, task_id: str, state: str, priority: int, wip_group: str | None, wip_limit: int | None, dependencies: list[str] | None, resources: list[str] | None) -> dict[str, Any]:
+        return self.scheduler.schedule_task(project_id, task_id, state, priority, wip_group, wip_limit, dependencies, resources)
 
     def task_scheduling(self, project_id: str, task_id: str) -> dict[str, Any]:
-        task = self.get_project_task(project_id, task_id)
-        now = utcnow()
-        with self.connect() as db:
-            row = self._dict(db.execute(
-                "SELECT task_id,project_id,state,priority,wip_group,wip_limit,dependencies_json,resources_json,"
-                "auto_admit,created_at,updated_at FROM v1_scheduling_entries WHERE task_id=? AND project_id=?",
-                (task_id, project_id),
-            ).fetchone())
-            if not row:
-                raise KeyError(f"no scheduling entry for {task_id}")
-            dependencies = json.loads(row.pop("dependencies_json") or "[]")
-            dependency_facts: list[dict[str, Any]] = []
-            for dependency in dependencies:
-                if isinstance(dependency, str) and dependency.startswith("plan:"):
-                    _, plan_id, task_ref = dependency.split(":", 2)
-                    latest = db.execute(
-                        "SELECT id,status,resolved_by_task_id FROM v1_tasks "
-                        "WHERE project_id=? AND orchestration_plan_id=? AND proposed_task_ref=? "
-                        "ORDER BY created_at DESC LIMIT 1",
-                        (project_id, plan_id, task_ref),
-                    ).fetchone()
-                    dependency_facts.append({
-                        "reference": dependency,
-                        "plan_id": plan_id,
-                        "task_ref": task_ref,
-                        "resolved_task_id": None,
-                        "required_terminal": "done",
-                        "latest_task_id": latest[0] if latest else None,
-                        "status": latest[1] if latest else "unmaterialized",
-                        "resolved_by_task_id": latest[2] if latest else None,
-                        "satisfied": False,
-                    })
-                    continue
-                dependency_row = db.execute(
-                    "SELECT id,status,proposed_task_ref FROM v1_tasks WHERE id=? AND project_id=?",
-                    (dependency, project_id),
-                ).fetchone()
-                dependency_facts.append({
-                    "reference": dependency,
-                    "task_ref": dependency_row[2] if dependency_row else None,
-                    "resolved_task_id": dependency_row[0] if dependency_row else None,
-                    "required_terminal": "done",
-                    "status": dependency_row[1] if dependency_row else "missing",
-                    "satisfied": bool(dependency_row and dependency_row[1] == "done"),
-                })
-            eligible = self._dispatch_eligible(db, task_id, now)
-        row["dependencies"] = dependency_facts
-        row["resources"] = json.loads(row.pop("resources_json") or "[]")
-        row["auto_admit"] = bool(row["auto_admit"])
-        row["dispatch_eligible"] = eligible
-        if task["status"] in {"done", "failed"}:
-            pending_reason = "terminal"
-        elif task["status"] == "running":
-            pending_reason = "running"
-        elif task["status"] == "waiting":
-            pending_reason = "external_wait"
-        elif any(not item["satisfied"] for item in dependency_facts):
-            pending_reason = "waiting_dependency"
-        elif row["state"] == "queued":
-            pending_reason = "explicit_queue"
-        elif row["state"] == "hold":
-            pending_reason = "hold"
-        elif eligible:
-            pending_reason = "ready"
-        else:
-            pending_reason = "waiting_wip_or_resource"
-        row["pending_reason"] = pending_reason
-        row["blocked_by"] = [
-            item for item in dependency_facts if not item["satisfied"]
-        ]
-        return row
+        return self.scheduler.task_scheduling(project_id, task_id)
 
     def task_dependency_context(self, project_id: str, task_id: str) -> list[dict[str, Any]]:
-        self.get_project_task(project_id, task_id)
-        with self.connect() as db:
-            rows = db.execute(
-                "SELECT dep.id,dep.proposed_task_ref,dep.title,dep.status,dep.finished_at,"
-                "dep.terminal_artifact_id,a.kind,a.path,a.sha256,a.size "
-                "FROM v1_task_dependencies d "
-                "JOIN v1_tasks dep ON dep.id=d.depends_on_task_id AND dep.project_id=d.project_id "
-                "LEFT JOIN v1_artifacts a ON a.id=dep.terminal_artifact_id AND a.project_id=dep.project_id "
-                "WHERE d.task_id=? AND d.project_id=? ORDER BY d.created_at,dep.id",
-                (task_id, project_id),
-            ).fetchall()
-        return [
-            {
-                "task_id": row[0],
-                "task_ref": row[1],
-                "title": row[2],
-                "status": row[3],
-                "finished_at": row[4],
-                "terminal_artifact": (
-                    {
-                        "id": row[5],
-                        "kind": row[6],
-                        "path": row[7],
-                        "sha256": row[8],
-                        "size": row[9],
-                    }
-                    if row[5]
-                    else None
-                ),
-            }
-            for row in rows
-        ]
+        return self.scheduler.task_dependency_context(project_id, task_id)
 
     def retry_task(self, task_id: str, column_key: str | None = None, *, clear_context: bool = False) -> dict[str, Any]:
-        task = self.get_task(task_id)
-        if task["status"] in {"done", "failed"}:
-            raise ValueError("terminal Tasks are immutable; use task.rerun to create a successor")
-        if task["status"] == "running":
-            raise ValueError("a running Task cannot be retried until its active Attempt stops")
-        TASK_STATE_MACHINE.require(task["status"], TaskStatus.PENDING)
-        workflow = self.workflow_by_id(task["project_id"], task["workflow_revision_id"])
-        target = column_key or workflow.entry
-        if workflow.terminal_kind(target):
-            raise ValueError("retry target must be a non-terminal Column")
-        workflow.column(target)
-        now = utcnow()
-        context = {} if clear_context else task["context"]
-        with self.tx(immediate=True) as db:
-            db.execute(
-                "UPDATE v1_tasks SET status='pending',control_state='active',current_column=?,attempt=0,context_json=?,error=NULL,lease_owner=NULL,lease_until=NULL,finished_at=NULL,state_version=state_version+1,updated_at=? WHERE id=?",
-                (target, json.dumps(context, ensure_ascii=False), now, task_id),
-            )
-            data = {"target": target, "clear_context": clear_context}
-            self._event(db, task["project_id"], task_id, None, "task.retry_requested", data)
-            self._mailbox(db, task["project_id"], "task.retry_requested", task_id, None, data)
-        return self.get_task(task_id)
+        return self.recovery_manager.retry_task(task_id, column_key, clear_context=clear_context)
 
     def reopen_task(self, task_id: str, column_key: str | None = None, *, clear_context: bool = False) -> dict[str, Any]:
-        task = self.get_task(task_id)
-        if task["status"] != "failed":
-            raise ValueError("task.reopen requires a failed Task; review rejection follows Workflow transitions")
-        TASK_STATE_MACHINE.require(task["status"], TaskStatus.PENDING)
-        workflow = self.workflow_by_id(task["project_id"], task["workflow_revision_id"])
-        target = column_key or workflow.entry
-        if workflow.terminal_kind(target):
-            raise ValueError("task.reopen target must be a non-terminal Column")
-        workflow.column(target)
-        now = utcnow()
-        context = {} if clear_context else task["context"]
-        with self.tx(immediate=True) as db:
-            sequence = int(db.execute(
-                "SELECT COALESCE(MAX(sequence),0)+1 FROM v1_column_runs WHERE task_id=?",
-                (task_id,),
-            ).fetchone()[0])
-            run_id = new_id("run")
-            db.execute(
-                "INSERT INTO v1_column_runs(id,project_id,task_id,column_key,sequence,status,attempt,input_json,created_at) "
-                "VALUES(?,?,?,?,?,'pending',0,'{}',?)",
-                (run_id, task["project_id"], task_id, target, sequence, now),
-            )
-            changed = db.execute(
-                "UPDATE v1_tasks SET status='pending',control_state='active',current_column=?,attempt=0,"
-                "context_json=?,error=NULL,lease_owner=NULL,lease_until=NULL,finished_at=NULL,"
-                "terminal_artifact_id=NULL,terminal_event_id=NULL,notified_at=NULL,observed_at=NULL,"
-                "supervision_action='reopened',state_version=state_version+1,updated_at=? "
-                "WHERE id=? AND status='failed'",
-                (target, json.dumps(context, ensure_ascii=False), now, task_id),
-            ).rowcount
-            if changed != 1:
-                raise RuntimeError("Task changed while reopening")
-            dependencies = json.loads(db.execute(
-                "SELECT dependencies_json FROM v1_scheduling_entries WHERE task_id=?",
-                (task_id,),
-            ).fetchone()[0] or "[]")
-            eligible = all(
-                isinstance(dependency, str)
-                and not dependency.startswith("plan:")
-                and (
-                    (row := db.execute(
-                        "SELECT status FROM v1_tasks WHERE id=? AND project_id=?",
-                        (dependency, task["project_id"]),
-                    ).fetchone())
-                    and row[0] == "done"
-                )
-                for dependency in dependencies
-            )
-            schedule_state = "admitted" if eligible else "queued"
-            db.execute(
-                "UPDATE v1_scheduling_entries SET state=?,auto_admit=?,updated_at=? WHERE task_id=?",
-                (schedule_state, int(not eligible), now, task_id),
-            )
-            data = {
-                "target": target,
-                "clear_context": clear_context,
-                "column_run_id": run_id,
-                "schedule_state": schedule_state,
-                "previous_error": task.get("error"),
-            }
-            self._event(db, task["project_id"], task_id, run_id, "task.reopened", data)
-            self._mailbox(db, task["project_id"], "task.reopened", task_id, run_id, data)
-            self._refresh_projection(db, task["project_id"])
-        return self.get_task(task_id)
+        return self.recovery_manager.reopen_task(task_id, column_key, clear_context=clear_context)
 
     def route_task_to_failed(self, task_id: str, reason: str) -> dict[str, Any]:
-        task = self.get_task(task_id)
-        if task["status"] in {"done", "failed"}:
-            raise ValueError("terminal Tasks are immutable")
-        return self._fail_task_now(task, reason, "cancelled")
+        return self.recovery_manager.route_task_to_failed(task_id, reason)
 
     def rerun_task(self, task_id: str) -> dict[str, Any]:
-        task = self.get_task(task_id)
-        if task["status"] not in {"done", "failed"}:
-            raise ValueError("task.rerun requires an immutable terminal Task")
-        workflow = self.get_workflow(task["project_id"])
-        orchestration_plan_id = str(
-            workflow.get("orchestration_plan_id") or task["orchestration_plan_id"]
-        )
-        return self.create_task(
-            task["project_id"],
-            task["title"],
-            task["brief"],
-            task["input"],
-            task["readiness"],
-            orchestration_plan_id=orchestration_plan_id,
-            proposed_task_ref=task["proposed_task_ref"],
-            rerun_of_task_id=task["id"],
-        )
+        return self.recovery_manager.rerun_task(task_id)
 
     def pause_task(self, task_id: str) -> dict[str, Any]:
-        task = self.get_task(task_id)
-        if task["status"] in {"done", "failed"}:
-            raise ValueError("terminal Tasks are immutable")
-        now = utcnow()
-        target_state = "pause_requested" if task["status"] == "running" else "paused"
-        with self.tx(immediate=True) as db:
-            changed = db.execute(
-                "UPDATE v1_tasks SET control_state=?,state_version=state_version+1,updated_at=? WHERE id=? AND status NOT IN ('done','failed')",
-                (target_state, now, task_id),
-            ).rowcount
-            if changed != 1:
-                raise RuntimeError("Task changed while pausing")
-            self._event(db, task["project_id"], task_id, None, "task.pause_requested", {})
-            self._mailbox(db, task["project_id"], "task.pause_requested", task_id, None, {})
-            self._refresh_projection(db, task["project_id"])
-        return self.get_task(task_id)
+        return self.recovery_manager.pause_task(task_id)
 
     def resume_task(self, task_id: str) -> dict[str, Any]:
-        task = self.get_task(task_id)
-        if task["status"] in {"done", "failed"}:
-            raise ValueError("terminal Tasks are immutable")
-        if task.get("control_state") not in {"paused", "pause_requested"}:
-            raise ValueError("Task is not paused")
-        now = utcnow()
-        with self.tx(immediate=True) as db:
-            db.execute(
-                "UPDATE v1_tasks SET control_state='active',state_version=state_version+1,updated_at=? WHERE id=? AND status NOT IN ('done','failed')",
-                (now, task_id),
-            )
-            self._event(db, task["project_id"], task_id, None, "task.resumed", {})
-            self._mailbox(db, task["project_id"], "task.resumed", task_id, None, {})
-            self._refresh_projection(db, task["project_id"])
-        return self.get_task(task_id)
+        return self.recovery_manager.resume_task(task_id)
 
     def fail_task_from_exception(self, task: dict[str, Any], run_id: str, error: str, terminal_artifact: dict[str, Any], *, checkpoint: dict[str, Any] | None = None) -> None:
-        TASK_STATE_MACHINE.require(task["status"], TaskStatus.FAILED)
-        now = utcnow()
-        with self.tx(immediate=True) as db:
-            db.execute("UPDATE v1_column_runs SET status='failed',error=?,finished_at=? WHERE id=?", (error, now, run_id))
-            db.execute("UPDATE v1_column_attempts SET status='failed',error=?,checkpoint_json=?,finished_at=? WHERE column_run_id=? AND status IN ('running','waiting')", (error, self._pack_json(checkpoint or {}), now, run_id))
-            db.execute(
-                "UPDATE v1_tasks SET status='failed',error=?,lease_owner=NULL,lease_until=NULL,state_version=state_version+1,updated_at=?,finished_at=? WHERE id=?",
-                (error, now, now, task["id"]),
-            )
-            artifact_id = new_id("art")
-            db.execute("INSERT INTO v1_artifacts(id,project_id,task_id,run_id,kind,path,sha256,size,meta_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(project_id,path) DO UPDATE SET id=excluded.id,task_id=excluded.task_id,run_id=excluded.run_id,kind=excluded.kind,sha256=excluded.sha256,size=excluded.size,meta_json=excluded.meta_json,created_at=excluded.created_at", (artifact_id, task["project_id"], task["id"], run_id, terminal_artifact["kind"], terminal_artifact["path"], terminal_artifact["sha256"], terminal_artifact["size"], json.dumps(terminal_artifact["meta"]), now))
-            data = {"error": error, "reason": "runtime_definition_unavailable", "artifact_id": artifact_id}
-            self._event(db, task["project_id"], task["id"], run_id, "task.failed", data)
-            terminal_event_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-            self._mailbox(db, task["project_id"], "task.failed", task["id"], run_id, data)
-            db.execute("UPDATE v1_tasks SET terminal_artifact_id=?,terminal_event_id=?,notified_at=?,state_version=state_version+1 WHERE id=?", (artifact_id, terminal_event_id, now, task["id"]))
-            self._refresh_projection(db, task["project_id"])
+        self.recovery_manager.fail_task_from_exception(task, run_id, error, terminal_artifact, checkpoint=checkpoint)
 
-    def recover_task_from_exception(
-        self,
-        task: dict[str, Any],
-        run_id: str,
-        error: str,
-        *,
-        error_code: str,
-        error_category: str,
-        checkpoint: dict[str, Any] | None = None,
-        agent_run_id: str | None = None,
-    ) -> None:
-        TASK_STATE_MACHINE.require(task["status"], TaskStatus.RECOVERING)
-        now = utcnow()
-        next_retry_at = (
-            datetime.now(timezone.utc)
-            + timedelta(seconds=self.policy.scheduling.recovery_retry_delay_seconds)
-        ).isoformat(timespec="milliseconds")
-        with self.tx(immediate=True) as db:
-            db.execute(
-                "UPDATE v1_column_runs SET status='failed',error=?,error_category=?,finished_at=? WHERE id=?",
-                (error, error_category, now, run_id),
-            )
-            db.execute(
-                "UPDATE v1_column_attempts SET status='failed',error=?,error_code=?,error_category=?,"
-                "checkpoint_json=?,agent_run_id=COALESCE(?,agent_run_id),finished_at=? "
-                "WHERE column_run_id=? AND status IN ('running','waiting')",
-                (error, error_code, error_category, self._pack_json(checkpoint or {}), agent_run_id, now, run_id),
-            )
-            changed = db.execute(
-                "UPDATE v1_tasks SET status='recovering',error=?,lease_owner=NULL,lease_until=NULL,next_retry_at=?,"
-                "finished_at=NULL,supervision_action='recovering',state_version=state_version+1,updated_at=? "
-                "WHERE id=? AND state_version=? AND status='running'",
-                (error, next_retry_at, now, task["id"], task["state_version"]),
-            ).rowcount
-            if changed != 1:
-                raise RuntimeError("stale Task state_version while entering recovery")
-            self._event(
-                db,
-                task["project_id"],
-                task["id"],
-                run_id,
-                "task.recovering",
-                {
-                    "column": task["current_column"],
-                    "failed_run_id": run_id,
-                    "error": error,
-                    "error_code": error_code,
-                    "error_category": error_category,
-                    "retry_after_seconds": self.policy.scheduling.recovery_retry_delay_seconds,
-                    "next_retry_at": next_retry_at,
-                },
-            )
-            self._refresh_projection(db, task["project_id"])
+    def recover_task_from_exception(self, task: dict[str, Any], run_id: str, error: str, *, error_code: str, error_category: str, checkpoint: dict[str, Any] | None = None, agent_run_id: str | None = None) -> None:
+        self.recovery_manager.recover_task_from_exception(task, run_id, error, error_code=error_code, error_category=error_category, checkpoint=checkpoint, agent_run_id=agent_run_id)
 
     def _fail_task_now(self, task: dict[str, Any], reason: str, failure_code: str) -> dict[str, Any]:
-        now = utcnow()
-        workflow = self.workflow_by_id(task["project_id"], task["workflow_revision_id"])
-        failed_column = workflow.terminal_key("failed")
-        with self.connect() as db:
-            row = db.execute(
-                "SELECT id FROM v1_column_runs WHERE task_id=? ORDER BY sequence DESC LIMIT 1",
-                (task["id"],),
-            ).fetchone()
-        run_id = row[0] if row else None
-        payload = {
-            "schema": "devwerk.task-terminal.v1",
-            "project_id": task["project_id"],
-            "task_id": task["id"],
-            "column_run_id": run_id,
-            "terminal": "failed",
-            "failure_code": failure_code,
-            "error": reason,
-            "recorded_at": now,
-        }
-        info = ProjectFiles(self.get_project(task["project_id"])["base_dir"], self.policy).write_text(
-            f".devwerk/terminal/{task['id']}.json",
-            json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
-        )
-        with self.tx(immediate=True) as db:
-            current = db.execute("SELECT status FROM v1_tasks WHERE id=?", (task["id"],)).fetchone()
-            if not current:
-                raise KeyError(task["id"])
-            if current[0] in {"done", "failed"}:
-                return self.get_task(task["id"])
-            TASK_STATE_MACHINE.require(current[0], TaskStatus.FAILED)
-            db.execute(
-                "UPDATE v1_column_runs SET status='failed',error=?,finished_at=? WHERE task_id=? AND status IN ('pending','running','waiting')",
-                (reason, now, task["id"]),
-            )
-            db.execute(
-                "UPDATE v1_column_attempts SET status='failed',error=?,finished_at=? WHERE task_id=? AND status IN ('running','waiting')",
-                (reason, now, task["id"]),
-            )
-            db.execute("UPDATE v1_await_handles SET status='cancelled',updated_at=? WHERE task_id=? AND status='pending'", (now, task["id"]))
-            changed = db.execute(
-                "UPDATE v1_tasks SET status='failed',control_state='active',current_column=?,error=?,lease_owner=NULL,lease_until=NULL,state_version=state_version+1,updated_at=?,finished_at=? WHERE id=? AND status NOT IN ('done','failed')",
-                (failed_column, reason, now, now, task["id"]),
-            ).rowcount
-            if changed != 1:
-                raise RuntimeError("Task changed while applying terminal failure")
-            artifact_id = new_id("art")
-            db.execute(
-                "INSERT INTO v1_artifacts(id,project_id,task_id,run_id,kind,path,sha256,size,meta_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(project_id,path) DO UPDATE SET id=excluded.id,task_id=excluded.task_id,run_id=excluded.run_id,kind=excluded.kind,sha256=excluded.sha256,size=excluded.size,meta_json=excluded.meta_json,created_at=excluded.created_at",
-                (artifact_id, task["project_id"], task["id"], run_id, "task_terminal", info["path"], info["sha256"], info["size"], json.dumps({"terminal": "failed", "failure_code": failure_code}, ensure_ascii=False), now),
-            )
-            data = {"error": reason, "failure_code": failure_code, "artifact_id": artifact_id}
-            self._event(db, task["project_id"], task["id"], run_id, "task.failed", data)
-            terminal_event_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-            self._mailbox(db, task["project_id"], "task.failed", task["id"], run_id, data)
-            db.execute(
-                "UPDATE v1_tasks SET terminal_artifact_id=?,terminal_event_id=?,notified_at=? WHERE id=?",
-                (artifact_id, terminal_event_id, now, task["id"]),
-            )
-            self._refresh_projection(db, task["project_id"])
-        return self.get_task(task["id"])
+        return self.recovery_manager._fail_task_now(task, reason, failure_code)
 
     def claim_task(self, task_id: str, owner: str, lease_seconds: int | None = None) -> dict[str, Any] | None:
-        now = utcnow()
-        lease_seconds = lease_seconds or self.policy.scheduling.task_lease_seconds
-        lease = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat(timespec="milliseconds")
-        with self.tx(immediate=True) as db:
-            requested_row = db.execute(
-                "SELECT t.project_id,s.resources_json,t.status,t.current_column,t.next_retry_at FROM v1_tasks t JOIN v1_scheduling_entries s ON s.task_id=t.id AND s.project_id=t.project_id WHERE t.id=?",
-                (task_id,),
-            ).fetchone()
-            if not requested_row:
-                return None
-            TASK_STATE_MACHINE.parse(requested_row[2])
-            if requested_row[2] in {TaskStatus.PENDING.value, TaskStatus.RECOVERING.value}:
-                TASK_STATE_MACHINE.require(requested_row[2], TaskStatus.RUNNING)
-            requested = json.loads(requested_row[1] or "[]")
-            held_rows = db.execute(
-                "SELECT s.resources_json FROM v1_tasks t JOIN v1_scheduling_entries s ON s.task_id=t.id AND s.project_id=t.project_id "
-                "WHERE t.project_id=? AND t.id!=? AND t.status='running'",
-                (requested_row[0], task_id),
-            ).fetchall()
-            if any(_resource_domains_overlap(requested, json.loads(row[0] or "[]")) for row in held_rows):
-                return None
-            cursor = db.execute(
-                "UPDATE v1_tasks SET status='running',lease_owner=?,lease_until=?,next_retry_at=NULL,state_version=state_version+1,updated_at=? WHERE id=? AND status IN ('pending','recovering') AND control_state='active' "
-                "AND (status!='recovering' OR next_retry_at IS NULL OR next_retry_at<=?) "
-                "AND EXISTS (SELECT 1 FROM v1_scheduling_entries s WHERE s.task_id=v1_tasks.id AND s.project_id=v1_tasks.project_id AND s.state='admitted' "
-                "AND NOT EXISTS (SELECT 1 FROM json_each(s.dependencies_json) d LEFT JOIN v1_tasks dep ON dep.id=d.value WHERE dep.id IS NULL OR dep.status!='done') "
-                "AND (SELECT COUNT(*) FROM v1_tasks active JOIN v1_scheduling_entries sa ON sa.task_id=active.id WHERE active.project_id=v1_tasks.project_id AND active.status='running' AND sa.wip_group=s.wip_group)<s.wip_limit)",
-                (owner, lease, now, task_id, now),
-            )
-            if cursor.rowcount != 1:
-                return None
-            if requested_row[2] == "recovering":
-                self._event(
-                    db,
-                    requested_row[0],
-                    task_id,
-                    None,
-                    "task.recovery_started",
-                    {"column": requested_row[3], "scheduled_retry_at": requested_row[4]},
-                )
-        return self.get_task(task_id)
+        return self.scheduler.claim_task(task_id, owner, lease_seconds)
 
     def renew_lease(self, task_id: str, owner: str, lease_seconds: int | None = None) -> bool:
-        now = utcnow()
-        lease_seconds = lease_seconds or self.policy.scheduling.task_lease_seconds
-        lease = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat(timespec="milliseconds")
-        with self.tx(immediate=True) as db:
-            cursor = db.execute(
-                "UPDATE v1_tasks SET lease_until=?,updated_at=? WHERE id=? AND status='running' AND lease_owner=?",
-                (lease, now, task_id, owner),
-            )
-            if cursor.rowcount == 1:
-                db.execute(
-                    "UPDATE v1_column_runs SET heartbeat_at=? WHERE id=(SELECT id FROM v1_column_runs WHERE task_id=? AND status='running' ORDER BY sequence DESC LIMIT 1)",
-                    (now, task_id),
-                )
-        return cursor.rowcount == 1
+        return self.scheduler.renew_lease(task_id, owner, lease_seconds)
 
     def runnable_task_ids(self, limit: int | None = None) -> list[str]:
-        now = utcnow()
-        limit = limit or self.policy.scheduling.runnable_batch_size
-        self._resolve_planned_dependencies()
-        runnable: list[str] = []
-        with self.tx(immediate=True) as db:
-            rows = db.execute(
-                "SELECT t.id,t.status FROM v1_tasks t JOIN v1_scheduling_entries s ON s.task_id=t.id AND s.project_id=t.project_id "
-                "WHERE t.control_state='active' AND t.status IN ('pending','recovering') "
-                "AND (t.status!='recovering' OR t.next_retry_at IS NULL OR t.next_retry_at<=?) "
-                "ORDER BY s.priority DESC,t.updated_at LIMIT ?",
-                (now, max(limit * 10, limit)),
-            ).fetchall()
-            for row in rows:
-                task_id, status = row[0], row[1]
-                if self._dispatch_eligible(db, task_id, now):
-                    runnable.append(task_id)
-                if len(runnable) >= limit:
-                    break
-        return runnable
+        return self.scheduler.runnable_task_ids(limit)
 
     def _dispatch_eligible(self, db: sqlite3.Connection, task_id: str, now: str) -> bool:
-        row = db.execute(
-            "SELECT t.project_id,t.status,t.control_state,s.state,s.wip_group,s.wip_limit,"
-            "s.dependencies_json,s.resources_json,t.next_retry_at "
-            "FROM v1_tasks t JOIN v1_scheduling_entries s ON s.task_id=t.id AND s.project_id=t.project_id "
-            "WHERE t.id=?",
-            (task_id,),
-        ).fetchone()
-        if not row:
-            return False
-        if row[1] not in {"pending", "recovering"} or row[2] != "active" or row[3] != "admitted":
-            return False
-        if row[1] == "recovering" and row[8] and row[8] > now:
-            return False
-        dependencies = json.loads(row[6] or "[]")
-        for dependency in dependencies:
-            if not isinstance(dependency, str) or dependency.startswith("plan:"):
-                return False
-            dependency_row = db.execute(
-                "SELECT status FROM v1_tasks WHERE id=? AND project_id=?",
-            (dependency, row[0]),
-            ).fetchone()
-            if not dependency_row or dependency_row[0] != "done":
-                return False
-        active_count = db.execute(
-            "SELECT COUNT(*) FROM v1_tasks active JOIN v1_scheduling_entries sa ON sa.task_id=active.id "
-            "WHERE active.project_id=? AND active.status='running' AND sa.wip_group=?",
-            (row[0], row[4]),
-        ).fetchone()[0]
-        if active_count >= int(row[5]):
-            return False
-        requested = json.loads(row[7] or "[]")
-        held_rows = db.execute(
-            "SELECT sa.resources_json FROM v1_tasks active JOIN v1_scheduling_entries sa ON sa.task_id=active.id "
-            "WHERE active.project_id=? AND active.status='running' AND active.id!=?",
-            (row[0], task_id),
-        ).fetchall()
-        return not any(_resource_domains_overlap(requested, json.loads(held[0] or "[]")) for held in held_rows)
+        return self.scheduler._dispatch_eligible(db, task_id, now)
 
     def _resolve_planned_dependencies(self) -> None:
-        now = utcnow()
-        with self.tx(immediate=True) as db:
-            rows = db.execute(
-                "SELECT s.task_id,s.project_id,s.dependencies_json FROM v1_scheduling_entries s "
-                "JOIN v1_tasks t ON t.id=s.task_id AND t.project_id=s.project_id "
-                "WHERE s.state='queued' AND s.auto_admit=1 AND t.status='pending'"
-            ).fetchall()
-            for row in rows:
-                dependencies = json.loads(row[2] or "[]")
-                resolved: list[str] = []
-                changed = False
-                for value in dependencies:
-                    if not isinstance(value, str) or not value.startswith("plan:"):
-                        resolved.append(value)
-                        continue
-                    _, plan_id, task_ref = value.split(":", 2)
-                    match = db.execute(
-                        "SELECT id FROM v1_tasks WHERE project_id=? AND orchestration_plan_id=? AND proposed_task_ref=? AND status='done' "
-                        "ORDER BY finished_at DESC,created_at DESC LIMIT 1",
-                        (row[1], plan_id, task_ref),
-                    ).fetchone()
-                    if not match:
-                        match = db.execute(
-                            "SELECT successor.id FROM v1_tasks predecessor "
-                            "JOIN v1_tasks successor ON successor.id=predecessor.resolved_by_task_id "
-                            "WHERE predecessor.project_id=? AND predecessor.orchestration_plan_id=? "
-                            "AND predecessor.proposed_task_ref=? AND predecessor.status='failed' "
-                            "AND successor.project_id=predecessor.project_id AND successor.status='done' "
-                            "ORDER BY successor.finished_at DESC,successor.created_at DESC LIMIT 1",
-                            (row[1], plan_id, task_ref),
-                        ).fetchone()
-                    if not match:
-                        resolved.append(value)
-                        continue
-                    dependency_id = match[0]
-                    resolved.append(dependency_id)
-                    db.execute(
-                        "INSERT OR IGNORE INTO v1_task_dependencies(task_id,depends_on_task_id,project_id,required_terminal,created_at) VALUES(?,?,?,'done',?)",
-                        (row[0], dependency_id, row[1], now),
-                    )
-                    changed = True
-                if changed:
-                    db.execute(
-                        "UPDATE v1_scheduling_entries SET dependencies_json=?,updated_at=? WHERE task_id=?",
-                        (json.dumps(resolved), now, row[0]),
-                    )
-                if resolved and all(not value.startswith("plan:") for value in resolved):
-                    admitted = db.execute(
-                        "UPDATE v1_scheduling_entries SET state='admitted',auto_admit=0,updated_at=? "
-                        "WHERE task_id=? AND state='queued' AND auto_admit=1",
-                        (now, row[0]),
-                    ).rowcount
-                    if admitted:
-                        db.execute("UPDATE v1_tasks SET updated_at=? WHERE id=? AND status='pending'", (now, row[0]))
-                        db.execute(
-                            "UPDATE v1_backlog_items SET state='dispatched',updated_at=? WHERE task_id=?",
-                            (now, row[0]),
-                        )
-                        self._event(
-                            db,
-                            row[1],
-                            row[0],
-                            None,
-                            "task.dependencies_satisfied",
-                            {
-                                "dependencies": resolved,
-                                "schedule_state": "admitted",
-                            },
-                        )
+        self.scheduler._resolve_planned_dependencies()
 
     def begin_run(self, task: dict[str, Any], input_data: dict[str, Any]) -> dict[str, Any]:
         now = utcnow()
@@ -3035,50 +1935,19 @@ class V1Store:
         return result
 
     def register_artifact(self, project_id: str, task_id: str | None, run_id: str | None, kind: str, path: str, sha256: str, size: int, meta: dict[str, Any] | None = None) -> dict[str, Any]:
-        artifact_id, now = new_id("art"), utcnow()
-        with self.tx(immediate=True) as db:
-            db.execute(
-                "INSERT INTO v1_artifacts(id,project_id,task_id,run_id,kind,path,sha256,size,meta_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(project_id,path) DO UPDATE SET id=excluded.id,task_id=excluded.task_id,run_id=excluded.run_id,kind=excluded.kind,sha256=excluded.sha256,size=excluded.size,meta_json=excluded.meta_json,created_at=excluded.created_at",
-                (artifact_id, project_id, task_id, run_id, kind, path, sha256, size, json.dumps(meta or {}, ensure_ascii=False), now),
-            )
-            self._event(db, project_id, task_id, run_id, "artifact.written", {"path": path, "kind": kind, "size": size})
-        return {"id": artifact_id, "path": path, "kind": kind, "size": size, "sha256": sha256}
+        return self.artifact_repository.register_artifact(project_id, task_id, run_id, kind, path, sha256, size, meta)
 
     def artifacts(self, project_id: str, task_id: str, limit: int | None = None, after: str = "") -> list[dict[str, Any]]:
-        limit = limit or self.policy.service_limits.detail_page_size
-        with self.connect() as db:
-            rows = db.execute("SELECT * FROM v1_artifacts WHERE project_id=? AND task_id=? AND created_at>? ORDER BY created_at LIMIT ?", (project_id, task_id, after, min(max(limit, 1), self.policy.service_limits.max_page_size))).fetchall()
-        return [self._decode(dict(row), "meta_json") for row in rows]  # type: ignore[misc]
+        return self.artifact_repository.artifacts(project_id, task_id, limit, after)
 
     def events(self, project_id: str | None = None, task_id: str | None = None, after: int = 0, limit: int | None = None) -> list[dict[str, Any]]:
-        limit = limit or self.policy.service_limits.detail_page_size
-        where, values = ["id>?"], [after]
-        if project_id:
-            where.append("project_id=?")
-            values.append(project_id)
-        if task_id:
-            where.append("task_id=?")
-            values.append(task_id)
-        values.append(min(max(limit, 1), self.policy.service_limits.max_page_size))
-        with self.connect() as db:
-            rows = db.execute(f"SELECT * FROM v1_events WHERE {' AND '.join(where)} ORDER BY id LIMIT ?", values).fetchall()
-        return [self._decode(dict(row), "data_json") for row in rows]  # type: ignore[misc]
+        return self.event_repository.events(project_id, task_id, after, limit)
 
     def record_external_event(self, project_id: str, event_type: str, correlation_key: str, output: dict[str, Any]) -> dict[str, Any]:
-        self.get_project(project_id)
-        now = utcnow()
-        with self.tx(immediate=True) as db:
-            self._event(db, project_id, None, None, event_type, {"correlation_key": correlation_key, "output": output, "source": "automation_api"})
-            event_id = int(db.execute("SELECT last_insert_rowid()").fetchone()[0])
-        return {"id": event_id, "project_id": project_id, "type": event_type, "correlation_key": correlation_key, "output": output, "created_at": now}
+        return self.event_repository.record_external_event(project_id, event_type, correlation_key, output)
 
     def correlated_event(self, project_id: str, event_type: str, correlation_key: str, after: str) -> dict[str, Any] | None:
-        with self.connect() as db:
-            row = db.execute(
-                "SELECT * FROM v1_events WHERE project_id=? AND type=? AND created_at>=? AND json_extract(data_json,'$.correlation_key')=? ORDER BY id LIMIT 1",
-                (project_id, event_type, after, correlation_key),
-            ).fetchone()
-        return self._decode(dict(row), "data_json") if row else None
+        return self.event_repository.correlated_event(project_id, event_type, correlation_key, after)
 
     def mailbox(self, project_id: str, *, state: str = "pending", limit: int | None = None) -> list[dict[str, Any]]:
         limit = limit or self.policy.context.mailbox_limit

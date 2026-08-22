@@ -717,7 +717,10 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     )
     add(
         "task.fail",
-        "Route a Task through the explicit failed terminal with a recorded reason.",
+        (
+            "Route a non-running Task through the explicit failed terminal with a recorded reason. "
+            "Never use this against a live Column Attempt; request task.pause and observe it outside running first."
+        ),
         {
             "type": "object",
             "required": ["task_id", "reason"],
@@ -730,7 +733,10 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     )
     add(
         "task.cancel",
-        "Cancel a non-terminal Task through the explicit failed terminal path.",
+        (
+            "Cancel a non-running Task through the explicit failed terminal path. "
+            "A running Task owns a live Column Attempt and must first be paused and observed outside running."
+        ),
         {
             "type": "object",
             "required": ["task_id", "reason"],

@@ -633,3 +633,23 @@ def test_non_json_provider_503_is_still_a_structured_provider_error():
 
     assert captured.value.error_code == "LLM_PROVIDER_ERROR"
     assert captured.value.status_code == 503
+
+
+def test_minimax_usage_limit_embedded_in_message_is_not_classified_as_rate_limit():
+    response = Response(
+        {
+            "type": "error",
+            "error": {
+                "type": "rate_limit_error",
+                "message": "Token Plan usage limit reached (2056)",
+            },
+        },
+        status_code=429,
+    )
+    response.url = "https://api.minimaxi.com/anthropic/v1/messages"
+
+    with pytest.raises(LLMProviderError) as captured:
+        raise_for_provider_response(response, provider="anthropic", api_name="minimax")
+
+    assert captured.value.error_code == "LLM_USAGE_LIMIT"
+    assert captured.value.details.provider_code == 2056

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
 from app.v1.domain import WorkflowDefinition
-from tests.helpers import create_planned_task, publish_planned_workflow, sequence_workflow
+from tests.helpers import create_planned_task, orchestration_plan, publish_planned_workflow, sequence_workflow
 
 
 def test_filesystem_loops_are_discoverable_and_novel_is_a_directed_graph(store):
@@ -43,6 +45,29 @@ def test_preset_loop_definitions_are_not_stored_in_sqlite(store):
     assert "v1_workflow_templates" not in tables
     assert "v1_project_template_applications" not in tables
     assert "v1_loop_applications" in tables
+
+
+def test_workflow_revision_requires_loop_provenance(store, tmp_path):
+    project = store.create_project("legacy workflow", "", str(tmp_path / "legacy"))
+    workflow = sequence_workflow()
+    plan = store.create_orchestration_plan(project["id"], orchestration_plan(workflow))
+    now = "2026-08-21T00:00:00+00:00"
+    with store.tx(immediate=True) as db:
+        db.execute(
+            "INSERT INTO v1_workflows(id,project_id,name,active_revision_id,state_version,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            ("workflow_legacy", project["id"], workflow.name, "wfrev_legacy", 1, now, now),
+        )
+        db.execute(
+            "INSERT INTO v1_workflow_revisions(id,project_id,revision,definition_json,active,created_at,"
+            "workflow_id,revision_no,schema_version,definition_hash,orchestration_plan_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            ("wfrev_legacy", project["id"], 1, workflow.model_dump_json(), 1, now,
+             "workflow_legacy", 1, workflow.schema_version, "legacy", plan["id"]),
+        )
+
+    with pytest.raises(ValueError, match="filesystem Loop application"):
+        store.publish_workflow(project["id"], workflow, plan["id"])
 
 
 def test_novel_loop_application_materializes_serial_chapter_tasks(store, tmp_path):

@@ -20,9 +20,14 @@ def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text
     project = store.create_project("conversation", "", str(tmp_path / "project"), "project instruction")
     calls = 0
 
-    def model(_messages, _tools, **_kwargs):
+    def model(_messages, tools, **_kwargs):
         nonlocal calls
         calls += 1
+        exposed = {item["function"]["name"] for item in tools}
+        assert "loop.apply" in exposed
+        assert "workflow.publish" not in exposed
+        assert "orchestration.plan.save" not in exposed
+        assert "task.create" not in exposed
         if calls == 1:
             return AgentModelResponse(tool_calls=[AgentToolCall(id="loops", name="loop.list", arguments={"query": "GitLab software delivery"})])
         if calls == 2:
@@ -52,6 +57,47 @@ def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text
         assert job["result"]["reply"] == "Workflow and Task are now tracked."
         assert len(job["result"]["task_ids"]) == 1
         assert wakes == [True]
+    finally:
+        agent.stop()
+
+
+def test_conversation_with_loop_workflow_can_revise_but_cannot_reapply_loop(store, tmp_path):
+    project = store.create_project("revision", "", str(tmp_path / "revision"))
+    store.apply_loop(
+        project["id"],
+        "software.gitlab_devops",
+        {
+            "product_name": "Managed delivery",
+            "requirements_path": "docs/requirements.md",
+            "requirements_confirmed": True,
+            "gitlab_repository": "group/project",
+        },
+    )
+    exposed: list[set[str]] = []
+    calls = 0
+
+    def model(_messages, tools, **_kwargs):
+        nonlocal calls
+        calls += 1
+        exposed.append({item["function"]["name"] for item in tools})
+        assert "workflow.publish" in exposed[-1]
+        assert "orchestration.plan.save" in exposed[-1]
+        assert "task.create" in exposed[-1]
+        if calls == 1:
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id="workflow",
+                name="workflow.inspect",
+                arguments={},
+            )])
+        return AgentModelResponse(text="The Loop-created Workflow is ready for supervision.")
+
+    registry = build_core_registry()
+    agent = ConversationAgent(store, registry, workers=1, agent_core=AgentCore(store, registry, model))
+    try:
+        accepted = agent.submit(project["id"], "Inspect the existing Workflow.", True)
+        assert agent.wait_for_idle()
+        assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
+        assert "loop.apply" not in exposed[0]
     finally:
         agent.stop()
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -309,6 +310,11 @@ def _extract_provider_code(value: Any) -> int | None:
             parsed = _parse_int(candidate.get(key))
             if parsed is not None:
                 return parsed
+        message = _extract_message(candidate)
+        if message:
+            match = re.search(r"[\(（](\d{3,6})[\)）]\s*$", message)
+            if match:
+                return int(match.group(1))
     return None
 
 
