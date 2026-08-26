@@ -14,9 +14,33 @@ export function renderKanban(state) {
 }
 
 function columnView(column, tasks) {
-  const items = tasks.filter((task) => column.terminal ? task.status === column.terminal : task.current_column === column.key);
+  const items = tasks
+    .filter((task) => column.terminal ? task.status === column.terminal : task.current_column === column.key)
+    .sort(compareTasks);
   const contractView = column.terminal ? "" : columnDefinitionView(column);
   return `<section class="kanban-column ${column.terminal ? `terminal ${column.terminal}` : ""}"><header><span class="column-dot"></span><div><h2>${escapeHtml(column.name)}</h2><small>${escapeHtml(column.key)}</small></div><b>${items.length}</b></header><div class="kanban-cards">${items.length ? items.map(taskCard).join("") : '<div class="column-empty">No Task in this Column</div>'}</div>${contractView}</section>`;
+}
+
+function compareTasks(left, right) {
+  const leftPlan = left.task_plan_created_at || left.created_at || "";
+  const rightPlan = right.task_plan_created_at || right.created_at || "";
+  const planComparison = leftPlan.localeCompare(rightPlan);
+  if (planComparison) return planComparison;
+
+  const leftOrder = Number.isInteger(left.task_plan_order) ? left.task_plan_order : titleNumber(left.title);
+  const rightOrder = Number.isInteger(right.task_plan_order) ? right.task_plan_order : titleNumber(right.title);
+  if (leftOrder !== rightOrder) return leftOrder - rightOrder;
+
+  const createdComparison = String(left.created_at || "").localeCompare(String(right.created_at || ""));
+  if (createdComparison) return createdComparison;
+  const updatedComparison = String(left.updated_at || "").localeCompare(String(right.updated_at || ""));
+  if (updatedComparison) return updatedComparison;
+  return String(left.id || "").localeCompare(String(right.id || ""));
+}
+
+function titleNumber(title) {
+  const match = String(title || "").match(/(?:^|\s)(\d+)(?:\s|$)/);
+  return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
 }
 
 function columnDefinitionView(column) {

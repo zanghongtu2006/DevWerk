@@ -17,6 +17,8 @@ Code and secondary documentation must remain consistent with all four. For Loop,
 - [`loop-task-plan-decoupling-v1.md`](loop-task-plan-decoupling-v1.md): separates reusable Workflow Plans from objective-specific Task Plans and defines Task materialization.
 - [`kanban-recovering-runtime-v1.md`](kanban-recovering-runtime-v1.md): same-Task recovery from structured temporary provider failures.
 - [`agent-tool-rejection-recovery-v1.md`](agent-tool-rejection-recovery-v1.md): distinction between rejection before effect and a failed execution effect.
+- [`conversation-session-gateway-v1.md`](conversation-session-gateway-v1.md): persistent per-Project Conversation Sessions, Hermes-style background Turn execution, transcript continuity, and failure isolation.
+- [`global-settings-v1.md`](global-settings-v1.md): validated YAML global settings and the default startup pause contract for unfinished Tasks.
 
 ## Verification
 

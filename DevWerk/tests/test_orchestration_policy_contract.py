@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from app.v1.capabilities import CapabilityEntry, build_core_registry
 from app.v1.domain import (
     CapabilitySequenceExecutor,
@@ -23,6 +25,50 @@ from tests.helpers import (
     task_plan,
     workflow_plan,
 )
+
+
+def _waiting_poll_task(store, project, poll_output):
+    registry = store.registry
+    registry.register(CapabilityEntry(
+        id="test.async.failure", description="begin async work", input_schema={}, output_schema={},
+        handler=lambda _args, _ctx: ToolResult(
+            ok=True, status="awaiting", capability="test.async.failure",
+            await_handle_draft={
+                "provider": "test",
+                "poll_capability": "test.poll.failure",
+                "poll_arguments": {},
+            },
+            checkpoint={"provider_job": "job-failure"},
+        ),
+    ))
+    registry.register(CapabilityEntry(
+        id="test.poll.failure", description="poll async work", input_schema={}, output_schema={},
+        handler=lambda _args, _ctx: poll_output,
+    ))
+    workflow = WorkflowDefinition(name="async failure", entry="execute", columns=[ColumnDefinition(
+        key="execute", name="Execute",
+        executor=CapabilitySequenceExecutor(steps=[
+            CapabilityStep(capability="test.async.failure"),
+            CapabilityStep(capability="test.poll.failure"),
+        ]),
+        wait_policy=PollWaitPolicy(
+            poll_capability="test.poll.failure", poll_interval_seconds=1
+        ),
+        transitions=[
+            Transition(outcome="success", target="done"),
+            Transition(outcome="failure", target="failed"),
+        ],
+    )])
+    publish_planned_workflow(store, project["id"], workflow)
+    task = create_planned_task(store, project["id"], "async failure")
+    runtime = WorkflowRuntime(store, registry, "worker")
+    runtime.step(task["id"])
+    with store.tx(immediate=True) as db:
+        db.execute(
+            "UPDATE v1_await_handles SET next_check_at=? WHERE task_id=? AND status='pending'",
+            ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), task["id"]),
+        )
+    return runtime, task, store.due_await_handles()[0]
 
 
 def test_workflow_and_task_use_separate_persisted_plans(store, tmp_path):
@@ -74,14 +120,137 @@ def test_failed_predecessor_requires_explicit_successor(store, tmp_path):
     assert child["id"] in store.runnable_task_ids()
 
 
-def test_explicit_queue_is_not_auto_admitted(store, tmp_path):
+def test_task_plan_queue_is_admitted_when_dependencies_are_already_satisfied(store, tmp_path):
     project = store.create_project("queue", "", str(tmp_path / "project"))
     workflow = sequence_workflow()
     _plan, revision = publish_planned_workflow(store, project["id"], workflow)
     concrete = store.create_task_plan(project["id"], task_plan(revision["id"], workflow, title="queued", readiness_data=readiness(decision="queue")))
     task = store.create_task(project["id"], task_plan_id=concrete["id"], proposed_task_ref="primary")
-    assert task["id"] not in store.runnable_task_ids()
-    assert store.claim_task(task["id"], "worker") is None
+    assert task["id"] in store.runnable_task_ids()
+    assert store.claim_task(task["id"], "worker") is not None
+
+
+def test_task_plan_queue_auto_admits_after_dependency_completes(store, tmp_path):
+    project = store.create_project("dependency queue", "", str(tmp_path / "project"))
+    workflow = sequence_workflow()
+    _plan, revision = publish_planned_workflow(store, project["id"], workflow)
+    base = task_plan(revision["id"], workflow, task_ref="root", title="root")
+    child = base.tasks[0].model_copy(update={
+        "proposed_task_ref": "child",
+        "title": "child",
+        "dependencies": ["root"],
+        "readiness": base.tasks[0].readiness.model_copy(update={"decision": "queue"}),
+    })
+    concrete = store.create_task_plan(project["id"], base.model_copy(update={"tasks": [base.tasks[0], child]}))
+    root = store.create_task(project["id"], task_plan_id=concrete["id"], proposed_task_ref="root")
+    queued = store.create_task(project["id"], task_plan_id=concrete["id"], proposed_task_ref="child")
+    assert queued["id"] not in store.runnable_task_ids()
+    WorkflowRuntime(store, build_core_registry(store.policy), "root-worker").step(root["id"])
+    assert queued["id"] in store.runnable_task_ids()
+
+
+def test_starting_task_plan_materializes_complete_dependency_graph(store, tmp_path):
+    project = store.create_project("plan start", "", str(tmp_path / "project"))
+    workflow = sequence_workflow()
+    _plan, revision = publish_planned_workflow(store, project["id"], workflow)
+    base = task_plan(revision["id"], workflow, task_ref="root", title="root")
+    child = base.tasks[0].model_copy(update={
+        "proposed_task_ref": "child",
+        "title": "child",
+        "dependencies": ["root"],
+        "readiness": base.tasks[0].readiness.model_copy(update={"decision": "queue"}),
+    })
+    concrete = store.create_task_plan(
+        project["id"],
+        base.model_copy(update={"tasks": [base.tasks[0], child]}),
+    )
+
+    requested = store.materialize_task_plan(
+        project["id"],
+        task_plan_id=concrete["id"],
+        proposed_task_ref="root",
+    )
+
+    tasks = store.list_tasks(project["id"])
+    assert requested["proposed_task_ref"] == "root"
+    assert {task["proposed_task_ref"] for task in tasks} == {"root", "child"}
+    queued = next(task for task in tasks if task["proposed_task_ref"] == "child")
+    assert queued["id"] not in store.runnable_task_ids()
+
+    WorkflowRuntime(store, build_core_registry(store.policy), "root-worker").step(requested["id"])
+    assert queued["id"] in store.runnable_task_ids()
+
+    repeated = store.materialize_task_plan(
+        project["id"],
+        task_plan_id=concrete["id"],
+        proposed_task_ref="root",
+    )
+    assert repeated["id"] == requested["id"]
+    assert len(store.list_tasks(project["id"])) == 2
+
+
+def test_task_plan_preflight_failure_materializes_zero_tasks(store, tmp_path, monkeypatch):
+    project = store.create_project("plan preflight", "", str(tmp_path / "preflight"))
+    workflow = sequence_workflow()
+    _plan, revision = publish_planned_workflow(store, project["id"], workflow)
+    base = task_plan(revision["id"], workflow, task_ref="root", title="root")
+    child = base.tasks[0].model_copy(update={
+        "proposed_task_ref": "child",
+        "title": "child",
+        "dependencies": ["root"],
+        "readiness": base.tasks[0].readiness.model_copy(update={"decision": "queue"}),
+    })
+    concrete = store.create_task_plan(
+        project["id"], base.model_copy(update={"tasks": [base.tasks[0], child]})
+    )
+    original = store._prepare_task_materialization
+
+    def fail_second(*args, **kwargs):
+        prepared = original(*args, **kwargs)
+        if args[3].proposed_task_ref == "child":
+            raise ValueError("second Task preflight failed")
+        return prepared
+
+    monkeypatch.setattr(store, "_prepare_task_materialization", fail_second)
+    with pytest.raises(ValueError, match="second Task preflight failed"):
+        store.materialize_task_plan(
+            project["id"], task_plan_id=concrete["id"], proposed_task_ref="root"
+        )
+
+    assert store.list_tasks(project["id"]) == []
+
+
+def test_task_plan_insert_failure_rolls_back_complete_graph(store, tmp_path, monkeypatch):
+    project = store.create_project("plan rollback", "", str(tmp_path / "rollback"))
+    workflow = sequence_workflow()
+    _plan, revision = publish_planned_workflow(store, project["id"], workflow)
+    base = task_plan(revision["id"], workflow, task_ref="root", title="root")
+    child = base.tasks[0].model_copy(update={
+        "proposed_task_ref": "child",
+        "title": "child",
+        "dependencies": ["root"],
+        "readiness": base.tasks[0].readiness.model_copy(update={"decision": "queue"}),
+    })
+    concrete = store.create_task_plan(
+        project["id"], base.model_copy(update={"tasks": [base.tasks[0], child]})
+    )
+    original = store._insert_prepared_task
+    calls = 0
+
+    def fail_during_insert(db, prepared):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("materialization interrupted")
+        return original(db, prepared)
+
+    monkeypatch.setattr(store, "_insert_prepared_task", fail_during_insert)
+    with pytest.raises(RuntimeError, match="materialization interrupted"):
+        store.materialize_task_plan(
+            project["id"], task_plan_id=concrete["id"], proposed_task_ref="root"
+        )
+
+    assert store.list_tasks(project["id"]) == []
 
 
 def test_poll_wait_resumes_without_deadline_or_timeout_route(store, tmp_path):
@@ -118,6 +287,64 @@ def test_poll_wait_resumes_without_deadline_or_timeout_route(store, tmp_path):
     assert "hard_deadline_at" not in handle
     runtime.reconcile_await(handle)
     assert store.get_task(task["id"])["status"] == "done"
+
+
+def test_recoverable_await_failure_atomically_enters_recovery(store, tmp_path):
+    project = store.create_project("recoverable await", "", str(tmp_path / "recoverable"))
+    runtime, task, handle = _waiting_poll_task(
+        store,
+        project,
+        {
+            "status": "failed",
+            "recoverable": True,
+            "error_category": "external_transient",
+            "error": {"type": "RemoteTransient", "message": "try again"},
+        },
+    )
+
+    runtime.reconcile_await(handle)
+
+    resolved = store.get_task(task["id"])
+    assert resolved["status"] == "recovering"
+    assert store.await_handle(handle["id"])["status"] == "failed"
+    assert store.runs(project["id"], task["id"])[0]["status"] == "interrupted"
+    assert store.attempts(project["id"], task["id"])[0]["status"] == "interrupted"
+
+
+def test_permanent_await_failure_atomically_reaches_failed(store, tmp_path):
+    project = store.create_project("permanent await", "", str(tmp_path / "permanent"))
+    runtime, task, handle = _waiting_poll_task(
+        store,
+        project,
+        {
+            "status": "failed",
+            "error": {"type": "RemoteRejected", "message": "invalid request"},
+        },
+    )
+
+    runtime.reconcile_await(handle)
+
+    resolved = store.get_task(task["id"])
+    assert resolved["status"] == "failed"
+    assert store.await_handle(handle["id"])["status"] == "failed"
+    assert store.runs(project["id"], task["id"])[0]["status"] == "failed"
+    assert store.attempts(project["id"], task["id"])[0]["status"] == "failed"
+    assert any(item["type"] == "task.failed" for item in store.events(project["id"]))
+
+
+def test_waiting_task_retry_is_rejected_without_orphaning_await(store, tmp_path):
+    project = store.create_project("waiting retry", "", str(tmp_path / "waiting-retry"))
+    _runtime, task, handle = _waiting_poll_task(
+        store,
+        project,
+        {"status": "pending"},
+    )
+
+    with pytest.raises(ValueError, match="Await Handle is active"):
+        store.retry_task(task["id"])
+
+    assert store.get_task(task["id"])["status"] == "waiting"
+    assert store.await_handle(handle["id"])["status"] == "pending"
 
 
 def test_runtime_audit_records_policy_identity_without_execution_budget(store, tmp_path):
@@ -157,7 +384,7 @@ def test_mailbox_observation_does_not_invalidate_running_task_state(store, tmp_p
             "UPDATE v1_conversation_jobs SET mailbox_ids_json=? WHERE id=?",
             (f"[{mailbox_id}]", job["id"]),
         )
-    assert store.claim_conversation_job(job["id"], "conversation-worker") is not None
+    assert store.claim_conversation_job(job["id"], "conversation-session-owner") is not None
     store.finish_conversation_job(job["id"], task["id"], result={})
 
     observed = store.get_task(task["id"])

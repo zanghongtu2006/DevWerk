@@ -2,6 +2,7 @@ export const state = {
   route: "overview",
   health: null,
   statusCatalog: null,
+  settings: null,
   projects: [],
   projectId: null,
   project: null,
@@ -24,6 +25,7 @@ export function routeFromPath(pathname) {
   if (pathname === "/kanban") return "kanban";
   if (pathname === "/tasks") return "tasks";
   if (pathname === "/events") return "events";
+  if (pathname === "/settings") return "settings";
   return "overview";
 }
 

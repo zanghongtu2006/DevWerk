@@ -10,6 +10,9 @@ The Task keeps its identity, current Column, context, artifacts, dependencies, s
 
 ```text
 running -- recoverable infrastructure error --> recovering
+running -- execution lease expired ----------> recovering
+waiting -- recoverable Await failure --------> recovering
+waiting -- permanent Await failure ----------> failed
 recovering -- retry time reached + scheduler claim --> running
 running -- successful Column result ----------> next Column / done
 running -- non-recoverable error -------------> failed
@@ -35,13 +38,15 @@ Workflow outcomes such as reviewer rejection are not infrastructure recovery. Th
 
 ## 4. Recovery record
 
-When a recoverable failure occurs, the current Column Run and Attempt are closed as failed audit records. The Task moves to `recovering` without creating terminal evidence or a `task.failed` notification. Runtime emits:
+When a recoverable provider failure occurs, the current Column Run and Attempt are closed as failed audit records. When a Worker lease expires or a recoverable Await fails, the current Column Run and Attempt are closed as `interrupted`; any abandoned execution receipt is failed before the Task becomes runnable again. The Task moves to `recovering` without creating terminal evidence or a `task.failed` notification. Runtime emits:
 
 - `task.recovering`: failure code, category, failed Column, failed Run and `next_retry_at`;
 - `task.recovery_started`: the scheduler reclaimed the same Task and Column;
 - `task.recovered`: the retried Column completed successfully and workflow execution continued.
 
-The next claim creates a new Column Run/Attempt for the same Task and Column. Existing project files and Task context remain available to the executor.
+The next claim always creates a new immutable Attempt. A lease/Await interruption resumes the same logical Column Run visit; an ordinary provider failure starts a new Column Run. Existing project files and Task context remain available to the executor. Task `state_version` fences late results from the abandoned Worker so they cannot overwrite the replacement execution.
+
+Await Handle settlement, its owning Column Run and Attempt, the execution receipt, and the Task transition are committed as one state change. A failed Await Handle is never left attached to a `waiting` Task. Direct `task.retry` is rejected while a pending Await Handle owns the Task; cancellation or terminal failure must settle the wait first.
 
 ## 5. Conversation Agent boundary
 
@@ -50,6 +55,10 @@ Conversation Agent observes recovery through events and may explain it to the us
 ## 6. V1 acceptance
 
 - A provider timeout causes `running -> recovering`, not `failed`.
+- An expired Worker lease interrupts the old Attempt and makes the same Task eligible for recovery.
+- A late Worker result cannot overwrite a Task reclaimed by another Worker.
+- Await failure cannot leave `AwaitHandle=failed` with `Task=waiting`.
+- A waiting Task cannot be retried into a second execution path while its Await Handle is pending.
 - A recovering Task is not reclaimed before `next_retry_at`, preventing a tight provider retry loop.
 - The scheduler automatically reclaims the recovering Task.
 - A later successful execution continues the original workflow using the same Task ID and Column.

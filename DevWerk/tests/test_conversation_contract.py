@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
+from pathlib import Path
 
 import pytest
 
 from app.v1.agent import AgentCore, AgentRunSpec
 from app.v1.capabilities import CapabilityContext, CapabilityEntry, build_core_registry
-from app.v1.conversation import ConversationAgent
+from app.v1.conversation import ConversationGateway
 from app.v1.domain import AgentModelResponse, AgentToolCall, WorkflowDefinition
 from tests.helpers import (
     create_planned_task,
@@ -15,6 +17,35 @@ from tests.helpers import (
     sequence_workflow,
     task_plan,
 )
+
+
+def run_turn(
+    gateway: ConversationGateway,
+    project_id: str,
+    message: str,
+    start_task: bool,
+    *,
+    timeout: float = 5.0,
+) -> dict:
+    async def execute() -> dict:
+        await gateway.start()
+        try:
+            accepted = await gateway.submit(project_id, message, start_task)
+            assert await gateway.wait_for_idle(timeout=timeout)
+            return accepted
+        finally:
+            await gateway.stop()
+
+    return asyncio.run(execute())
+
+
+def test_platform_policy_defines_concise_human_facing_replies():
+    policy = (Path(__file__).resolve().parents[1] / "DEVWERK.md").read_text(encoding="utf-8")
+
+    assert "Communicate as a human project manager, not as an audit log" in policy
+    assert "one to three short sentences" in policy
+    assert "at most 300 Chinese characters or 120 English words" in policy
+    assert "Runtime records and inspection views rather than ordinary chat" in policy
 
 
 def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text(store, tmp_path):
@@ -39,8 +70,6 @@ def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text
                     "loop_key": "software.gitlab_devops",
                     "bindings": {
                         "product_name": "Managed delivery",
-                        "requirements_path": "docs/requirements.md",
-                        "requirements_confirmed": True,
                         "gitlab_repository": "group/project",
                     },
                 },
@@ -53,10 +82,8 @@ def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text
                 definition,
                 title="Deliver the managed product",
                 input_data={
-                    "product_name": "Managed delivery",
                     "requirements_path": "docs/requirements.md",
                     "requirements_confirmed": True,
-                    "gitlab_repository": "group/project",
                 },
             )
             return AgentModelResponse(tool_calls=[AgentToolCall(
@@ -75,17 +102,13 @@ def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text
 
     wakes: list[bool] = []
     registry = build_core_registry()
-    agent = ConversationAgent(store, registry, on_task_created=lambda: wakes.append(True), workers=1, agent_core=AgentCore(store, registry, model))
-    try:
-        accepted = agent.submit(project["id"], "Please manage this delivery.", True)
-        assert agent.wait_for_idle()
-        job = store.get_conversation_job(accepted["job"]["id"])
-        assert job["status"] == "succeeded"
-        assert job["result"]["reply"] == "Workflow and Task are now tracked."
-        assert len(job["result"]["task_ids"]) == 1
-        assert wakes == [True]
-    finally:
-        agent.stop()
+    agent = ConversationGateway(store, registry, on_task_created=lambda: wakes.append(True), agent_core=AgentCore(store, registry, model))
+    accepted = run_turn(agent, project["id"], "Please manage this delivery.", True)
+    job = store.get_conversation_job(accepted["job"]["id"])
+    assert job["status"] == "succeeded"
+    assert job["result"]["reply"] == "Workflow and Task are now tracked."
+    assert len(job["result"]["task_ids"]) == 1
+    assert wakes == [True]
 
 
 def test_conversation_with_loop_workflow_can_revise_but_cannot_reapply_loop(store, tmp_path):
@@ -95,8 +118,6 @@ def test_conversation_with_loop_workflow_can_revise_but_cannot_reapply_loop(stor
         "software.gitlab_devops",
         {
             "product_name": "Managed delivery",
-            "requirements_path": "docs/requirements.md",
-            "requirements_confirmed": True,
             "gitlab_repository": "group/project",
         },
     )
@@ -120,14 +141,10 @@ def test_conversation_with_loop_workflow_can_revise_but_cannot_reapply_loop(stor
         return AgentModelResponse(text="The Loop-created Workflow is ready for supervision.")
 
     registry = build_core_registry()
-    agent = ConversationAgent(store, registry, workers=1, agent_core=AgentCore(store, registry, model))
-    try:
-        accepted = agent.submit(project["id"], "Inspect the existing Workflow.", True)
-        assert agent.wait_for_idle()
-        assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
-        assert "loop.apply" not in exposed[0]
-    finally:
-        agent.stop()
+    agent = ConversationGateway(store, registry, agent_core=AgentCore(store, registry, model))
+    accepted = run_turn(agent, project["id"], "Inspect the existing Workflow.", True)
+    assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
+    assert "loop.apply" not in exposed[0]
 
 
 def test_start_task_false_exposes_only_read_capabilities(store, tmp_path):
@@ -139,14 +156,10 @@ def test_start_task_false_exposes_only_read_capabilities(store, tmp_path):
         return AgentModelResponse(text="Discussion complete.")
 
     registry = build_core_registry()
-    agent = ConversationAgent(store, registry, workers=1, agent_core=AgentCore(store, registry, model))
-    try:
-        accepted = agent.submit(project["id"], "Only discuss this.", False)
-        assert agent.wait_for_idle()
-        assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
-        assert all(registry.side_effect_kind(item) in {"none", "read"} for item in exposed[0])
-    finally:
-        agent.stop()
+    agent = ConversationGateway(store, registry, agent_core=AgentCore(store, registry, model))
+    accepted = run_turn(agent, project["id"], "Only discuss this.", False)
+    assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
+    assert all(registry.side_effect_kind(item) in {"none", "read"} for item in exposed[0])
 
 
 def test_runtime_notifications_are_not_replayed_as_conversation_history(store, tmp_path):
@@ -158,13 +171,9 @@ def test_runtime_notifications_are_not_replayed_as_conversation_history(store, t
         return AgentModelResponse(text="Discussion complete.")
 
     registry = build_core_registry()
-    agent = ConversationAgent(store, registry, workers=1, agent_core=AgentCore(store, registry, model))
-    try:
-        accepted = agent.submit(project["id"], "Discuss the current state.", False)
-        assert agent.wait_for_idle()
-        assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
-    finally:
-        agent.stop()
+    agent = ConversationGateway(store, registry, agent_core=AgentCore(store, registry, model))
+    accepted = run_turn(agent, project["id"], "Discuss the current state.", False)
+    assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
 
 
 def test_executing_conversation_cannot_finish_with_unevidenced_prose(store, tmp_path):
@@ -177,25 +186,20 @@ def test_executing_conversation_cannot_finish_with_unevidenced_prose(store, tmp_
         return AgentModelResponse(text="I inspected and changed the project.")
 
     registry = build_core_registry()
-    agent = ConversationAgent(
+    agent = ConversationGateway(
         store,
         registry,
-        workers=1,
         agent_core=AgentCore(store, registry, model),
     )
-    try:
-        accepted = agent.submit(project["id"], "Inspect before acting.", True)
-        assert agent.wait_for_idle()
-        job = store.get_conversation_job(accepted["job"]["id"])
-        assert job["status"] == "failed"
-        assert turns == 1
-        assert job["result"]["action_ledger"] == []
-        assert store.conversation_agent(project["id"])["state"] == "attention"
-    finally:
-        agent.stop()
+    accepted = run_turn(agent, project["id"], "Inspect before acting.", True)
+    job = store.get_conversation_job(accepted["job"]["id"])
+    assert job["status"] == "failed"
+    assert turns == 1
+    assert job["result"]["action_ledger"] == []
+    assert store.conversation_agent(project["id"])["state"] == "attention"
 
 
-def test_same_project_jobs_remain_ordered_with_multiple_workers(store, tmp_path):
+def test_same_project_jobs_remain_ordered_by_session_gateway(store, tmp_path):
     project = store.create_project("ordered", "", str(tmp_path / "project"))
     first_entered = threading.Event()
     release_first = threading.Event()
@@ -210,19 +214,28 @@ def test_same_project_jobs_remain_ordered_with_multiple_workers(store, tmp_path)
         return AgentModelResponse(text=f"Handled {current}.")
 
     registry = build_core_registry()
-    agent = ConversationAgent(store, registry, workers=2, agent_core=AgentCore(store, registry, model))
-    try:
-        first = agent.submit(project["id"], "first", False)
-        assert first_entered.wait(timeout=3)
-        second = agent.submit(project["id"], "second", False)
-        release_first.set()
-        assert agent.wait_for_idle(timeout=10)
-        assert store.get_conversation_job(first["job"]["id"])["status"] == "succeeded"
-        assert store.get_conversation_job(second["job"]["id"])["status"] == "succeeded"
-        assert observed == ["first", "second"]
-    finally:
-        release_first.set()
-        agent.stop()
+    agent = ConversationGateway(store, registry, agent_core=AgentCore(store, registry, model))
+
+    async def execute() -> tuple[dict, dict]:
+        await agent.start()
+        try:
+            first = await agent.submit(project["id"], "first", False)
+            assert await asyncio.to_thread(first_entered.wait, 3)
+            second = await agent.submit(project["id"], "second", False)
+            release_first.set()
+            assert await agent.wait_for_idle(timeout=10)
+            return first, second
+        finally:
+            release_first.set()
+            await agent.stop()
+
+    first, second = asyncio.run(execute())
+    first_job = store.get_conversation_job(first["job"]["id"])
+    second_job = store.get_conversation_job(second["job"]["id"])
+    assert first_job["status"] == "succeeded"
+    assert second_job["status"] == "succeeded"
+    assert first_job["conversation_session_id"] == second_job["conversation_session_id"]
+    assert observed == ["first", "second"]
 
 
 def test_capability_validation_failure_is_returned_for_model_repair(store, tmp_path):
@@ -322,15 +335,11 @@ def test_current_request_is_authoritative_and_not_duplicated(store, tmp_path):
         return AgentModelResponse(text="Acknowledged.")
 
     registry = build_core_registry()
-    agent = ConversationAgent(store, registry, workers=1, agent_core=AgentCore(store, registry, model))
-    try:
-        accepted = agent.submit(project["id"], "current instruction", False)
-        assert agent.wait_for_idle()
-        assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
-        encoded = json.dumps(captured[0], ensure_ascii=False)
-        assert encoded.count("current instruction") == 2
-    finally:
-        agent.stop()
+    agent = ConversationGateway(store, registry, agent_core=AgentCore(store, registry, model))
+    accepted = run_turn(agent, project["id"], "current instruction", False)
+    assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
+    encoded = json.dumps(captured[0], ensure_ascii=False)
+    assert encoded.count("current instruction") == 2
 
 
 def test_terminal_mailbox_turn_reports_model_text_to_user(store, tmp_path):
@@ -348,12 +357,133 @@ def test_terminal_mailbox_turn_reports_model_text_to_user(store, tmp_path):
         return AgentModelResponse(text="任务失败，原因已核实：synthetic terminal failure")
 
     registry = build_core_registry()
-    agent = ConversationAgent(store, registry, workers=1, agent_core=AgentCore(store, registry, model))
-    try:
-        agent.wake()
-        assert agent.wait_for_idle(timeout=10)
-        assistant = [item for item in store.messages(project["id"]) if item["role"] == "assistant"]
-        assert assistant[-1]["content"] == "任务失败，原因已核实：synthetic terminal failure"
-        assert assistant[-1]["meta"]["subject_status"] == "failed"
-    finally:
-        agent.stop()
+    agent = ConversationGateway(store, registry, agent_core=AgentCore(store, registry, model))
+
+    async def execute() -> None:
+        await agent.start()
+        try:
+            await agent.wake_async()
+            assert await agent.wait_for_idle(timeout=10)
+        finally:
+            await agent.stop()
+
+    asyncio.run(execute())
+    assistant = [item for item in store.messages(project["id"]) if item["role"] == "assistant"]
+    assert assistant[-1]["content"] == "任务失败，原因已核实：synthetic terminal failure"
+    assert assistant[-1]["meta"]["subject_status"] == "failed"
+
+
+def test_project_session_replays_prior_dialogue_and_tool_evidence(store, tmp_path):
+    project = store.create_project("durable session", "", str(tmp_path / "project"))
+    registry = build_core_registry()
+    registry.register(CapabilityEntry(
+        id="test.session.inspect",
+        description="Return durable evidence for a Session continuity test.",
+        input_schema={"type": "object", "additionalProperties": False},
+        output_schema={"type": "object"},
+        handler=lambda _args, _ctx: {"evidence": "workflow-revision-7"},
+        side_effect_kind="read",
+    ))
+    model_calls = 0
+
+    def model(messages, _tools, **_kwargs):
+        nonlocal model_calls
+        model_calls += 1
+        if model_calls == 1:
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id="inspect-session",
+                name="test.session.inspect",
+                arguments={},
+            )])
+        if model_calls == 2:
+            return AgentModelResponse(text="I inspected workflow revision 7.")
+        encoded = json.dumps(messages, ensure_ascii=False)
+        assert "Remember the inspected workflow." in encoded
+        assert "workflow-revision-7" in encoded
+        assert "I inspected workflow revision 7." in encoded
+        return AgentModelResponse(text="The same Project Session is continuing.")
+
+    first_gateway = ConversationGateway(
+        store,
+        registry,
+        agent_core=AgentCore(store, registry, model),
+    )
+
+    async def first_turn() -> dict:
+        await first_gateway.start()
+        try:
+            accepted = await first_gateway.submit(
+                project["id"],
+                "Remember the inspected workflow.",
+                False,
+            )
+            assert await first_gateway.wait_for_idle()
+            return accepted
+        finally:
+            await first_gateway.stop()
+
+    first = asyncio.run(first_turn())
+    second_gateway = ConversationGateway(
+        store,
+        registry,
+        agent_core=AgentCore(store, registry, model),
+    )
+
+    async def second_turn() -> dict:
+        await second_gateway.start()
+        try:
+            accepted = await second_gateway.submit(
+                project["id"],
+                "What did you inspect in the previous turn?",
+                False,
+            )
+            assert await second_gateway.wait_for_idle()
+            return accepted
+        finally:
+            await second_gateway.stop()
+
+    second = asyncio.run(second_turn())
+    first_job = store.get_conversation_job(first["job"]["id"])
+    second_job = store.get_conversation_job(second["job"]["id"])
+    assert first_job["status"] == "succeeded"
+    assert second_job["status"] == "succeeded"
+    assert first_job["conversation_session_id"] == second_job["conversation_session_id"]
+    runs = list(reversed(store.agent_runs(project_id=project["id"])))
+    assert len(runs) == 2
+    assert runs[0]["agent_session_id"] == runs[1]["agent_session_id"]
+    assert runs[0]["agent_session_id"] == store.conversation_agent(project["id"])["logical_id"]
+
+
+def test_failed_turn_does_not_destroy_project_session(store, tmp_path):
+    project = store.create_project("failure isolation", "", str(tmp_path / "project"))
+    registry = build_core_registry()
+    model_calls = 0
+
+    def model(_messages, _tools, **_kwargs):
+        nonlocal model_calls
+        model_calls += 1
+        if model_calls == 1:
+            raise RuntimeError("provider unavailable for this turn")
+        return AgentModelResponse(text="The next turn still runs in this Project Session.")
+
+    gateway = ConversationGateway(
+        store,
+        registry,
+        agent_core=AgentCore(store, registry, model),
+    )
+
+    async def execute() -> tuple[dict, dict]:
+        await gateway.start()
+        try:
+            failed = await gateway.submit(project["id"], "first turn", False)
+            assert await gateway.wait_for_idle()
+            succeeded = await gateway.submit(project["id"], "second turn", False)
+            assert await gateway.wait_for_idle()
+            return failed, succeeded
+        finally:
+            await gateway.stop()
+
+    failed, succeeded = asyncio.run(execute())
+    assert store.get_conversation_job(failed["job"]["id"])["status"] == "failed"
+    assert store.get_conversation_job(succeeded["job"]["id"])["status"] == "succeeded"
+    assert model_calls == 2

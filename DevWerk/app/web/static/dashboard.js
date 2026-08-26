@@ -14,13 +14,16 @@ import {
 } from "./ui/shell.js?v=20260804-debug1";
 import { renderOverview } from "./pages/overview.js?v=20260804-debug1";
 import { renderProjects } from "./pages/projects.js?v=20260804-debug1";
-import { renderKanban } from "./pages/kanban.js?v=20260804-debug1";
+import { renderKanban } from "./pages/kanban.js?v=20260825-task-order1";
 import { renderTasks } from "./pages/tasks.js?v=20260804-debug1";
 import { renderEvents } from "./pages/events.js?v=20260804-debug1";
+import { renderSettings } from "./pages/settings.js?v=20260826-settings1";
 
 const page = document.getElementById("page");
 let projectStream = null;
 let activeBundleRequest = 0;
+let projectEventFlushTimer = null;
+let pendingProjectEvents = [];
 
 const renderers = {
   overview: renderOverview,
@@ -28,16 +31,18 @@ const renderers = {
   kanban: renderKanban,
   tasks: renderTasks,
   events: renderEvents,
+  settings: renderSettings,
 };
 
 function navigate(route) {
-  const paths = { overview: "/workbench", projects: "/dashboard", kanban: "/kanban", tasks: "/tasks", events: "/events" };
+  const paths = { overview: "/workbench", projects: "/dashboard", kanban: "/kanban", tasks: "/tasks", events: "/events", settings: "/settings" };
   history.pushState({}, "", updateProjectUrl(paths[route] || "/workbench", state.projectId));
   state.route = route;
   state.taskDetail = null;
   state.agentDetail = null;
   renderNavigation();
   renderPage();
+  if (route === "projects" && state.projectId) refreshConversationView();
 }
 
 function renderNavigation() {
@@ -84,13 +89,36 @@ async function refreshConversationStatus() {
   state.conversationStatus = await api.get(`/projects/${state.projectId}/conversation-state`);
 }
 
+function currentPageView() {
+  if (state.route !== "kanban") return null;
+  const scroll = document.querySelector(".kanban-scroll");
+  return scroll ? { left: scroll.scrollLeft, top: scroll.scrollTop } : null;
+}
+
 function renderPage() {
+  const view = currentPageView();
   const renderer = renderers[state.route] || renderOverview;
   page.innerHTML = renderer(state);
   bindPageActions();
+  if (view && state.route === "kanban") {
+    const scroll = document.querySelector(".kanban-scroll");
+    if (scroll) {
+      scroll.scrollLeft = view.left;
+      scroll.scrollTop = view.top;
+    }
+  }
   if (state.route === "projects") {
     const messages = document.getElementById("conversation-messages");
     if (messages) messages.scrollTop = messages.scrollHeight;
+  }
+}
+
+async function refreshConversationView() {
+  try {
+    await Promise.all([refreshConversationMessages(), refreshConversationStatus()]);
+    if (state.route === "projects") renderPage();
+  } catch (error) {
+    setConnection("degraded", "Conversation refresh failed");
   }
 }
 
@@ -111,6 +139,7 @@ function bindPageActions() {
   const form = document.getElementById("conversation-form");
   if (form) form.addEventListener("submit", sendConversation);
   document.querySelector("[data-load-older-messages]")?.addEventListener("click", loadOlderConversation);
+  document.getElementById("global-settings-form")?.addEventListener("submit", saveGlobalSettings);
 }
 
 async function boot() {
@@ -119,14 +148,16 @@ async function boot() {
   setBusy(true, "正在连接 DevWerk…");
   renderLoading();
   try {
-    const [health, projects, statusCatalog] = await Promise.all([
+    const [health, projects, statusCatalog, globalSettings] = await Promise.all([
       api.get("/health"),
       api.get("/projects"),
       api.get("/runtime-statuses"),
+      api.get("/settings"),
     ]);
     state.health = health;
     state.projects = projects;
     state.statusCatalog = statusCatalog;
+    state.settings = globalSettings;
     configureStatusCatalog(statusCatalog);
     setConnection("online", "Runtime online");
     const urlProject = new URL(location.href).searchParams.get("project_id");
@@ -282,35 +313,112 @@ async function loadOlderConversation() {
 
 function startProjectStream() {
   if (projectStream) projectStream.close();
+  if (projectEventFlushTimer) clearTimeout(projectEventFlushTimer);
+  projectEventFlushTimer = null;
+  pendingProjectEvents = [];
   if (!state.projectId) return;
   const cursor = state.events.reduce((value, item) => Math.max(value, Number(item.id) || 0), 0);
-  projectStream = openProjectStream(state.projectId, cursor, applyProjectEvent, () => setConnection("degraded", "Event stream reconnecting"));
+  projectStream = openProjectStream(state.projectId, cursor, queueProjectEvent, () => setConnection("degraded", "Event stream reconnecting"));
 }
 
-async function applyProjectEvent(event) {
-  if (!state.projectId || state.events.some((item) => item.id === event.id)) return;
-  state.events.push(event);
-  if (state.events.length > 500) state.events.shift();
+async function saveGlobalSettings(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const submit = form.querySelector("button[type='submit']");
+  const values = JSON.parse(JSON.stringify(state.settings.values));
+  form.querySelectorAll("[data-setting-key]").forEach((input) => {
+    const path = input.dataset.settingKey.split(".");
+    const name = path.pop();
+    const owner = path.reduce((value, part) => value[part], values);
+    owner[name] = input.type === "checkbox" ? input.checked : input.value;
+  });
+  submit.disabled = true;
   try {
-    if (event.type === "workflow.published" || !state.board) {
-      const snapshot = await api.get(`/projects/${state.projectId}/projection`);
+    const result = await api.post("/settings", {
+      ...values,
+      schema_version: state.settings.schema_version,
+    });
+    state.settings = result;
+    if (result.restart_scheduled) {
+      projectStream?.close();
+      setConnection("connecting", "Runtime restarting");
+      setBusy(true, "设置已保存，DevWerk 正在自动重启…");
+      await waitForRuntimeRestart();
+      location.reload();
+      return;
+    }
+    showToast(result.restart_required ? "设置已保存，但当前启动方式不支持自动重启。" : "设置已保存。", result.restart_required ? "error" : "success");
+    renderPage();
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    submit.disabled = false;
+  }
+}
+
+async function waitForRuntimeRestart() {
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    try {
+      const health = await api.get("/health", { timeout: 1500 });
+      if (health.status === "ok") return;
+    } catch (_error) {
+      // The expected gap while startup.bat replaces Uvicorn.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error("设置已保存，但 DevWerk 未能在 30 秒内重新启动。");
+}
+
+function queueProjectEvent(event) {
+  if (!state.projectId || state.events.some((item) => item.id === event.id) || pendingProjectEvents.some((item) => item.id === event.id)) return;
+  pendingProjectEvents.push(event);
+  if (!projectEventFlushTimer) projectEventFlushTimer = setTimeout(flushProjectEvents, 250);
+}
+
+function changesBoard(event) {
+  return event.type === "workflow.published"
+    || event.type.startsWith("task.")
+    || event.type.startsWith("column.")
+    || event.type.startsWith("retry.");
+}
+
+function changesConversation(event) {
+  return event.type.startsWith("conversation.") && event.type !== "conversation.progress";
+}
+
+async function flushProjectEvents() {
+  projectEventFlushTimer = null;
+  const events = pendingProjectEvents;
+  pendingProjectEvents = [];
+  if (!state.projectId || !events.length) return;
+  const projectId = state.projectId;
+  for (const event of events) {
+    state.events.push(event);
+    if (state.events.length > 500) state.events.shift();
+  }
+  try {
+    const boardChanged = !state.board || events.some(changesBoard);
+    if (boardChanged) {
+      const snapshot = await api.get(`/projects/${projectId}/projection`);
+      if (projectId !== state.projectId) return;
       state.board = { ...state.board, workflow: snapshot.projection.workflow, tasks: snapshot.projection.tasks, version: snapshot.version };
-    } else if (event.task_id) {
-      const task = await api.get(`/projects/${state.projectId}/tasks/${event.task_id}`);
-      const tasks = [...(state.board.tasks || [])];
-      const index = tasks.findIndex((item) => item.id === task.id);
-      if (index >= 0) tasks[index] = task;
-      else tasks.unshift(task);
-      state.board = { ...state.board, tasks: tasks.slice(0, 100), version: Math.max(state.board.version || 0, Number(event.id) || 0) };
     }
     setProjectContext(state.project, state.board.tasks || []);
-    if (event.type === "conversation.message") await refreshConversationMessages();
-    if (event.type.startsWith("conversation.")) await refreshConversationStatus();
+    const conversationChanged = state.route === "projects" && events.some(changesConversation);
+    if (conversationChanged) {
+      if (events.some((event) => event.type === "conversation.message")) await refreshConversationMessages();
+      await refreshConversationStatus();
+    }
     const editing = document.activeElement?.id === "message-input";
-    if (!editing && !state.sending) renderPage();
+    const pageChanged = boardChanged || conversationChanged || state.route === "events";
+    if (pageChanged && !editing && !state.sending) renderPage();
     setConnection("online", "Runtime online");
   } catch (error) {
     setConnection("degraded", "Projection refresh failed");
+  } finally {
+    if (pendingProjectEvents.length && !projectEventFlushTimer) projectEventFlushTimer = setTimeout(flushProjectEvents, 250);
   }
 }
 
@@ -329,7 +437,14 @@ document.addEventListener("click", (event) => {
   if (projectButton) selectProject(projectButton.dataset.projectId);
 });
 
-document.getElementById("refresh")?.addEventListener("click", () => refreshBundle({ showLoading: true }));
+document.getElementById("refresh")?.addEventListener("click", async () => {
+  if (state.route === "settings") {
+    state.settings = await api.get("/settings");
+    renderPage();
+    return;
+  }
+  await refreshBundle({ showLoading: true });
+});
 document.getElementById("new-project")?.addEventListener("click", showProjectDialog);
 document.getElementById("rail-new-project")?.addEventListener("click", showProjectDialog);
 document.getElementById("project-rail-toggle")?.addEventListener("click", () => toggleProjectRail());

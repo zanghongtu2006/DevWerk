@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-import queue
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Any, Callable
 
 from app.v1.agent import AgentCore, AgentRunSpec, ConversationEvidenceRequiredError, _ledger_entry
@@ -17,42 +17,60 @@ from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, PlatformPolicySnapshot, V1R
 log = logging.getLogger("devwerk.v1.conversation")
 
 
-class ConversationAgent:
-    """One durable logical Agent per Project, without platform execution budgets."""
+class ConversationGateway:
+    """Run one durable logical Conversation Session per Project."""
 
     def __init__(
         self,
         store: V1Store,
         registry: CapabilityRegistry,
         on_task_created: Callable[[], None] | None = None,
-        workers: int | None = None,
         agent_core: AgentCore | None = None,
         policy: V1RuntimePolicy | None = None,
         platform_policy: PlatformPolicySnapshot | None = None,
+        global_settings: dict[str, Any] | None = None,
     ):
         self.store = store
         self.registry = registry
         self.policy = policy or DEFAULT_V1_RUNTIME_POLICY
         self.platform_policy = platform_policy or store.latest_platform_policy()
+        self.global_settings = dict(global_settings or {})
         self.agent_core = agent_core or AgentCore(store, registry, policy=self.policy, platform_policy=self.platform_policy)
         self._on_task_created = on_task_created
         self._locks: defaultdict[str, threading.RLock] = defaultdict(threading.RLock)
-        self._queue: queue.Queue[str | None] = queue.Queue()
-        self._stop = threading.Event()
-        self._workers = [
-            threading.Thread(target=self._worker, name=f"conversation-agent-{index + 1}", daemon=True)
-            for index in range(max(1, workers or self.policy.scheduling.conversation_workers))
-        ]
-        for worker in self._workers:
-            worker.start()
-        self._dispatcher = threading.Thread(target=self._dispatch_governance, name="conversation-governance-dispatcher", daemon=True)
-        self._dispatcher.start()
-        for job in self.store.startup_conversation_jobs():
-            self._queue.put(job["id"])
+        self._pending: defaultdict[str, deque[str]] = defaultdict(deque)
+        self._pending_ids: set[str] = set()
+        self._session_tasks: dict[str, asyncio.Task[None]] = {}
+        self._dispatcher_task: asyncio.Task[None] | None = None
+        self._wake_event: asyncio.Event | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._started = False
+        self._stopping = False
 
-    def submit(self, project_id: str, message: str, start_task: bool = True) -> dict[str, Any]:
-        job = self.store.create_conversation_job(project_id, message, start_task)
-        self._queue.put(job["id"])
+    async def start(self) -> None:
+        if self._started:
+            return
+        self._loop = asyncio.get_running_loop()
+        self._started = True
+        self._stopping = False
+        self._wake_event = asyncio.Event()
+        for job in await asyncio.to_thread(self.store.startup_conversation_jobs):
+            self._enqueue_job(job)
+        self._dispatcher_task = asyncio.create_task(
+            self._dispatch_governance(),
+            name="conversation-gateway-dispatcher",
+        )
+
+    async def submit(self, project_id: str, message: str, start_task: bool = True) -> dict[str, Any]:
+        if not self._started:
+            await self.start()
+        job = await asyncio.to_thread(
+            self.store.create_conversation_job,
+            project_id,
+            message,
+            start_task,
+        )
+        self._enqueue_job(job)
         return {
             "status": "accepted",
             "job": job,
@@ -62,58 +80,187 @@ class ConversationAgent:
             "tasks": [],
         }
 
-    def stop(self) -> None:
-        self._stop.set()
-        for _ in self._workers:
-            self._queue.put(None)
-        for worker in self._workers:
-            worker.join(timeout=1)
-        self._dispatcher.join(timeout=1)
+    async def stop(self) -> None:
+        if not self._started:
+            return
+        self._stopping = True
+        if self._dispatcher_task:
+            self._dispatcher_task.cancel()
+        session_tasks = list(self._session_tasks.values())
+        for task in session_tasks:
+            task.cancel()
+        tasks = [task for task in [self._dispatcher_task, *session_tasks] if task]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._session_tasks.clear()
+        self._pending.clear()
+        self._pending_ids.clear()
+        self._dispatcher_task = None
+        self._wake_event = None
+        self._loop = None
+        self._started = False
 
     def wake(self) -> None:
-        for job_id in self.store.enqueue_governance_jobs():
-            self._queue.put(job_id)
+        """Wake governance from either Runtime threads or the Web event loop."""
+        if (
+            not self._started
+            or self._stopping
+            or self._loop is None
+            or self._wake_event is None
+        ):
+            return
+        self._loop.call_soon_threadsafe(self._wake_event.set)
 
-    def _dispatch_governance(self) -> None:
-        while not self._stop.wait(self.policy.service_limits.event_poll_interval_seconds):
-            self.wake()
+    async def wake_async(self) -> None:
+        if not self._started:
+            await self.start()
+        await self._enqueue_governance_jobs()
 
-    def wait_for_idle(self, timeout: float = 5.0) -> bool:
+    async def _dispatch_governance(self) -> None:
+        while not self._stopping:
+            assert self._wake_event is not None
+            try:
+                await asyncio.wait_for(
+                    self._wake_event.wait(),
+                    timeout=self.policy.service_limits.event_poll_interval_seconds,
+                )
+            except asyncio.TimeoutError:
+                pass
+            self._wake_event.clear()
+            await self._enqueue_governance_jobs()
+
+    async def _enqueue_governance_jobs(self) -> None:
+        for job_id in await asyncio.to_thread(self.store.enqueue_governance_jobs):
+            job = await asyncio.to_thread(self.store.get_conversation_job, job_id)
+            self._enqueue_job(job)
+
+    def _enqueue_job(self, job: dict[str, Any]) -> None:
+        job_id = str(job["id"])
+        if job_id in self._pending_ids:
+            return
+        project_id = str(job["project_id"])
+        self._pending_ids.add(job_id)
+        self._pending[project_id].append(job_id)
+        task = self._session_tasks.get(project_id)
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._drain_session(project_id),
+                name=f"conversation-session-{project_id}",
+            )
+            self._session_tasks[project_id] = task
+            task.add_done_callback(
+                lambda completed, key=project_id: self._session_finished(key, completed)
+            )
+
+    def _session_finished(self, project_id: str, task: asyncio.Task[None]) -> None:
+        if self._session_tasks.get(project_id) is task:
+            self._session_tasks.pop(project_id, None)
+        if not task.cancelled() and task.exception() is not None:
+            error = task.exception()
+            assert error is not None
+            log.error(
+                "conversation session task failed project_id=%s",
+                project_id,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+        if self._pending.get(project_id) and not self._stopping:
+            next_task = asyncio.create_task(
+                self._drain_session(project_id),
+                name=f"conversation-session-{project_id}",
+            )
+            self._session_tasks[project_id] = next_task
+            next_task.add_done_callback(
+                lambda completed, key=project_id: self._session_finished(key, completed)
+            )
+
+    async def _drain_session(self, project_id: str) -> None:
+        identity = await asyncio.to_thread(self.store.conversation_agent, project_id)
+        session_owner = f"conversation-session:{identity['logical_id']}"
+        while self._pending[project_id] and not self._stopping:
+            job_id = self._pending[project_id].popleft()
+            settled = True
+            try:
+                job = await asyncio.to_thread(
+                    self.store.claim_conversation_job,
+                    job_id,
+                    session_owner,
+                )
+                if job is None:
+                    queued = await asyncio.to_thread(
+                        self.store.get_conversation_job,
+                        job_id,
+                    )
+                    if queued["status"] == "queued":
+                        settled = False
+                        self._pending[project_id].appendleft(job_id)
+                        await asyncio.sleep(
+                            self.policy.service_limits.event_poll_interval_seconds
+                        )
+                        continue
+                else:
+                    try:
+                        await self._run_turn(job, session_owner)
+                    except Exception:  # noqa: BLE001
+                        # _process persisted and logged the failed Turn. The
+                        # durable Project Session continues with its next Job.
+                        pass
+            finally:
+                if settled:
+                    self._pending_ids.discard(job_id)
+        if not self._pending[project_id]:
+            self._pending.pop(project_id, None)
+
+    async def _run_turn(self, job: dict[str, Any], session_owner: str) -> None:
+        lease_task = asyncio.create_task(
+            self._renew_session_lease(str(job["project_id"]), session_owner),
+            name=f"conversation-lease-{job['project_id']}",
+        )
+        try:
+            await asyncio.to_thread(self._process, job)
+        finally:
+            lease_task.cancel()
+            await asyncio.gather(lease_task, return_exceptions=True)
+
+    async def _renew_session_lease(
+        self,
+        project_id: str,
+        session_owner: str,
+    ) -> None:
+        while True:
+            await asyncio.sleep(
+                self.policy.scheduling.conversation_lease_renew_seconds
+            )
+            renewed = await asyncio.to_thread(
+                self.store.renew_conversation_lease,
+                project_id,
+                session_owner,
+            )
+            if not renewed:
+                return
+
+    async def wait_for_idle(self, timeout: float = 5.0) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self._queue.unfinished_tasks == 0:
+            active = any(not task.done() for task in self._session_tasks.values())
+            if not active and not self._pending_ids:
                 return True
-            time.sleep(0.01)
+            await asyncio.sleep(0.01)
         return False
 
-    def _worker(self) -> None:
-        worker_id = threading.current_thread().name
-        while not self._stop.is_set():
-            job_id = self._queue.get()
-            if job_id is None:
-                self._queue.task_done()
-                return
-            queued = self.store.get_conversation_job(job_id)
-            claim_deferred = False
-            with self._locks[queued["project_id"]]:
-                job = self.store.claim_conversation_job(job_id, worker_id)
-                if job:
-                    self._process(job)
-                elif self.store.get_conversation_job(job_id)["status"] == "queued":
-                    claim_deferred = True
-            if claim_deferred and not self._stop.wait(
-                self.policy.service_limits.event_poll_interval_seconds
-            ):
-                self._queue.put(job_id)
-            self._queue.task_done()
+    def status(self) -> dict[str, Any]:
+        return {
+            "status": "running" if self._started and not self._stopping else "stopped",
+            "active_sessions": sum(
+                1 for task in self._session_tasks.values() if not task.done()
+            ),
+            "pending_jobs": len(self._pending_ids),
+        }
 
     def _process(self, job: dict[str, Any]) -> None:
         job_id = job["id"]
         project_id = job["project_id"]
         action_ledger: list[dict[str, Any]] = []
         mailbox: list[dict[str, Any]] = []
-        lease_keeper = GovernanceLeaseKeeper(self.store, project_id, str(job.get("worker_id") or threading.current_thread().name))
-        lease_keeper.start()
         try:
             with self._locks[project_id]:
                 project = self.store.get_project(project_id)
@@ -138,11 +285,14 @@ class ConversationAgent:
                         for item in capabilities
                         if self.registry.side_effect_kind(item) in {"none", "read"}
                     ]
+                trigger_kind = str(job.get("trigger_kind") or "user")
+                is_user_turn = trigger_kind == "user"
                 context = {
                     "active_workflow": workflow,
+                    "global_settings": self.global_settings,
                     "loops": self.store.list_loops(limit=20),
-                    "workflow_plans": self.store.list_workflow_plans(project_id),
-                    "task_plans": self.store.list_task_plans(project_id),
+                    "workflow_plans": self.store.list_workflow_plans(project_id) if is_user_turn else [],
+                    "task_plans": self.store.list_task_plans(project_id) if is_user_turn else [],
                     "tasks": self.store.task_summaries(project_id, self.policy.context.task_summary_limit),
                     "mailbox": mailbox,
                     "conversation_job": {"id": job_id, "start_task": bool(job["start_task"]), "trigger_kind": job.get("trigger_kind", "user"), "trigger": job.get("trigger", {})},
@@ -154,19 +304,28 @@ class ConversationAgent:
                         "job_id": job_id,
                     },
                 }
-                history = [
-                    item
-                    for item in self.store.messages(project_id, limit=None)
-                    if item.get("id") != job.get("user_message_id")
-                    and not (
-                        item.get("role") == "assistant"
-                        and (item.get("meta") or {}).get("kind") == "notification"
-                    )
-                    and not (
-                        item.get("role") == "assistant"
-                        and (item.get("meta") or {}).get("status") == "failed"
-                    )
-                ]
+                session_id = str(identity["logical_id"])
+                history = []
+                if not self.store.conversation_session_has_messages(
+                    project_id,
+                    session_id,
+                ):
+                    # Import an existing Project's public transcript into its
+                    # first Session-bound Run. Subsequent Turns replay the
+                    # canonical Session transcript without duplicating it.
+                    history = [
+                        item
+                        for item in self.store.messages(project_id, limit=None)
+                        if item.get("id") != job.get("user_message_id")
+                        and not (
+                            item.get("role") == "assistant"
+                            and (item.get("meta") or {}).get("kind") == "notification"
+                        )
+                        and not (
+                            item.get("role") == "assistant"
+                            and (item.get("meta") or {}).get("status") == "failed"
+                        )
+                    ]
                 result = self.agent_core.run(AgentRunSpec(
                     kind="conversation",
                     project=project,
@@ -177,6 +336,8 @@ class ConversationAgent:
                     history=history,
                     start_task=bool(job["start_task"]),
                     conversation_job_id=job_id,
+                    agent_session_id=session_id,
+                    user_initiated=is_user_turn,
                 ))
                 run_ids = [result.agent_run_id]
                 invocations = self.store.tool_invocations(
@@ -222,7 +383,7 @@ class ConversationAgent:
                     if item["capability"] == "workflow.publish"
                     and item["ok"]
                     and isinstance(item.get("result", {}).get("output"), dict)
-                ]
+                ] if is_user_turn else []
                 workflow_publications.extend(
                     item["result"]["output"]["workflow"]
                     for item in all_invocations
@@ -240,7 +401,6 @@ class ConversationAgent:
                     and item["result"]["output"]["artifact"].get("id")
                 ]
                 conversation_reply = result.text.strip()
-                trigger_kind = str(job.get("trigger_kind") or "user")
                 publish_reply = trigger_kind == "user" or mailbox_requires_user_update
                 notification = (
                     {
@@ -295,8 +455,6 @@ class ConversationAgent:
             if isinstance(exc, ConversationEvidenceRequiredError):
                 return
             raise
-        finally:
-            lease_keeper.stop()
 
 _TASK_TERMINAL_EVENTS = {"task.done", "task.failed"}
 _USER_UPDATE_EVENTS = _TASK_TERMINAL_EVENTS | {"conversation.planning_failed"}
@@ -343,22 +501,3 @@ def _has_durable_governance_progress(
         )
         for item in action_ledger
     )
-
-
-class GovernanceLeaseKeeper:
-    def __init__(self, store: V1Store, project_id: str, worker_id: str):
-        self.store, self.project_id, self.worker_id = store, project_id, worker_id
-        self.policy = store.policy
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._loop, name=f"governance-lease-{project_id[-8:]}", daemon=True)
-
-    def start(self) -> None:
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set(); self._thread.join(timeout=2)
-
-    def _loop(self) -> None:
-        while not self._stop.wait(self.policy.scheduling.conversation_lease_renew_seconds):
-            if not self.store.renew_conversation_lease(self.project_id, self.worker_id):
-                return

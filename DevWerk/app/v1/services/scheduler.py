@@ -6,7 +6,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.v1.repositories.base import StoreHost
-from app.v1.states import TASK_STATE_MACHINE, TaskStatus
+from app.v1.states import (
+    ATTEMPT_STATE_MACHINE,
+    COLUMN_RUN_STATE_MACHINE,
+    TASK_STATE_MACHINE,
+    AttemptStatus,
+    ColumnRunStatus,
+    TaskStatus,
+)
 from app.v1.storage_support import utcnow
 
 def _resource_domains_overlap(left: list[Any], right: list[Any]) -> bool:
@@ -32,6 +39,130 @@ def _resource_domains_overlap(left: list[Any], right: list[Any]) -> bool:
 class SchedulerService:
     def __init__(self, store: StoreHost):
         self.store = store
+
+    def prepare_startup(self, auto_resume_previous_tasks: bool) -> dict[str, Any]:
+        if auto_resume_previous_tasks:
+            return {
+                "auto_resume_previous_tasks": True,
+                "paused_tasks": 0,
+                "dependency_tasks_released": 0,
+                "projects": [],
+            }
+
+        now = utcnow()
+        interruption = "DevWerk startup paused unfinished Task because automatic resume is disabled"
+        with self.store.tx(immediate=True) as db:
+            dependency_rows = db.execute(
+                "SELECT t.id,t.project_id,t.task_plan_id FROM v1_tasks t "
+                "JOIN v1_scheduling_entries s ON s.task_id=t.id AND s.project_id=t.project_id "
+                "WHERE t.status='pending' AND t.control_state='paused' "
+                "AND t.supervision_action='startup_hold' AND s.state='queued'"
+            ).fetchall()
+            if dependency_rows:
+                dependency_ids = [str(row[0]) for row in dependency_rows]
+                placeholders = ",".join("?" for _ in dependency_ids)
+                db.execute(
+                    f"UPDATE v1_tasks SET control_state='active',supervision_action=NULL,"
+                    f"state_version=state_version+1,updated_at=? WHERE id IN ({placeholders})",
+                    (now, *dependency_ids),
+                )
+                for row in dependency_rows:
+                    self.store._event(
+                        db,
+                        str(row[1]),
+                        str(row[0]),
+                        None,
+                        "task.startup_hold_released",
+                        {
+                            "task_plan_id": str(row[2]),
+                            "reason": "dependency_queued_tasks_are_workflow_driven",
+                        },
+                    )
+
+            rows = db.execute(
+                "SELECT t.id,t.project_id,t.status,t.current_column,t.task_plan_id FROM v1_tasks t "
+                "JOIN v1_scheduling_entries s ON s.task_id=t.id AND s.project_id=t.project_id "
+                "WHERE t.status IN ('pending','running','waiting','recovering') AND ("
+                "(t.control_state='active' AND (t.status!='pending' OR s.state='admitted')) OR "
+                "(t.control_state='paused' AND t.supervision_action='startup_hold' AND s.state='admitted')"
+                ") ORDER BY t.created_at"
+            ).fetchall()
+            if not rows:
+                projects = sorted({str(row[1]) for row in dependency_rows})
+                for project_id in projects:
+                    self.store._refresh_projection(db, project_id)
+                return {
+                    "auto_resume_previous_tasks": False,
+                    "paused_tasks": 0,
+                    "dependency_tasks_released": len(dependency_rows),
+                    "projects": projects,
+                }
+
+            for row in rows:
+                TASK_STATE_MACHINE.require(row[2], TaskStatus.PENDING)
+            task_ids = [str(row[0]) for row in rows]
+            placeholders = ",".join("?" for _ in task_ids)
+            run_rows = db.execute(
+                "SELECT id,status FROM v1_column_runs WHERE status IN ('running','waiting') "
+                f"AND task_id IN ({placeholders})",
+                task_ids,
+            ).fetchall()
+            for row in run_rows:
+                COLUMN_RUN_STATE_MACHINE.require(row[1], ColumnRunStatus.INTERRUPTED)
+            attempt_rows = db.execute(
+                "SELECT id,status FROM v1_column_attempts WHERE status IN ('running','waiting') "
+                f"AND task_id IN ({placeholders})",
+                task_ids,
+            ).fetchall()
+            for row in attempt_rows:
+                ATTEMPT_STATE_MACHINE.require(row[1], AttemptStatus.INTERRUPTED)
+
+            db.execute(
+                "UPDATE v1_column_attempts SET status='interrupted',error=COALESCE(error,?),finished_at=COALESCE(finished_at,?) "
+                f"WHERE status IN ('running','waiting') AND task_id IN ({placeholders})",
+                (interruption, now, *task_ids),
+            )
+            db.execute(
+                "UPDATE v1_column_runs SET status='interrupted',error=COALESCE(error,?),finished_at=COALESCE(finished_at,?) "
+                f"WHERE status IN ('running','waiting') AND task_id IN ({placeholders})",
+                (interruption, now, *task_ids),
+            )
+            db.execute(
+                "UPDATE v1_await_handles SET status='interrupted',result_json=?,updated_at=? "
+                f"WHERE status='pending' AND task_id IN ({placeholders})",
+                (json.dumps({"reason": "startup_auto_resume_disabled"}), now, *task_ids),
+            )
+            db.execute(
+                "UPDATE v1_tasks SET status='pending',control_state='paused',supervision_action='startup_hold',"
+                "error=NULL,lease_owner=NULL,lease_until=NULL,next_retry_at=NULL,finished_at=NULL,"
+                "state_version=state_version+1,updated_at=? "
+                f"WHERE id IN ({placeholders})",
+                (now, *task_ids),
+            )
+
+            projects = sorted({str(row[1]) for row in [*dependency_rows, *rows]})
+            for row in rows:
+                self.store._event(
+                    db,
+                    str(row[1]),
+                    str(row[0]),
+                    None,
+                    "task.startup_paused",
+                    {
+                        "previous_status": str(row[2]),
+                        "current_column": str(row[3]),
+                        "setting": "workflow.auto_resume_previous_tasks",
+                    },
+                )
+            for project_id in projects:
+                self.store._refresh_projection(db, project_id)
+
+        return {
+            "auto_resume_previous_tasks": False,
+            "paused_tasks": len(rows),
+            "dependency_tasks_released": len(dependency_rows),
+            "projects": projects,
+        }
 
     def schedule_task(
         self,
@@ -195,6 +326,8 @@ class SchedulerService:
             pending_reason = "running"
         elif task["status"] == "waiting":
             pending_reason = "external_wait"
+        elif task.get("control_state") != "active":
+            pending_reason = task.get("supervision_action") or task.get("control_state") or "paused"
         elif any(not item["satisfied"] for item in dependency_facts):
             pending_reason = "waiting_dependency"
         elif row["state"] == "queued":
@@ -309,8 +442,9 @@ class SchedulerService:
 
 
     def runnable_task_ids(self, limit: int | None = None) -> list[str]:
-        now = utcnow()
         limit = limit or self.store.policy.scheduling.runnable_batch_size
+        self.store.recovery_manager.recover_expired_task_leases(limit)
+        now = utcnow()
         self._resolve_planned_dependencies()
         runnable: list[str] = []
         with self.store.tx(immediate=True) as db:

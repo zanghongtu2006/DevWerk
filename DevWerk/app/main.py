@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -14,10 +15,11 @@ from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
 from app.core.logging import configure_logging, configure_logging_from_env
+from app.core.restart import ManagedRestart
 from app.services.usage import init_usage_db
 from app.v1.api import router as v1_router
 from app.v1.capabilities import build_core_registry
-from app.v1.conversation import ConversationAgent
+from app.v1.conversation import ConversationGateway
 from app.v1.runtime import RuntimeSupervisor
 from app.v1.store import V1Store
 from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, PlatformPolicyLoader
@@ -26,6 +28,7 @@ from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, PlatformPolicyLoader
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cfg = settings()
+    global_settings = cfg.global_settings()
     configure_logging(cfg)
     log = logging.getLogger("devwerk")
     log.info("DevWerk V1 starting app_env=%s db=%s", cfg.app_env, cfg.devwerk_db_path)
@@ -34,11 +37,34 @@ async def lifespan(app: FastAPI):
     platform_policy = PlatformPolicyLoader(Path(__file__).resolve().parents[1] / "DEVWERK.md").load()
     registry = build_core_registry(policy)
     store = V1Store(cfg.devwerk_db_path, policy, registry=registry)
+    startup_result = store.prepare_workflow_startup(
+        global_settings.workflow.auto_resume_previous_tasks
+    )
+    log.info("Workflow startup policy applied result=%s", startup_result)
     platform_policy = store.register_platform_policy(platform_policy)
     supervisor = RuntimeSupervisor(store, registry)
     app.state.v1_store = store
     app.state.v1_registry = registry
-    conversation = ConversationAgent(store, registry, on_task_created=supervisor.wake, policy=policy, platform_policy=platform_policy)
+    app.state.v1_global_settings = global_settings
+    app.state.v1_global_settings_path = cfg.global_settings_path()
+    app.state.v1_restart = ManagedRestart(
+        Path(
+            os.environ.get(
+                "DEVWERK_RESTART_MARKER",
+                str(Path(__file__).resolve().parents[1] / "data" / "restart.request"),
+            )
+        ),
+        enabled=os.environ.get("DEVWERK_STARTUP_MANAGED") == "1",
+    )
+    conversation = ConversationGateway(
+        store,
+        registry,
+        on_task_created=supervisor.wake,
+        policy=policy,
+        platform_policy=platform_policy,
+        global_settings=global_settings.model_dump(mode="json"),
+    )
+    await conversation.start()
     app.state.v1_conversation = conversation
     app.state.v1_supervisor = supervisor
     if cfg.workflow_supervisor_enabled:
@@ -46,7 +72,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        conversation.stop()
+        await conversation.stop()
         supervisor.stop()
         log.info("DevWerk V1 stopped")
 
@@ -64,7 +90,7 @@ def create_app() -> FastAPI:
     async def disable_v1_web_cache(request: Request, call_next):
         response = await call_next(request)
         if request.url.path.startswith("/web/static/") or request.url.path in {
-            "/", "/workbench", "/dashboard", "/kanban", "/tasks", "/events"
+            "/", "/workbench", "/dashboard", "/kanban", "/tasks", "/events", "/settings"
         }:
             response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
             response.headers["Pragma"] = "no-cache"
@@ -92,6 +118,7 @@ def create_app() -> FastAPI:
         ("/kanban", "web-kanban"),
         ("/tasks", "web-tasks"),
         ("/events", "web-events"),
+        ("/settings", "web-settings"),
     ):
         app.add_api_route(route, index, methods=["GET"], include_in_schema=False, name=name)
 

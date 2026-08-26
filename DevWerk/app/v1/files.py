@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import subprocess
 import tempfile
@@ -8,6 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, V1RuntimePolicy
+
+
+logger = logging.getLogger("devwerk.files")
 
 
 class ProjectFiles:
@@ -187,18 +191,45 @@ class ProjectFiles:
             "actual": actual,
         }
 
-    def existing_texts(self, pattern: str, max_total_chars: int | None = None) -> list[dict[str, str]]:
+    def existing_texts(
+        self,
+        pattern: str,
+        max_total_chars: int | None = None,
+        *,
+        limit: int | None = None,
+        exclude_paths: set[str] | None = None,
+    ) -> list[dict[str, str]]:
         result: list[dict[str, str]] = []
         remaining = max_total_chars
+        maximum_files = max(1, limit or self.policy.context.artifact_context_max_files)
+        excluded = exclude_paths or set()
         for path, relative in self._matched_files(pattern):
-            if remaining is not None and remaining <= 0:
+            relative_path = relative.as_posix()
+            if relative_path in excluded:
                 continue
-            text = path.read_text(encoding="utf-8")
+            if remaining is not None and remaining <= 0:
+                break
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    text = handle.read(remaining + 1 if remaining is not None else -1)
+            except UnicodeDecodeError as exc:
+                logger.debug(
+                    "context artifact skipped path=%s reason=non_utf8 error=%s",
+                    relative_path,
+                    exc,
+                )
+                continue
             if remaining is not None and len(text) > remaining:
+                logger.debug(
+                    "context artifact skipped path=%s reason=context_character_limit",
+                    relative_path,
+                )
                 continue
             if remaining is not None:
                 remaining -= len(text)
-            result.append({"path": relative.as_posix(), "content": text})
+            result.append({"path": relative_path, "content": text})
+            if len(result) >= maximum_files:
+                break
         return result
 
     def run(self, argv: list[str], cwd: str = ".") -> dict[str, Any]:

@@ -24,7 +24,7 @@ Use after the Conversation Agent has completed requirement discovery with the us
 Select only for a software delivery project with a frozen requirement baseline and GitLab delivery target. Continue requirement conversation instead when material questions remain open. <br>
 
 ## Loop Input: <br>
-Product name, confirmed requirement document path, confirmation flag, and GitLab repository identity. <br>
+Product name and GitLab repository identity. Each Task Plan supplies its own confirmed requirement document. <br>
 
 ## Loop Output: <br>
 Versioned design documents, implementation, build and test evidence, independent review, GitLab merge-request and CI evidence, and final acceptance. <br>

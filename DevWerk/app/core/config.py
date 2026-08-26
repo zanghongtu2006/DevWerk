@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.core.global_settings import GlobalSettings, load_global_settings
+
 
 def _project_root() -> Path:
     return Path(__file__).resolve().parents[2]
@@ -147,6 +149,7 @@ class Settings(BaseSettings):
     workflow_supervisor_interval_seconds: float = Field(default=5.0)
     devwerk_usage_tracking: bool = Field(default=True)
     devwerk_db_path: str = Field(default="./data/devwerk.db")
+    devwerk_global_settings_path: str = Field(default="./config/global-settings.yaml")
 
     devwerk_llm_config_path: str = Field(default="./config/llm.json")
     devwerk_llm_config_json: str | None = Field(default=None)
@@ -183,6 +186,12 @@ class Settings(BaseSettings):
             return LLMCatalog.model_validate(value)
         except Exception as exc:  # Pydantic provides the exact unknown/missing field path.
             raise ValueError(f"{label} does not match the LLM configuration schema: {exc}") from exc
+
+    def global_settings(self) -> GlobalSettings:
+        return load_global_settings(self.global_settings_path())
+
+    def global_settings_path(self) -> Path:
+        return _resolve_config_path(self.devwerk_global_settings_path)
 
     def api_profiles(self) -> dict[str, ApiProfile]:
         config = self.llm_config()

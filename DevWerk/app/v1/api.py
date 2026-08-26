@@ -11,6 +11,12 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.core.debug_trace import trace_json
+from app.core.global_settings import (
+    GlobalSettings,
+    global_settings_payload,
+    restart_required_changes,
+    save_global_settings,
+)
 from app.v1.domain import ConversationRequest, ExternalEventSignal, LoopApplyRequest, ProjectCreate, TaskCreate, TaskPlanCreate, WorkflowPlanCreate, WorkflowRevisionPublishRequest
 from app.v1.capabilities import (
     CapabilityContext,
@@ -31,6 +37,32 @@ def runtime_statuses() -> dict[str, dict[str, object]]:
     return runtime_status_catalog()
 
 
+@router.get("/settings")
+def get_global_settings(request: Request) -> dict[str, Any]:
+    return global_settings_payload(request.app.state.v1_global_settings)
+
+
+@router.post("/settings")
+def update_global_settings(
+    payload: GlobalSettings,
+    request: Request,
+) -> dict[str, Any]:
+    previous = request.app.state.v1_global_settings
+    restart_changes = restart_required_changes(previous, payload)
+    save_global_settings(request.app.state.v1_global_settings_path, payload)
+    request.app.state.v1_global_settings = payload
+    request.app.state.v1_conversation.global_settings = payload.model_dump(mode="json")
+    restart_scheduled = bool(restart_changes) and request.app.state.v1_restart.schedule()
+    return {
+        **global_settings_payload(payload),
+        "saved": True,
+        "changed": previous != payload,
+        "restart_required": bool(restart_changes),
+        "restart_scheduled": restart_scheduled,
+        "restart_changes": restart_changes,
+    }
+
+
 def store(request: Request):
     return request.app.state.v1_store
 
@@ -47,7 +79,12 @@ def not_found(exc: KeyError) -> HTTPException:
 def health(request: Request) -> dict[str, Any]:
     with store(request).connect() as db:
         db.execute("SELECT 1").fetchone()
-    return {"status": "ok", "runtime": "devwerk-v1", "supervisor": "running"}
+    return {
+        "status": "ok",
+        "runtime": "devwerk-v1",
+        "supervisor": "running",
+        "conversation_gateway": request.app.state.v1_conversation.status(),
+    }
 
 
 @router.post("/projects", status_code=201)
@@ -87,7 +124,7 @@ def project_capabilities(project_id: str, request: Request) -> list[dict[str, An
 
 
 @router.post("/projects/{project_id}/conversation", status_code=202)
-def converse(project_id: str, payload: ConversationRequest, request: Request) -> dict[str, Any]:
+async def converse(project_id: str, payload: ConversationRequest, request: Request) -> dict[str, Any]:
     trace_json(
         _trace_log,
         "web.conversation_input",
@@ -96,7 +133,11 @@ def converse(project_id: str, payload: ConversationRequest, request: Request) ->
         start_task=payload.start_task,
     )
     try:
-        result = request.app.state.v1_conversation.submit(project_id, payload.message, payload.start_task)
+        result = await request.app.state.v1_conversation.submit(
+            project_id,
+            payload.message,
+            payload.start_task,
+        )
         trace_json(_trace_log, "web.conversation_output", project_id=project_id, output=result)
         return result
     except KeyError as exc:
@@ -240,7 +281,7 @@ def list_task_plans(project_id: str, request: Request, limit: int = Query(DEFAUL
 @router.post("/projects/{project_id}/automation/tasks", status_code=201)
 def create_task(project_id: str, payload: TaskCreate, request: Request) -> dict[str, Any]:
     try:
-        task = store(request).create_task(
+        task = store(request).materialize_task_plan(
             project_id,
             task_plan_id=payload.task_plan_id,
             proposed_task_ref=payload.proposed_task_ref,

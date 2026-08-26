@@ -68,6 +68,9 @@ if /i "%UVICORN_ACCESS_LOG%"=="false" set "UVICORN_ACCESS_FLAG=--no-access-log"
 if /i "%UVICORN_ACCESS_LOG%"=="0" set "UVICORN_ACCESS_FLAG=--no-access-log"
 if /i "%UVICORN_ACCESS_LOG%"=="no" set "UVICORN_ACCESS_FLAG=--no-access-log"
 
+set "DEVWERK_STARTUP_MANAGED=1"
+set "DEVWERK_RESTART_MARKER=%CD%\data\restart.request"
+
 "%PYTHON_EXE%" -c "import fastapi, pydantic, uvicorn" >nul 2>&1
 if errorlevel 1 (
     echo [DevWerk] Service dependencies are missing or out of date.
@@ -97,4 +100,11 @@ echo.
 echo [DevWerk] Press Ctrl+C to stop.
 echo.
 
+:run_service
 "%PYTHON_EXE%" -m uvicorn app.main:app %UVICORN_RELOAD% --host %HOST% --port %PORT% --log-level %LOG_LEVEL% %UVICORN_ACCESS_FLAG%
+
+if exist "%DEVWERK_RESTART_MARKER%" (
+    del /q "%DEVWERK_RESTART_MARKER%"
+    echo [DevWerk] Settings saved. Restarting with the Project virtual environment...
+    goto run_service
+)

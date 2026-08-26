@@ -14,7 +14,6 @@ class _PolicyModel(BaseModel):
 
 
 class SchedulingPolicy(_PolicyModel):
-    conversation_workers: int = Field(default=4, ge=1)
     runtime_workers: int = Field(default=4, ge=1)
     default_wip_limit: int = Field(default=4, ge=1)
     task_lease_seconds: int = Field(default=120, ge=1)
@@ -31,6 +30,8 @@ class SchedulingPolicy(_PolicyModel):
 class ContextPolicy(_PolicyModel):
     task_summary_limit: int = Field(default=100, ge=1)
     mailbox_limit: int = Field(default=100, ge=1)
+    artifact_context_max_characters: int = Field(default=200_000, ge=65_535)
+    artifact_context_max_files: int = Field(default=200, ge=1)
 
 
 class ServiceLimits(_PolicyModel):

@@ -60,6 +60,20 @@ def _resolve_loop_parameters(value: Any, parameters: dict[str, Any]) -> Any:
     return value
 
 
+def _validate_loop_parameter_ownership(
+    loop_key: str,
+    parameter_schema: dict[str, Any],
+    workflow_plan: WorkflowPlan,
+) -> None:
+    project_fields = set((parameter_schema.get("properties") or {}).keys())
+    task_fields = set((workflow_plan.task_contract.input_schema.get("properties") or {}).keys())
+    overlap = sorted(project_fields & task_fields)
+    if overlap:
+        raise ValueError(
+            f"Loop {loop_key} declares fields in both Project bindings and Task input: {overlap}"
+        )
+
+
 def _validate_process_stage_alignment(
     plan: WorkflowPlan,
     workflow: WorkflowDefinition,
@@ -258,6 +272,7 @@ class V1Store:
             workflow_plan = WorkflowPlan.model_validate(bundle["workflow_plan"])
             check_schema(workflow_plan.task_contract.input_schema, label=f"Loop {loop_key} task input_schema")
             WorkflowDefinition.model_validate(bundle["workflow"])
+        _validate_loop_parameter_ownership(loop_key, parameter_schema, workflow_plan)
         return loop
 
     def apply_loop(
@@ -509,6 +524,12 @@ class V1Store:
         self.get_project(project_id)
         job_id, now = new_id("cjob"), utcnow()
         with self.tx(immediate=True) as db:
+            session = db.execute(
+                "SELECT logical_id FROM v1_conversation_agents WHERE project_id=?",
+                (project_id,),
+            ).fetchone()
+            if session is None:
+                raise KeyError(project_id)
             cursor = db.execute(
                 "INSERT INTO v1_conversations(project_id,role,content,meta_json,created_at) VALUES(?,?,?,?,?)",
                 (
@@ -522,9 +543,9 @@ class V1Store:
             message_id = int(cursor.lastrowid)
             db.execute(
                 "INSERT INTO v1_conversation_jobs "
-                "(id,project_id,user_message_id,message,start_task,status,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,'queued',?,?)",
-                (job_id, project_id, message_id, message, int(start_task), now, now),
+                "(id,project_id,conversation_session_id,user_message_id,message,start_task,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,'queued',?,?)",
+                (job_id, project_id, session[0], message_id, message, int(start_task), now, now),
             )
             db.execute(
                 "UPDATE v1_conversation_agents SET state='planning',updated_at=? WHERE project_id=?",
@@ -572,6 +593,12 @@ class V1Store:
                 trigger = {"mailbox_ids": mailbox_ids, "review_reason": review[1] if review else None}
                 job_id = new_id("cjob")
                 review_reason = review[1] if review else None
+                session = db.execute(
+                    "SELECT logical_id FROM v1_conversation_agents WHERE project_id=?",
+                    (project_id,),
+                ).fetchone()
+                if session is None:
+                    continue
                 cursor = db.execute(
                     "INSERT INTO v1_conversations(project_id,role,content,meta_json,created_at) VALUES(?,?,?,?,?)",
                     (
@@ -586,9 +613,9 @@ class V1Store:
                     ),
                 )
                 db.execute(
-                    "INSERT INTO v1_conversation_jobs(id,project_id,user_message_id,message,start_task,status,trigger_kind,trigger_json,mailbox_ids_json,scheduled_review_id,created_at,updated_at) "
-                    "VALUES(?,?,?,?,1,'queued',?,?,?,?,?,?)",
-                    (job_id, project_id, int(cursor.lastrowid), "", trigger_kind, json.dumps(trigger, ensure_ascii=False), json.dumps(mailbox_ids), review[0] if review else None, now, now),
+                    "INSERT INTO v1_conversation_jobs(id,project_id,conversation_session_id,user_message_id,message,start_task,status,trigger_kind,trigger_json,mailbox_ids_json,scheduled_review_id,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,1,'queued',?,?,?,?,?,?)",
+                    (job_id, project_id, session[0], int(cursor.lastrowid), "", trigger_kind, json.dumps(trigger, ensure_ascii=False), json.dumps(mailbox_ids), review[0] if review else None, now, now),
                 )
                 db.execute("UPDATE v1_conversation_agents SET state='planning',updated_at=? WHERE project_id=?", (now, project_id))
                 self._event(
@@ -611,11 +638,11 @@ class V1Store:
         row = self._decode(row, "trigger_json", "mailbox_ids_json", "result_json") or row
         return row
 
-    def claim_conversation_job(self, job_id: str, worker_id: str) -> dict[str, Any] | None:
+    def claim_conversation_job(self, job_id: str, claim_owner: str) -> dict[str, Any] | None:
         now = utcnow()
         with self.tx(immediate=True) as db:
             changed = db.execute(
-                "UPDATE v1_conversation_jobs SET status='running',worker_id=?,updated_at=?,error=NULL "
+                "UPDATE v1_conversation_jobs SET status='running',claim_owner=?,updated_at=?,error=NULL "
                 "WHERE id=? AND status='queued' "
                 "AND NOT EXISTS ("
                 "SELECT 1 FROM v1_conversation_jobs earlier "
@@ -624,7 +651,7 @@ class V1Store:
                 "AND (earlier.created_at<current.created_at OR (earlier.created_at=current.created_at AND earlier.user_message_id<current.user_message_id))"
                 ") "
                 "AND NOT EXISTS (SELECT 1 FROM v1_conversation_agents a JOIN v1_conversation_jobs j ON j.project_id=a.project_id WHERE j.id=? AND a.lease_until IS NOT NULL AND a.lease_until>?)",
-                (worker_id, now, job_id, job_id, job_id, now),
+                (claim_owner, now, job_id, job_id, job_id, now),
             ).rowcount
             if not changed:
                 return None
@@ -642,11 +669,11 @@ class V1Store:
                 placeholders = ",".join("?" for _ in captured)
                 db.execute(
                     f"UPDATE v1_project_mailbox SET state='claimed',claim_owner=?,claim_expires_at=? WHERE project_id=? AND state='pending' AND id IN ({placeholders})",
-                    [worker_id, lease_until, row["project_id"], *captured],
+                    [claim_owner, lease_until, row["project_id"], *captured],
                 )
             db.execute(
                 "UPDATE v1_conversation_agents SET lease_owner=?,lease_until=?,state='planning',updated_at=? WHERE project_id=?",
-                (worker_id, lease_until, now, row["project_id"]),
+                (claim_owner, lease_until, now, row["project_id"]),
             )
             agent = db.execute(
                 "SELECT logical_id FROM v1_conversation_agents WHERE project_id=?", (row["project_id"],)
@@ -657,7 +684,7 @@ class V1Store:
                 None,
                 None,
                 "conversation.planning_started",
-                {"job_id": job_id, "worker_id": worker_id, "agent_id": agent[0] if agent else None, "llm_used": True},
+                {"job_id": job_id, "session_owner": claim_owner, "agent_id": agent[0] if agent else None, "llm_used": True},
             )
         return self.get_conversation_job(job_id)
 
@@ -671,7 +698,7 @@ class V1Store:
     ) -> dict[str, Any]:
         now = utcnow()
         with self.tx(immediate=True) as db:
-            row = db.execute("SELECT project_id,mailbox_ids_json,scheduled_review_id,worker_id FROM v1_conversation_jobs WHERE id=?", (job_id,)).fetchone()
+            row = db.execute("SELECT project_id,mailbox_ids_json,scheduled_review_id,claim_owner FROM v1_conversation_jobs WHERE id=?", (job_id,)).fetchone()
             if not row:
                 raise KeyError(job_id)
             project_id = row[0]
@@ -782,7 +809,7 @@ class V1Store:
         safe_error = error
         with self.tx(immediate=True) as db:
             row = db.execute(
-                "SELECT project_id,trigger_kind,mailbox_ids_json,worker_id,scheduled_review_id "
+                "SELECT project_id,trigger_kind,mailbox_ids_json,claim_owner,scheduled_review_id "
                 "FROM v1_conversation_jobs WHERE id=?",
                 (job_id,),
             ).fetchone()
@@ -862,11 +889,11 @@ class V1Store:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def renew_conversation_lease(self, project_id: str, worker_id: str, lease_seconds: int | None = None) -> bool:
+    def renew_conversation_lease(self, project_id: str, claim_owner: str, lease_seconds: int | None = None) -> bool:
         lease_seconds = lease_seconds or self.policy.scheduling.conversation_lease_seconds
         now = utcnow(); lease = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat(timespec="milliseconds")
         with self.tx(immediate=True) as db:
-            changed = db.execute("UPDATE v1_conversation_agents SET lease_until=?,updated_at=? WHERE project_id=? AND lease_owner=? AND state='planning'", (lease, now, project_id, worker_id)).rowcount
+            changed = db.execute("UPDATE v1_conversation_agents SET lease_until=?,updated_at=? WHERE project_id=? AND lease_owner=? AND state='planning'", (lease, now, project_id, claim_owner)).rowcount
         return changed == 1
 
     @staticmethod
@@ -977,6 +1004,29 @@ class V1Store:
         row["loop_bindings"] = json.loads(binding[0]) if binding else {}
         return row
 
+    def get_project_loop_binding(self, project_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = self._dict(db.execute(
+                "SELECT * FROM v1_project_loop_bindings WHERE project_id=? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (project_id,),
+            ).fetchone())
+        if not row:
+            return None
+        row["bindings"] = json.loads(row.pop("bindings_json"))
+        return row
+
+    def get_project_loop_assets(self, project_id: str) -> list[dict[str, str]]:
+        binding = self.get_project_loop_binding(project_id)
+        if not binding:
+            return []
+        loop = self.get_loop(binding["loop_key"])
+        if loop["digest"] != binding["loop_digest"]:
+            raise ValueError(
+                f"Loop assets for {binding['loop_key']!r} no longer match the Project binding digest"
+            )
+        return [dict(asset) for asset in loop.get("assets", [])]
+
     def workflow_by_id(self, project_id: str, workflow_id: str) -> WorkflowDefinition:
         with self.connect() as db:
             row = db.execute("SELECT definition_json FROM v1_workflow_revisions WHERE id=? AND project_id=?", (workflow_id, project_id)).fetchone()
@@ -992,6 +1042,275 @@ class V1Store:
         row["definition"] = json.loads(row.pop("definition_json"))
         row["active"] = bool(row["active"])
         return row
+
+    def materialize_task_plan(
+        self,
+        project_id: str,
+        *,
+        task_plan_id: str,
+        proposed_task_ref: str,
+    ) -> dict[str, Any]:
+        """Start one immutable Task Plan by materializing its complete Task graph."""
+        plan_row = self.get_task_plan(project_id, task_plan_id)
+        plan = TaskPlan.model_validate(plan_row["plan"])
+        task_refs = [item.proposed_task_ref for item in plan.tasks]
+        if proposed_task_ref not in task_refs:
+            raise KeyError(proposed_task_ref)
+        workflow = self.get_workflow_revision(project_id, plan.workflow_revision_id)
+        definition = WorkflowDefinition.model_validate(workflow["definition"])
+        workflow_plan = WorkflowPlan.model_validate(
+            self.get_workflow_plan(project_id, str(workflow["workflow_plan_id"]))["plan"]
+        )
+        prepared = [
+            self._prepare_task_materialization(
+                project_id,
+                task_plan_id,
+                plan,
+                proposed,
+                workflow,
+                definition,
+                workflow_plan,
+            )
+            for proposed in plan.tasks
+        ]
+
+        requested_task_id: str | None = None
+        created_task_ids: list[str] = []
+        with self.tx(immediate=True) as db:
+            existing_rows = db.execute(
+                "SELECT proposed_task_ref,id FROM v1_tasks WHERE project_id=? AND task_plan_id=? "
+                "ORDER BY created_at DESC",
+                (project_id, task_plan_id),
+            ).fetchall()
+            existing: dict[str, str] = {}
+            for row in existing_rows:
+                existing.setdefault(str(row[0]), str(row[1]))
+            present_refs = set(existing) & set(task_refs)
+            if present_refs and present_refs != set(task_refs):
+                raise RuntimeError(
+                    "Task Plan is partially materialized; refusing to expose a mixed runnable graph"
+                )
+            if present_refs == set(task_refs):
+                requested_task_id = existing[proposed_task_ref]
+            else:
+                for item in prepared:
+                    task_id = self._insert_prepared_task(db, item)
+                    created_task_ids.append(task_id)
+                    if item["proposed"].proposed_task_ref == proposed_task_ref:
+                        requested_task_id = task_id
+                self._event(
+                    db,
+                    project_id,
+                    None,
+                    None,
+                    "task.plan_materialized",
+                    {
+                        "task_plan_id": task_plan_id,
+                        "requested_task_ref": proposed_task_ref,
+                        "created_task_ids": created_task_ids,
+                        "task_refs": task_refs,
+                    },
+                )
+                self._refresh_projection(db, project_id)
+        if requested_task_id is None:
+            raise RuntimeError("requested Task Plan item was not materialized")
+        return self.get_project_task(project_id, requested_task_id)
+
+    def _prepare_task_materialization(
+        self,
+        project_id: str,
+        task_plan_id: str,
+        plan: TaskPlan,
+        proposed: Any,
+        workflow: dict[str, Any],
+        definition: WorkflowDefinition,
+        workflow_plan: WorkflowPlan,
+        *,
+        rerun_of_task_id: str | None = None,
+    ) -> dict[str, Any]:
+        input_data = validate_task_capability_bindings(
+            definition,
+            self.registry,
+            dict(proposed.input),
+            exact_strings=task_binding_exact_strings(
+                self,
+                project_id,
+                task_plan_id,
+                proposed.proposed_task_ref,
+            ),
+        )
+        proposed.validate_agent_execution_workflow(definition)
+        readiness = ReadinessDecision.model_validate({
+            **proposed.readiness.model_dump(mode="json"),
+            "objective": proposed.objective,
+            "dependencies": list(proposed.dependencies),
+            "conflict_domains": [
+                item.model_dump(mode="json")
+                for item in proposed.conflict_domains
+            ],
+        }).model_dump(mode="json")
+        _validate_deterministic_deliverable_coverage(definition, readiness)
+        if rerun_of_task_id:
+            predecessor = self.get_project_task(project_id, rerun_of_task_id)
+            if predecessor["status"] not in {"done", "failed"}:
+                raise ValueError("a Task successor requires an immutable terminal predecessor")
+            if predecessor.get("proposed_task_ref") != proposed.proposed_task_ref:
+                raise ValueError("a Task successor must preserve proposed task identity")
+        return {
+            "project_id": project_id,
+            "task_plan_id": task_plan_id,
+            "plan": plan,
+            "proposed": proposed,
+            "workflow": workflow,
+            "definition": definition,
+            "workflow_plan": workflow_plan,
+            "input_data": input_data,
+            "readiness": readiness,
+            "rerun_of_task_id": rerun_of_task_id,
+        }
+
+    def _insert_prepared_task(
+        self,
+        db: sqlite3.Connection,
+        prepared: dict[str, Any],
+    ) -> str:
+        project_id = str(prepared["project_id"])
+        task_plan_id = str(prepared["task_plan_id"])
+        proposed = prepared["proposed"]
+        workflow = prepared["workflow"]
+        definition = prepared["definition"]
+        workflow_plan = prepared["workflow_plan"]
+        input_data = dict(prepared["input_data"])
+        readiness = dict(prepared["readiness"])
+        rerun_of_task_id = prepared.get("rerun_of_task_id")
+        now = utcnow()
+        if rerun_of_task_id:
+            existing_successor = db.execute(
+                "SELECT id FROM v1_tasks WHERE project_id=? AND rerun_of_task_id=? LIMIT 1",
+                (project_id, rerun_of_task_id),
+            ).fetchone()
+            if existing_successor:
+                raise ValueError("The terminal predecessor already has a materialized successor")
+        else:
+            latest = db.execute(
+                "SELECT id,status,resolved_by_task_id FROM v1_tasks "
+                "WHERE project_id=? AND task_plan_id=? AND proposed_task_ref=? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (project_id, task_plan_id, proposed.proposed_task_ref),
+            ).fetchone()
+            if latest and latest[1] == "failed" and not latest[2]:
+                rerun_of_task_id = str(latest[0])
+            elif latest:
+                raise ValueError(
+                    "The referenced Task Plan item is already materialized; "
+                    "use task.rerun for an explicit terminal successor"
+                )
+
+        resolved_dependencies: list[str] = []
+        unresolved_dependencies: list[str] = []
+        for ref in proposed.dependencies:
+            dependency = db.execute(
+                "SELECT id FROM v1_tasks WHERE project_id=? AND task_plan_id=? "
+                "AND proposed_task_ref=? AND status='done' "
+                "ORDER BY finished_at DESC,created_at DESC LIMIT 1",
+                (project_id, task_plan_id, ref),
+            ).fetchone()
+            if dependency:
+                resolved_dependencies.append(str(dependency[0]))
+            else:
+                unresolved_dependencies.append(str(ref))
+        schedule_state = "queued" if unresolved_dependencies else "admitted"
+        task_id = new_id("tsk")
+        conflict_domains = [item.canonical_key for item in proposed.conflict_domains]
+        initial_context = {
+            "planning": {
+                "task_plan_id": task_plan_id,
+                "workflow_plan_id": workflow["workflow_plan_id"],
+                "task_ref": proposed.proposed_task_ref,
+                "workflow_fit": proposed.workflow_fit,
+                "review_scope": proposed.review_scope,
+                "retry_scope": proposed.retry_scope,
+            }
+        }
+        db.execute(
+            "INSERT INTO v1_tasks(id,project_id,workflow_revision_id,task_plan_id,proposed_task_ref,"
+            "title,brief,input_json,context_json,readiness_json,conflict_domains_json,status,control_state,"
+            "rerun_of_task_id,current_column,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,'pending','active',?,?,?,?)",
+            (
+                task_id, project_id, workflow["id"], task_plan_id, proposed.proposed_task_ref,
+                proposed.title, proposed.brief, json.dumps(input_data, ensure_ascii=False),
+                json.dumps(initial_context, ensure_ascii=False), json.dumps(readiness, ensure_ascii=False),
+                json.dumps(conflict_domains, ensure_ascii=False), rerun_of_task_id, definition.entry, now, now,
+            ),
+        )
+        run_id = new_id("run")
+        db.execute(
+            "INSERT INTO v1_column_runs(id,project_id,task_id,column_key,sequence,status,attempt,input_json,created_at) "
+            "VALUES(?,?,?,?,1,'pending',0,?,?)",
+            (run_id, project_id, task_id, definition.entry, json.dumps(input_data, ensure_ascii=False), now),
+        )
+        backlog_id = new_id("backlog")
+        db.execute(
+            "INSERT INTO v1_backlog_items(id,project_id,title,brief,readiness_json,state,task_id,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                backlog_id, project_id, proposed.title, proposed.brief,
+                json.dumps(readiness, ensure_ascii=False),
+                "dispatched" if schedule_state == "admitted" else "queued", task_id, now, now,
+            ),
+        )
+        dependency_tokens = resolved_dependencies + [
+            f"task-plan:{task_plan_id}:{ref}" for ref in unresolved_dependencies
+        ]
+        db.execute(
+            "INSERT INTO v1_scheduling_entries(task_id,project_id,state,priority,wip_group,wip_limit,"
+            "dependencies_json,resources_json,created_at,updated_at,auto_admit) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                task_id, project_id, schedule_state, 0, workflow_plan.wip_group, workflow_plan.wip_limit,
+                json.dumps(dependency_tokens), json.dumps(conflict_domains), now, now,
+                int(bool(unresolved_dependencies)),
+            ),
+        )
+        for dependency_id in resolved_dependencies:
+            db.execute(
+                "INSERT INTO v1_task_dependencies(task_id,depends_on_task_id,project_id,required_terminal,created_at) "
+                "VALUES(?,?,?,'done',?)",
+                (task_id, dependency_id, project_id, now),
+            )
+        db.execute(
+            "INSERT INTO v1_governance_decisions(id,project_id,kind,subject_id,decision,data_json,created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (
+                new_id("gdec"), project_id, "readiness", task_id, schedule_state,
+                json.dumps({**readiness, "unresolved_dependencies": unresolved_dependencies}, ensure_ascii=False), now,
+            ),
+        )
+        self._event(
+            db,
+            project_id,
+            task_id,
+            None,
+            "task.created",
+            {
+                "title": proposed.title,
+                "entry": definition.entry,
+                "schedule_state": schedule_state,
+                "task_plan_id": task_plan_id,
+                "proposed_task_ref": proposed.proposed_task_ref,
+                "rerun_of_task_id": rerun_of_task_id,
+            },
+        )
+        if unresolved_dependencies:
+            self._event(
+                db,
+                project_id,
+                task_id,
+                None,
+                "task.dependency_waiting",
+                {"dependencies": unresolved_dependencies, "pending_reason": "waiting_dependency"},
+            )
+        return task_id
 
     def create_task(
         self,
@@ -1011,142 +1330,18 @@ class V1Store:
         workflow_plan = WorkflowPlan.model_validate(
             self.get_workflow_plan(project_id, str(workflow["workflow_plan_id"]))["plan"]
         )
-        title = proposed.title
-        brief = proposed.brief
-        input_data = dict(proposed.input)
-        input_data = validate_task_capability_bindings(
+        prepared = self._prepare_task_materialization(
+            project_id,
+            task_plan_id,
+            plan,
+            proposed,
+            workflow,
             definition,
-            self.registry,
-            input_data,
-            exact_strings=task_binding_exact_strings(
-                self,
-                project_id,
-                task_plan_id,
-                proposed_task_ref,
-            ),
+            workflow_plan,
+            rerun_of_task_id=rerun_of_task_id,
         )
-        proposed.validate_agent_execution_workflow(definition)
-        readiness = ReadinessDecision.model_validate({
-            **proposed.readiness.model_dump(mode="json"),
-            "objective": proposed.objective,
-            "dependencies": list(proposed.dependencies),
-            "conflict_domains": [
-                item.model_dump(mode="json")
-                for item in proposed.conflict_domains
-            ],
-        }).model_dump(mode="json")
-        _validate_deterministic_deliverable_coverage(definition, readiness)
-        if rerun_of_task_id:
-            predecessor = self.get_project_task(project_id, rerun_of_task_id)
-            if predecessor["status"] not in {"done", "failed"}:
-                raise ValueError("a Task successor requires an immutable terminal predecessor")
-            if (
-                predecessor.get("proposed_task_ref") != proposed_task_ref
-            ):
-                raise ValueError(
-                    "a Task successor must preserve proposed task identity"
-                )
-        task_id, now = new_id("tsk"), utcnow()
-        conflict_domains = [item.canonical_key for item in proposed.conflict_domains]
-        resolved_dependencies: list[str] = []
-        unresolved_dependencies: list[str] = []
-        with self.connect() as db:
-            for ref in proposed.dependencies:
-                dependency = db.execute(
-                    "SELECT id FROM v1_tasks WHERE project_id=? AND task_plan_id=? AND proposed_task_ref=? AND status='done' "
-                    "ORDER BY finished_at DESC,created_at DESC LIMIT 1",
-                    (project_id, task_plan_id, ref),
-                ).fetchone()
-                if dependency:
-                    resolved_dependencies.append(dependency[0])
-                else:
-                    unresolved_dependencies.append(ref)
-        schedule_state = "admitted" if readiness.get("decision") == "dispatch" and not unresolved_dependencies else "queued"
-        pending_deadline = None
-        initial_context = {
-            "planning": {
-                "task_plan_id": task_plan_id,
-                "workflow_plan_id": workflow["workflow_plan_id"],
-                "task_ref": proposed_task_ref,
-                "workflow_fit": proposed.workflow_fit,
-                "review_scope": proposed.review_scope,
-                "retry_scope": proposed.retry_scope,
-            }
-        }
         with self.tx(immediate=True) as db:
-            if rerun_of_task_id:
-                existing_successor = db.execute(
-                    "SELECT id FROM v1_tasks WHERE project_id=? AND rerun_of_task_id=? LIMIT 1",
-                    (project_id, rerun_of_task_id),
-                ).fetchone()
-                if existing_successor:
-                    raise ValueError(
-                        "The terminal predecessor already has a materialized successor"
-                    )
-            else:
-                latest = db.execute(
-                    "SELECT id,status,resolved_by_task_id FROM v1_tasks "
-                    "WHERE project_id=? AND task_plan_id=? AND proposed_task_ref=? "
-                    "ORDER BY created_at DESC LIMIT 1",
-                    (project_id, task_plan_id, proposed_task_ref),
-                ).fetchone()
-                if latest and latest[1] == "failed" and not latest[2]:
-                    rerun_of_task_id = str(latest[0])
-                elif latest:
-                    raise ValueError(
-                        "The referenced Task Plan item is already materialized; "
-                        "use task.rerun for an explicit terminal successor"
-                    )
-            db.execute(
-                "INSERT INTO v1_tasks(id,project_id,workflow_revision_id,task_plan_id,proposed_task_ref,title,brief,input_json,context_json,readiness_json,conflict_domains_json,status,control_state,rerun_of_task_id,current_column,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,'pending','active',?,?,?,?)",
-                (task_id, project_id, workflow["id"], task_plan_id, proposed_task_ref, title, brief, json.dumps(input_data, ensure_ascii=False), json.dumps(initial_context, ensure_ascii=False), json.dumps(readiness, ensure_ascii=False), json.dumps(conflict_domains, ensure_ascii=False), rerun_of_task_id, definition.entry, now, now),
-            )
-            run_id = new_id("run")
-            db.execute(
-                "INSERT INTO v1_column_runs(id,project_id,task_id,column_key,sequence,status,attempt,input_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (run_id, project_id, task_id, definition.entry, 1, "pending", 0, json.dumps(input_data, ensure_ascii=False), now),
-            )
-            backlog_id = new_id("backlog")
-            db.execute("INSERT INTO v1_backlog_items(id,project_id,title,brief,readiness_json,state,task_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (backlog_id, project_id, title, brief, json.dumps(readiness, ensure_ascii=False), "dispatched" if schedule_state == "admitted" else "queued", task_id, now, now))
-            dependency_tokens = resolved_dependencies + [f"task-plan:{task_plan_id}:{ref}" for ref in unresolved_dependencies]
-            db.execute("INSERT INTO v1_scheduling_entries(task_id,project_id,state,priority,wip_group,wip_limit,dependencies_json,resources_json,created_at,updated_at,auto_admit) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (task_id, project_id, schedule_state, 0, workflow_plan.wip_group, workflow_plan.wip_limit, json.dumps(dependency_tokens), json.dumps(conflict_domains), now, now, int(readiness.get("decision") == "dispatch" and bool(unresolved_dependencies))))
-            for dependency_id in resolved_dependencies:
-                db.execute(
-                    "INSERT INTO v1_task_dependencies(task_id,depends_on_task_id,project_id,required_terminal,created_at) VALUES(?,?,?,'done',?)",
-                    (task_id, dependency_id, project_id, now),
-                )
-            db.execute(
-                "INSERT INTO v1_governance_decisions(id,project_id,kind,subject_id,decision,data_json,created_at) VALUES(?,?,?,?,?,?,?)",
-                (new_id("gdec"), project_id, "readiness", task_id, schedule_state, json.dumps({**readiness, "unresolved_dependencies": unresolved_dependencies}, ensure_ascii=False), now),
-            )
-            self._event(
-                db,
-                project_id,
-                task_id,
-                None,
-                "task.created",
-                {
-                    "title": title,
-                    "entry": definition.entry,
-                    "schedule_state": schedule_state,
-                    "task_plan_id": task_plan_id,
-                    "proposed_task_ref": proposed_task_ref,
-                    "rerun_of_task_id": rerun_of_task_id,
-                },
-            )
-            if unresolved_dependencies:
-                self._event(
-                    db,
-                    project_id,
-                    task_id,
-                    None,
-                    "task.dependency_waiting",
-                    {
-                        "dependencies": unresolved_dependencies,
-                        "pending_reason": "waiting_dependency",
-                    },
-                )
+            task_id = self._insert_prepared_task(db, prepared)
             self._refresh_projection(db, project_id)
         return self.get_task(task_id)
 
@@ -1183,7 +1378,7 @@ class V1Store:
         limit = limit or self.policy.context.task_summary_limit
         with self.connect() as db:
             rows = db.execute(
-                "SELECT id,title,status,current_column,attempt,error,state_version,"
+                "SELECT id,title,status,control_state,current_column,attempt,error,state_version,"
                 "terminal_artifact_id,notified_at,observed_at,supervision_action,"
                 "rerun_of_task_id,resolved_by_task_id,updated_at "
                 "FROM v1_tasks WHERE project_id=? ORDER BY created_at DESC LIMIT ?",
@@ -1240,11 +1435,19 @@ class V1Store:
     def claim_task(self, task_id: str, owner: str, lease_seconds: int | None = None) -> dict[str, Any] | None:
         return self.scheduler.claim_task(task_id, owner, lease_seconds)
 
+    def prepare_workflow_startup(self, auto_resume_previous_tasks: bool) -> dict[str, Any]:
+        return self.scheduler.prepare_startup(auto_resume_previous_tasks)
+
     def renew_lease(self, task_id: str, owner: str, lease_seconds: int | None = None) -> bool:
         return self.scheduler.renew_lease(task_id, owner, lease_seconds)
 
     def runnable_task_ids(self, limit: int | None = None) -> list[str]:
         return self.scheduler.runnable_task_ids(limit)
+
+    def recover_expired_task_leases(self, limit: int | None = None) -> list[str]:
+        return self.recovery_manager.recover_expired_task_leases(
+            limit or self.policy.scheduling.runnable_batch_size
+        )
 
     def _dispatch_eligible(self, db: sqlite3.Connection, task_id: str, now: str) -> bool:
         return self.scheduler._dispatch_eligible(db, task_id, now)
@@ -1284,6 +1487,7 @@ class V1Store:
             )
             event_type = "column.started" if attempt_no == 1 else "column.retry_started"
             self._event(db, task["project_id"], task["id"], run_id, event_type, {"column": task["current_column"], "sequence": sequence, "attempt_id": attempt_id, "attempt_no": attempt_no})
+            self._refresh_projection(db, task["project_id"])
         return {"id": run_id, "attempt_id": attempt_id, "attempt_no": attempt_no, "sequence": sequence, "column_key": task["current_column"], "status": "running", "started_at": now}
 
     def prepare_terminal_evidence(self, task: dict[str, Any], run_id: str, terminal: str, output: dict[str, Any], error: str | None) -> dict[str, Any]:
@@ -1508,6 +1712,8 @@ class V1Store:
 
     def settle_await_handle(self, handle_id: str, status: str, result: dict[str, Any], *, next_check_seconds: int | None = None) -> dict[str, Any]:
         now = utcnow()
+        if status in {"failed", "cancelled"}:
+            raise ValueError("terminal Await failure must use resolve_await_failure")
         if status == "pending" and next_check_seconds is None:
             raise ValueError("pending await settlement requires an explicit next_check_seconds")
         with self.tx(immediate=True) as db:
@@ -1523,6 +1729,23 @@ class V1Store:
                     return self.await_handle(handle_id)
                 self._event(db, row["project_id"], row["task_id"], row["run_id"], f"await.{status}", {"await_handle_id": handle_id, "result": result})
         return self.await_handle(handle_id)
+
+    def resolve_await_failure(
+        self,
+        handle_id: str,
+        result: dict[str, Any],
+        *,
+        recoverable: bool,
+        error_code: str,
+        error_category: str,
+    ) -> dict[str, Any]:
+        return self.recovery_manager.resolve_await_failure(
+            handle_id,
+            result,
+            recoverable=recoverable,
+            error_code=error_code,
+            error_category=error_category,
+        )
 
     def runs(self, project_id: str, task_id: str, limit: int | None = None, after_sequence: int = 0) -> list[dict[str, Any]]:
         limit = limit or self.policy.service_limits.detail_page_size
@@ -1622,6 +1845,41 @@ class V1Store:
                     "session_key": session_key,
                 })
         return dict(row)
+
+    def conversation_session_has_messages(
+        self,
+        project_id: str,
+        conversation_session_id: str,
+    ) -> bool:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT 1 FROM v1_agent_runs r JOIN v1_agent_messages m ON m.agent_run_id=r.id "
+                "WHERE r.project_id=? AND r.agent_session_id=? AND r.kind='conversation' "
+                "LIMIT 1",
+                (project_id, conversation_session_id),
+            ).fetchone()
+        return row is not None
+
+    def conversation_session_messages(
+        self,
+        project_id: str,
+        conversation_session_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return the exact persisted transcript for one Project Session."""
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT m.agent_run_id,m.sequence,m.role,m.content,m.tool_calls_json,m.tool_call_id "
+                "FROM v1_agent_runs r JOIN v1_agent_messages m ON m.agent_run_id=r.id "
+                "WHERE r.project_id=? AND r.agent_session_id=? AND r.kind='conversation' "
+                "AND r.status IN ('succeeded','failed') "
+                "ORDER BY r.created_at,r.id,m.sequence",
+                (project_id, conversation_session_id),
+            ).fetchall()
+        return [
+            self._decode(dict(row), "tool_calls_json")
+            for row in rows
+            if row["role"] != "system"
+        ]  # type: ignore[misc]
 
     def agent_session_messages(self, project_id: str, agent_session_id: str) -> list[dict[str, Any]]:
         with self.connect() as db:
@@ -2121,15 +2379,43 @@ class V1Store:
         if not version_row:
             return
         workflow_row = db.execute("SELECT id,revision,definition_json FROM v1_workflow_revisions WHERE project_id=? AND active=1", (project_id,)).fetchone()
-        tasks = []
-        for row in db.execute(
-            "SELECT id,title,substr(brief,1,1000) AS brief,status,current_column,attempt,"
+        tasks = [dict(row) for row in db.execute(
+            "SELECT id,task_plan_id,proposed_task_ref,title,substr(brief,1,1000) AS brief,status,current_column,attempt,"
             "error,state_version,terminal_artifact_id,notified_at,observed_at,"
             "supervision_action,rerun_of_task_id,resolved_by_task_id,created_at,updated_at "
             "FROM v1_tasks WHERE project_id=? ORDER BY created_at DESC LIMIT ?",
             (project_id, self.policy.context.task_summary_limit),
-        ):
-            tasks.append(dict(row))
+        )]
+        plan_ids = sorted({str(task["task_plan_id"]) for task in tasks})
+        plan_facts: dict[str, tuple[str, dict[str, int]]] = {}
+        if plan_ids:
+            placeholders = ",".join("?" for _ in plan_ids)
+            for row in db.execute(
+                f"SELECT id,created_at,plan_json FROM v1_task_plans WHERE id IN ({placeholders})",
+                plan_ids,
+            ):
+                plan = json.loads(row[2])
+                plan_facts[str(row[0])] = (
+                    str(row[1]),
+                    {
+                        str(item.get("proposed_task_ref")): index
+                        for index, item in enumerate(plan.get("tasks") or [])
+                    },
+                )
+        for task in tasks:
+            plan_created_at, positions = plan_facts.get(
+                str(task["task_plan_id"]),
+                (str(task["created_at"]), {}),
+            )
+            task["task_plan_created_at"] = plan_created_at
+            task["task_plan_order"] = positions.get(str(task["proposed_task_ref"]))
+        tasks.sort(key=lambda task: (
+            str(task["task_plan_created_at"]),
+            task["task_plan_order"] if task["task_plan_order"] is not None else 2**31,
+            str(task["created_at"]),
+            str(task["updated_at"]),
+            str(task["id"]),
+        ))
         projection = {
             "workflow": ({"id": workflow_row[0], "revision": workflow_row[1], "definition": json.loads(workflow_row[2])} if workflow_row else None),
             "tasks": tasks,
