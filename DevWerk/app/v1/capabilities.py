@@ -306,6 +306,132 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         )
 
     add("system.noop", "Complete a deterministic no-operation step.", {"type": "object", "additionalProperties": False}, lambda _a, _c: {"completed": True})
+    memory_record_properties = {
+        "id": {"type": "string", "minLength": 1, "maxLength": 500},
+        "kind": {"type": "string", "minLength": 1, "maxLength": 200},
+        "scope": {
+            "type": "string",
+            "enum": ["project", "conversation", "workflow", "task", "workcell", "participant"],
+        },
+        "scope_id": {"type": ["string", "null"], "maxLength": 500},
+        "authority": {"type": "string", "minLength": 1, "maxLength": 200},
+        "content": {"type": "string", "minLength": 1},
+        "source_type": {"type": "string", "minLength": 1, "maxLength": 200},
+        "source_id": {"type": ["string", "null"], "maxLength": 500},
+        "source_hash": {"type": ["string", "null"], "maxLength": 128},
+        "revision": {"type": "integer", "minimum": 1},
+        "status": {
+            "type": "string",
+            "enum": ["active", "superseded", "stale", "tombstoned"],
+        },
+    }
+    add(
+        "project.memory.read",
+        "Read one human-readable semantic Memory record inside the current Project.",
+        {
+            "type": "object",
+            "required": ["reference"],
+            "properties": {"reference": {"type": "string", "minLength": 1}},
+            "additionalProperties": False,
+        },
+        lambda args, ctx: ctx.store.memory_read(ctx.project_id, str(args["reference"])),
+        side_effect_kind="read",
+    )
+    add(
+        "project.memory.search",
+        "Search active Project semantic Memory through the configured rebuildable index.",
+        {
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {"type": "string", "maxLength": 4000},
+                "scope": {"type": "string", "enum": ["project", "conversation", "workflow", "task", "workcell", "participant"]},
+                "scope_id": {"type": "string", "maxLength": 500},
+                "kinds": {"type": "array", "items": {"type": "string"}, "maxItems": 100},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+            },
+            "additionalProperties": False,
+        },
+        lambda args, ctx: ctx.store.memory_search(
+            ctx.project_id,
+            str(args.get("query") or ""),
+            scope=str(args["scope"]) if args.get("scope") else None,
+            scope_id=str(args["scope_id"]) if args.get("scope_id") else None,
+            kinds=list(args.get("kinds") or []),
+            limit=int(args.get("limit") or 20),
+        ),
+        side_effect_kind="read",
+    )
+    add(
+        "project.memory.write",
+        "Write one versioned, source-linked semantic Memory record to the current Project's File Memory.",
+        {
+            "type": "object",
+            "required": ["kind", "scope", "content"],
+            "properties": memory_record_properties,
+            "additionalProperties": False,
+        },
+        lambda args, ctx: ctx.store.memory_write(
+            ctx.project_id,
+            {
+                **args,
+                "source_id": args.get("source_id") or ctx.agent_run_id,
+                "source_type": args.get("source_type") or "agent_run",
+            },
+        ),
+        side_effect_kind="write",
+    )
+    add(
+        "project.memory.append",
+        "Append a source-linked revision to an existing semantic Memory record.",
+        {
+            "type": "object",
+            "required": ["reference", "content"],
+            "properties": {
+                "reference": {"type": "string", "minLength": 1},
+                "content": {"type": "string", "minLength": 1},
+                "source_type": {"type": "string", "minLength": 1, "maxLength": 200},
+                "source_id": {"type": ["string", "null"], "maxLength": 500},
+            },
+            "additionalProperties": False,
+        },
+        lambda args, ctx: ctx.store.memory_append(
+            ctx.project_id,
+            str(args["reference"]),
+            str(args["content"]),
+            source_type=str(args.get("source_type") or "agent_run"),
+            source_id=str(args.get("source_id") or ctx.agent_run_id or "") or None,
+        ),
+        side_effect_kind="write",
+    )
+    add(
+        "project.memory.supersede",
+        "Supersede one semantic Memory record with a new, explicitly versioned record.",
+        {
+            "type": "object",
+            "required": ["reference", "replacement"],
+            "properties": {
+                "reference": {"type": "string", "minLength": 1},
+                "replacement": {
+                    "type": "object",
+                    "required": ["kind", "scope", "content"],
+                    "properties": memory_record_properties,
+                    "additionalProperties": False,
+                },
+            },
+            "additionalProperties": False,
+        },
+        lambda args, ctx: ctx.store.memory_supersede(
+            ctx.project_id,
+            str(args["reference"]),
+            {
+                **dict(args["replacement"]),
+                "source_id": dict(args["replacement"]).get("source_id") or ctx.agent_run_id,
+                "source_type": dict(args["replacement"]).get("source_type") or "agent_run",
+            },
+        ),
+        side_effect_kind="write",
+    )
     add("project.inspect", "Read the current Project metadata and active workflow summary.", {"type": "object", "additionalProperties": False}, _project_inspect)
     add(
         "project.files.list",
@@ -818,6 +944,14 @@ def _bind_workflow_capability_catalog(schema_defs: dict[str, Any], capability_id
     )
     capability_list.setdefault("items", {})["enum"] = catalog
 
+    workcell_agent = schema_defs.get("WorkcellAgentParticipant", {})
+    workcell_capabilities = workcell_agent.get("properties", {}).get("capabilities", {})
+    workcell_capabilities["description"] = (
+        "Explicit allowlist for this named Workcell participant. Values must be exact IDs "
+        "from the live Capability Registry."
+    )
+    workcell_capabilities.setdefault("items", {})["enum"] = catalog
+
     capability_step = schema_defs.get("CapabilityStep", {})
     capability = capability_step.get("properties", {}).get("capability", {})
     capability["description"] = "Exact capability ID from the live Capability Registry."
@@ -889,8 +1023,9 @@ def _bind_workflow_plan_authoring_contract(schema_defs: dict[str, Any]) -> None:
     column_plan = schema_defs.get("WorkflowColumnPlan", {})
     column_plan["description"] = (
         "One reusable lifecycle stage, not a Task, batch, numbered work unit, file group, or deliverable slice. "
-        "The execution_mode is a deliberate project-management choice: agent creates a fresh stage-scoped Agent; "
-        "capability_sequence performs declared deterministic operations without an Agent."
+        "The execution_mode is a deliberate project-management choice: agent runs one stage-scoped Agent; "
+        "capability_sequence performs declared deterministic operations without an Agent; workcell runs a "
+        "directed collaboration graph with named, session-stable participants."
     )
     self_check = schema_defs.get("WorkflowPlanSelfCheck", {})
     self_check["description"] = (
@@ -937,8 +1072,18 @@ def validate_workflow_capabilities(workflow: WorkflowDefinition, registry: Capab
             continue
         if column.executor.kind == "agent":
             requested = set(column.executor.capabilities)
-        else:
+        elif column.executor.kind == "capability_sequence":
             requested = {step.capability for step in column.executor.steps}
+        else:
+            requested = {
+                capability
+                for participant in column.executor.participants
+                for capability in (
+                    participant.capabilities
+                    if participant.kind == "agent"
+                    else [step.capability for step in participant.steps]
+                )
+            }
         if isinstance(column.wait_policy, PollWaitPolicy):
             requested.update(item for item in (column.wait_policy.poll_capability, column.wait_policy.cancel_capability, column.wait_policy.cleanup_capability) if item)
         unknown = sorted(requested - known)
@@ -992,6 +1137,27 @@ def validate_workflow_capabilities(workflow: WorkflowDefinition, registry: Capab
                         f"column {column.key!r} has no transition for selected outcome values "
                         f"{missing} declared by its Capability output schema"
                     )
+        elif column.executor.kind == "workcell":
+            for participant in column.executor.participants:
+                if participant.kind != "capability_sequence":
+                    continue
+                for index, step in enumerate(participant.steps):
+                    registry.validate_workflow_references(step.capability, step.arguments)
+                    _validate_sequence_argument_references(
+                        f"{column.key}.{participant.key}",
+                        participant.steps,
+                        index,
+                        step.arguments,
+                        registry,
+                    )
+                    registry.validate_argument_template(step.capability, step.arguments)
+                if participant.signal_from:
+                    _validate_sequence_outcome_pointer(
+                        f"{column.key}.{participant.key}",
+                        participant.steps,
+                        participant.signal_from,
+                        registry,
+                    )
 
 
 def canonicalize_workflow_capability_arguments(
@@ -1021,6 +1187,16 @@ def canonicalize_workflow_capability_arguments(
             if isinstance(steps, list):
                 for step in steps:
                     _canonicalize_dynamic_capability_arguments(step, registry)
+        elif isinstance(executor, dict) and executor.get("kind") == "workcell":
+            participants = executor.get("participants")
+            if isinstance(participants, list):
+                for participant in participants:
+                    if not isinstance(participant, dict) or participant.get("kind") != "capability_sequence":
+                        continue
+                    steps = participant.get("steps")
+                    if isinstance(steps, list):
+                        for step in steps:
+                            _canonicalize_dynamic_capability_arguments(step, registry)
         wait_policy = column.get("wait_policy")
         if isinstance(wait_policy, dict):
             for prefix in ("poll", "cancel", "cleanup"):
@@ -1222,26 +1398,36 @@ def validate_task_capability_bindings(
     scope = {"input": {"task": {"input": normalized_input}}}
     task_input_references: set[str] = set()
     for column in workflow.columns:
-        if column.executor is None or column.executor.kind != "capability_sequence":
+        if column.executor is None:
             continue
-        for index, step in enumerate(column.executor.steps):
-            task_input_references.update(_task_input_references(step.arguments))
-            try:
-                arguments = _resolve_task_input_references(step.arguments, scope)
-            except (KeyError, IndexError, ValueError, TypeError) as exc:
-                raise ValueError(
-                    f"Task input cannot resolve Column {column.key} capability step {index} "
-                    f"({step.capability}): {exc}"
-                ) from exc
-            if _contains_runtime_reference(arguments):
-                continue
-            try:
-                registry.validate_arguments(step.capability, arguments)
-            except Exception as exc:
-                raise ValueError(
-                    f"Task input rejects Column {column.key} capability step {index} "
-                    f"({step.capability}): {exc}"
-                ) from exc
+        sequences: list[tuple[str, list[Any]]] = []
+        if column.executor.kind == "capability_sequence":
+            sequences.append((column.key, column.executor.steps))
+        elif column.executor.kind == "workcell":
+            sequences.extend(
+                (f"{column.key}.{participant.key}", participant.steps)
+                for participant in column.executor.participants
+                if participant.kind == "capability_sequence"
+            )
+        for owner, steps in sequences:
+            for index, step in enumerate(steps):
+                task_input_references.update(_task_input_references(step.arguments))
+                try:
+                    arguments = _resolve_task_input_references(step.arguments, scope)
+                except (KeyError, IndexError, ValueError, TypeError) as exc:
+                    raise ValueError(
+                        f"Task input cannot resolve Column {owner} capability step {index} "
+                        f"({step.capability}): {exc}"
+                    ) from exc
+                if _contains_runtime_reference(arguments):
+                    continue
+                try:
+                    registry.validate_arguments(step.capability, arguments)
+                except Exception as exc:
+                    raise ValueError(
+                        f"Task input rejects Column {owner} capability step {index} "
+                        f"({step.capability}): {exc}"
+                    ) from exc
     if exact_strings is not None:
         for pointer in sorted(task_input_references):
             try:

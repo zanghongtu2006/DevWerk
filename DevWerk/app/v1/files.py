@@ -56,6 +56,8 @@ class ProjectFiles:
             if not textual.is_file():
                 continue
             relative = self._relative_resolved(textual, source=str(textual))
+            if relative.parts and relative.parts[0] == ".devwerk":
+                continue
             matches.append((textual.resolve(), relative))
         return matches
 

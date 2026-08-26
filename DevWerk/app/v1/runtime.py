@@ -29,6 +29,9 @@ from app.v1.domain import (
     TaskPlan,
     TimerWaitPolicy,
     ToolResult,
+    WorkcellAgentParticipant,
+    WorkcellCapabilityParticipant,
+    WorkcellExecutor,
     WorkflowDefinition,
 )
 from app.v1.files import ProjectFiles
@@ -161,6 +164,12 @@ class WorkflowRuntime:
                 else "provider_transient" if is_recoverable_llm_error(exc) else "runtime_permanent"
             )
             if is_recoverable_llm_error(exc) or is_recoverable_llm_error_code(error_code):
+                if run is not None:
+                    self.store.mark_workcell_recovering(
+                        task["project_id"],
+                        run["id"],
+                        error,
+                    )
                 self.store.recover_task_from_exception(
                     task,
                     run["id"],
@@ -262,6 +271,13 @@ class WorkflowRuntime:
                 if remaining_chars <= 0 or remaining_files <= 0:
                     break
             data["artifacts"] = artifacts
+        if column.context.memory:
+            data["memory"] = self.store.memory.build_context(
+                project,
+                selectors=column.context.memory,
+                task_id=task["id"],
+                include_core=column.context.include_project,
+            )
         return data
 
     def _execute(
@@ -276,6 +292,8 @@ class WorkflowRuntime:
             return self._execute_sequence(task, run, column.executor, input_data)
         if isinstance(column.executor, AgentExecutor):
             return self._execute_agent(task, workflow, run, column, input_data)
+        if isinstance(column.executor, WorkcellExecutor):
+            return self._execute_workcell(task, workflow, run, column, input_data)
         raise ValueError(f"column {column.key!r} has no supported declarative executor")
 
     def _execute_sequence(
@@ -380,6 +398,184 @@ class WorkflowRuntime:
                 ) from exc
         outcome = str(outcome_value or "")
         return {"summary": f"capability sequence completed with outcome {outcome}", "steps": results}, outcome
+
+    def _execute_workcell(
+        self,
+        task: dict[str, Any],
+        workflow: WorkflowDefinition,
+        run: dict[str, Any],
+        column: ColumnDefinition,
+        input_data: dict[str, Any],
+    ) -> tuple[dict[str, Any], str]:
+        executor = column.executor
+        assert isinstance(executor, WorkcellExecutor)
+        project = self.store.get_project(task["project_id"])
+        workflow_row = self.store.get_workflow_revision(
+            task["project_id"], task["workflow_revision_id"]
+        )
+        workcell = self.store.get_or_create_workcell(
+            task["project_id"],
+            task["id"],
+            run["id"],
+            executor,
+            input_data,
+        )
+        participants = {
+            item["participant_key"]: item
+            for item in self.store.workcell_participants(task["project_id"], workcell["id"])
+        }
+        while workcell["status"] == "active":
+            state = executor.state(str(workcell["current_state"]))
+            participant = executor.participant(state.participant)
+            handoffs = self.store.workcell_handoffs(
+                task["project_id"],
+                workcell["id"],
+                receiver=participant.key,
+            )
+            activation = {
+                **input_data,
+                "workcell": {
+                    "id": workcell["id"],
+                    "current_state": state.key,
+                    "participant": participant.key,
+                },
+                "handoffs": handoffs,
+            }
+            validate_contract(
+                activation,
+                state.input_contract,
+                label=f"Workcell state {state.key} input",
+            )
+            self.store.activate_workcell_participant(
+                task["project_id"],
+                workcell["id"],
+                participant.key,
+                state.key,
+            )
+            if isinstance(participant, WorkcellAgentParticipant):
+                memory = self.store.memory.build_context(
+                    project,
+                    selectors=participant.context.memory,
+                    task_id=task["id"],
+                    workcell_id=workcell["id"],
+                    participant_key=participant.key,
+                    include_core=participant.context.include_project,
+                )
+                result = self.agent_core.run(
+                    AgentRunSpec(
+                        kind="column",
+                        project=project,
+                        instruction="\n\n".join(
+                            item
+                            for item in (participant.instruction, state.instruction)
+                            if item.strip()
+                        ),
+                        instruction_revision=int(workflow_row["revision"]),
+                        context={
+                            "workflow": {
+                                "id": workflow_row["id"],
+                                "name": workflow.name,
+                                "description": workflow.description,
+                            },
+                            "column": {"key": column.key, "name": column.name},
+                            "workcell": activation["workcell"],
+                            "input": input_data,
+                            "handoffs": handoffs,
+                            "memory": memory,
+                        },
+                        capability_ids=participant.capabilities,
+                        task_id=task["id"],
+                        column_run_id=run["id"],
+                        column_attempt_id=run["attempt_id"],
+                        completion_outcomes={item.signal for item in state.transitions},
+                        completion_targets={
+                            item.signal: item.target for item in state.transitions
+                        },
+                        output_contract=state.output_contract,
+                        agent_session_id=(
+                            participants[participant.key].get("agent_session_id")
+                            if participant.lifecycle != "invocation"
+                            else None
+                        ),
+                        completion_tool_name="workcell.signal",
+                        completion_requires_evidence=state.require_evidence,
+                    )
+                )
+                if result.status != "succeeded" or not result.completion:
+                    raise RuntimeExecutionError(
+                        result.error or "Workcell participant failed without a signal",
+                        result.error_category or "runtime_permanent",
+                        error_code=result.error_code,
+                        checkpoint={
+                            **result.checkpoint,
+                            "workcell_id": workcell["id"],
+                            "workcell_state": state.key,
+                            "participant": participant.key,
+                        },
+                        agent_run_id=result.agent_run_id,
+                    )
+                signal = str(result.completion["outcome"])
+                payload = {
+                    "output": dict(result.completion["output"]),
+                    "summary": str(result.completion.get("summary") or result.text),
+                    "evidence_ids": list(result.completion.get("evidence_ids") or []),
+                    "agent_run_id": result.agent_run_id,
+                }
+            elif isinstance(participant, WorkcellCapabilityParticipant):
+                sequence = CapabilitySequenceExecutor(
+                    steps=participant.steps,
+                    completed_outcome=participant.completed_signal,
+                    outcome_from=participant.signal_from,
+                )
+                output, signal = self._execute_sequence(
+                    task,
+                    run,
+                    sequence,
+                    activation,
+                )
+                payload = {"output": output, "summary": output.get("summary", "")}
+            else:
+                raise TypeError(f"unsupported Workcell participant: {type(participant).__name__}")
+            transition = next(
+                (item for item in state.transitions if item.signal == signal),
+                None,
+            )
+            if transition is None:
+                raise ValueError(
+                    f"Workcell state {state.key!r} produced undeclared signal {signal!r}"
+                )
+            terminal_outcome = executor.terminal_outcome(transition.target)
+            workcell = self.store.advance_workcell(
+                task["project_id"],
+                workcell["id"],
+                sender_key=participant.key,
+                signal=signal,
+                payload=payload,
+                receivers=transition.receivers,
+                target=transition.target,
+                terminal_outcome=terminal_outcome,
+            )
+            self.store.snapshot_workcell(task["project_id"], workcell["id"])
+            if terminal_outcome is not None:
+                for item in participants.values():
+                    session_id = item.get("agent_session_id")
+                    if session_id and item.get("lifecycle") == "column_visit":
+                        self.store.suspend_agent_session(
+                            task["project_id"], session_id, task["id"]
+                        )
+                final_output = payload.get("output")
+                if not isinstance(final_output, dict):
+                    final_output = {"value": final_output}
+                return final_output, terminal_outcome
+        terminal_outcome = executor.terminal_outcome(str(workcell["current_state"]))
+        if terminal_outcome is None:
+            raise RuntimeError("Workcell stopped outside a declared terminal")
+        output = workcell.get("output") or {}
+        final_output = output.get("output") if isinstance(output, dict) else output
+        return (
+            final_output if isinstance(final_output, dict) else {"value": final_output},
+            terminal_outcome,
+        )
 
     def _persist_wait(self, task: dict[str, Any], run: dict[str, Any], column: ColumnDefinition, request: dict[str, Any]) -> None:
         policy = column.wait_policy

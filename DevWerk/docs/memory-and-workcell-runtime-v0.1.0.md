@@ -1,8 +1,8 @@
 # DevWerk Memory and Workcell Runtime — v0.1.0 Design
 
-Status: **Normative / Implementation Source of Truth**  
-Version: **0.1.0-draft**  
-Date: **2026-08-26**
+Status: **Normative / Implemented Architecture**
+Version: **0.1.0**
+Date: **2026-08-27**
 
 ## 1. Authority
 
@@ -74,12 +74,8 @@ The default semantic Memory Store is rooted inside the Project workspace:
   CONSTRAINTS.md
   OPEN_ISSUES.md
   knowledge/
-  tasks/{task_id}/
-  workcells/{workcell_id}/
-    WORKCELL.md
-    participants/{participant_key}/WORKING.md
-    handoffs/messages.jsonl
-    snapshots/
+  records/{scope}/{scope_id}/{memory_id}.md
+  snapshots/{scope}/{scope_id}/{content_hash}.json
 ```
 
 Markdown carries human-readable durable knowledge. YAML front matter carries stable metadata:
@@ -170,9 +166,9 @@ for every tool invocation or turn.
 
 ### 6.2 Commit
 
-Memory writes validate Project scope, source references, current source hashes, and record
-revision. File replacement is atomic. A committed change emits a compact event containing the
-Memory reference, not the full body.
+Memory writes validate Project scope and record revision, retain source IDs and hashes, and use
+atomic file replacement. Supersede and stale state remain explicit metadata rather than deleting
+history. Index providers receive Memory references and can be rebuilt from files.
 
 ### 6.3 Retrieval
 
@@ -191,15 +187,16 @@ Complete storage never implies complete prompt injection.
 
 Every Agent Run freezes a queryable context manifest containing selected Memory and Artifact
 references, source hashes, selection reasons, index provider, and omitted candidates. Context
-capacity is derived from model/provider configuration; the Runtime does not introduce a hidden
-domain limit. When selected material cannot fit, it uses references or a maintained snapshot and
-exposes that decision in the manifest.
+selectors use explicit Loop-declared limits; the Runtime does not introduce a hidden domain limit.
+Larger semantic material stays as references or maintained snapshots and is read on demand.
 
 ### 6.5 Session boundary
 
-At Conversation turn, Column, Task, and Workcell terminal boundaries, the owner commits an
-updated working snapshot. Raw tool traces and complete participant transcripts remain execution
-evidence and are not automatically promoted into semantic memory.
+Agents commit semantic Memory explicitly through Memory capabilities. Runtime also writes compact,
+content-addressed Workcell snapshots after inner state transitions. Those snapshots contain node,
+participant Session, Signal, and reference metadata rather than copying full artifacts or raw
+transcripts. Raw tool traces and complete participant transcripts remain execution evidence and
+are not automatically promoted into semantic memory.
 
 ## 7. Column Executor Model
 
@@ -245,6 +242,10 @@ and a structured payload. A transition maps `(state, signal)` to another inner s
 The graph validator requires unique keys, a valid entry, reachable states, declared signals, and
 a path from every state to a terminal. Runtime owns graph movement; no coordinator LLM is needed
 for mechanical routing.
+
+An Agent state requires successful capability evidence before its Signal is accepted by default.
+A Loop may set `require_evidence: false` only when the state is explicitly a pure reasoning step
+with no external effect.
 
 ### 8.3 Handoffs
 

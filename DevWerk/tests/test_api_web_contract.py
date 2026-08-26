@@ -100,10 +100,46 @@ def test_web_routes_and_modular_assets_are_served():
         assert "失败阶段" in tasks
         assert "查看原始 Runtime 错误" in tasks
         assert "task.error" in tasks
+        assert "WORKCELLS" in tasks
+        assert "Participant collaboration" in tasks
+        assert "workcell.participants" in tasks
         settings_page = web.get("/web/static/pages/settings.js").text
         assert "global-settings-form" in settings_page
         assert "data-setting-key" in settings_page
         assert "保存后自动重启" in settings_page
+
+
+def test_project_memory_api_uses_project_local_files(tmp_path):
+    with client() as web:
+        project = web.post(
+            "/v1/projects",
+            json={
+                "name": "memory-api",
+                "description": "",
+                "base_dir": str(tmp_path / "memory-api"),
+            },
+        ).json()
+        written = web.post(
+            f"/v1/projects/{project['id']}/memory",
+            json={
+                "id": "decision_api",
+                "kind": "decision",
+                "scope": "project",
+                "authority": "user_confirmed",
+                "content": "Keep runtime collaboration domain-neutral.",
+                "source_type": "user",
+            },
+        )
+        assert written.status_code == 201
+        assert written.json()["reference"] == "records/project/_/decision_api.md"
+
+        searched = web.get(
+            f"/v1/projects/{project['id']}/memory",
+            params={"query": "domain-neutral", "scope": "project"},
+        )
+        assert searched.status_code == 200
+        assert [item["metadata"]["id"] for item in searched.json()] == ["decision_api"]
+        assert (tmp_path / "memory-api" / ".devwerk" / "memory" / "PROJECT.md").is_file()
 
 
 def test_global_settings_api_saves_and_requests_managed_restart(tmp_path):

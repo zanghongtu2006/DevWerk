@@ -44,6 +44,8 @@ class AgentRunSpec:
     agent_session_id: str | None = None
     writable_paths: tuple[str, ...] | None = None
     user_initiated: bool = False
+    completion_tool_name: str = "column.complete"
+    completion_requires_evidence: bool = False
 
 
 @dataclass(frozen=True)
@@ -89,7 +91,13 @@ class AgentCore:
         effect_kinds = {item.id: item.side_effect_kind for item in resolved_capabilities}
         tools = [item.tool_schema() for item in resolved_capabilities]
         if spec.kind == "column":
-            tools.append(_column_complete_schema(spec.completion_outcomes, spec.output_contract))
+            tools.append(
+                _column_complete_schema(
+                    spec.completion_outcomes,
+                    spec.output_contract,
+                    tool_name=spec.completion_tool_name,
+                )
+            )
             if spec.wait_config:
                 tools.append(_column_await_schema(allowed, spec.wait_config))
         envelope = self._envelope(spec, platform_policy)
@@ -100,7 +108,7 @@ class AgentCore:
             instruction_snapshot=spec.instruction,
             context_snapshot=envelope,
             capabilities=allowed + (
-                ["column.complete"]
+                [spec.completion_tool_name]
                 if spec.kind == "column"
                 else []
             ),
@@ -267,7 +275,10 @@ class AgentCore:
                     completion: dict[str, Any] | None = None
                     wait_request: dict[str, Any] | None = None
                     completion_protocol_error = (
-                        _column_completion_protocol_error(response.tool_calls)
+                        _column_completion_protocol_error(
+                            response.tool_calls,
+                            spec.completion_tool_name,
+                        )
                         if spec.kind == "column"
                         else None
                     )
@@ -282,7 +293,7 @@ class AgentCore:
                                 },
                                 checkpoint={"failure_disposition": "rejected_before_effect"},
                             )
-                        elif call.name == "column.complete":
+                        elif call.name == spec.completion_tool_name:
                             try:
                                 result, accepted = self._complete_column(
                                     call.arguments,
@@ -292,7 +303,7 @@ class AgentCore:
                             except ValueError as exc:
                                 result = ToolResult(
                                     ok=False,
-                                    capability="column.complete",
+                                    capability=spec.completion_tool_name,
                                     error={"type": type(exc).__name__, "message": str(exc)},
                                 )
                                 accepted = False
@@ -414,7 +425,9 @@ class AgentCore:
                     continue
 
                 if spec.kind == "column":
-                    raise RuntimeError("Column Agent ended without calling column.complete")
+                    raise RuntimeError(
+                        f"Column Agent ended without calling {spec.completion_tool_name}"
+                    )
                 text = response.text.strip()
                 if not text:
                     raise RuntimeError("Conversation Agent returned neither tools nor final text")
@@ -506,7 +519,11 @@ class AgentCore:
             if item.get("evidence_id")
         }
         target = spec.completion_targets.get(outcome)
-        success_completion = outcome == "success" or target == "done"
+        success_completion = (
+            spec.completion_requires_evidence
+            or outcome == "success"
+            or target == "done"
+        )
         if success_completion:
             if not evidence_ids:
                 raise ValueError("successful Column completion requires capability evidence")
@@ -584,7 +601,11 @@ class AgentCore:
                     or "a failed Column action has not been repaired"
                 )
                 raise RuntimeError(message)
-        return ToolResult(ok=True, capability="column.complete", output={"accepted": True}), True
+        return ToolResult(
+            ok=True,
+            capability=spec.completion_tool_name,
+            output={"accepted": True},
+        ), True
 
     @staticmethod
     def _await_column(arguments: dict[str, Any], allowed: list[str]) -> tuple[ToolResult, bool]:
@@ -594,11 +615,16 @@ class AgentCore:
         return ToolResult(ok=True, capability="column.await", output={"accepted": True}), True
 
 
-def _column_complete_schema(outcomes: set[str], output_contract: dict[str, Any]) -> dict[str, Any]:
+def _column_complete_schema(
+    outcomes: set[str],
+    output_contract: dict[str, Any],
+    *,
+    tool_name: str = "column.complete",
+) -> dict[str, Any]:
     return {
         "type": "function",
         "function": {
-            "name": "column.complete",
+            "name": tool_name,
             "description": "Finish this Column Run with one declared outcome and contract-valid structured output.",
             "parameters": {
                 "type": "object",
@@ -710,30 +736,33 @@ def _column_await_schema(allowed: list[str], wait_config: dict[str, Any]) -> dic
     }
 
 
-def _column_completion_protocol_error(tool_calls: list[Any]) -> str | None:
+def _column_completion_protocol_error(
+    tool_calls: list[Any],
+    completion_tool_name: str = "column.complete",
+) -> str | None:
     complete_indices = [
         index
         for index, call in enumerate(tool_calls)
-        if call.name == "column.complete"
+        if call.name == completion_tool_name
     ]
     if not complete_indices:
         return None
     if len(complete_indices) > 1:
         return (
-            "A model response may contain only one column.complete call. "
-            "Combine outcome, output, summary, and evidence_ids into one final column.complete call. "
+            f"A model response may contain only one {completion_tool_name} call. "
+            f"Combine outcome, output, summary, and evidence_ids into one final {completion_tool_name} call. "
             "No tool call from this response was executed."
         )
     if complete_indices[0] != len(tool_calls) - 1:
         return (
-            "column.complete must be the final tool call in its model response. "
-            "Move all required tool calls before one final column.complete call. "
+            f"{completion_tool_name} must be the final tool call in its model response. "
+            f"Move all required tool calls before one final {completion_tool_name} call. "
             "No tool call from this response was executed."
         )
     if any(call.name == "column.await" for call in tool_calls):
         return (
-            "column.complete and column.await are mutually exclusive in one model response. "
-            "Return either one final column.complete call or one column.await call. "
+            f"{completion_tool_name} and column.await are mutually exclusive in one model response. "
+            f"Return either one final {completion_tool_name} call or one column.await call. "
             "No tool call from this response was executed."
         )
     return None

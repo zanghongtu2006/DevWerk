@@ -290,6 +290,7 @@ class ConversationGateway:
                 context = {
                     "active_workflow": workflow,
                     "global_settings": self.global_settings,
+                    "memory": self.store.memory.build_context(project),
                     "loops": self.store.list_loops(limit=20),
                     "workflow_plans": self.store.list_workflow_plans(project_id) if is_user_turn else [],
                     "task_plans": self.store.list_task_plans(project_id) if is_user_turn else [],

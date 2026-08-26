@@ -13,6 +13,8 @@ from app.v1.domain import (
     TaskPlanItem,
     TaskPlanReadiness,
     Transition,
+    WorkcellAgentParticipant,
+    WorkcellExecutor,
     WorkflowDefinition,
     WorkflowPlan,
 )
@@ -185,7 +187,17 @@ def task_plan(
             objective="Deliver the requested result",
             workflow_fit="The task can start at entry and every column applies as a process stage.",
             agent_execution=agent_execution or (
-                "required" if any(isinstance(column.executor, AgentExecutor) for column in workflow.columns) else "forbidden"
+                "required" if any(
+                    isinstance(column.executor, AgentExecutor)
+                    or (
+                        isinstance(column.executor, WorkcellExecutor)
+                        and any(
+                            isinstance(participant, WorkcellAgentParticipant)
+                            for participant in column.executor.participants
+                        )
+                    )
+                    for column in workflow.columns
+                ) else "forbidden"
             ),
             dependencies=list(dependencies or []),
             conflict_domains=list(conflict_domains or []),

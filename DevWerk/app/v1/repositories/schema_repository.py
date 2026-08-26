@@ -173,6 +173,42 @@ class SchemaRepository:
                     FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
                     FOREIGN KEY(task_id) REFERENCES v1_tasks(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS v1_workcells (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task_id TEXT NOT NULL,
+                    column_run_id TEXT NOT NULL UNIQUE, status TEXT NOT NULL,
+                    current_state TEXT NOT NULL, definition_json TEXT NOT NULL,
+                    input_json TEXT NOT NULL DEFAULT '{}', output_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, finished_at TEXT,
+                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
+                    FOREIGN KEY(task_id) REFERENCES v1_tasks(id) ON DELETE CASCADE,
+                    FOREIGN KEY(column_run_id) REFERENCES v1_column_runs(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_v1_workcells_task
+                    ON v1_workcells(task_id, created_at);
+                CREATE TABLE IF NOT EXISTS v1_workcell_participants (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, workcell_id TEXT NOT NULL,
+                    participant_key TEXT NOT NULL, kind TEXT NOT NULL, lifecycle TEXT NOT NULL,
+                    agent_session_id TEXT, status TEXT NOT NULL, config_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    UNIQUE(workcell_id, participant_key),
+                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
+                    FOREIGN KEY(workcell_id) REFERENCES v1_workcells(id) ON DELETE CASCADE,
+                    FOREIGN KEY(agent_session_id) REFERENCES v1_agent_sessions(id)
+                );
+                CREATE TABLE IF NOT EXISTS v1_workcell_handoffs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL, workcell_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+                    sender_key TEXT NOT NULL, receivers_json TEXT NOT NULL DEFAULT '[]',
+                    signal TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}',
+                    artifact_refs_json TEXT NOT NULL DEFAULT '[]',
+                    memory_refs_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL,
+                    UNIQUE(workcell_id, sequence),
+                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
+                    FOREIGN KEY(task_id) REFERENCES v1_tasks(id) ON DELETE CASCADE,
+                    FOREIGN KEY(workcell_id) REFERENCES v1_workcells(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_v1_workcell_handoffs
+                    ON v1_workcell_handoffs(workcell_id, sequence);
                 CREATE INDEX IF NOT EXISTS idx_v1_agent_runs_project
                     ON v1_agent_runs(project_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_v1_agent_runs_task

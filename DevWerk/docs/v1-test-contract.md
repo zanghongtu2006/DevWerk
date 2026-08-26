@@ -23,6 +23,7 @@ The complete `tests` directory protects the current Version 1 architecture. It i
 | `test_orchestration_policy_contract.py` | centralized scheduling policy, absence of Agent execution budgets, versioned policy evidence |
 | `test_failure_transparency_contract.py` | original failure propagation, structured failure summaries, no silent fallback |
 | `test_logging_contract.py` | full V1 debug trace, fixed `devwerk.log` name, daily rotation, no queue wrapper |
+| `test_memory_workcell_contract.py` | File-first replaceable Memory providers, scoped retrieval and supersession, generic deterministic/Agent Workcells, typed feedback, persistent participant Sessions, and recovery continuity |
 
 ## Required Gate
 

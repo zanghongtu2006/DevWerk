@@ -13,6 +13,7 @@ from app.v1.domain import (
     CapabilitySequenceExecutor,
     ReadinessDecision,
     TaskPlan,
+    WorkcellExecutor,
     WorkflowPlan,
     WorkflowDefinition,
 )
@@ -25,6 +26,7 @@ from app.v1.capabilities import (
 )
 from app.v1.files import ProjectFiles
 from app.v1.loops import LoopCatalog
+from app.v1.memory import MemoryIndex, MemoryManager, MemoryRecord, MemoryStore
 from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, PlatformPolicySnapshot, V1RuntimePolicy
 from app.v1.states import (
     AGENT_RUN_STATE_MACHINE,
@@ -193,10 +195,13 @@ class V1Store:
         policy: V1RuntimePolicy | None = None,
         *,
         registry: CapabilityRegistry,
+        memory_store: MemoryStore | None = None,
+        memory_index: MemoryIndex | None = None,
     ):
         self.policy = policy or DEFAULT_V1_RUNTIME_POLICY
         self.registry = registry
         self.loops = LoopCatalog()
+        self.memory = MemoryManager(memory_store, memory_index)
         self.projects = ProjectRepository(self)
         self.planning = PlanningRepository(self)
         self.artifact_repository = ArtifactRepository(self)
@@ -413,7 +418,107 @@ class V1Store:
         return self.planning.list_task_plans(project_id, limit)
 
     def create_project(self, name: str, description: str, base_dir: str, agent_instruction: str = "") -> dict[str, Any]:
-        return self.projects.create_project(name, description, base_dir, agent_instruction)
+        project = self.projects.create_project(name, description, base_dir, agent_instruction)
+        self.memory.initialize_project(project)
+        return project
+
+    def memory_write(self, project_id: str, value: dict[str, Any]) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        record = MemoryRecord.model_validate(value)
+        written = self.memory.store.write(project, record)
+        self.memory.index.index(self.memory.store, project, written["reference"])
+        return written
+
+    def memory_read(self, project_id: str, reference: str) -> dict[str, Any]:
+        return self.memory.store.read(self.get_project(project_id), reference)
+
+    def memory_snapshot(
+        self,
+        project_id: str,
+        *,
+        scope: str,
+        scope_id: str,
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.memory.store.snapshot(
+            self.get_project(project_id),
+            scope=scope,
+            scope_id=scope_id,
+            state=state,
+        )
+
+    def memory_append(
+        self,
+        project_id: str,
+        reference: str,
+        content: str,
+        *,
+        source_type: str,
+        source_id: str | None = None,
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        written = self.memory.store.append(
+            project,
+            reference,
+            content,
+            source_type=source_type,
+            source_id=source_id,
+        )
+        self.memory.index.index(self.memory.store, project, written["reference"])
+        return written
+
+    def memory_list(
+        self,
+        project_id: str,
+        *,
+        scope: str | None = None,
+        scope_id: str | None = None,
+        kinds: list[str] | None = None,
+        include_inactive: bool = False,
+    ) -> list[dict[str, Any]]:
+        return self.memory.store.list(
+            self.get_project(project_id),
+            scope=scope,
+            scope_id=scope_id,
+            kinds=kinds or [],
+            include_inactive=include_inactive,
+        )
+
+    def memory_search(
+        self,
+        project_id: str,
+        query: str,
+        *,
+        scope: str | None = None,
+        scope_id: str | None = None,
+        kinds: list[str] | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        return self.memory.index.search(
+            self.memory.store,
+            self.get_project(project_id),
+            query,
+            scope=scope,
+            scope_id=scope_id,
+            kinds=kinds or [],
+            limit=limit,
+        )
+
+    def memory_supersede(
+        self,
+        project_id: str,
+        reference: str,
+        replacement: dict[str, Any],
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        self.memory.index.remove(self.memory.store, project, reference)
+        written = self.memory.store.supersede(
+            project,
+            reference,
+            MemoryRecord.model_validate(replacement),
+        )
+        self.memory.index.index(self.memory.store, project, written["reference"])
+        return written
 
     def conversation_agent(self, project_id: str) -> dict[str, Any]:
         return self.projects.conversation_agent(project_id)
@@ -1845,6 +1950,398 @@ class V1Store:
                     "session_key": session_key,
                 })
         return dict(row)
+
+    def get_or_create_workcell(
+        self,
+        project_id: str,
+        task_id: str,
+        column_run_id: str,
+        executor: WorkcellExecutor,
+        input_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = utcnow()
+        created = False
+        with self.tx(immediate=True) as db:
+            row = db.execute(
+                "SELECT * FROM v1_workcells WHERE project_id=? AND column_run_id=?",
+                (project_id, column_run_id),
+            ).fetchone()
+            if row is None:
+                row = db.execute(
+                    "SELECT w.* FROM v1_workcells w "
+                    "JOIN v1_column_runs previous_run ON previous_run.id=w.column_run_id "
+                    "JOIN v1_column_runs current_run ON current_run.id=? "
+                    "WHERE w.project_id=? AND w.task_id=? AND w.status='recovering' "
+                    "AND previous_run.column_key=current_run.column_key "
+                    "ORDER BY w.updated_at DESC LIMIT 1",
+                    (column_run_id, project_id, task_id),
+                ).fetchone()
+                if row is not None:
+                    db.execute(
+                        "UPDATE v1_workcells SET column_run_id=?,status='active',updated_at=? WHERE id=?",
+                        (column_run_id, now, row["id"]),
+                    )
+                    self._event(
+                        db,
+                        project_id,
+                        task_id,
+                        column_run_id,
+                        "workcell.resumed",
+                        {"workcell_id": row["id"], "state": row["current_state"]},
+                    )
+                    row = db.execute(
+                        "SELECT * FROM v1_workcells WHERE id=?",
+                        (row["id"],),
+                    ).fetchone()
+            if row is None:
+                workcell_id = new_id("wcell")
+                db.execute(
+                    "INSERT INTO v1_workcells(id,project_id,task_id,column_run_id,status,current_state,definition_json,input_json,output_json,created_at,updated_at) "
+                    "VALUES(?,?,?,?,'active',?,?,?,'{}',?,?)",
+                    (
+                        workcell_id,
+                        project_id,
+                        task_id,
+                        column_run_id,
+                        executor.entry,
+                        self._pack_json(executor.model_dump(mode="json")),
+                        self._pack_json(input_data),
+                        now,
+                        now,
+                    ),
+                )
+                for participant in executor.participants:
+                    db.execute(
+                        "INSERT INTO v1_workcell_participants(id,project_id,workcell_id,participant_key,kind,lifecycle,status,config_json,created_at,updated_at) "
+                        "VALUES(?,?,?,?,?,?,'ready',?,?,?)",
+                        (
+                            new_id("wpart"),
+                            project_id,
+                            workcell_id,
+                            participant.key,
+                            participant.kind,
+                            participant.lifecycle,
+                            self._pack_json(participant.model_dump(mode="json")),
+                            now,
+                            now,
+                        ),
+                    )
+                self._event(
+                    db,
+                    project_id,
+                    task_id,
+                    column_run_id,
+                    "workcell.started",
+                    {"workcell_id": workcell_id, "entry": executor.entry},
+                )
+                row = db.execute("SELECT * FROM v1_workcells WHERE id=?", (workcell_id,)).fetchone()
+                created = True
+            elif row["status"] == "recovering":
+                db.execute(
+                    "UPDATE v1_workcells SET status='active',updated_at=? WHERE id=?",
+                    (now, row["id"]),
+                )
+                self._event(
+                    db,
+                    project_id,
+                    task_id,
+                    column_run_id,
+                    "workcell.resumed",
+                    {"workcell_id": row["id"], "state": row["current_state"]},
+                )
+                row = db.execute("SELECT * FROM v1_workcells WHERE id=?", (row["id"],)).fetchone()
+        workcell = self._decode(dict(row), "definition_json", "input_json", "output_json")
+        if created:
+            for participant in executor.participants:
+                if participant.kind != "agent" or participant.lifecycle == "invocation":
+                    continue
+                session_key = (
+                    f"task-participant:{participant.key}"
+                    if participant.lifecycle == "task"
+                    else f"workcell:{workcell['id']}:{participant.key}"
+                )
+                session = self.get_or_create_agent_session(
+                    project_id,
+                    task_id,
+                    session_key,
+                )
+                with self.tx(immediate=True) as db:
+                    db.execute(
+                        "UPDATE v1_workcell_participants SET agent_session_id=?,updated_at=? "
+                        "WHERE workcell_id=? AND participant_key=?",
+                        (session["id"], utcnow(), workcell["id"], participant.key),
+                    )
+        return self.get_workcell(project_id, str(workcell["id"]))
+
+    def mark_workcell_recovering(
+        self,
+        project_id: str,
+        column_run_id: str,
+        error: str,
+    ) -> dict[str, Any] | None:
+        now = utcnow()
+        with self.tx(immediate=True) as db:
+            row = db.execute(
+                "SELECT id,task_id,current_state,status FROM v1_workcells "
+                "WHERE project_id=? AND column_run_id=?",
+                (project_id, column_run_id),
+            ).fetchone()
+            if row is None:
+                return None
+            if row[3] == "active":
+                db.execute(
+                    "UPDATE v1_workcells SET status='recovering',updated_at=? WHERE id=?",
+                    (now, row[0]),
+                )
+                self._event(
+                    db,
+                    project_id,
+                    row[1],
+                    column_run_id,
+                    "workcell.recovering",
+                    {"workcell_id": row[0], "state": row[2], "error": error},
+                )
+            workcell_id = row[0]
+        return self.get_workcell(project_id, workcell_id)
+
+    def get_workcell(self, project_id: str, workcell_id: str) -> dict[str, Any]:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM v1_workcells WHERE project_id=? AND id=?",
+                (project_id, workcell_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(workcell_id)
+        return self._decode(dict(row), "definition_json", "input_json", "output_json")
+
+    def workcells(
+        self,
+        project_id: str,
+        *,
+        task_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            if task_id is None:
+                rows = db.execute(
+                    "SELECT * FROM v1_workcells WHERE project_id=? ORDER BY created_at,id",
+                    (project_id,),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT * FROM v1_workcells WHERE project_id=? AND task_id=? ORDER BY created_at,id",
+                    (project_id, task_id),
+                ).fetchall()
+        return [
+            self._decode(dict(row), "definition_json", "input_json", "output_json")
+            for row in rows
+        ]
+
+    def workcell_participants(self, project_id: str, workcell_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM v1_workcell_participants WHERE project_id=? AND workcell_id=? "
+                "ORDER BY created_at,participant_key",
+                (project_id, workcell_id),
+            ).fetchall()
+        return [self._decode(dict(row), "config_json") for row in rows]
+
+    def workcell_handoffs(
+        self,
+        project_id: str,
+        workcell_id: str,
+        *,
+        receiver: str | None = None,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM v1_workcell_handoffs WHERE project_id=? AND workcell_id=? "
+                "ORDER BY sequence",
+                (project_id, workcell_id),
+            ).fetchall()
+        handoffs = [
+            self._decode(
+                dict(row),
+                "receivers_json",
+                "payload_json",
+                "artifact_refs_json",
+                "memory_refs_json",
+            )
+            for row in rows
+        ]
+        if receiver is None:
+            return handoffs
+        return [
+            item
+            for item in handoffs
+            if not item["receivers"] or receiver in item["receivers"]
+        ]
+
+    def snapshot_workcell(self, project_id: str, workcell_id: str) -> dict[str, Any]:
+        workcell = self.get_workcell(project_id, workcell_id)
+        participants = self.workcell_participants(project_id, workcell_id)
+        handoffs = self.workcell_handoffs(project_id, workcell_id)
+        return self.memory_snapshot(
+            project_id,
+            scope="workcell",
+            scope_id=workcell_id,
+            state={
+                "workcell": {
+                    key: workcell.get(key)
+                    for key in (
+                        "id",
+                        "task_id",
+                        "column_run_id",
+                        "status",
+                        "current_state",
+                        "updated_at",
+                        "finished_at",
+                    )
+                },
+                "participants": [
+                    {
+                        key: item.get(key)
+                        for key in (
+                            "participant_key",
+                            "kind",
+                            "lifecycle",
+                            "agent_session_id",
+                            "status",
+                        )
+                    }
+                    for item in participants
+                ],
+                "handoffs": [
+                    {
+                        key: item.get(key)
+                        for key in (
+                            "sequence",
+                            "sender_key",
+                            "receivers",
+                            "signal",
+                            "artifact_refs",
+                            "memory_refs",
+                        )
+                    }
+                    for item in handoffs
+                ],
+            },
+        )
+
+    def activate_workcell_participant(
+        self,
+        project_id: str,
+        workcell_id: str,
+        participant_key: str,
+        state_key: str,
+    ) -> None:
+        now = utcnow()
+        with self.tx(immediate=True) as db:
+            workcell = db.execute(
+                "SELECT task_id,column_run_id,status FROM v1_workcells WHERE project_id=? AND id=?",
+                (project_id, workcell_id),
+            ).fetchone()
+            if workcell is None:
+                raise KeyError(workcell_id)
+            if workcell[2] != "active":
+                raise ValueError(f"workcell {workcell_id!r} is not active")
+            changed = db.execute(
+                "UPDATE v1_workcell_participants SET status='running',updated_at=? "
+                "WHERE workcell_id=? AND participant_key=?",
+                (now, workcell_id, participant_key),
+            ).rowcount
+            if changed != 1:
+                raise KeyError(participant_key)
+            self._event(
+                db,
+                project_id,
+                workcell[0],
+                workcell[1],
+                "workcell.participant.activated",
+                {
+                    "workcell_id": workcell_id,
+                    "participant": participant_key,
+                    "state": state_key,
+                },
+            )
+
+    def advance_workcell(
+        self,
+        project_id: str,
+        workcell_id: str,
+        *,
+        sender_key: str,
+        signal: str,
+        payload: dict[str, Any],
+        receivers: list[str],
+        target: str,
+        terminal_outcome: str | None,
+    ) -> dict[str, Any]:
+        now = utcnow()
+        with self.tx(immediate=True) as db:
+            row = db.execute(
+                "SELECT task_id,column_run_id,status,current_state FROM v1_workcells "
+                "WHERE project_id=? AND id=?",
+                (project_id, workcell_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(workcell_id)
+            if row[2] != "active":
+                raise ValueError(f"workcell {workcell_id!r} is not active")
+            sequence = db.execute(
+                "SELECT COALESCE(MAX(sequence),0)+1 FROM v1_workcell_handoffs WHERE workcell_id=?",
+                (workcell_id,),
+            ).fetchone()[0]
+            db.execute(
+                "INSERT INTO v1_workcell_handoffs(project_id,task_id,workcell_id,sequence,sender_key,receivers_json,signal,payload_json,artifact_refs_json,memory_refs_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    project_id,
+                    row[0],
+                    workcell_id,
+                    sequence,
+                    sender_key,
+                    self._pack_json(receivers),
+                    signal,
+                    self._pack_json(payload),
+                    self._pack_json(payload.get("artifact_refs") or []),
+                    self._pack_json(payload.get("memory_refs") or []),
+                    now,
+                ),
+            )
+            status = "completed" if terminal_outcome is not None else "active"
+            db.execute(
+                "UPDATE v1_workcells SET status=?,current_state=?,output_json=?,updated_at=?,finished_at=? WHERE id=?",
+                (
+                    status,
+                    target,
+                    self._pack_json(payload),
+                    now,
+                    now if terminal_outcome is not None else None,
+                    workcell_id,
+                ),
+            )
+            db.execute(
+                "UPDATE v1_workcell_participants SET status=?,updated_at=? "
+                "WHERE workcell_id=? AND participant_key=?",
+                ("completed" if terminal_outcome is not None else "ready", now, workcell_id, sender_key),
+            )
+            self._event(
+                db,
+                project_id,
+                row[0],
+                row[1],
+                "workcell.handoff" if terminal_outcome is None else "workcell.completed",
+                {
+                    "workcell_id": workcell_id,
+                    "sequence": sequence,
+                    "sender": sender_key,
+                    "receivers": receivers,
+                    "signal": signal,
+                    "target": target,
+                    "outcome": terminal_outcome,
+                },
+            )
+        return self.get_workcell(project_id, workcell_id)
 
     def conversation_session_has_messages(
         self,

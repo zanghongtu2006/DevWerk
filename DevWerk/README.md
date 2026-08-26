@@ -14,6 +14,7 @@ This directory contains the standalone DevWerk Version 1 service. It is a conver
 - [`docs/kanban-recovering-runtime-v1.md`](docs/kanban-recovering-runtime-v1.md)
 - [`docs/agent-tool-rejection-recovery-v1.md`](docs/agent-tool-rejection-recovery-v1.md)
 - [`docs/conversation-session-gateway-v1.md`](docs/conversation-session-gateway-v1.md)
+- [`docs/memory-and-workcell-runtime-v0.1.0.md`](docs/memory-and-workcell-runtime-v0.1.0.md)
 - [`docs/v1-test-contract.md`](docs/v1-test-contract.md)
 
 The first four documents are locked architecture facts for the general Agent and Kanban Runtime. `loop-task-plan-decoupling-v1.md` is the approved authority for planning ownership and naming. Loop Runtime, Kanban recovery, rejected-tool recovery, and test-contract documents describe implemented V1 extensions. The full `tests` directory protects the current V1 implementation and does not provide a compatibility contract for older designs.
@@ -33,7 +34,10 @@ flowchart LR
     TSK --> S["Runtime Supervisor"]
     S --> R["Column Run / Attempt"]
     R --> D["Deterministic Runtime"]
-    R --> A["Ephemeral Agent"]
+    R --> A["Single Agent"]
+    R --> WC["Workcell graph"]
+    WC --> PS["Persistent participant Sessions"]
+    PS --> H["Typed handoffs"]
     D --> E["Artifact + Event + Outcome"]
     A --> E
     E --> S
@@ -62,6 +66,7 @@ app/v1/repositories/event_repository.py
 app/v1/services/scheduler.py
 app/v1/services/recovery_manager.py
 app/v1/files.py
+app/v1/memory.py
 app/v1/contracts.py
 app/v1/capabilities.py
 app/v1/agent.py
@@ -102,7 +107,9 @@ The Workflow Plan describes the reusable method and Task Contract but contains n
 
 ### Runtime and Evidence
 
-Every Column visit creates a Column Run; each retry creates a new immutable Attempt under the same Run. `capability_sequence` Columns execute declared capability steps without an LLM. `agent` Columns create an ephemeral Agent Run that shares the same iterative AgentCore as the Conversation Agent, but receives selected Project + Task + Column context and a declared tool allowlist. Declared artifact context is UTF-8 text only, deduplicated, and bounded by the shared V1 file/character policy; broad software-repository discovery is performed on demand through file list/search/read capabilities.
+Every Column visit creates a Column Run and immutable Attempts. `capability_sequence` executes deterministic tools without an LLM; `agent` runs one logical Agent; `workcell` runs a declarative inner graph with arbitrary named Agent or deterministic participants. Workcell feedback is a typed, receiver-scoped handoff, and `column_visit` or `task` lifecycle participants resume the same logical Session through revision cycles and provider recovery. Only a Workcell terminal can complete its outer Column. Declared artifact context is UTF-8 text only, deduplicated, and bounded; broad repositories are discovered on demand through file list/search/read capabilities.
+
+Semantic Memory is File-first under `{project.base_dir}/.devwerk/memory/`. Markdown plus YAML front matter is the human-readable source of truth; SQLite stores transactional Runtime state, and a replaceable text/FTS/vector index is only a rebuildable projection. Conversation and Workcell participants receive selected Memory references with a frozen context manifest rather than the complete store.
 
 Python source contains no business Workflow factory, task-type route, domain prompt, directory layout rule, or Column-name executor branch. Reusable domain knowledge is stored under `loops/<name>/` as a human-readable `loop.meta` card, declarative `loop.json`, and optional read-only `assets/`. Asset content participates in the Loop digest and is exposed to Column Agents as `project.loop.assets`. SQLite stores only materialized Workflow Plans, Workflow Revisions, Task Plans, Tasks, and source provenance.
 
@@ -141,6 +148,9 @@ Default endpoints:
 - `/v1/loops/{loop_key}`
 - `/v1/projects/{project_id}/automation/loop`
 - `/v1/projects/{project_id}/capabilities`
+- `/v1/projects/{project_id}/memory`
+- `/v1/projects/{project_id}/workcells`
+- `/v1/projects/{project_id}/workcells/{workcell_id}`
 - `/v1/projects/{project_id}/workflow`
 - `/v1/projects/{project_id}/workflow-plans`
 - `/v1/projects/{project_id}/task-plans`
