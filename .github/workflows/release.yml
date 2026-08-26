@@ -49,7 +49,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=${{ inputs.tag || github.ref_name }}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ !contains(inputs.tag || github.ref_name, '-') }}
           labels: |
             org.opencontainers.image.source=https://github.com/zanghongtu2006/Devwerk
 
@@ -67,6 +67,7 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           name: DevWerk ${{ inputs.tag || github.ref_name }}
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
           files: dist/devwerk-release.zip
           generate_release_notes: true
         env:
