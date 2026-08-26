@@ -1,5 +1,9 @@
 # DevWerk V1 Document Map
 
+## v0.1.0 normative extension
+
+- [`memory-and-workcell-runtime-v0.1.0.md`](memory-and-workcell-runtime-v0.1.0.md): File-first pluggable semantic Memory, context manifests, persistent Participant Sessions, and generic declarative Workcell execution. It supersedes earlier statements that Memory is postponed or every Agent Column is necessarily a one-Attempt ephemeral instance.
+
 ## Architecture authority
 
 These documents define the locked V1 product and runtime direction:
