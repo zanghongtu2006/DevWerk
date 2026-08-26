@@ -47,9 +47,11 @@ class SchemaRepository:
                     ON v1_conversations(project_id, id DESC);
                 CREATE TABLE IF NOT EXISTS v1_conversation_jobs (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                    conversation_session_id TEXT NOT NULL,
                     user_message_id INTEGER NOT NULL, message TEXT NOT NULL,
                     start_task INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL,
                     task_id TEXT, agent_run_id TEXT, error TEXT, resolved_by_job_id TEXT,
+                    claim_owner TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL, finished_at TEXT,
                     FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
@@ -305,7 +307,14 @@ class SchemaRepository:
             self._ensure_column(db, "v1_conversation_jobs", "trigger_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(db, "v1_conversation_jobs", "mailbox_ids_json", "TEXT NOT NULL DEFAULT '[]'")
             self._ensure_column(db, "v1_conversation_jobs", "scheduled_review_id", "TEXT")
-            self._ensure_column(db, "v1_conversation_jobs", "worker_id", "TEXT")
+            self._ensure_column(db, "v1_conversation_jobs", "conversation_session_id", "TEXT")
+            self._ensure_column(db, "v1_conversation_jobs", "claim_owner", "TEXT")
+            db.execute(
+                "UPDATE v1_conversation_jobs SET conversation_session_id=("
+                "SELECT logical_id FROM v1_conversation_agents "
+                "WHERE project_id=v1_conversation_jobs.project_id) "
+                "WHERE conversation_session_id IS NULL OR conversation_session_id=''"
+            )
             self._ensure_column(db, "v1_conversation_jobs", "result_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(db, "v1_conversation_jobs", "resolved_by_job_id", "TEXT")
             self._ensure_column(db, "v1_tasks", "readiness_json", "TEXT NOT NULL DEFAULT '{}'")

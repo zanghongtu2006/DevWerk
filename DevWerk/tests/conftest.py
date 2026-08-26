@@ -18,6 +18,13 @@ os.environ.setdefault("ANTHROPIC_AUTH_TOKEN", "test-token")
 
 @pytest.fixture(autouse=True)
 def isolated_settings(tmp_path, monkeypatch):
+    global_settings_path = tmp_path / "global-settings.yaml"
+    global_settings_path.write_text(
+        "schema_version: devwerk.global-settings.v1\n"
+        "workflow:\n"
+        "  auto_resume_previous_tasks: false\n",
+        encoding="utf-8",
+    )
     config = {
         "providers": {
             "test": {
@@ -41,6 +48,7 @@ def isolated_settings(tmp_path, monkeypatch):
     }
     monkeypatch.setenv("APP_ENV", "test")
     monkeypatch.setenv("DEVWERK_DB_PATH", str(tmp_path / "devwerk.db"))
+    monkeypatch.setenv("DEVWERK_GLOBAL_SETTINGS_PATH", str(global_settings_path))
     monkeypatch.setenv("DEVWERK_LLM_CONFIG_PATH", str(tmp_path / "missing-llm.json"))
     monkeypatch.setenv("DEVWERK_LLM_CONFIG_JSON", json.dumps(config))
     monkeypatch.setenv("WORKFLOW_SUPERVISOR_INTERVAL_SECONDS", "0.02")

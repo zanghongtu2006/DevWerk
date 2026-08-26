@@ -21,7 +21,7 @@ def test_project_files_reject_escape_and_write_hash_tracked_atomic_content(tmp_p
     assert list((tmp_path / "project" / "nested").glob("*.tmp")) == []
 
 
-def test_context_file_reads_are_bounded_and_skip_build_directories(tmp_path):
+def test_context_file_reads_respect_character_budget(tmp_path):
     files = ProjectFiles(str(tmp_path / "project"))
     files.write_text("a.md", "a" * 10)
     files.write_text("nested/b.md", "b" * 10)
@@ -30,6 +30,20 @@ def test_context_file_reads_are_bounded_and_skip_build_directories(tmp_path):
     selected = files.existing_texts("**/*.md", max_total_chars=20)
     assert {item["path"] for item in selected} == {"a.md", "nested/b.md"}
     assert sum(len(item["content"]) for item in selected) <= 20
+
+
+def test_context_file_reads_skip_non_utf8_files_and_log_reason(tmp_path, caplog):
+    files = ProjectFiles(str(tmp_path / "project"))
+    files.write_text("readable.md", "usable context")
+    binary = tmp_path / "project" / "image.bin"
+    binary.write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe")
+
+    caplog.set_level("DEBUG", logger="devwerk.files")
+    selected = files.existing_texts("**/*", max_total_chars=65_535)
+
+    assert selected == [{"path": "readable.md", "content": "usable context"}]
+    assert "reason=non_utf8" in caplog.text
+    assert "image.bin" in caplog.text
 
 
 def test_project_files_verify_text_reports_exact_mismatch_and_match(tmp_path):

@@ -15,6 +15,7 @@ from app.v1.domain import (
     ColumnDefinition,
     ConflictDomain,
     ExactTaskInputString,
+    TaskPlan,
     TaskPlanItem,
     Transition,
     WorkflowDefinition,
@@ -53,10 +54,40 @@ def test_conversation_messages_page_by_stable_message_id(store, tmp_path):
         store.messages(project["id"], after_id=messages[0]["id"], before_id=messages[-1]["id"])
 
 
+def test_kanban_projection_uses_task_plan_order_not_materialization_time(store, tmp_path):
+    project = store.create_project("projection ordering", "", str(tmp_path / "projection-order"))
+    workflow = sequence_workflow()
+    _, revision = publish_planned_workflow(store, project["id"], workflow)
+    template = task_plan(revision["id"], workflow)
+    first = template.tasks[0].model_copy(update={
+        "proposed_task_ref": "unit-01",
+        "title": "Unit 01",
+    })
+    second = template.tasks[0].model_copy(update={
+        "proposed_task_ref": "unit-02",
+        "title": "Unit 02",
+    })
+    plan_id = store.create_task_plan(
+        project["id"],
+        TaskPlan(
+            objective="Keep the declared Task Plan order",
+            workflow_revision_id=revision["id"],
+            tasks=[first, second],
+        ),
+    )["id"]
+    store.create_task(project["id"], task_plan_id=plan_id, proposed_task_ref="unit-02")
+    store.create_task(project["id"], task_plan_id=plan_id, proposed_task_ref="unit-01")
+
+    projected = store.project_projection(project["id"])["projection"]["tasks"]
+
+    assert [task["proposed_task_ref"] for task in projected] == ["unit-01", "unit-02"]
+    assert [task["task_plan_order"] for task in projected] == [0, 1]
+
+
 def test_failed_conversation_job_changes_status_without_creating_assistant_speech(store, tmp_path):
     project = store.create_project("failed conversation", "", str(tmp_path / "failed-conversation"))
     job = store.create_conversation_job(project["id"], "Please inspect.", True)
-    assert store.claim_conversation_job(job["id"], "worker") is not None
+    assert store.claim_conversation_job(job["id"], "session-owner") is not None
 
     store.fail_conversation_job(job["id"], "protocol did not complete")
 
@@ -74,7 +105,7 @@ def test_failed_conversation_job_releases_claimed_mailbox_for_redelivery(store, 
     mailbox_id = store.mailbox(project["id"])[0]["id"]
     job = store.create_conversation_job(project["id"], "Inspect the failure.", True)
 
-    assert store.claim_conversation_job(job["id"], "worker") is not None
+    assert store.claim_conversation_job(job["id"], "session-owner") is not None
     assert [item["id"] for item in store.mailbox(project["id"], state="claimed")] == [mailbox_id]
 
     store.fail_conversation_job(job["id"], "model called an unavailable capability")
@@ -93,7 +124,7 @@ def test_protocol_failed_conversation_quarantines_trigger_without_blocking_later
         store._mailbox(db, project["id"], "task.failed", None, None, {"reason": "recovery needs evidence"})
     mailbox_id = store.mailbox(project["id"])[0]["id"]
     job = store.create_conversation_job(project["id"], "Inspect the failure.", True)
-    assert store.claim_conversation_job(job["id"], "worker") is not None
+    assert store.claim_conversation_job(job["id"], "session-owner") is not None
 
     store.fail_conversation_job(job["id"], "execution report had no evidence", attention=True)
 
@@ -119,7 +150,7 @@ def test_startup_releases_mailbox_claimed_by_interrupted_conversation(store, tmp
         store._mailbox(db, project["id"], "task.failed", None, None, {"reason": "provider unavailable"})
     mailbox_id = store.mailbox(project["id"])[0]["id"]
     job = store.create_conversation_job(project["id"], "Inspect the failure.", True)
-    assert store.claim_conversation_job(job["id"], "worker") is not None
+    assert store.claim_conversation_job(job["id"], "session-owner") is not None
 
     store.startup_conversation_jobs()
 
@@ -229,6 +260,35 @@ def test_task_plan_save_enforces_task_agent_execution_policy(store, tmp_path):
             project["id"],
             task_plan(agent_revision["id"], agent_based, agent_execution="forbidden"),
         )
+
+
+def test_task_plan_save_canonicalizes_provider_primitive_strings(store, tmp_path):
+    project = store.create_project("provider primitive transport", "", str(tmp_path / "project"))
+    workflow = agent_workflow()
+    method = workflow_plan(workflow)
+    method.task_contract.input_schema = {
+        "type": "object",
+        "required": ["chapter_number", "is_final_chapter"],
+        "properties": {
+            "chapter_number": {"type": "integer", "minimum": 1},
+            "is_final_chapter": {"type": "boolean"},
+        },
+        "additionalProperties": False,
+    }
+    method_record = store.create_workflow_plan(project["id"], method)
+    revision = publish_initial_workflow(store, project["id"], workflow, method_record["id"])
+
+    stored = store.create_task_plan(
+        project["id"],
+        task_plan(
+            revision["id"],
+            workflow,
+            input_data={"chapter_number": "1", "is_final_chapter": "false"},
+        ),
+    )
+
+    task_input = stored["plan"]["tasks"][0]["input"]
+    assert task_input == {"chapter_number": 1, "is_final_chapter": False}
 
 
 def test_task_plan_must_bind_every_exact_string_to_fixed_workflow_revision(store, tmp_path):
@@ -498,3 +558,22 @@ def test_running_task_cannot_be_failed_while_column_attempt_is_active(store, tmp
     attempts = store.attempts(project["id"], task["id"])
     assert attempts[-1]["id"] == run["attempt_id"]
     assert attempts[-1]["status"] == "running"
+
+
+def test_begin_run_refreshes_kanban_projection_to_running(store, tmp_path):
+    project = store.create_project("running projection", "", str(tmp_path / "project"))
+    publish_planned_workflow(store, project["id"], sequence_workflow())
+    task = create_planned_task(store, project["id"], "projected work")
+    claimed = store.claim_task(task["id"], "worker")
+    assert claimed is not None
+
+    store.begin_run(claimed, {"task": claimed, "column": "execute"})
+
+    projected = {
+        item["id"]: item
+        for item in store.project_projection(project["id"])["projection"]["tasks"]
+    }
+    current = store.get_task(task["id"])
+    assert current["status"] == "running"
+    assert projected[task["id"]]["status"] == "running"
+    assert projected[task["id"]]["state_version"] == current["state_version"]

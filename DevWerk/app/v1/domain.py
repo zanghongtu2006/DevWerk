@@ -354,10 +354,19 @@ class ReadinessDecision(BaseModel):
 
 
 class TaskPlanReadiness(BaseModel):
-    """Readiness facts authored once in a Task Plan and materialized into a Task."""
+    """Readiness facts authored once in a Task Plan and materialized into a Task.
+
+    ``queue`` is an automatically managed dependency/WIP queue. Use an explicit
+    scheduling ``hold`` after materialization when human intervention is required.
+    """
 
     model_config = ConfigDict(extra="forbid")
-    decision: Literal["dispatch", "queue"]
+    decision: Literal["dispatch", "queue"] = Field(
+        description=(
+            "dispatch marks work eligible immediately; queue marks planned work that DevWerk "
+            "automatically admits when its dependencies and WIP constraints allow."
+        ),
+    )
     scope: list[str] = Field(default_factory=list, max_length=200)
     non_scope: list[str] = Field(default_factory=list, max_length=200)
     deliverables: list[str] = Field(min_length=1, max_length=200)
@@ -599,9 +608,17 @@ class WorkflowWalkthroughStep(BaseModel):
     )
 
 
+class LinearTaskDependencyContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["linear_by_integer_input"] = "linear_by_integer_input"
+    order_pointer: str = Field(pattern=r"^/.*", max_length=2_000)
+    first_value: int = 1
+
+
 class TaskContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
     input_schema: dict[str, Any] = Field(default_factory=dict)
+    dependency_contract: LinearTaskDependencyContract | None = None
     required_context: list[str] = Field(default_factory=list, max_length=200)
     expected_outputs: list[str] = Field(min_length=1, max_length=200)
     acceptance_contract: list[str] = Field(min_length=1, max_length=200)

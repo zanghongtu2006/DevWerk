@@ -156,8 +156,6 @@ def test_loop_apply_capability_creates_initial_workflow(store, tmp_path):
             "loop_key": "software.gitlab_devops",
             "bindings": {
                 "product_name": "Loop delivery",
-                "requirements_path": "docs/requirements.md",
-                "requirements_confirmed": True,
                 "gitlab_repository": "group/project",
             },
         },
@@ -777,3 +775,43 @@ def test_conversation_agent_control_tools_preserve_terminal_immutability_and_rer
     assert inspected.ok
     assert inspected.output["scheduling"]["dispatch_eligible"] is True
     assert inspected.output["scheduling"]["dependencies"] == []
+
+
+def test_conversation_diagnostics_do_not_repeat_persisted_runtime_context(store, tmp_path):
+    project = store.create_project("compact diagnostics", "", str(tmp_path / "project"))
+    publish_planned_workflow(store, project["id"], sequence_workflow())
+    task = create_planned_task(store, project["id"], "inspect compactly")
+    registry = build_core_registry()
+    context = CapabilityContext(project_id=project["id"], project=project, store=store)
+
+    inspected = registry.dispatch("task.inspect", {"task_id": task["id"]}, context)
+
+    assert inspected.ok
+    assert inspected.output["task"]["id"] == task["id"]
+    assert "input" not in inspected.output["task"]
+    assert "context" not in inspected.output["task"]
+    assert "readiness" not in inspected.output["task"]
+
+    with store.tx(immediate=True) as db:
+        store._event(
+            db,
+            project["id"],
+            None,
+            None,
+            "conversation.progress",
+            {
+                "kind": "tool_result",
+                "iteration": 3,
+                "capability": "task.inspect",
+                "content": "large persisted payload must not be replayed",
+            },
+        )
+    events = registry.dispatch("event.list", {"after": 0, "limit": 100}, context)
+
+    assert events.ok
+    progress = next(item for item in events.output if item["type"] == "conversation.progress")
+    assert progress["data"] == {
+        "kind": "tool_result",
+        "iteration": 3,
+        "capability": "task.inspect",
+    }

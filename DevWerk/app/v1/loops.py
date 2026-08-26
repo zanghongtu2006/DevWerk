@@ -14,6 +14,7 @@ _TITLE = re.compile(r"^#\s+(.+?)\s*$")
 _BREAK = re.compile(r"\s*<br\s*/?>\s*", re.IGNORECASE)
 _KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _VERSION = re.compile(r"^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$")
+_ASSET_SUFFIXES = {".json", ".md", ".txt", ".yaml", ".yml"}
 
 
 def _field_key(value: str) -> str:
@@ -170,12 +171,26 @@ class LoopCatalog:
             raise ValueError(f"Loop {loop_key!r} has an unsupported bundle schema")
         if not isinstance(executable.get("parameter_schema"), dict) or not isinstance(executable.get("bundle"), dict):
             raise ValueError(f"Loop {loop_key!r} must declare parameter_schema and bundle objects")
-        digest = hashlib.sha256(record["meta"].encode("utf-8") + b"\0" + bundle_bytes).hexdigest()
+        assets: list[dict[str, str]] = []
+        asset_digest_parts: list[bytes] = []
+        assets_root = Path(record["meta_path"]).parent / "assets"
+        if assets_root.is_dir():
+            for asset_path in sorted(path for path in assets_root.rglob("*") if path.is_file()):
+                if asset_path.suffix.casefold() not in _ASSET_SUFFIXES:
+                    continue
+                relative_path = asset_path.relative_to(assets_root).as_posix()
+                content = asset_path.read_text(encoding="utf-8")
+                assets.append({"path": relative_path, "content": content})
+                asset_digest_parts.extend((relative_path.encode("utf-8"), b"\0", content.encode("utf-8"), b"\0"))
+        digest = hashlib.sha256(
+            record["meta"].encode("utf-8") + b"\0" + bundle_bytes + b"\0" + b"".join(asset_digest_parts)
+        ).hexdigest()
         result = self._summary(record)
         result.update({
             "digest": digest,
             "parameter_schema": executable["parameter_schema"],
             "bundle": executable["bundle"],
             "meta": record["meta"],
+            "assets": assets,
         })
         return result

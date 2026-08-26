@@ -1,0 +1,4 @@
+schema_version: devwerk.global-settings.v1
+
+workflow:
+  auto_resume_previous_tasks: false

@@ -4,8 +4,8 @@ import hashlib
 import json
 from typing import Any
 
-from app.v1.contracts import validate_contract
-from app.v1.domain import TaskPlan, WorkflowPlan
+from app.v1.contracts import canonicalize_contract_value, validate_contract
+from app.v1.domain import LinearTaskDependencyContract, TaskPlan, WorkflowPlan
 from app.v1.repositories.base import StoreHost
 from app.v1.storage_support import new_id, utcnow
 
@@ -74,7 +74,12 @@ class PlanningRepository:
         method = WorkflowPlan.model_validate(
             self.get_workflow_plan(project_id, str(revision["workflow_plan_id"]))["plan"]
         )
+        plan = plan.model_copy(deep=True)
         for item in plan.tasks:
+            item.input = canonicalize_contract_value(
+                item.input,
+                method.task_contract.input_schema,
+            )
             item.validate_agent_execution_workflow(workflow)
             item.validate_exact_input_workflow(workflow)
             validate_contract(
@@ -82,6 +87,7 @@ class PlanningRepository:
                 method.task_contract.input_schema,
                 label=f"Task Plan {item.proposed_task_ref} input",
             )
+        _validate_task_dependency_contract(plan, method.task_contract.dependency_contract)
         payload = plan.model_dump_json()
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         now = utcnow()
@@ -143,3 +149,42 @@ class PlanningRepository:
             row["plan"] = json.loads(row.pop("plan_json"))
             result.append(row)
         return result
+
+
+def _validate_task_dependency_contract(
+    plan: TaskPlan,
+    contract: LinearTaskDependencyContract | None,
+) -> None:
+    if contract is None:
+        return
+    ordered: list[tuple[int, str, set[str]]] = []
+    for task in plan.tasks:
+        value: Any = task.input
+        for raw_token in contract.order_pointer[1:].split("/"):
+            token = raw_token.replace("~1", "/").replace("~0", "~")
+            if not isinstance(value, dict) or token not in value:
+                raise ValueError(
+                    f"task {task.proposed_task_ref!r} cannot resolve dependency order "
+                    f"pointer {contract.order_pointer!r}"
+                )
+            value = value[token]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"task {task.proposed_task_ref!r} dependency order value must be an integer"
+            )
+        ordered.append((value, task.proposed_task_ref, set(task.dependencies)))
+    ordered.sort(key=lambda item: item[0])
+    values = [item[0] for item in ordered]
+    expected_values = list(range(contract.first_value, contract.first_value + len(ordered)))
+    if values != expected_values:
+        raise ValueError(
+            "linear Task dependency order must be contiguous from "
+            f"{contract.first_value}: expected {expected_values}, got {values}"
+        )
+    for index, (_, task_ref, actual_dependencies) in enumerate(ordered):
+        expected_dependencies = set() if index == 0 else {ordered[index - 1][1]}
+        if actual_dependencies != expected_dependencies:
+            raise ValueError(
+                f"task {task_ref!r} must depend exactly on its linear predecessor: "
+                f"expected {sorted(expected_dependencies)}, got {sorted(actual_dependencies)}"
+            )

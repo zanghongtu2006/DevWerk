@@ -217,6 +217,15 @@ class WorkflowRuntime:
                 "description": project["description"],
                 "base_dir": project["base_dir"],
             }
+            loop_binding = self.store.get_project_loop_binding(task["project_id"])
+            if loop_binding:
+                data["project"]["loop"] = {
+                    "key": loop_binding["loop_key"],
+                    "version": loop_binding["loop_version"],
+                    "digest": loop_binding["loop_digest"],
+                    "bindings": loop_binding["bindings"],
+                    "assets": self.store.get_project_loop_assets(task["project_id"]),
+                }
         if column.context.include_task:
             data["task"] = {
                 "id": task["id"],
@@ -235,9 +244,23 @@ class WorkflowRuntime:
         if column.context.artifact_globs:
             files = ProjectFiles(project["base_dir"], self.policy)
             artifacts: list[dict[str, str]] = []
+            seen_paths: set[str] = set()
+            remaining_chars = self.policy.context.artifact_context_max_characters
+            remaining_files = self.policy.context.artifact_context_max_files
             for pattern in column.context.artifact_globs:
-                for item in files.existing_texts(pattern, None):
+                selected = files.existing_texts(
+                    pattern,
+                    remaining_chars,
+                    limit=remaining_files,
+                    exclude_paths=seen_paths,
+                )
+                for item in selected:
                     artifacts.append(item)
+                    seen_paths.add(item["path"])
+                    remaining_chars -= len(item["content"])
+                    remaining_files -= 1
+                if remaining_chars <= 0 or remaining_files <= 0:
+                    break
             data["artifacts"] = artifacts
         return data
 
@@ -495,14 +518,32 @@ class WorkflowRuntime:
             payload = {"status": "succeeded", "output": event_data.get("output") or {}, "event_id": event["id"]}
         elif handle["waiting_kind"] == "poll":
             project = self.store.get_project(task["project_id"])
-            result = self.registry.dispatch(
-                handle["poll_capability"], handle["poll_arguments"],
-                CapabilityContext(project_id=task["project_id"], project=project, store=self.store, task_id=task["id"], column_run_id=handle["run_id"], execution_key=f"{handle['id']}:poll:{handle['next_check_at']}"),
-            )
-            if result.status != "completed":
+            try:
+                result = self.registry.dispatch(
+                    handle["poll_capability"], handle["poll_arguments"],
+                    CapabilityContext(project_id=task["project_id"], project=project, store=self.store, task_id=task["id"], column_run_id=handle["run_id"], execution_key=f"{handle['id']}:poll:{handle['next_check_at']}"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                error_code = llm_error_code(exc, default=type(exc).__name__)
+                recoverable = is_recoverable_llm_error(exc) or is_recoverable_llm_error_code(error_code)
+                self.store.resolve_await_failure(
+                    handle["id"],
+                    {
+                        "status": "failed",
+                        "error": {"type": type(exc).__name__, "message": str(exc), "code": error_code},
+                    },
+                    recoverable=recoverable,
+                    error_code=error_code,
+                    error_category="provider_transient" if recoverable else "external_permanent",
+                )
+                return
+            if result.status == "failed":
+                payload = {"status": "failed", "error": result.error or {"type": "PollFailed"}}
+            elif result.status != "completed":
                 self.store.settle_await_handle(handle["id"], "pending", {"error": result.error or {"type": "PollNotCompleted"}}, next_check_seconds=self._poll_interval(column))
                 return
-            payload = result.output if isinstance(result.output, dict) else {"value": result.output}
+            else:
+                payload = result.output if isinstance(result.output, dict) else {"value": result.output}
         else:
             raise ValueError(f"unsupported V1 wait kind: {handle['waiting_kind']!r}")
         state = str(payload.get("status") or "succeeded").lower()
@@ -511,8 +552,31 @@ class WorkflowRuntime:
             self.store.settle_await_handle(handle["id"], "pending", payload, next_check_seconds=self._poll_interval(column))
             return
         if state in {"failed", "error", "cancelled"}:
-            self.store.settle_await_handle(handle["id"], "failed", payload)
-            raise RuntimeExecutionError(f"AwaitFailed: {payload}", "external_permanent")
+            error_value = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+            error_code = str(
+                error_value.get("code")
+                or error_value.get("error_code")
+                or error_value.get("type")
+                or "AWAIT_FAILED"
+            )
+            error_category = str(
+                payload.get("error_category")
+                or error_value.get("category")
+                or "external_permanent"
+            )
+            recoverable = bool(payload.get("recoverable")) or error_category in {
+                "provider_transient",
+                "tool_transient",
+                "external_transient",
+            } or is_recoverable_llm_error_code(error_code) or "transient" in error_code.casefold()
+            self.store.resolve_await_failure(
+                handle["id"],
+                payload,
+                recoverable=recoverable,
+                error_code=error_code,
+                error_category=error_category if recoverable else "external_permanent",
+            )
+            return
         awaited_output = payload.get("output") if isinstance(payload.get("output"), dict) else payload
         try:
             output, outcome = self._resume_awaited_execution(task, workflow, column, handle, awaited_output)

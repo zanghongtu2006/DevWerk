@@ -1,7 +1,7 @@
 # Long-form Novel Production
 
 ## Description: <br>
-Create a continuous multi-chapter novel through a reusable directed lifecycle: establish the writing foundation, read accepted history and produce a recap, write or revise in one logical Writer session, run an independent review, and deliver accepted chapters. <br>
+Create a continuous multi-chapter novel through a reusable directed lifecycle. Versioned Loop assets supply fixed writing methods; the Project stores only its story baseline; each chapter reads accepted history, produces a recap, writes or revises in one logical Writer session, receives independent review, and delivers an accepted version. <br>
 
 ## Publisher: <br>
 DevWerk <br>
@@ -24,10 +24,10 @@ Use when the user needs a continuous chapter-based novel whose chapters must rea
 Select for a managed long-form fiction project with repeated chapter Tasks and explicit review/rework. Do not select for a short standalone passage, a single unreviewed response, or non-fiction software delivery. <br>
 
 ## Loop Input: <br>
-Project title, confirmed premise, target chapter length, and permissive maximum chapter length. <br>
+Project title, confirmed premise, chapter count, target chapter length, and permissive maximum chapter length. <br>
 
 ## Loop Output: <br>
-Frozen writing guides, serial chapter summaries and bodies, review evidence, index, final acceptance evidence, and explicit Task terminal states. <br>
+Versioned writing-method assets, a Project-specific story baseline, serial chapter summaries and bodies, review evidence, index, final acceptance evidence, and explicit Task terminal states. <br>
 
 ## Loop Version(s): <br>
 1.0.0 <br>

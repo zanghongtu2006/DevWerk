@@ -99,7 +99,11 @@ TASK_STATE_MACHINE = StateMachine(
             TaskStatus.DONE,
             TaskStatus.FAILED,
         },
-        TaskStatus.RECOVERING: {TaskStatus.RUNNING, TaskStatus.FAILED},
+        TaskStatus.RECOVERING: {
+            TaskStatus.PENDING,
+            TaskStatus.RUNNING,
+            TaskStatus.FAILED,
+        },
         TaskStatus.DONE: set(),
         TaskStatus.FAILED: {TaskStatus.PENDING},
     },

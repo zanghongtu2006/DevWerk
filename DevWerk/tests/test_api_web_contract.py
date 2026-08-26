@@ -22,7 +22,11 @@ def test_web_routes_and_modular_assets_are_served():
         assert set(statuses) == {
             "task", "column_run", "attempt", "agent_run", "tool_invocation"
         }
-        for route in ("/", "/workbench", "/dashboard", "/kanban", "/tasks", "/events"):
+        settings = web.get("/v1/settings")
+        assert settings.status_code == 200
+        assert settings.json()["values"]["workflow"]["auto_resume_previous_tasks"] is False
+        assert settings.json()["fields"][0]["restart_required"] is True
+        for route in ("/", "/workbench", "/dashboard", "/kanban", "/tasks", "/events", "/settings"):
             response = web.get(route)
             assert response.status_code == 200
             assert 'type="module"' in response.text
@@ -35,6 +39,7 @@ def test_web_routes_and_modular_assets_are_served():
             "/web/static/pages/kanban.js",
             "/web/static/pages/tasks.js",
             "/web/static/pages/events.js",
+            "/web/static/pages/settings.js",
         ):
             response = web.get(asset)
             assert response.status_code == 200
@@ -44,6 +49,16 @@ def test_web_routes_and_modular_assets_are_served():
         assert "after_id=" in dashboard
         assert "before_id=" in dashboard
         assert "refreshConversationStatus" in dashboard
+        assert "queueProjectEvent" in dashboard
+        assert "flushProjectEvents" in dashboard
+        assert 'event.type !== "conversation.progress"' in dashboard
+        assert 'state.route === "projects"' in dashboard
+        assert "currentPageView" in dashboard
+        assert "scroll.scrollLeft = view.left" in dashboard
+        assert "scroll.scrollTop = view.top" in dashboard
+        assert "saveGlobalSettings" in dashboard
+        assert "waitForRuntimeRestart" in dashboard
+        assert "tasks/${event.task_id}" not in dashboard
         assert "conversationProgressFromEvents" not in dashboard
         assert "appendConversationProgress" not in dashboard
         assert 'projects.js?v=20260804-debug1' in dashboard
@@ -61,6 +76,7 @@ def test_web_routes_and_modular_assets_are_served():
         core_api = web.get("/web/static/core/api.js").text
         assert "events?limit=500" in core_api
         assert "conversation-state" in core_api
+        assert "new EventSource" in core_api
         components = web.get("/web/static/ui/components.js").text
         assert "data.content" in components
         kanban = web.get("/web/static/pages/kanban.js").text
@@ -70,11 +86,73 @@ def test_web_routes_and_modular_assets_are_served():
         assert "派生临时 Agent" in kanban
         assert "查看原始 Runtime JSON" in kanban
         assert "column.instruction" in kanban
+        pages_css = web.get("/web/static/styles/pages.css").text
+        assert ".conversation-head { grid-row: 1;" in pages_css
+        assert ".conversation-status-strip { grid-row: 2;" in pages_css
+        assert ".conversation-messages { grid-row: 3;" in pages_css
+        assert ".conversation-composer { grid-row: 4; min-height: max-content;" in pages_css
+        assert ".kanban-page" in pages_css
+        assert "grid-template-rows: auto minmax(0,1fr)" in pages_css
+        assert ".kanban-scroll" in pages_css
+        assert "overflow: auto" in pages_css
         tasks = web.get("/web/static/pages/tasks.js").text
         assert "FAILURE REASON" in tasks
         assert "失败阶段" in tasks
         assert "查看原始 Runtime 错误" in tasks
         assert "task.error" in tasks
+        settings_page = web.get("/web/static/pages/settings.js").text
+        assert "global-settings-form" in settings_page
+        assert "data-setting-key" in settings_page
+        assert "保存后自动重启" in settings_page
+
+
+def test_global_settings_api_saves_and_requests_managed_restart(tmp_path):
+    class RestartProbe:
+        def __init__(self):
+            self.calls = 0
+
+        def schedule(self):
+            self.calls += 1
+            return True
+
+    with client() as web:
+        path = tmp_path / "saved-global-settings.yaml"
+        restart = RestartProbe()
+        web.app.state.v1_global_settings_path = path
+        web.app.state.v1_restart = restart
+
+        response = web.post(
+            "/v1/settings",
+            json={
+                "schema_version": "devwerk.global-settings.v1",
+                "workflow": {"auto_resume_previous_tasks": True},
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["saved"] is True
+        assert response.json()["restart_required"] is True
+        assert response.json()["restart_scheduled"] is True
+        assert response.json()["restart_changes"] == [
+            "workflow.auto_resume_previous_tasks"
+        ]
+        assert restart.calls == 1
+        assert "auto_resume_previous_tasks: true" in path.read_text(encoding="utf-8")
+        assert web.app.state.v1_conversation.global_settings["workflow"][
+            "auto_resume_previous_tasks"
+        ] is True
+
+        unchanged = web.post(
+            "/v1/settings",
+            json={
+                "schema_version": "devwerk.global-settings.v1",
+                "workflow": {"auto_resume_previous_tasks": True},
+            },
+        )
+        assert unchanged.status_code == 200
+        assert unchanged.json()["restart_required"] is False
+        assert unchanged.json()["restart_scheduled"] is False
+        assert restart.calls == 1
 
 
 def test_loop_api_is_the_only_initial_workflow_creation_path(tmp_path):
@@ -97,8 +175,6 @@ def test_loop_api_is_the_only_initial_workflow_creation_path(tmp_path):
                 "loop_key": "software.gitlab_devops",
                 "bindings": {
                     "product_name": "API product",
-                    "requirements_path": "docs/requirements.md",
-                    "requirements_confirmed": True,
                     "gitlab_repository": "group/project",
                 },
             },

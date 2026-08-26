@@ -43,6 +43,7 @@ class AgentRunSpec:
     completion_targets: dict[str, str] = field(default_factory=dict)
     agent_session_id: str | None = None
     writable_paths: tuple[str, ...] | None = None
+    user_initiated: bool = False
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,7 @@ class AgentCore:
             column_attempt_id=spec.column_attempt_id,
             start_task=spec.start_task,
             writable_paths=spec.writable_paths,
+            user_initiated=spec.user_initiated,
         )
         allowed = list(dict.fromkeys(spec.capability_ids))
         resolved_capabilities = self.registry.resolve(allowed, capability_context)
@@ -120,13 +122,23 @@ class AgentCore:
             column_attempt_id=spec.column_attempt_id,
             start_task=spec.start_task,
             writable_paths=spec.writable_paths,
+            user_initiated=spec.user_initiated,
         )
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": _stable_json(envelope)}]
         self.store.add_agent_message(run["id"], "system", messages[0]["content"], [])
         if spec.agent_session_id:
-            history = self.store.agent_session_messages(spec.project["id"], spec.agent_session_id)
-            if history:
+            if spec.kind == "conversation":
+                history = _replayable_session_messages(
+                    self.store.conversation_session_messages(
+                        spec.project["id"],
+                        spec.agent_session_id,
+                    )
+                )
+                messages.extend(history)
+            else:
+                history = self.store.agent_session_messages(spec.project["id"], spec.agent_session_id)
+            if spec.kind == "column" and history:
                 item = {
                     "role": "user",
                     "content": _stable_json({
@@ -254,24 +266,36 @@ class AgentCore:
                     calls_used += len(response.tool_calls)
                     completion: dict[str, Any] | None = None
                     wait_request: dict[str, Any] | None = None
-                    for call_index, call in enumerate(response.tool_calls):
-                        if call.name == "column.complete":
-                            if call_index != len(response.tool_calls) - 1:
-                                raise RuntimeError("column.complete must be the final tool call in its model response")
-                            else:
-                                try:
-                                    result, accepted = self._complete_column(
-                                        call.arguments,
-                                        spec,
-                                        logical_ledger,
-                                    )
-                                except ValueError as exc:
-                                    result = ToolResult(
-                                        ok=False,
-                                        capability="column.complete",
-                                        error={"type": type(exc).__name__, "message": str(exc)},
-                                    )
-                                    accepted = False
+                    completion_protocol_error = (
+                        _column_completion_protocol_error(response.tool_calls)
+                        if spec.kind == "column"
+                        else None
+                    )
+                    for call in response.tool_calls:
+                        if completion_protocol_error is not None:
+                            result = ToolResult(
+                                ok=False,
+                                capability=call.name,
+                                error={
+                                    "type": "ColumnCompletionProtocolError",
+                                    "message": completion_protocol_error,
+                                },
+                                checkpoint={"failure_disposition": "rejected_before_effect"},
+                            )
+                        elif call.name == "column.complete":
+                            try:
+                                result, accepted = self._complete_column(
+                                    call.arguments,
+                                    spec,
+                                    logical_ledger,
+                                )
+                            except ValueError as exc:
+                                result = ToolResult(
+                                    ok=False,
+                                    capability="column.complete",
+                                    error={"type": type(exc).__name__, "message": str(exc)},
+                                )
+                                accepted = False
                             if accepted:
                                 completion = call.arguments
                         elif call.name == "column.await":
@@ -684,6 +708,80 @@ def _column_await_schema(allowed: list[str], wait_config: dict[str, Any]) -> dic
             },
         },
     }
+
+
+def _column_completion_protocol_error(tool_calls: list[Any]) -> str | None:
+    complete_indices = [
+        index
+        for index, call in enumerate(tool_calls)
+        if call.name == "column.complete"
+    ]
+    if not complete_indices:
+        return None
+    if len(complete_indices) > 1:
+        return (
+            "A model response may contain only one column.complete call. "
+            "Combine outcome, output, summary, and evidence_ids into one final column.complete call. "
+            "No tool call from this response was executed."
+        )
+    if complete_indices[0] != len(tool_calls) - 1:
+        return (
+            "column.complete must be the final tool call in its model response. "
+            "Move all required tool calls before one final column.complete call. "
+            "No tool call from this response was executed."
+        )
+    if any(call.name == "column.await" for call in tool_calls):
+        return (
+            "column.complete and column.await are mutually exclusive in one model response. "
+            "Return either one final column.complete call or one column.await call. "
+            "No tool call from this response was executed."
+        )
+    return None
+
+
+def _replayable_session_messages(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Replay complete Turns while removing an interrupted tool-call tail."""
+    replay: list[dict[str, Any]] = []
+    index = 0
+    while index < len(history):
+        item = history[index]
+        role = str(item.get("role") or "")
+        if role != "assistant" or not item.get("tool_calls"):
+            if role in {"user", "assistant", "tool"}:
+                replay.append({
+                    key: item[key]
+                    for key in ("role", "content", "tool_calls", "tool_call_id")
+                    if key in item and item[key] not in (None, [])
+                })
+            index += 1
+            continue
+
+        calls = list(item.get("tool_calls") or [])
+        expected_ids = {str(call.get("id") or "") for call in calls}
+        tool_messages: list[dict[str, Any]] = []
+        cursor = index + 1
+        while cursor < len(history) and history[cursor].get("role") == "tool":
+            tool_messages.append(history[cursor])
+            cursor += 1
+        returned_ids = {str(tool.get("tool_call_id") or "") for tool in tool_messages}
+        if expected_ids and expected_ids.issubset(returned_ids):
+            replay.append({
+                "role": "assistant",
+                "content": str(item.get("content") or ""),
+                "tool_calls": calls,
+            })
+            replay.extend({
+                "role": "tool",
+                "content": str(tool.get("content") or ""),
+                "tool_call_id": str(tool.get("tool_call_id") or ""),
+            } for tool in tool_messages)
+        elif str(item.get("content") or "").strip():
+            replay.append({
+                "role": "assistant",
+                "content": str(item.get("content") or ""),
+            })
+        index = cursor
+    return replay
 
 
 def _assistant_message(response: AgentModelResponse) -> dict[str, Any]:

@@ -85,7 +85,7 @@ def test_runtime_failure_is_persisted_and_re_raised(store, tmp_path):
     assert attempt["checkpoint"]["failed_result"]["output"]["exit_code"] == 23
 
 
-def test_expired_lease_does_not_trigger_automatic_recovery(store, tmp_path):
+def test_expired_lease_enters_explicit_recovery(store, tmp_path):
     project = store.create_project("expired lease", "", str(tmp_path / "project"))
     publish_planned_workflow(store, project["id"], sequence_workflow())
     task = create_planned_task(store, project["id"], "owned task")
@@ -96,8 +96,10 @@ def test_expired_lease_does_not_trigger_automatic_recovery(store, tmp_path):
             (task["id"],),
         )
 
-    assert task["id"] not in store.runnable_task_ids()
-    assert store.get_task(task["id"])["status"] == "running"
+    assert task["id"] in store.runnable_task_ids()
+    recovered = store.get_task(task["id"])
+    assert recovered["status"] == "recovering"
+    assert "WorkerLeaseExpired" in recovered["error"]
 
 
 def test_command_capability_has_no_runtime_timeout_argument(store, tmp_path):

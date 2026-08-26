@@ -35,6 +35,7 @@ class CapabilityContext:
     start_task: bool = True
     execution_key: str | None = None
     writable_paths: tuple[str, ...] | None = None
+    user_initiated: bool = False
 
     @property
     def files(self) -> ProjectFiles:
@@ -557,7 +558,10 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         (
             "Persist one immutable concrete Task Plan for an existing Workflow Revision. The plan owns every Task's "
             "title, input, readiness, dependencies, conflict domains, acceptance facts, and Agent-use policy. "
-            "Dependencies reference Task refs in the same plan and must be acyclic. Saving the plan creates no Tasks."
+            "Dependencies reference Task refs in the same plan and must be acyclic. Saving the plan creates no Tasks. "
+            "This is a mutating capability, never a schema probe: do not submit placeholder, test, TODO, or partial "
+            "plans. If validation rejects a call before persistence, correct and resubmit the same complete user-owned "
+            "plan. A queue readiness decision is automatically admitted when dependencies and WIP constraints allow."
         ),
         {"type": "object", "required": ["plan"], "properties": {"plan": task_plan_schema}, "additionalProperties": False, "$defs": task_plan_defs},
         _task_plan_save,
@@ -612,9 +616,11 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     add(
         "task.create",
         (
-            "Instantiate one formal Task from an immutable Task Plan item. Supply only task_plan_id and "
-            "proposed_task_ref; DevWerk materializes the authoritative title, input, readiness, dependencies, "
-            "conflict domains, exact strings, and fixed Workflow Revision from that plan."
+            "Start one immutable Task Plan. Supply its task_plan_id and the item that should be returned as the "
+            "requested Task; DevWerk materializes every planned Task exactly once with the authoritative title, "
+            "input, readiness, dependencies, conflict domains, exact strings, and fixed Workflow Revision. "
+            "Dependency/WIP-queued Tasks then advance automatically without further task.create calls. Use "
+            "scheduling.decide hold only for deliberate manual waiting."
         ),
         {**task_schema, "$defs": task_defs},
         lambda args, ctx: _task_create(args, ctx, registry),
@@ -633,7 +639,8 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         "Persist Task admission, priority, and WIP policy. Dependencies and resources are optional assertions: "
         "omit them to preserve the Task Plan facts, or provide the exact current values. "
         "An admitted decision is rejected while any declared dependency is unresolved or not done. "
-        "An explicit queued decision remains queued until a later scheduling decision.",
+        "An explicit queued scheduling mutation remains queued until a later scheduling decision; this is distinct "
+        "from Task Plan readiness queue, which auto-admits when its dependencies and WIP constraints allow.",
         {"type": "object", "required": ["task_id", "state"], "properties": {"task_id": {"type": "string"}, "state": {"type": "string", "enum": ["admitted", "queued", "hold", "cancelled"]}, "priority": {"type": "integer", "minimum": -1000, "maximum": 1000}, "wip_group": {"type": "string", "minLength": 1, "maxLength": 200}, "wip_limit": {"type": "integer", "minimum": 1, "maximum": 100}, "dependencies": {"type": "array", "items": {"type": "string"}, "maxItems": 200}, "resources": {"type": "array", "items": {"type": "string"}, "maxItems": 200}}, "additionalProperties": False},
         lambda args, ctx: ctx.store.schedule_task(
             ctx.project_id,
@@ -1537,7 +1544,7 @@ def _task_create(
 ) -> dict[str, Any]:
     if not ctx.start_task:
         raise PermissionError("task.create is disabled for this conversation turn")
-    return ctx.store.create_task(
+    return ctx.store.materialize_task_plan(
         ctx.project_id,
         task_plan_id=str(args["task_plan_id"]),
         proposed_task_ref=str(args["proposed_task_ref"]),
@@ -1552,11 +1559,33 @@ def _task_inspect(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any
     task = ctx.store.get_task(str(args["task_id"]))
     if task["project_id"] != ctx.project_id:
         raise PermissionError("task is outside the current Project")
+    task_fields = (
+        "id", "project_id", "workflow_revision_id", "task_plan_id", "proposed_task_ref",
+        "title", "status", "control_state", "current_column", "attempt", "error",
+        "created_at", "updated_at", "finished_at", "state_version", "terminal_artifact_id",
+        "terminal_event_id", "notified_at", "observed_at", "supervision_action",
+        "next_retry_at", "rerun_of_task_id", "resolved_by_task_id",
+    )
+    run_fields = (
+        "id", "task_id", "column_key", "sequence", "status", "attempt", "error",
+        "error_category", "failure_fingerprint", "started_at", "finished_at", "created_at",
+    )
+    attempt_fields = (
+        "id", "task_id", "column_run_id", "attempt_no", "status", "error",
+        "error_category", "failure_fingerprint", "agent_run_id", "started_at",
+        "finished_at", "created_at",
+    )
     return {
-        "task": task,
+        "task": {key: task.get(key) for key in task_fields},
         "scheduling": ctx.store.task_scheduling(ctx.project_id, task["id"]),
-        "runs": ctx.store.runs(ctx.project_id, task["id"]),
-        "attempts": ctx.store.attempts(ctx.project_id, task["id"]),
+        "runs": [
+            {key: item.get(key) for key in run_fields}
+            for item in ctx.store.runs(ctx.project_id, task["id"])
+        ],
+        "attempts": [
+            {key: item.get(key) for key in attempt_fields}
+            for item in ctx.store.attempts(ctx.project_id, task["id"])
+        ],
         "artifacts": ctx.store.artifacts(ctx.project_id, task["id"]),
     }
 
@@ -1584,6 +1613,10 @@ def _task_pause(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
 
 def _task_resume(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
     task = ctx.store.get_project_task(ctx.project_id, str(args["task_id"]))
+    if task.get("supervision_action") == "startup_hold" and not ctx.user_initiated:
+        raise ValueError(
+            "A startup-held Task can only be resumed from a user-initiated Conversation turn"
+        )
     return ctx.store.resume_task(task["id"])
 
 
@@ -1595,7 +1628,24 @@ def _task_fail(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
 
 
 def _event_list(args: dict[str, Any], ctx: CapabilityContext) -> list[dict[str, Any]]:
-    return ctx.store.events(project_id=ctx.project_id, after=int(args.get("after") or 0), limit=int(args.get("limit") or ctx.store.policy.service_limits.detail_page_size))
+    events = ctx.store.events(
+        project_id=ctx.project_id,
+        after=int(args.get("after") or 0),
+        limit=int(args.get("limit") or ctx.store.policy.service_limits.detail_page_size),
+    )
+    for event in events:
+        if event.get("type") != "conversation.progress":
+            continue
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        event["data"] = {
+            key: data.get(key)
+            for key in (
+                "agent_run_id", "conversation_job_id", "kind", "iteration", "sequence",
+                "capability", "tool_call_id",
+            )
+            if data.get(key) is not None
+        }
+    return events
 
 
 def _instruction_update(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:

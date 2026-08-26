@@ -10,8 +10,10 @@ This directory contains the standalone DevWerk Version 1 service. It is a conver
 - [`docs/conversation-agent-orchestration-soul-p0-design.md`](docs/conversation-agent-orchestration-soul-p0-design.md)
 - [`docs/loop-runtime-v1.md`](docs/loop-runtime-v1.md)
 - [`docs/loop-task-plan-decoupling-v1.md`](docs/loop-task-plan-decoupling-v1.md)
+- [`docs/novel-loop-assets-v1.md`](docs/novel-loop-assets-v1.md)
 - [`docs/kanban-recovering-runtime-v1.md`](docs/kanban-recovering-runtime-v1.md)
 - [`docs/agent-tool-rejection-recovery-v1.md`](docs/agent-tool-rejection-recovery-v1.md)
+- [`docs/conversation-session-gateway-v1.md`](docs/conversation-session-gateway-v1.md)
 - [`docs/v1-test-contract.md`](docs/v1-test-contract.md)
 
 The first four documents are locked architecture facts for the general Agent and Kanban Runtime. `loop-task-plan-decoupling-v1.md` is the approved authority for planning ownership and naming. Loop Runtime, Kanban recovery, rejected-tool recovery, and test-contract documents describe implemented V1 extensions. The full `tests` directory protects the current V1 implementation and does not provide a compatibility contract for older designs.
@@ -84,7 +86,7 @@ Anything outside this list must have a current, explicit reason to exist before 
 
 Project is the isolation boundary. Each Project persists exactly one logical Conversation Agent identity, a canonical and unique `base_dir`, its conversation, Workflow revisions, Tasks, Runs, Events, Artifacts, and mailbox notifications.
 
-The Conversation Agent is a general-purpose tool-using Agent with Project-manager, Agile-coach, Kanban and recovery responsibilities. Every governance Run preloads the versioned `DEVWERK.md` platform policy. It has no task-type classifier. It may answer or directly execute bounded work, select a Loop, persist a Task Plan for the current objective, and materialize formal Tasks through capabilities. Same-Project turns are serialized.
+The Conversation Agent is a general-purpose tool-using Agent with Project-manager, Agile-coach, Kanban and recovery responsibilities. Every Project has one stable Conversation Session identified by the Agent's `logical_id`; each user or supervision Turn is a short-lived background Agent Run under that Session. Every governance Run preloads the versioned `DEVWERK.md` platform policy, restores the persisted dialogue and tool evidence, and refreshes current Workflow/Task facts. It has no task-type classifier. It may answer or directly execute bounded work, select a Loop, persist a Task Plan for the current objective, and materialize formal Tasks through capabilities. Same-Project turns are serialized, while a failed Turn leaves the Session available for the next durable Job.
 
 ### Workflow and Task
 
@@ -96,13 +98,15 @@ A valid Workflow Revision is bound to an immutable Workflow Plan and:
 - gives every non-terminal Column an explicit transition path to a terminal;
 - rejects duplicate outcomes and unknown transition targets.
 
-The Workflow Plan describes the reusable method and Task Contract but contains no concrete Task list. A Task Plan binds one user objective to an immutable Workflow Revision and owns concrete Task inputs, dependencies, conflict domains, readiness, and Agent policy. `task.create` accepts only a Task Plan ID and item reference, so Provider calls cannot restate or drift those facts. Publishing a new Workflow Revision never rewrites an existing Task or Task Plan.
+The Workflow Plan describes the reusable method and Task Contract but contains no concrete Task list. Loop bindings own Project-wide facts and are exposed to every Column as `project.loop`; Task input owns only facts that vary between Tasks. A Loop is rejected when the two schemas claim the same field. A Task Plan binds one user objective to an immutable Workflow Revision and owns concrete Task inputs, dependencies, conflict domains, readiness, and Agent policy. `task.create` starts the immutable plan: it accepts only a Task Plan ID and requested item reference, preflights the complete graph, atomically materializes every planned Task exactly once, and returns the requested Task. A failed preflight or transaction exposes zero runnable Tasks. Provider calls cannot restate or drift plan facts, and Kanban owns all later dependency/WIP admission. Publishing a new Workflow Revision never rewrites an existing Task or Task Plan.
 
 ### Runtime and Evidence
 
-Every Column visit creates a Column Run; each retry creates a new immutable Attempt under the same Run. `capability_sequence` Columns execute declared capability steps without an LLM. `agent` Columns create an ephemeral Agent Run that shares the same iterative AgentCore as the Conversation Agent, but receives selected Project + Task + Column context and a declared tool allowlist.
+Every Column visit creates a Column Run; each retry creates a new immutable Attempt under the same Run. `capability_sequence` Columns execute declared capability steps without an LLM. `agent` Columns create an ephemeral Agent Run that shares the same iterative AgentCore as the Conversation Agent, but receives selected Project + Task + Column context and a declared tool allowlist. Declared artifact context is UTF-8 text only, deduplicated, and bounded by the shared V1 file/character policy; broad software-repository discovery is performed on demand through file list/search/read capabilities.
 
-Python source contains no business Workflow factory, task-type route, domain prompt, directory layout rule, or Column-name executor branch. Reusable domain knowledge is stored under `loops/<name>/` as a human-readable `loop.meta` card plus declarative `loop.json`. The catalog reads these files directly; SQLite stores only materialized Workflow Plans, Workflow Revisions, Task Plans, Tasks, and source provenance.
+Python source contains no business Workflow factory, task-type route, domain prompt, directory layout rule, or Column-name executor branch. Reusable domain knowledge is stored under `loops/<name>/` as a human-readable `loop.meta` card, declarative `loop.json`, and optional read-only `assets/`. Asset content participates in the Loop digest and is exposed to Column Agents as `project.loop.assets`. SQLite stores only materialized Workflow Plans, Workflow Revisions, Task Plans, Tasks, and source provenance.
+
+The Novel Production Loop keeps reusable writing methods in its versioned assets, derives only chapter-independent story facts into the Project `baseline/`, and leaves recap, scene, pacing, emotional movement, draft, and review feedback to each chapter Task. Task Plan `queue` means dependency/WIP-managed automatic waiting; explicit human or operational waiting uses scheduling `hold`.
 
 The first Workflow revision for a Project can only be created by applying a selected Loop. After materialization, the Conversation Agent may publish validated immutable revisions; it cannot create an unrelated initial graph through `workflow.publish`.
 
@@ -110,7 +114,7 @@ Failed attempts remain immutable evidence. Non-recoverable runtime failures pres
 
 Conversation and Column execution have no platform-defined model-iteration, tool-call, wall-clock, retry, or continuation budgets in V1. Provider, tool-contract, and runtime failures are recorded with their original details and surface directly instead of being converted into budget exhaustion or fallback results.
 
-Execution leases are renewable ownership coordination. They do not substitute results. Kanban recovery is authorized only by structured recoverable provider classification and creates a new immutable Column Run/Attempt for the same Task and Column.
+Execution leases are renewable ownership coordination. An expired lease atomically fences its former Worker, interrupts the active Attempt and re-enters the same Task through `recovering`; a late result cannot overwrite the replacement owner. Await terminal failure settles the Handle, execution receipt, Column Run, Attempt and Task together. Recoverable failure creates a new immutable Attempt, while permanent failure reaches the explicit failed terminal. A waiting Task cannot be retried while its pending Await Handle owns the execution path.
 
 ### SQLite and Files
 
@@ -157,6 +161,8 @@ Default endpoints:
 
 V1 automation applies the initial Loop at `/v1/projects/{project_id}/automation/loop`, persists reusable Workflow Plans at `/v1/projects/{project_id}/automation/workflow-plans`, publishes Workflow Revisions at `/v1/projects/{project_id}/automation/workflow-revisions`, persists objective-specific Task Plans at `/v1/projects/{project_id}/automation/task-plans`, and materializes their Tasks at `/v1/projects/{project_id}/automation/tasks`. Loop application itself creates no Tasks. This is an explicit low-cost V1 boundary; the customer Web Kanban remains read-only and does not expose mutation controls. Authentication and approval are deferred until after V1.
 
+User Conversation turns receive the complete planning view. Task-terminal, mailbox, and scheduled supervision turns receive a compact projection of the active Workflow, Task summaries, and the current trigger, then inspect additional evidence on demand. Diagnostic capability results expose state and audit metadata without replaying persisted Runtime Context into every supervision turn.
+
 ## Web Workbench
 
 - `/` and `/workbench`: Project overview
@@ -178,6 +184,12 @@ The primary trace event names are `web.conversation_input`, `web.conversation_ou
 Copy `config/llm.example.json` to the ignored `config/llm.json`, or set `DEVWERK_LLM_CONFIG_JSON`. The strict configuration schema has four top-level sections: `providers`, `models`, `routes`, and `runtime`. Runtime routes are `conversation`, `column`, and `default`. Request timeouts belong to model entries as `request_timeout_seconds`; unknown or legacy fields fail startup validation instead of being ignored. Supported protocols are Anthropic-compatible Messages, OpenAI-compatible Chat Completions, and Ollama Chat.
 
 Do not commit provider credentials.
+
+## Global Settings
+
+Repository-wide Runtime behavior is configured in `config/global-settings.yaml`. The file is strictly validated during startup. By default, `workflow.auto_resume_previous_tasks` is `false`: Tasks already executing or admitted to the execution frontier become startup-paused `pending` Tasks. Dependency-queued downstream Tasks remain active, and resuming or reopening one Task releases the startup gate for its Task Plan so the Scheduler can drive the dependency graph without per-Task user or Conversation Agent intervention. Workflow revisions, current Columns, dependencies, scheduling policy, and terminal history are preserved.
+
+See `docs/global-settings-v1.md` for the startup state contract.
 
 ## Test Gate
 

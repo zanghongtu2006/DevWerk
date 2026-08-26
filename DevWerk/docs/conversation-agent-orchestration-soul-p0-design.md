@@ -341,7 +341,6 @@ v1_runtime_policy:
     backoff_base_seconds:
     backoff_cap_seconds:
   scheduling:
-    conversation_workers:
     runtime_workers:
     capability_workers:
     default_wip_limit:
