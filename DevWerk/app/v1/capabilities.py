@@ -534,6 +534,8 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         "project.files.write",
         (
             "Atomically write a complete UTF-8 file inside the Project base directory and register it as an artifact. "
+            "The successful receipt already contains byte size, UTF-8 and non-whitespace character counts, line count, "
+            "and SHA-256; do not call project.files.measure merely to rediscover those same facts. "
             "For Task-owned exact paths or content, pass the value losslessly from Task input with an explicit "
             "JSON Pointer $ref; never retype or normalize content, including trailing newlines."
         ),

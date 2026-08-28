@@ -421,6 +421,7 @@ class MemoryManager:
         participant_key: str | None = None,
         include_core: bool = True,
     ) -> dict[str, Any]:
+        self.store.initialize_project(project)
         references: list[dict[str, Any]] = []
         seen: set[str] = set()
         if include_core:

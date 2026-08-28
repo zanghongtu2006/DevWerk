@@ -87,6 +87,11 @@ class ProjectFiles:
         return {
             "path": target.relative_to(self.root).as_posix(),
             "size": len(data),
+            "utf8_characters": len(content),
+            "non_whitespace_characters": sum(
+                1 for character in content if not character.isspace()
+            ),
+            "line_count": len(content.splitlines()),
             "sha256": hashlib.sha256(data).hexdigest(),
         }
 
@@ -200,8 +205,8 @@ class ProjectFiles:
         *,
         limit: int | None = None,
         exclude_paths: set[str] | None = None,
-    ) -> list[dict[str, str]]:
-        result: list[dict[str, str]] = []
+    ) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
         remaining = max_total_chars
         maximum_files = max(1, limit or self.policy.context.artifact_context_max_files)
         excluded = exclude_paths or set()
@@ -229,7 +234,18 @@ class ProjectFiles:
                 continue
             if remaining is not None:
                 remaining -= len(text)
-            result.append({"path": relative_path, "content": text})
+            encoded = text.encode("utf-8")
+            result.append({
+                "path": relative_path,
+                "content": text,
+                "size_bytes": len(encoded),
+                "utf8_characters": len(text),
+                "non_whitespace_characters": sum(
+                    1 for character in text if not character.isspace()
+                ),
+                "line_count": len(text.splitlines()),
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+            })
             if len(result) >= maximum_files:
                 break
         return result

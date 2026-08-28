@@ -17,6 +17,9 @@ def test_project_files_reject_escape_and_write_hash_tracked_atomic_content(tmp_p
     assert files.read_text("nested/result.txt") == "second"
     assert second["sha256"] == hashlib.sha256(b"second").hexdigest()
     assert second["size"] == 6
+    assert second["utf8_characters"] == 6
+    assert second["non_whitespace_characters"] == 6
+    assert second["line_count"] == 1
     assert first["path"] == second["path"] == "nested/result.txt"
     assert list((tmp_path / "project" / "nested").glob("*.tmp")) == []
 
@@ -41,7 +44,11 @@ def test_context_file_reads_skip_non_utf8_files_and_log_reason(tmp_path, caplog)
     caplog.set_level("DEBUG", logger="devwerk.files")
     selected = files.existing_texts("**/*", max_total_chars=65_535)
 
-    assert selected == [{"path": "readable.md", "content": "usable context"}]
+    assert len(selected) == 1
+    assert selected[0]["path"] == "readable.md"
+    assert selected[0]["content"] == "usable context"
+    assert selected[0]["utf8_characters"] == len("usable context")
+    assert selected[0]["sha256"] == hashlib.sha256(b"usable context").hexdigest()
     assert "reason=non_utf8" in caplog.text
     assert "image.bin" in caplog.text
 

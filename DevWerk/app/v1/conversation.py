@@ -306,27 +306,6 @@ class ConversationGateway:
                     },
                 }
                 session_id = str(identity["logical_id"])
-                history = []
-                if not self.store.conversation_session_has_messages(
-                    project_id,
-                    session_id,
-                ):
-                    # Import an existing Project's public transcript into its
-                    # first Session-bound Run. Subsequent Turns replay the
-                    # canonical Session transcript without duplicating it.
-                    history = [
-                        item
-                        for item in self.store.messages(project_id, limit=None)
-                        if item.get("id") != job.get("user_message_id")
-                        and not (
-                            item.get("role") == "assistant"
-                            and (item.get("meta") or {}).get("kind") == "notification"
-                        )
-                        and not (
-                            item.get("role") == "assistant"
-                            and (item.get("meta") or {}).get("status") == "failed"
-                        )
-                    ]
                 result = self.agent_core.run(AgentRunSpec(
                     kind="conversation",
                     project=project,
@@ -334,7 +313,6 @@ class ConversationGateway:
                     instruction_revision=int(identity.get("instruction_revision") or 1),
                     context=context,
                     capability_ids=capabilities,
-                    history=history,
                     start_task=bool(job["start_task"]),
                     conversation_job_id=job_id,
                     agent_session_id=session_id,

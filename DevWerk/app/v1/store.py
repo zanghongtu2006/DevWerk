@@ -2361,31 +2361,65 @@ class V1Store:
         self,
         project_id: str,
         conversation_session_id: str,
+        *,
+        before_message_id: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Return the exact persisted transcript for one Project Session."""
+        """Return the human dialogue projection for one Project Session.
+
+        Complete internal Agent and tool messages remain in their execution tables. Active
+        Conversation context replays only public user messages and user-facing replies because
+        current Workflow, Task, mailbox, and Memory state is rebuilt separately.
+        """
         with self.connect() as db:
-            rows = db.execute(
-                "SELECT m.agent_run_id,m.sequence,m.role,m.content,m.tool_calls_json,m.tool_call_id "
-                "FROM v1_agent_runs r JOIN v1_agent_messages m ON m.agent_run_id=r.id "
-                "WHERE r.project_id=? AND r.agent_session_id=? AND r.kind='conversation' "
-                "AND r.status IN ('succeeded','failed') "
-                "ORDER BY r.created_at,r.id,m.sequence",
+            identity = db.execute(
+                "SELECT 1 FROM v1_conversation_agents WHERE project_id=? AND logical_id=?",
                 (project_id, conversation_session_id),
-            ).fetchall()
-        return [
-            self._decode(dict(row), "tool_calls_json")
-            for row in rows
-            if row["role"] != "system"
-        ]  # type: ignore[misc]
+            ).fetchone()
+            if identity is None:
+                raise KeyError(conversation_session_id)
+            if before_message_id is None:
+                rows = db.execute(
+                    "SELECT role,content,meta_json FROM v1_conversations "
+                    "WHERE project_id=? ORDER BY id",
+                    (project_id,),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT role,content,meta_json FROM v1_conversations "
+                    "WHERE project_id=? AND id<? ORDER BY id",
+                    (project_id, int(before_message_id)),
+                ).fetchall()
+        projected: list[dict[str, Any]] = []
+        for row in rows:
+            meta = json.loads(row["meta_json"] or "{}")
+            role = str(row["role"])
+            if role == "assistant" and (
+                meta.get("kind") == "notification"
+                or meta.get("status") == "failed"
+            ):
+                continue
+            if role in {"user", "assistant"}:
+                projected.append({"role": role, "content": str(row["content"] or "")})
+        return projected
 
     def agent_session_messages(self, project_id: str, agent_session_id: str) -> list[dict[str, Any]]:
         with self.connect() as db:
             rows = db.execute(
-                "SELECT id,final_text,error,status FROM v1_agent_runs "
+                "SELECT id,final_text,error,status,created_at FROM v1_agent_runs "
                 "WHERE project_id=? AND agent_session_id=? AND status IN ('succeeded','failed') "
                 "ORDER BY created_at,id",
                 (project_id, agent_session_id),
             ).fetchall()
+        selected: list[sqlite3.Row] = []
+        if rows:
+            latest = rows[-1]
+            latest_success = next(
+                (row for row in reversed(rows) if row[3] == "succeeded"),
+                None,
+            )
+            if latest_success is not None and latest_success[0] != latest[0]:
+                selected.append(latest_success)
+            selected.append(latest)
         return [
             {
                 "role": "prior_run",
@@ -2399,7 +2433,7 @@ class V1Store:
                 "tool_calls": [],
                 "tool_call_id": None,
             }
-            for row in rows
+            for row in selected
         ]
 
     def suspend_agent_session(self, project_id: str, agent_session_id: str, task_id: str) -> None:

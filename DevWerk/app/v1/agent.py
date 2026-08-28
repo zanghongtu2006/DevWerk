@@ -135,12 +135,22 @@ class AgentCore:
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": _stable_json(envelope)}]
         self.store.add_agent_message(run["id"], "system", messages[0]["content"], [])
+        current_request = (
+            spec.context.get("current_request")
+            if isinstance(spec.context, dict)
+            else None
+        )
         if spec.agent_session_id:
             if spec.kind == "conversation":
                 history = _replayable_session_messages(
                     self.store.conversation_session_messages(
                         spec.project["id"],
                         spec.agent_session_id,
+                        before_message_id=(
+                            current_request.get("message_id")
+                            if isinstance(current_request, dict)
+                            else None
+                        ),
                     )
                 )
                 messages.extend(history)
@@ -167,7 +177,6 @@ class AgentCore:
                     [],
                     emit_progress=False,
                 )
-        current_request = spec.context.get("current_request") if isinstance(spec.context, dict) else None
         if isinstance(current_request, dict):
             item = {
                 "role": "user",
@@ -403,7 +412,11 @@ class AgentCore:
                         if wait_request is not None:
                             break
                     if completion is not None:
-                        completed_text = response.text
+                        completed_text = _stable_json({
+                            "outcome": completion.get("outcome"),
+                            "summary": completion.get("summary"),
+                            "output": completion.get("output"),
+                        })
                         self.store.finish_agent_run(run["id"], "succeeded", completed_text, None, iteration, calls_used)
                         return AgentRunResult(
                             run["id"],
@@ -542,13 +555,19 @@ class AgentCore:
                 if item.get("ok")
                 and item.get("status") == "completed"
                 and item.get("effect_kind") in {"write", "process", "control"}
-                and item.get("capability") not in {"column.complete", "column.await"}
+                and item.get("capability") not in {
+                    spec.completion_tool_name,
+                    "column.await",
+                }
             }
             if not required_actions.issubset(referenced_ids):
                 raise ValueError("successful Column completion omitted successful action evidence")
             unresolved_failures: dict[str, dict[str, Any]] = {}
             for item in logical_ledger:
-                if item.get("capability") in {"column.complete", "column.await"}:
+                if item.get("capability") in {
+                    spec.completion_tool_name,
+                    "column.await",
+                }:
                     continue
                 if item.get("effect_kind") not in {"write", "process", "control"}:
                     continue
@@ -576,7 +595,10 @@ class AgentCore:
         else:
             unresolved_failures: dict[str, dict[str, Any]] = {}
             for item in logical_ledger:
-                if item.get("capability") in {"column.complete", "column.await"}:
+                if item.get("capability") in {
+                    spec.completion_tool_name,
+                    "column.await",
+                }:
                     continue
                 if item.get("effect_kind") not in {"write", "process", "control"}:
                     continue
@@ -639,7 +661,11 @@ def _column_complete_schema(
                         "items": {
                             "type": "string",
                             "minLength": 1,
-                            "description": "Canonical evidence_id from a Column tool result.",
+                            "description": (
+                                "Canonical evidence_id from a successful business capability result. "
+                                "Include every successful write, process, and control action from this Run; "
+                                "do not include rejected completion-tool calls."
+                            ),
                         },
                     },
                 },

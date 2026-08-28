@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -24,6 +25,7 @@ from app.v1.domain import (
     AgentExecutor,
     CapabilitySequenceExecutor,
     ColumnDefinition,
+    ContextSelection,
     EventWaitPolicy,
     PollWaitPolicy,
     TaskPlan,
@@ -40,6 +42,15 @@ from app.v1.store import V1Store
 
 log = logging.getLogger("devwerk.v1.runtime")
 trace_log = logging.getLogger("devwerk.runtime.trace")
+
+_CONTEXT_CONSUMPTION_CONTRACT = (
+    "Runtime context is authoritative for this activation. Use embedded "
+    "project.loop.assets and artifacts content directly; do not list or read a path "
+    "already named in context_manifest unless it is absent, known to have changed, "
+    "or independent verification is explicitly required. Loop asset paths are not "
+    "Project filesystem paths. On a Session resume, use the logical checkpoint and "
+    "directed Handoffs, then fetch only the specific missing or changed Project files."
+)
 
 
 class WaitRequested(RuntimeError):
@@ -197,9 +208,14 @@ class WorkflowRuntime:
         task: dict[str, Any],
         workflow: WorkflowDefinition,
         column: ColumnDefinition,
+        *,
+        context_selection: ContextSelection | None = None,
     ) -> dict[str, Any]:
         project = self.store.get_project(task["project_id"])
+        selection = context_selection or column.context
         data: dict[str, Any] = {"column": {"key": column.key, "name": column.name}}
+        preloaded_loop_assets: list[dict[str, Any]] = []
+        preloaded_artifacts: list[dict[str, Any]] = []
         revision = self.store.get_workflow_revision(task["project_id"], task["workflow_revision_id"])
         workflow_plan_row = self.store.get_workflow_plan(task["project_id"], revision["workflow_plan_id"])
         task_plan_row = self.store.get_task_plan(task["project_id"], task["task_plan_id"])
@@ -219,7 +235,7 @@ class WorkflowRuntime:
             task["project_id"],
             task["id"],
         )
-        if column.context.include_project:
+        if selection.include_project:
             data["project"] = {
                 "id": project["id"],
                 "name": project["name"],
@@ -228,14 +244,26 @@ class WorkflowRuntime:
             }
             loop_binding = self.store.get_project_loop_binding(task["project_id"])
             if loop_binding:
+                loop_assets = self.store.get_project_loop_assets(task["project_id"])
+                preloaded_loop_assets = [
+                    {
+                        "path": item["path"],
+                        "utf8_characters": len(item["content"]),
+                        "sha256": hashlib.sha256(
+                            item["content"].encode("utf-8")
+                        ).hexdigest(),
+                    }
+                    for item in loop_assets
+                ]
                 data["project"]["loop"] = {
                     "key": loop_binding["loop_key"],
                     "version": loop_binding["loop_version"],
                     "digest": loop_binding["loop_digest"],
                     "bindings": loop_binding["bindings"],
-                    "assets": self.store.get_project_loop_assets(task["project_id"]),
+                    "assets": loop_assets,
+                    "asset_manifest": preloaded_loop_assets,
                 }
-        if column.context.include_task:
+        if selection.include_task:
             data["task"] = {
                 "id": task["id"],
                 "title": task["title"],
@@ -243,20 +271,20 @@ class WorkflowRuntime:
                 "input": task["input"],
                 "context": task["context"],
             }
-        if column.context.upstream_outputs:
-            selected = set(column.context.upstream_outputs)
+        if selection.upstream_outputs:
+            selected = set(selection.upstream_outputs)
             data["upstream_outputs"] = {
                 item["column_key"]: item["output"]
                 for item in self.store.runs(task["project_id"], task["id"])
                 if item["column_key"] in selected and item["status"] == "succeeded"
             }
-        if column.context.artifact_globs:
+        if selection.artifact_globs:
             files = ProjectFiles(project["base_dir"], self.policy)
             artifacts: list[dict[str, str]] = []
             seen_paths: set[str] = set()
             remaining_chars = self.policy.context.artifact_context_max_characters
             remaining_files = self.policy.context.artifact_context_max_files
-            for pattern in column.context.artifact_globs:
+            for pattern in selection.artifact_globs:
                 selected = files.existing_texts(
                     pattern,
                     remaining_chars,
@@ -271,14 +299,59 @@ class WorkflowRuntime:
                 if remaining_chars <= 0 or remaining_files <= 0:
                     break
             data["artifacts"] = artifacts
-        if column.context.memory:
+            preloaded_artifacts = [
+                {
+                    key: item[key]
+                    for key in (
+                        "path",
+                        "size_bytes",
+                        "utf8_characters",
+                        "non_whitespace_characters",
+                        "line_count",
+                        "sha256",
+                    )
+                }
+                for item in artifacts
+            ]
+        if selection.memory:
             data["memory"] = self.store.memory.build_context(
                 project,
-                selectors=column.context.memory,
+                selectors=selection.memory,
                 task_id=task["id"],
-                include_core=column.context.include_project,
+                include_core=selection.include_project,
             )
+        data["context_manifest"] = {
+            "preloaded_project_artifacts": preloaded_artifacts,
+            "preloaded_loop_assets": preloaded_loop_assets,
+            "preloaded_content_is_authoritative": True,
+            "read_preloaded_path_only_when_missing_or_changed": True,
+            "write_receipt_contains_text_metrics": True,
+            "consumption_contract": _CONTEXT_CONSUMPTION_CONTRACT,
+            "projection": "full_activation",
+        }
         return data
+
+    @staticmethod
+    def _resume_input(input_data: dict[str, Any]) -> dict[str, Any]:
+        """Project a bounded state delta for a persistent logical Agent Session."""
+        projected = dict(input_data)
+        project = dict(projected.get("project") or {})
+        loop = dict(project.get("loop") or {})
+        if loop:
+            loop.pop("assets", None)
+            project["loop"] = loop
+            projected["project"] = project
+        projected.pop("artifacts", None)
+        manifest = dict(projected.get("context_manifest") or {})
+        manifest["projection"] = "session_resume_delta"
+        projected["context_manifest"] = manifest
+        return projected
+
+    @staticmethod
+    def _agent_instruction(*parts: str) -> str:
+        return "\n\n".join(
+            item for item in (*parts, _CONTEXT_CONSUMPTION_CONTRACT) if item.strip()
+        )
 
     def _execute(
         self,
@@ -432,8 +505,26 @@ class WorkflowRuntime:
                 workcell["id"],
                 receiver=participant.key,
             )
+            participant_session_id = (
+                participants[participant.key].get("agent_session_id")
+                if isinstance(participant, WorkcellAgentParticipant)
+                and participant.lifecycle != "invocation"
+                else None
+            )
+            participant_input = input_data
+            if isinstance(participant, WorkcellAgentParticipant):
+                participant_input = self._input_for(
+                    task,
+                    workflow,
+                    column,
+                    context_selection=participant.context,
+                )
+                if participant_session_id and self.store.agent_session_messages(
+                    task["project_id"], participant_session_id
+                ):
+                    participant_input = self._resume_input(participant_input)
             activation = {
-                **input_data,
+                **participant_input,
                 "workcell": {
                     "id": workcell["id"],
                     "current_state": state.key,
@@ -465,10 +556,9 @@ class WorkflowRuntime:
                     AgentRunSpec(
                         kind="column",
                         project=project,
-                        instruction="\n\n".join(
-                            item
-                            for item in (participant.instruction, state.instruction)
-                            if item.strip()
+                        instruction=self._agent_instruction(
+                            participant.instruction,
+                            state.instruction,
                         ),
                         instruction_revision=int(workflow_row["revision"]),
                         context={
@@ -479,7 +569,7 @@ class WorkflowRuntime:
                             },
                             "column": {"key": column.key, "name": column.name},
                             "workcell": activation["workcell"],
-                            "input": input_data,
+                            "input": participant_input,
                             "handoffs": handoffs,
                             "memory": memory,
                         },
@@ -492,11 +582,7 @@ class WorkflowRuntime:
                             item.signal: item.target for item in state.transitions
                         },
                         output_contract=state.output_contract,
-                        agent_session_id=(
-                            participants[participant.key].get("agent_session_id")
-                            if participant.lifecycle != "invocation"
-                            else None
-                        ),
+                        agent_session_id=participant_session_id,
                         completion_tool_name="workcell.signal",
                         completion_requires_evidence=state.require_evidence,
                     )
@@ -643,9 +729,12 @@ class WorkflowRuntime:
             self.store.get_or_create_agent_session(task["project_id"], task["id"], session_key)
             if session_key else None
         )
+        agent_input = input_data
+        if session and self.store.agent_session_messages(task["project_id"], session["id"]):
+            agent_input = self._resume_input(input_data)
         writable_path_values = resolve_references(
             column.metadata.get("writable_paths", []),
-            {"input": input_data},
+            {"input": agent_input},
         ) if "writable_paths" in column.metadata else None
         if writable_path_values is not None and not isinstance(writable_path_values, list):
             raise ValueError("Column metadata writable_paths must resolve to a list")
@@ -653,12 +742,12 @@ class WorkflowRuntime:
             AgentRunSpec(
                 kind="column",
                 project=project,
-                instruction=column.instruction,
+                instruction=self._agent_instruction(column.instruction),
                 instruction_revision=int(workflow_row["revision"]),
                 context={
                     "workflow": {"id": workflow_row["id"], "name": workflow.name, "description": workflow.description},
                     "column": column.model_dump(mode="json"),
-                    "input": input_data,
+                    "input": agent_input,
                     "action_ledger": prior_action_ledger or [],
                 },
                 capability_ids=column.executor.capabilities,

@@ -373,7 +373,7 @@ def test_terminal_mailbox_turn_reports_model_text_to_user(store, tmp_path):
     assert assistant[-1]["meta"]["subject_status"] == "failed"
 
 
-def test_project_session_replays_prior_dialogue_and_tool_evidence(store, tmp_path):
+def test_project_session_replays_human_dialogue_without_raw_tool_evidence(store, tmp_path):
     project = store.create_project("durable session", "", str(tmp_path / "project"))
     registry = build_core_registry()
     registry.register(CapabilityEntry(
@@ -399,7 +399,7 @@ def test_project_session_replays_prior_dialogue_and_tool_evidence(store, tmp_pat
             return AgentModelResponse(text="I inspected workflow revision 7.")
         encoded = json.dumps(messages, ensure_ascii=False)
         assert "Remember the inspected workflow." in encoded
-        assert "workflow-revision-7" in encoded
+        assert "workflow-revision-7" not in encoded
         assert "I inspected workflow revision 7." in encoded
         return AgentModelResponse(text="The same Project Session is continuing.")
 

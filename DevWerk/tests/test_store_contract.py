@@ -54,6 +54,40 @@ def test_conversation_messages_page_by_stable_message_id(store, tmp_path):
         store.messages(project["id"], after_id=messages[0]["id"], before_id=messages[-1]["id"])
 
 
+def test_conversation_session_projects_human_dialogue_without_internal_notifications(
+    store,
+    tmp_path,
+):
+    project = store.create_project("session projection", "", str(tmp_path / "session"))
+    identity = store.conversation_agent(project["id"])
+    first = store.add_message(project["id"], "user", "Build the Project.")
+    reply = store.add_message(project["id"], "assistant", "The Workflow is ready.")
+    store.add_message(
+        project["id"],
+        "assistant",
+        "Internal task notification.",
+        {"kind": "notification", "status": "succeeded"},
+    )
+    store.add_message(
+        project["id"],
+        "assistant",
+        "Failed status bubble.",
+        {"kind": "reply", "status": "failed"},
+    )
+    current = store.add_message(project["id"], "user", "Continue delivery.")
+
+    projected = store.conversation_session_messages(
+        project["id"],
+        identity["logical_id"],
+        before_message_id=current["id"],
+    )
+
+    assert projected == [
+        {"role": "user", "content": first["content"]},
+        {"role": "assistant", "content": reply["content"]},
+    ]
+
+
 def test_kanban_projection_uses_task_plan_order_not_materialization_time(store, tmp_path):
     project = store.create_project("projection ordering", "", str(tmp_path / "projection-order"))
     workflow = sequence_workflow()

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import requests
 
 from app.services.provider_errors import provider_timeout_error
@@ -93,6 +95,22 @@ def test_memory_store_provider_is_replaceable_without_runtime_branching(tmp_path
     assert provider.writes == 1
     assert written["provider"] == "tracking-file"
     assert value.memory.build_context(project)["manifest"]["store_provider"] == "tracking-file"
+
+
+def test_memory_context_initializes_a_pre_memory_project_workspace(store, tmp_path):
+    project = store.projects.create_project(
+        "existing",
+        "created before File Memory",
+        str(tmp_path / "existing"),
+        "",
+    )
+    memory_root = tmp_path / "existing" / ".devwerk" / "memory"
+    assert not memory_root.exists()
+
+    context = store.memory.build_context(project)
+
+    assert (memory_root / "PROJECT.md").is_file()
+    assert context["manifest"]["selected"]
 
 
 def _workcell_workflow() -> WorkflowDefinition:
@@ -193,15 +211,23 @@ def test_workcell_supports_deterministic_participants_without_an_llm(store, tmp_
 def test_workcell_routes_typed_handoffs_and_keeps_participant_sessions(store, tmp_path):
     project = store.create_project("workcell", "generic collaboration", str(tmp_path / "project"))
     workflow = _workcell_workflow()
+    workflow.columns[0].executor.participants[0].context.artifact_globs = ["shared.md"]
+    workflow.columns[0].executor.participants[1].context.artifact_globs = ["shared.md"]
     publish_planned_workflow(store, project["id"], workflow)
     task = create_planned_task(store, project["id"], "deliver")
+    shared = tmp_path / "project" / "shared.md"
+    shared.write_text("version-one", encoding="utf-8")
     calls = 0
+    activation_inputs = []
 
     def model(messages, tools, **_kwargs):
         nonlocal calls
         calls += 1
         assert any(item["function"]["name"] == "workcell.signal" for item in tools)
+        activation_inputs.append(json.loads(messages[0]["content"])["context"]["input"])
         if calls in {1, 3}:
+            if calls == 1:
+                shared.write_text("version-two", encoding="utf-8")
             return AgentModelResponse(tool_calls=[AgentToolCall(
                 id=f"candidate-{calls}",
                 name="workcell.signal",
@@ -277,6 +303,16 @@ def test_workcell_routes_typed_handoffs_and_keeps_participant_sessions(store, tm
         sum(item["agent_session_id"] == session_id for item in agent_runs)
         for session_id in {item["agent_session_id"] for item in agent_runs}
     ) == [2, 2]
+    assert activation_inputs[0]["artifacts"][0]["content"] == "version-one"
+    assert activation_inputs[1]["artifacts"][0]["content"] == "version-two"
+    assert [item["context_manifest"]["projection"] for item in activation_inputs] == [
+        "full_activation",
+        "full_activation",
+        "session_resume_delta",
+        "session_resume_delta",
+    ]
+    assert "artifacts" not in activation_inputs[2]
+    assert activation_inputs[2]["context_manifest"]["preloaded_project_artifacts"][0]["path"] == "shared.md"
 
 
 def test_workcell_recovers_same_node_and_participant_session_after_provider_timeout(store, tmp_path):
