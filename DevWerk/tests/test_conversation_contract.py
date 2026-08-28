@@ -176,14 +176,18 @@ def test_runtime_notifications_are_not_replayed_as_conversation_history(store, t
     assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
 
 
-def test_executing_conversation_cannot_finish_with_unevidenced_prose(store, tmp_path):
-    project = store.create_project("evidenced execution", "", str(tmp_path / "project"))
+def test_action_enabled_conversation_can_finish_with_plain_text(store, tmp_path):
+    project = store.create_project("no matching loop", "", str(tmp_path / "project"))
     turns = 0
+    require_tool_values: list[bool] = []
 
-    def model(_messages, _tools, **_kwargs):
+    def model(_messages, _tools, **kwargs):
         nonlocal turns
         turns += 1
-        return AgentModelResponse(text="I inspected and changed the project.")
+        require_tool_values.append(bool(kwargs.get("require_tool")))
+        return AgentModelResponse(
+            text="No existing Loop matches this request, so no Workflow was created."
+        )
 
     registry = build_core_registry()
     agent = ConversationGateway(
@@ -191,12 +195,20 @@ def test_executing_conversation_cannot_finish_with_unevidenced_prose(store, tmp_
         registry,
         agent_core=AgentCore(store, registry, model),
     )
-    accepted = run_turn(agent, project["id"], "Inspect before acting.", True)
+    accepted = run_turn(agent, project["id"], "Try to create a new Loop.", True)
     job = store.get_conversation_job(accepted["job"]["id"])
-    assert job["status"] == "failed"
-    assert turns == 1
+    assert job["status"] == "succeeded"
+    assert job["result"]["reply"] == (
+        "No existing Loop matches this request, so no Workflow was created."
+    )
     assert job["result"]["action_ledger"] == []
-    assert store.conversation_agent(project["id"])["state"] == "attention"
+    assert turns == 1
+    assert require_tool_values == [False]
+    assert store.conversation_agent(project["id"])["state"] != "attention"
+    assert any(
+        item["role"] == "assistant" and item["content"] == job["result"]["reply"]
+        for item in store.messages(project["id"], 20)
+    )
 
 
 def test_same_project_jobs_remain_ordered_by_session_gateway(store, tmp_path):

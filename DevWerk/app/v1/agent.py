@@ -18,11 +18,6 @@ ModelComplete = Callable[..., AgentModelResponse]
 trace_log = logging.getLogger("devwerk.agent.trace")
 
 
-class ConversationEvidenceRequiredError(RuntimeError):
-    error_code = "conversation_evidence_required"
-    error_category = "protocol_error"
-
-
 @dataclass(frozen=True)
 class AgentRunSpec:
     kind: Literal["conversation", "column"]
@@ -235,11 +230,7 @@ class AgentCore:
                     project_id=spec.project["id"],
                     task_id=spec.task_id,
                     agent="conversation" if spec.kind == "conversation" else "column",
-                    require_tool=bool(
-                        spec.kind == "conversation"
-                        and spec.start_task
-                        and not logical_ledger
-                    ),
+                    require_tool=False,
                 )
                 trace_json(
                     trace_log,
@@ -444,10 +435,6 @@ class AgentCore:
                 text = response.text.strip()
                 if not text:
                     raise RuntimeError("Conversation Agent returned neither tools nor final text")
-                if spec.start_task and not logical_ledger:
-                    raise ConversationEvidenceRequiredError(
-                        "Conversation Agent returned an execution report without calling any project tool"
-                    )
                 self.store.finish_agent_run(run["id"], "succeeded", text, None, iteration, calls_used)
                 return AgentRunResult(run["id"], "succeeded", text, None, calls_used, iteration)
         except Exception as exc:  # noqa: BLE001

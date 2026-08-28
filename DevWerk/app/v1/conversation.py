@@ -7,7 +7,7 @@ import time
 from collections import defaultdict, deque
 from typing import Any, Callable
 
-from app.v1.agent import AgentCore, AgentRunSpec, ConversationEvidenceRequiredError, _ledger_entry
+from app.v1.agent import AgentCore, AgentRunSpec, _ledger_entry
 from app.v1.capabilities import CapabilityRegistry
 from app.v1.domain import ToolResult
 from app.v1.store import V1Store
@@ -429,10 +429,7 @@ class ConversationGateway:
                     ),
                 },
                 notification=None,
-                attention=isinstance(exc, ConversationEvidenceRequiredError),
             )
-            if isinstance(exc, ConversationEvidenceRequiredError):
-                return
             raise
 
 _TASK_TERMINAL_EVENTS = {"task.done", "task.failed"}
