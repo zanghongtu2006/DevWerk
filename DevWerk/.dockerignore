@@ -1,0 +1,12 @@
+.devwerk
+.env
+.env.*
+.git
+.idea
+.pytest_cache
+.venv
+__pycache__
+config/llm.json
+data
+tests
+venv

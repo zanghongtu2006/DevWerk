@@ -138,6 +138,18 @@ cd D:\workspace\DevWerk\DevWerk
 .\startup.bat
 ```
 
+Standalone release archives use the checked-in portable launchers instead:
+
+```bash
+sh ./start.sh
+```
+
+```powershell
+.\start.bat
+```
+
+The portable launchers invoke `install.sh` or `install.bat` once when `.venv` is absent. Container builds use the colocated `Dockerfile` and `docker-start.sh`; they do not depend on either portable launcher or `startup.bat`.
+
 Default endpoints:
 
 - `/v1/health`

@@ -69,6 +69,10 @@ DevWerk/
   config/         LLM routing
   loops/          discoverable Loop cards and declarative Workflow bundles
   scripts/        current V1 operational helpers
+  Dockerfile      Linux container definition
+  docker-start.sh container process entrypoint
+  install.*       portable release installers
+  start.*         portable release launchers
   startup.bat     project-venv-only service launcher
 
 idea-plugin/      suspended; not part of the standalone V1 release gate
@@ -81,6 +85,20 @@ Download the current standalone ZIP package from [GitHub Releases](https://githu
 ```text
 https://github.com/zanghongtu2006/DevWerk/releases/download/v0.0.5/devwerk-release.zip
 ```
+
+The ZIP contains checked-in Linux and Windows launchers. After extraction, start it with:
+
+```bash
+sh ./start.sh
+```
+
+or on Windows:
+
+```powershell
+.\start.bat
+```
+
+The first start creates the portable `.venv` and installs `requirements.txt`. These files are maintained under `DevWerk/`; release packaging copies them unchanged and does not generate launch scripts.
 
 Docker Hub is the recommended container source:
 

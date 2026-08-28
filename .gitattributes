@@ -1,0 +1,4 @@
+DevWerk/*.sh text eol=lf
+DevWerk/Dockerfile text eol=lf
+scripts/*.sh text eol=lf
+DevWerk/*.bat text eol=crlf

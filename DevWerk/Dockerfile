@@ -10,14 +10,13 @@ WORKDIR /opt/devwerk
 
 RUN python -m pip install --upgrade pip
 
-COPY DevWerk/requirements.txt ./requirements.txt
+COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY DevWerk/ ./
-RUN chmod +x /opt/devwerk/start.sh 2>/dev/null || true
+COPY . ./
+RUN chmod +x /opt/devwerk/docker-start.sh
 
 EXPOSE 8000
 VOLUME ["/opt/devwerk/data", "/opt/devwerk/config"]
 
-ENTRYPOINT ["python", "-m", "uvicorn", "app.main:app"]
-CMD ["--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["/opt/devwerk/docker-start.sh"]
