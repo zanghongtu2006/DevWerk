@@ -50,6 +50,15 @@ class ToolInvocationStatus(StringStatus):
     FAILED = "failed"
 
 
+class MailboxStatus(StringStatus):
+    PENDING = "pending"
+    DELIVERED = "delivered"
+    RECEIVED = "received"
+    ACKNOWLEDGED = "acknowledged"
+    FAILED = "failed"
+    ATTENTION = "attention"
+
+
 StatusT = TypeVar("StatusT", bound=StringStatus)
 
 
@@ -174,6 +183,25 @@ AGENT_RUN_STATE_MACHINE = StateMachine(
     },
 )
 
+MAILBOX_STATE_MACHINE = StateMachine(
+    MailboxStatus,
+    {
+        MailboxStatus.PENDING: {MailboxStatus.DELIVERED},
+        MailboxStatus.DELIVERED: {
+            MailboxStatus.RECEIVED,
+            MailboxStatus.FAILED,
+        },
+        MailboxStatus.RECEIVED: {
+            MailboxStatus.ACKNOWLEDGED,
+            MailboxStatus.FAILED,
+            MailboxStatus.ATTENTION,
+        },
+        MailboxStatus.ACKNOWLEDGED: set(),
+        MailboxStatus.FAILED: {MailboxStatus.PENDING},
+        MailboxStatus.ATTENTION: {MailboxStatus.PENDING},
+    },
+)
+
 
 def runtime_status_catalog() -> dict[str, dict[str, object]]:
     machines = {
@@ -192,5 +220,9 @@ def runtime_status_catalog() -> dict[str, dict[str, object]]:
     catalog["tool_invocation"] = {
         "values": [status.value for status in ToolInvocationStatus],
         "transitions": {},
+    }
+    catalog["mailbox"] = {
+        "values": [status.value for status in MailboxStatus],
+        "transitions": MAILBOX_STATE_MACHINE.catalog(),
     }
     return catalog

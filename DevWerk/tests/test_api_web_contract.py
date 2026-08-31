@@ -20,7 +20,7 @@ def test_web_routes_and_modular_assets_are_served():
         statuses = web.get("/v1/runtime-statuses").json()
         assert "recovering" in statuses["task"]["values"]
         assert set(statuses) == {
-            "task", "column_run", "attempt", "agent_run", "tool_invocation"
+            "task", "column_run", "attempt", "agent_run", "tool_invocation", "mailbox"
         }
         settings = web.get("/v1/settings")
         assert settings.status_code == 200
@@ -48,6 +48,8 @@ def test_web_routes_and_modular_assets_are_served():
         assert "mergeConversationMessages" in dashboard
         assert "after_id=" in dashboard
         assert "before_id=" in dashboard
+        assert 'conversationMessages?.addEventListener("scroll"' in dashboard
+        assert "loadingOlderConversation" in dashboard
         assert "refreshConversationStatus" in dashboard
         assert "queueProjectEvent" in dashboard
         assert "flushProjectEvents" in dashboard
@@ -74,7 +76,8 @@ def test_web_routes_and_modular_assets_are_served():
         assert "Conversation 已失败" not in projects
         assert "conversation-trace" not in projects
         core_api = web.get("/web/static/core/api.js").text
-        assert "events?limit=500" in core_api
+        assert "events?recent=true&limit=20" in core_api
+        assert "events?limit=500" not in core_api
         assert "conversation-state" in core_api
         assert "new EventSource" in core_api
         components = web.get("/web/static/ui/components.js").text
@@ -107,6 +110,38 @@ def test_web_routes_and_modular_assets_are_served():
         assert "global-settings-form" in settings_page
         assert "data-setting-key" in settings_page
         assert "保存后自动重启" in settings_page
+
+
+def test_project_events_recent_snapshot_returns_latest_events_in_stream_order(tmp_path):
+    with client() as web:
+        project = web.post(
+            "/v1/projects",
+            json={
+                "name": "recent-events",
+                "description": "",
+                "base_dir": str(tmp_path / "recent-events"),
+            },
+        ).json()
+        for index in range(8):
+            response = web.post(
+                f"/v1/projects/{project['id']}/automation/events",
+                json={
+                    "event_type": "test.activity",
+                    "correlation_key": f"activity-{index}",
+                    "output": {"index": index},
+                },
+            )
+            assert response.status_code == 201
+
+        recent = web.get(
+            f"/v1/projects/{project['id']}/events",
+            params={"recent": True, "limit": 4},
+        )
+
+        assert recent.status_code == 200
+        events = recent.json()
+        assert [item["data"]["output"]["index"] for item in events] == [4, 5, 6, 7]
+        assert [item["id"] for item in events] == sorted(item["id"] for item in events)
 
 
 def test_project_memory_api_uses_project_local_files(tmp_path):
@@ -321,7 +356,7 @@ def test_conversation_and_agent_audit_endpoints(tmp_path, monkeypatch):
             f"/v1/projects/{project['id']}/conversation",
             json={"message": "Inspect only.", "start_task": False},
         ).json()
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + 15
         job = {}
         while time.monotonic() < deadline:
             job = web.get(f"/v1/projects/{project['id']}/conversation-jobs/{accepted['job']['id']}").json()

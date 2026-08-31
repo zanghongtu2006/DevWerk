@@ -27,7 +27,7 @@ tar -C "$APP" \
   --exclude='venv' \
   -cf - . | tar -C "$STAGE" -xf -
 
-chmod +x "$STAGE/install.sh" "$STAGE/start.sh"
+chmod +x "$STAGE/install.sh" "$STAGE/startup.sh" "$STAGE/shutdown.sh"
 rm -f "$PACKAGE"
 if command -v zip >/dev/null 2>&1; then
   (cd "$STAGE" && zip -qr "$PACKAGE" .)

@@ -138,17 +138,17 @@ cd D:\workspace\DevWerk\DevWerk
 .\startup.bat
 ```
 
-Standalone release archives use the checked-in portable launchers instead:
+Linux and macOS use the matching project-environment launcher:
 
 ```bash
-sh ./start.sh
+sh ./startup.sh
 ```
 
 ```powershell
-.\start.bat
+.\startup.bat
 ```
 
-The portable launchers invoke `install.sh` or `install.bat` once when `.venv` is absent. Container builds use the colocated `Dockerfile` and `docker-start.sh`; they do not depend on either portable launcher or `startup.bat`.
+Run `install.sh` or `install.bat` once when `venv` is absent. Stop the service with `shutdown.sh` or `shutdown.bat`. Container builds use the colocated `Dockerfile` and the same `startup.sh` entrypoint.
 
 Default endpoints:
 

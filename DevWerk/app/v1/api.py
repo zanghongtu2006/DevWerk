@@ -213,6 +213,7 @@ def conversation(
             limit,
             after_id=after_id,
             before_id=before_id,
+            visible_only=True,
         )
     except KeyError as exc:
         raise not_found(exc) from exc
@@ -421,9 +422,17 @@ def task_events(project_id: str, task_id: str, request: Request, after: int = Qu
 
 
 @router.get("/projects/{project_id}/events")
-def project_events(project_id: str, request: Request, after: int = Query(0, ge=0), limit: int = Query(DETAIL_PAGE, ge=1, le=MAX_PAGE)) -> list[dict[str, Any]]:
+def project_events(
+    project_id: str,
+    request: Request,
+    after: int = Query(0, ge=0),
+    limit: int = Query(DETAIL_PAGE, ge=1, le=MAX_PAGE),
+    recent: bool = False,
+) -> list[dict[str, Any]]:
     try:
         store(request).get_project(project_id)
+        if recent:
+            return store(request).recent_events(project_id, limit)
         return store(request).events(project_id=project_id, after=after, limit=limit)
     except KeyError as exc:
         raise not_found(exc) from exc

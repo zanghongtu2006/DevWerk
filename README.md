@@ -70,10 +70,9 @@ DevWerk/
   loops/          discoverable Loop cards and declarative Workflow bundles
   scripts/        current V1 operational helpers
   Dockerfile      Linux container definition
-  docker-start.sh container process entrypoint
   install.*       portable release installers
-  start.*         portable release launchers
-  startup.bat     project-venv-only service launcher
+  startup.*       project-venv-only service launchers
+  shutdown.*      project-scoped service shutdown helpers
 
 idea-plugin/      suspended; not part of the standalone V1 release gate
 ```
@@ -89,16 +88,20 @@ https://github.com/zanghongtu2006/DevWerk/releases/download/v0.0.5/devwerk-relea
 The ZIP contains checked-in Linux and Windows launchers. After extraction, start it with:
 
 ```bash
-sh ./start.sh
+sh ./install.sh
+sh ./startup.sh
 ```
 
 or on Windows:
 
 ```powershell
-.\start.bat
+.\install.bat
+.\startup.bat
 ```
 
-The first start creates the portable `.venv` and installs `requirements.txt`. These files are maintained under `DevWerk/`; release packaging copies them unchanged and does not generate launch scripts.
+The installer creates `venv` and installs `requirements.txt`; both startup scripts then use only that project environment. These files are maintained under `DevWerk/`; release packaging copies them unchanged and does not generate launch scripts.
+
+Stop the corresponding local service with `sh ./shutdown.sh` or `.\shutdown.bat`. The shutdown helper only targets the Uvicorn process running from this DevWerk directory's `venv`.
 
 Docker Hub is the recommended container source:
 

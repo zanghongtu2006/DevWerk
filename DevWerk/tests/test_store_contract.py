@@ -54,6 +54,20 @@ def test_conversation_messages_page_by_stable_message_id(store, tmp_path):
         store.messages(project["id"], after_id=messages[0]["id"], before_id=messages[-1]["id"])
 
 
+def test_visible_conversation_pagination_ignores_internal_system_rows(store, tmp_path):
+    project = store.create_project("visible messages", "", str(tmp_path / "visible-messages"))
+    first = store.add_message(project["id"], "user", "First human message")
+    for index in range(175):
+        store.add_message(project["id"], "system", "", {"internal_index": index})
+    second = store.add_message(project["id"], "assistant", "Second human message")
+
+    latest = store.messages(project["id"], 150, visible_only=True)
+    older = store.messages(project["id"], 150, before_id=second["id"], visible_only=True)
+
+    assert [item["id"] for item in latest] == [first["id"], second["id"]]
+    assert [item["id"] for item in older] == [first["id"]]
+
+
 def test_conversation_session_projects_human_dialogue_without_internal_notifications(
     store,
     tmp_path,
@@ -132,24 +146,58 @@ def test_failed_conversation_job_changes_status_without_creating_assistant_speec
     assert state["job"]["has_error"] is True
 
 
-def test_failed_conversation_job_releases_claimed_mailbox_for_redelivery(store, tmp_path):
-    project = store.create_project("mailbox redelivery", "", str(tmp_path / "mailbox-redelivery"))
+def test_failed_conversation_job_finishes_delivery_without_automatic_redelivery(store, tmp_path):
+    project = store.create_project("mailbox failure", "", str(tmp_path / "mailbox-failure"))
     with store.tx(immediate=True) as db:
         store._mailbox(db, project["id"], "task.failed", None, None, {"reason": "provider unavailable"})
     mailbox_id = store.mailbox(project["id"])[0]["id"]
     job = store.create_conversation_job(project["id"], "Inspect the failure.", True)
 
     assert store.claim_conversation_job(job["id"], "session-owner") is not None
-    assert [item["id"] for item in store.mailbox(project["id"], state="claimed")] == [mailbox_id]
+    assert [item["id"] for item in store.mailbox(project["id"], state="received")] == [mailbox_id]
 
     store.fail_conversation_job(job["id"], "model called an unavailable capability")
 
-    assert [item["id"] for item in store.mailbox(project["id"], state="pending")] == [mailbox_id]
-    replacement_jobs = store.enqueue_governance_jobs()
-    assert len(replacement_jobs) == 1
-    replacement = store.get_conversation_job(replacement_jobs[0])
-    assert replacement["trigger_kind"] == "mailbox"
-    assert replacement["mailbox_ids"] == [mailbox_id]
+    assert store.mailbox(project["id"], state="pending") == []
+    failed = store.mailbox(project["id"], state="failed")
+    assert [item["id"] for item in failed] == [mailbox_id]
+    assert failed[0]["last_error"] == "model called an unavailable capability"
+    assert failed[0]["delivered_at"]
+    assert failed[0]["received_at"]
+    assert failed[0]["failed_at"]
+    deliveries = store.mailbox_deliveries(project["id"], mailbox_id)
+    assert [(item["attempt_no"], item["state"]) for item in deliveries] == [(1, "failed")]
+    for _ in range(5):
+        assert store.enqueue_governance_jobs() == []
+
+
+def test_failed_mailbox_requires_explicit_redelivery_and_keeps_attempt_history(store, tmp_path):
+    project = store.create_project("explicit redelivery", "", str(tmp_path / "explicit-redelivery"))
+    with store.tx(immediate=True) as db:
+        store._mailbox(db, project["id"], "task.failed", None, None, {"reason": "provider unavailable"})
+    mailbox_id = store.mailbox(project["id"])[0]["id"]
+    first_job_id = store.enqueue_governance_jobs()[0]
+    assert store.claim_conversation_job(first_job_id, "first-owner") is not None
+    store.fail_conversation_job(first_job_id, "LLM_USAGE_LIMIT")
+
+    redelivered = store.redeliver_mailbox(project["id"], mailbox_id, "operator restored provider plan")
+    assert redelivered["state"] == "pending"
+    assert redelivered["redelivered_at"]
+    second_job_id = store.enqueue_governance_jobs()[0]
+    assert second_job_id != first_job_id
+    delivered = store.mailbox(project["id"], state="delivered")[0]
+    assert delivered["delivery_count"] == 2
+    assert store.claim_conversation_job(second_job_id, "second-owner") is not None
+    store.finish_conversation_job(second_job_id, None, result={"observed": True})
+
+    acknowledged = store.mailbox(project["id"], state="acknowledged")[0]
+    assert acknowledged["id"] == mailbox_id
+    assert acknowledged["acknowledged_at"]
+    deliveries = store.mailbox_deliveries(project["id"], mailbox_id)
+    assert [(item["attempt_no"], item["state"]) for item in deliveries] == [
+        (1, "failed"),
+        (2, "acknowledged"),
+    ]
 
 
 def test_protocol_failed_conversation_quarantines_trigger_without_blocking_later_mailbox(store, tmp_path):
@@ -178,7 +226,7 @@ def test_protocol_failed_conversation_quarantines_trigger_without_blocking_later
     assert replacement["mailbox_ids"] == [later_mailbox_id]
 
 
-def test_startup_releases_mailbox_claimed_by_interrupted_conversation(store, tmp_path):
+def test_startup_fails_received_mailbox_without_automatic_redelivery(store, tmp_path):
     project = store.create_project("mailbox restart", "", str(tmp_path / "mailbox-restart"))
     with store.tx(immediate=True) as db:
         store._mailbox(db, project["id"], "task.failed", None, None, {"reason": "provider unavailable"})
@@ -189,7 +237,42 @@ def test_startup_releases_mailbox_claimed_by_interrupted_conversation(store, tmp
     store.startup_conversation_jobs()
 
     assert store.get_conversation_job(job["id"])["status"] == "failed"
-    assert [item["id"] for item in store.mailbox(project["id"], state="pending")] == [mailbox_id]
+    assert store.mailbox(project["id"], state="pending") == []
+    failed = store.mailbox(project["id"], state="failed")
+    assert [item["id"] for item in failed] == [mailbox_id]
+    assert failed[0]["last_error"] == "process interrupted"
+    assert store.enqueue_governance_jobs() == []
+
+
+def test_failed_scheduled_review_is_not_automatically_redelivered(store, tmp_path):
+    project = store.create_project("review failure", "", str(tmp_path / "review-failure"))
+    review = store.schedule_review(
+        project["id"],
+        "Inspect a durable runtime fact once.",
+        (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(timespec="milliseconds"),
+    )
+
+    job_id = store.enqueue_governance_jobs()[0]
+    assert store.claim_conversation_job(job_id, "review-owner") is not None
+    store.fail_conversation_job(job_id, "LLM_USAGE_LIMIT")
+
+    with store.connect() as db:
+        row = db.execute(
+            "SELECT state,conversation_job_id,delivered_at,received_at,failed_at,last_error "
+            "FROM v1_scheduled_reviews WHERE id=?",
+            (review["id"],),
+        ).fetchone()
+    assert tuple(row) == (
+        "failed",
+        job_id,
+        row[2],
+        row[3],
+        row[4],
+        "LLM_USAGE_LIMIT",
+    )
+    assert row[2] and row[3] and row[4]
+    for _ in range(5):
+        assert store.enqueue_governance_jobs() == []
 
 
 def test_task_creation_materializes_plan_owned_readiness_fields(store, tmp_path):

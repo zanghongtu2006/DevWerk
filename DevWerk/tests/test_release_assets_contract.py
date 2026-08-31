@@ -10,16 +10,20 @@ REPOSITORY_ROOT = APP_ROOT.parent
 def test_release_launchers_are_checked_in_assets() -> None:
     for name in (
         "install.sh",
-        "start.sh",
+        "startup.sh",
+        "shutdown.sh",
         "install.bat",
-        "start.bat",
-        "docker-start.sh",
+        "startup.bat",
+        "shutdown.bat",
         "Dockerfile",
         ".dockerignore",
     ):
         path = APP_ROOT / name
         assert path.is_file(), name
         assert path.read_text(encoding="utf-8").strip(), name
+
+    for obsolete in ("start.sh", "start.bat", "docker-start.sh"):
+        assert not (APP_ROOT / obsolete).exists(), obsolete
 
     assert not (REPOSITORY_ROOT / "packaging" / "Dockerfile").exists()
     assert not (REPOSITORY_ROOT / ".dockerignore").exists()
@@ -38,14 +42,13 @@ def test_release_packagers_copy_launchers_without_generating_them() -> None:
     ).read_text(encoding="utf-8")
 
     assert 'cat > "$STAGE/install.sh"' not in shell_packager
-    assert 'cat > "$STAGE/start.sh"' not in shell_packager
+    assert 'cat > "$STAGE/startup.sh"' not in shell_packager
     assert 'Join-Path $Stage "install.sh"' not in powershell_packager
-    assert 'Join-Path $Stage "start.sh"' not in powershell_packager
+    assert 'Join-Path $Stage "startup.sh"' not in powershell_packager
     assert "--exclude='.venv'" in shell_packager
     assert "--exclude='venv'" in shell_packager
     assert 'PYTHON=python3' in shell_packager
     assert 'PYTHON=python' in shell_packager
-    assert '".venv"' in powershell_packager
     assert '"venv"' in powershell_packager
 
 
@@ -66,5 +69,5 @@ def test_docker_builds_only_from_the_application_directory() -> None:
     assert 'DOCKERFILE="$APP/Dockerfile"' in shell_builder
     assert 'docker build -f "$DOCKERFILE" -t "$IMAGE" "$APP"' in shell_builder
     assert '$Dockerfile = Join-Path $App "Dockerfile"' in powershell_builder
-    assert "ENTRYPOINT [\"/opt/devwerk/docker-start.sh\"]" in dockerfile
+    assert "ENTRYPOINT [\"/opt/devwerk/startup.sh\", \"production\"]" in dockerfile
     assert "COPY . ./" in dockerfile

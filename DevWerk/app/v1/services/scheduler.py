@@ -240,7 +240,15 @@ class SchedulerService:
             raise ValueError("scheduling resources must preserve the Task Plan conflict domains")
         dependencies = canonical_dependencies
         resources = canonical_resources
-        auto_admit = int(bool(existing[4]) and state == "queued")
+        readiness = task.get("readiness") if isinstance(task.get("readiness"), dict) else {}
+        workflow_owned_queue = bool(
+            task.get("task_plan_id")
+            and readiness.get("decision") == "queue"
+        )
+        auto_admit = int(
+            state in {"queued", "hold"}
+            and (bool(existing[4]) or workflow_owned_queue)
+        )
         if state == "admitted":
             with self.store.connect() as db:
                 unsatisfied = [

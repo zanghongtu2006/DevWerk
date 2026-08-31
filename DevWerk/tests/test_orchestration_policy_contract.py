@@ -149,6 +149,37 @@ def test_task_plan_queue_auto_admits_after_dependency_completes(store, tmp_path)
     assert queued["id"] in store.runnable_task_ids()
 
 
+def test_workflow_owned_queue_keeps_auto_admission_across_hold_and_release(store, tmp_path):
+    project = store.create_project("held dependency queue", "", str(tmp_path / "project"))
+    workflow = sequence_workflow()
+    _plan, revision = publish_planned_workflow(store, project["id"], workflow)
+    base = task_plan(revision["id"], workflow, task_ref="root", title="root")
+    child = base.tasks[0].model_copy(update={
+        "proposed_task_ref": "child",
+        "title": "child",
+        "dependencies": ["root"],
+        "readiness": base.tasks[0].readiness.model_copy(update={"decision": "queue"}),
+    })
+    concrete = store.create_task_plan(
+        project["id"], base.model_copy(update={"tasks": [base.tasks[0], child]})
+    )
+    root = store.create_task(project["id"], task_plan_id=concrete["id"], proposed_task_ref="root")
+    queued = store.create_task(project["id"], task_plan_id=concrete["id"], proposed_task_ref="child")
+
+    store.schedule_task(project["id"], queued["id"], "hold", 0, None, None, None, None)
+    held = store.task_scheduling(project["id"], queued["id"])
+    assert held["state"] == "hold"
+    assert held["auto_admit"] is True
+
+    store.schedule_task(project["id"], queued["id"], "queued", 0, None, None, None, None)
+    released = store.task_scheduling(project["id"], queued["id"])
+    assert released["state"] == "queued"
+    assert released["auto_admit"] is True
+
+    WorkflowRuntime(store, build_core_registry(store.policy), "root-worker").step(root["id"])
+    assert queued["id"] in store.runnable_task_ids()
+
+
 def test_starting_task_plan_materializes_complete_dependency_graph(store, tmp_path):
     project = store.create_project("plan start", "", str(tmp_path / "project"))
     workflow = sequence_workflow()

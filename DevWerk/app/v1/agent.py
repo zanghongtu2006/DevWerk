@@ -435,6 +435,33 @@ class AgentCore:
                 text = response.text.strip()
                 if not text:
                     raise RuntimeError("Conversation Agent returned neither tools nor final text")
+                unsupported_claims = _unsupported_mutation_claims(
+                    text,
+                    effect_kinds,
+                    logical_ledger,
+                )
+                if unsupported_claims:
+                    correction = {
+                        "unsupported_mutation_claims": unsupported_claims,
+                        "instruction": (
+                            "The response reports state-changing capabilities without successful execution receipts. "
+                            "Call those capabilities now, or return a corrected concise reply that clearly says the "
+                            "changes were not executed. Do not report an intended action as completed."
+                        ),
+                    }
+                    correction_message = {
+                        "role": "user",
+                        "content": _stable_json(correction),
+                    }
+                    messages.append(correction_message)
+                    self.store.add_agent_message(
+                        run["id"],
+                        "user",
+                        correction_message["content"],
+                        [],
+                        emit_progress=False,
+                    )
+                    continue
                 self.store.finish_agent_run(run["id"], "succeeded", text, None, iteration, calls_used)
                 return AgentRunResult(run["id"], "succeeded", text, None, calls_used, iteration)
         except Exception as exc:  # noqa: BLE001
@@ -700,6 +727,25 @@ def _ledger_entry(
     entry["entity_ids_sha256"] = entity_digest
     entry["facts"] = facts
     return entry
+
+
+def _unsupported_mutation_claims(
+    text: str,
+    effect_kinds: dict[str, str],
+    logical_ledger: list[dict[str, Any]],
+) -> list[str]:
+    successful = {
+        str(item.get("capability") or "")
+        for item in logical_ledger
+        if item.get("ok") and item.get("status") == "completed"
+    }
+    return sorted(
+        capability
+        for capability, effect_kind in effect_kinds.items()
+        if effect_kind in {"write", "process", "control"}
+        and capability in text
+        and capability not in successful
+    )
 
 
 def _evidence_id(agent_run_id: str, tool_call_id: str) -> str:

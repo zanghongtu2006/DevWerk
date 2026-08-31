@@ -24,6 +24,7 @@ let projectStream = null;
 let activeBundleRequest = 0;
 let projectEventFlushTimer = null;
 let pendingProjectEvents = [];
+let loadingOlderConversation = false;
 
 const renderers = {
   overview: renderOverview,
@@ -139,6 +140,10 @@ function bindPageActions() {
   const form = document.getElementById("conversation-form");
   if (form) form.addEventListener("submit", sendConversation);
   document.querySelector("[data-load-older-messages]")?.addEventListener("click", loadOlderConversation);
+  const conversationMessages = document.getElementById("conversation-messages");
+  conversationMessages?.addEventListener("scroll", () => {
+    if (conversationMessages.scrollTop <= 24 && state.conversationHasOlder) loadOlderConversation();
+  }, { passive: true });
   document.getElementById("global-settings-form")?.addEventListener("submit", saveGlobalSettings);
 }
 
@@ -294,7 +299,8 @@ async function sendConversation(event) {
 }
 
 async function loadOlderConversation() {
-  if (!state.projectId || !state.conversation.length) return;
+  if (loadingOlderConversation || !state.projectId || !state.conversation.length || !state.conversationHasOlder) return;
+  loadingOlderConversation = true;
   const firstId = Math.min(...state.conversation.map((item) => Number(item.id)));
   const container = document.getElementById("conversation-messages");
   const oldHeight = container?.scrollHeight || 0;
@@ -308,6 +314,8 @@ async function loadOlderConversation() {
     if (next) next.scrollTop = next.scrollHeight - oldHeight + oldTop;
   } catch (error) {
     showToast(error.message, "error");
+  } finally {
+    loadingOlderConversation = false;
   }
 }
 

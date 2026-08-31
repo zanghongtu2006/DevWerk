@@ -268,7 +268,7 @@ class ConversationGateway:
                 captured_ids = set(job.get("mailbox_ids") or [])
                 mailbox = [
                     item
-                    for item in self.store.mailbox(project_id, state="claimed", limit=self.policy.context.mailbox_limit)
+                    for item in self.store.mailbox(project_id, state="received", limit=self.policy.context.mailbox_limit)
                     if item["id"] in captured_ids
                 ]
                 mailbox_requires_user_update = _mailbox_requires_user_update(mailbox)

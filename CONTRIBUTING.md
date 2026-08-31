@@ -4,13 +4,13 @@
 
 ```bash
 cd DevWerk
-python -m venv .venv
+python -m venv venv
 ```
 
 Windows:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
 copy .env.example .env
 copy config\llm.example.json config\llm.json
 .\startup.bat
@@ -19,7 +19,7 @@ copy config\llm.example.json config\llm.json
 Linux/macOS:
 
 ```bash
-source .venv/bin/activate
+source venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 cp config/llm.example.json config/llm.json
@@ -69,8 +69,8 @@ docs/
 
 ```powershell
 cd DevWerk
-.\.venv\Scripts\python.exe -m compileall app tests
-.\.venv\Scripts\python.exe -m pytest tests
+.\venv\Scripts\python.exe -m compileall app tests
+.\venv\Scripts\python.exe -m pytest tests
 
 cd ..\idea-plugin
 .\gradlew.bat test verifyPlugin --no-daemon

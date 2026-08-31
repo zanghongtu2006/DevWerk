@@ -13,7 +13,7 @@ from typing import Any, Callable, Iterable, Literal
 from app.core.debug_trace import trace_json
 from app.v1.contracts import canonicalize_contract_value, validate_contract, validate_contract_template
 from app.v1.domain import PollWaitPolicy, TaskCreate, TaskPlan, ToolResult, WorkflowDefinition, WorkflowPlan
-from app.v1.files import ProjectFiles
+from app.v1.files import ProjectFiles, SystemFiles
 from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, V1RuntimePolicy
 
 
@@ -40,6 +40,10 @@ class CapabilityContext:
     @property
     def files(self) -> ProjectFiles:
         return ProjectFiles(self.project["base_dir"], self.store.policy)
+
+    @property
+    def system_files(self) -> SystemFiles:
+        return SystemFiles()
 
 
 @dataclass(frozen=True)
@@ -150,7 +154,7 @@ class CapabilityRegistry:
                 )
             trace_json(trace_log, "capability.output", capability=capability_id, project_id=context.project_id, task_id=context.task_id, agent_run_id=context.agent_run_id, execution_key=execution_key, result=result.model_dump(mode="json"))
             return result
-        except (ValueError, FileNotFoundError) as exc:
+        except (KeyError, ValueError, FileNotFoundError) as exc:
             if receipt and receipt.get("claimed"):
                 context.store.finish_execution_receipt(context.project_id, receipt["execution_key"], False, None, f"{type(exc).__name__}: {exc}")
             trace_json(trace_log, "capability.error", capability=capability_id, project_id=context.project_id, task_id=context.task_id, agent_run_id=context.agent_run_id, execution_key=context.execution_key, error_type=type(exc).__name__, error=str(exc))
@@ -431,6 +435,112 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
             },
         ),
         side_effect_kind="write",
+    )
+    add(
+        "system.files.list",
+        (
+            "List files anywhere available to the DevWerk process. Relative paths use the DevWerk service "
+            "directory; absolute paths are accepted. This is a Conversation Agent system-maintenance tool, "
+            "not a Project deliverable tool."
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "pattern": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": policy.service_limits.max_file_list_size},
+            },
+            "additionalProperties": False,
+        },
+        _system_files_list,
+        side_effect_kind="read",
+        delegable_to_column=False,
+    )
+    add(
+        "system.files.read",
+        (
+            "Read a UTF-8 file anywhere available to the DevWerk process. Relative paths use the DevWerk "
+            "service directory; absolute paths are accepted."
+        ),
+        {
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "max_chars": {"type": "integer", "minimum": 1},
+            },
+            "additionalProperties": False,
+        },
+        _system_files_read,
+        side_effect_kind="read",
+        delegable_to_column=False,
+    )
+    add(
+        "system.files.write",
+        (
+            "Atomically write a complete UTF-8 file anywhere available to the DevWerk process. Relative paths "
+            "use the DevWerk service directory; absolute paths are accepted. Use project.files.write for Task "
+            "deliverables so they remain Project artifacts."
+        ),
+        {
+            "type": "object",
+            "required": ["path", "content"],
+            "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "content": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+        _system_files_write,
+        side_effect_kind="write",
+        delegable_to_column=False,
+    )
+    add(
+        "system.files.search",
+        (
+            "Search UTF-8 files anywhere available to the DevWerk process. Relative paths use the DevWerk "
+            "service directory; binary files are skipped."
+        ),
+        {
+            "type": "object",
+            "required": ["pattern"],
+            "properties": {
+                "path": {"type": "string"},
+                "pattern": {"type": "string", "minLength": 1},
+                "glob": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": policy.service_limits.max_search_results},
+            },
+            "additionalProperties": False,
+        },
+        _system_files_search,
+        side_effect_kind="read",
+        delegable_to_column=False,
+    )
+    add(
+        "system.command.run",
+        (
+            "Run an argv command without a shell in any directory available to the DevWerk process. Relative "
+            "working directories use the DevWerk service directory; absolute paths are accepted."
+        ),
+        {
+            "type": "object",
+            "required": ["argv"],
+            "properties": {
+                "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 100},
+                "cwd": {"type": "string"},
+                "success_exit_codes": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "minItems": 1,
+                    "maxItems": 32,
+                    "uniqueItems": True,
+                },
+            },
+            "additionalProperties": False,
+        },
+        _system_command_run,
+        side_effect_kind="process",
+        delegable_to_column=False,
     )
     add("project.inspect", "Read the current Project metadata and active workflow summary.", {"type": "object", "additionalProperties": False}, _project_inspect)
     add(
@@ -767,8 +877,8 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         "Persist Task admission, priority, and WIP policy. Dependencies and resources are optional assertions: "
         "omit them to preserve the Task Plan facts, or provide the exact current values. "
         "An admitted decision is rejected while any declared dependency is unresolved or not done. "
-        "An explicit queued scheduling mutation remains queued until a later scheduling decision; this is distinct "
-        "from Task Plan readiness queue, which auto-admits when its dependencies and WIP constraints allow.",
+        "For a Workflow-owned Task Plan queue, hold preserves automatic admission and queued releases the hold back "
+        "to dependency-driven admission. An explicitly queued non-Workflow item remains queued until a later decision.",
         {"type": "object", "required": ["task_id", "state"], "properties": {"task_id": {"type": "string"}, "state": {"type": "string", "enum": ["admitted", "queued", "hold", "cancelled"]}, "priority": {"type": "integer", "minimum": -1000, "maximum": 1000}, "wip_group": {"type": "string", "minLength": 1, "maxLength": 200}, "wip_limit": {"type": "integer", "minimum": 1, "maximum": 100}, "dependencies": {"type": "array", "items": {"type": "string"}, "maxItems": 200}, "resources": {"type": "array", "items": {"type": "string"}, "maxItems": 200}}, "additionalProperties": False},
         lambda args, ctx: ctx.store.schedule_task(
             ctx.project_id,
@@ -1568,6 +1678,62 @@ def _project_inspect(_args: dict[str, Any], ctx: CapabilityContext) -> dict[str,
     except KeyError:
         workflow = None
     return {"project": project, "workflow": workflow}
+
+
+def _system_files_list(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
+    limit = int(args.get("limit") or ctx.store.policy.service_limits.default_file_list_size)
+    paths = ctx.system_files.list_paths(
+        str(args.get("path") or "."),
+        str(args.get("pattern") or "**/*"),
+        limit=limit,
+    )
+    return {"paths": paths, "count": len(paths)}
+
+
+def _system_files_read(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
+    path = str(args["path"])
+    resolved = ctx.system_files.resolve(path)
+    return {
+        "path": str(resolved),
+        "content": ctx.system_files.read_text(
+            path,
+            int(args["max_chars"]) if args.get("max_chars") is not None else None,
+        ),
+    }
+
+
+def _system_files_write(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
+    return {"file": ctx.system_files.write_text(str(args["path"]), str(args["content"]))}
+
+
+def _system_files_search(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
+    return ctx.system_files.search_text(
+        str(args.get("path") or "."),
+        str(args["pattern"]),
+        str(args.get("glob") or "**/*"),
+        limit=int(args.get("limit") or ctx.store.policy.service_limits.default_search_results),
+    )
+
+
+def _system_command_run(args: dict[str, Any], ctx: CapabilityContext) -> ToolResult:
+    output = ctx.system_files.run(
+        [str(item) for item in args["argv"]],
+        str(args.get("cwd") or "."),
+    )
+    accepted = {int(item) for item in (args.get("success_exit_codes") or [0])}
+    exit_code = int(output["exit_code"])
+    if exit_code in accepted:
+        return ToolResult(ok=True, capability="system.command.run", output=output)
+    detail = str(output.get("stderr") or output.get("stdout") or "").strip()
+    message = f"command exited with code {exit_code}"
+    if detail:
+        message = f"{message}: {detail}"
+    return ToolResult(
+        ok=False,
+        capability="system.command.run",
+        output=output,
+        error={"type": "CommandFailed", "message": message, "exit_code": exit_code},
+    )
 
 
 def _files_list(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
