@@ -1,5 +1,13 @@
 # DevWerk V1 Document Map
 
+## P0 runtime correction
+
+- [`mailbox-lifecycle-p0-design.md`](mailbox-lifecycle-p0-design.md): durable Mailbox message/delivery lifecycle, single automatic delivery, explicit redelivery, and the Scheduler/Conversation boundary.
+
+## v0.1.0 normative extension
+
+- [`memory-and-workcell-runtime-v0.1.0.md`](memory-and-workcell-runtime-v0.1.0.md): File-first pluggable semantic Memory, context manifests, persistent Participant Sessions, and generic declarative Workcell execution. It supersedes earlier statements that Memory is postponed or every Agent Column is necessarily a one-Attempt ephemeral instance.
+
 ## Architecture authority
 
 These documents define the locked V1 product and runtime direction:

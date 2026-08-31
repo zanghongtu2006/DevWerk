@@ -18,11 +18,6 @@ ModelComplete = Callable[..., AgentModelResponse]
 trace_log = logging.getLogger("devwerk.agent.trace")
 
 
-class ConversationEvidenceRequiredError(RuntimeError):
-    error_code = "conversation_evidence_required"
-    error_category = "protocol_error"
-
-
 @dataclass(frozen=True)
 class AgentRunSpec:
     kind: Literal["conversation", "column"]
@@ -44,6 +39,8 @@ class AgentRunSpec:
     agent_session_id: str | None = None
     writable_paths: tuple[str, ...] | None = None
     user_initiated: bool = False
+    completion_tool_name: str = "column.complete"
+    completion_requires_evidence: bool = False
 
 
 @dataclass(frozen=True)
@@ -89,7 +86,13 @@ class AgentCore:
         effect_kinds = {item.id: item.side_effect_kind for item in resolved_capabilities}
         tools = [item.tool_schema() for item in resolved_capabilities]
         if spec.kind == "column":
-            tools.append(_column_complete_schema(spec.completion_outcomes, spec.output_contract))
+            tools.append(
+                _column_complete_schema(
+                    spec.completion_outcomes,
+                    spec.output_contract,
+                    tool_name=spec.completion_tool_name,
+                )
+            )
             if spec.wait_config:
                 tools.append(_column_await_schema(allowed, spec.wait_config))
         envelope = self._envelope(spec, platform_policy)
@@ -100,7 +103,7 @@ class AgentCore:
             instruction_snapshot=spec.instruction,
             context_snapshot=envelope,
             capabilities=allowed + (
-                ["column.complete"]
+                [spec.completion_tool_name]
                 if spec.kind == "column"
                 else []
             ),
@@ -127,12 +130,22 @@ class AgentCore:
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": _stable_json(envelope)}]
         self.store.add_agent_message(run["id"], "system", messages[0]["content"], [])
+        current_request = (
+            spec.context.get("current_request")
+            if isinstance(spec.context, dict)
+            else None
+        )
         if spec.agent_session_id:
             if spec.kind == "conversation":
                 history = _replayable_session_messages(
                     self.store.conversation_session_messages(
                         spec.project["id"],
                         spec.agent_session_id,
+                        before_message_id=(
+                            current_request.get("message_id")
+                            if isinstance(current_request, dict)
+                            else None
+                        ),
                     )
                 )
                 messages.extend(history)
@@ -159,7 +172,6 @@ class AgentCore:
                     [],
                     emit_progress=False,
                 )
-        current_request = spec.context.get("current_request") if isinstance(spec.context, dict) else None
         if isinstance(current_request, dict):
             item = {
                 "role": "user",
@@ -218,11 +230,7 @@ class AgentCore:
                     project_id=spec.project["id"],
                     task_id=spec.task_id,
                     agent="conversation" if spec.kind == "conversation" else "column",
-                    require_tool=bool(
-                        spec.kind == "conversation"
-                        and spec.start_task
-                        and not logical_ledger
-                    ),
+                    require_tool=False,
                 )
                 trace_json(
                     trace_log,
@@ -267,7 +275,10 @@ class AgentCore:
                     completion: dict[str, Any] | None = None
                     wait_request: dict[str, Any] | None = None
                     completion_protocol_error = (
-                        _column_completion_protocol_error(response.tool_calls)
+                        _column_completion_protocol_error(
+                            response.tool_calls,
+                            spec.completion_tool_name,
+                        )
                         if spec.kind == "column"
                         else None
                     )
@@ -282,7 +293,7 @@ class AgentCore:
                                 },
                                 checkpoint={"failure_disposition": "rejected_before_effect"},
                             )
-                        elif call.name == "column.complete":
+                        elif call.name == spec.completion_tool_name:
                             try:
                                 result, accepted = self._complete_column(
                                     call.arguments,
@@ -292,7 +303,7 @@ class AgentCore:
                             except ValueError as exc:
                                 result = ToolResult(
                                     ok=False,
-                                    capability="column.complete",
+                                    capability=spec.completion_tool_name,
                                     error={"type": type(exc).__name__, "message": str(exc)},
                                 )
                                 accepted = False
@@ -392,7 +403,11 @@ class AgentCore:
                         if wait_request is not None:
                             break
                     if completion is not None:
-                        completed_text = response.text
+                        completed_text = _stable_json({
+                            "outcome": completion.get("outcome"),
+                            "summary": completion.get("summary"),
+                            "output": completion.get("output"),
+                        })
                         self.store.finish_agent_run(run["id"], "succeeded", completed_text, None, iteration, calls_used)
                         return AgentRunResult(
                             run["id"],
@@ -414,14 +429,39 @@ class AgentCore:
                     continue
 
                 if spec.kind == "column":
-                    raise RuntimeError("Column Agent ended without calling column.complete")
+                    raise RuntimeError(
+                        f"Column Agent ended without calling {spec.completion_tool_name}"
+                    )
                 text = response.text.strip()
                 if not text:
                     raise RuntimeError("Conversation Agent returned neither tools nor final text")
-                if spec.start_task and not logical_ledger:
-                    raise ConversationEvidenceRequiredError(
-                        "Conversation Agent returned an execution report without calling any project tool"
+                unsupported_claims = _unsupported_mutation_claims(
+                    text,
+                    effect_kinds,
+                    logical_ledger,
+                )
+                if unsupported_claims:
+                    correction = {
+                        "unsupported_mutation_claims": unsupported_claims,
+                        "instruction": (
+                            "The response reports state-changing capabilities without successful execution receipts. "
+                            "Call those capabilities now, or return a corrected concise reply that clearly says the "
+                            "changes were not executed. Do not report an intended action as completed."
+                        ),
+                    }
+                    correction_message = {
+                        "role": "user",
+                        "content": _stable_json(correction),
+                    }
+                    messages.append(correction_message)
+                    self.store.add_agent_message(
+                        run["id"],
+                        "user",
+                        correction_message["content"],
+                        [],
+                        emit_progress=False,
                     )
+                    continue
                 self.store.finish_agent_run(run["id"], "succeeded", text, None, iteration, calls_used)
                 return AgentRunResult(run["id"], "succeeded", text, None, calls_used, iteration)
         except Exception as exc:  # noqa: BLE001
@@ -506,7 +546,11 @@ class AgentCore:
             if item.get("evidence_id")
         }
         target = spec.completion_targets.get(outcome)
-        success_completion = outcome == "success" or target == "done"
+        success_completion = (
+            spec.completion_requires_evidence
+            or outcome == "success"
+            or target == "done"
+        )
         if success_completion:
             if not evidence_ids:
                 raise ValueError("successful Column completion requires capability evidence")
@@ -525,13 +569,19 @@ class AgentCore:
                 if item.get("ok")
                 and item.get("status") == "completed"
                 and item.get("effect_kind") in {"write", "process", "control"}
-                and item.get("capability") not in {"column.complete", "column.await"}
+                and item.get("capability") not in {
+                    spec.completion_tool_name,
+                    "column.await",
+                }
             }
             if not required_actions.issubset(referenced_ids):
                 raise ValueError("successful Column completion omitted successful action evidence")
             unresolved_failures: dict[str, dict[str, Any]] = {}
             for item in logical_ledger:
-                if item.get("capability") in {"column.complete", "column.await"}:
+                if item.get("capability") in {
+                    spec.completion_tool_name,
+                    "column.await",
+                }:
                     continue
                 if item.get("effect_kind") not in {"write", "process", "control"}:
                     continue
@@ -559,7 +609,10 @@ class AgentCore:
         else:
             unresolved_failures: dict[str, dict[str, Any]] = {}
             for item in logical_ledger:
-                if item.get("capability") in {"column.complete", "column.await"}:
+                if item.get("capability") in {
+                    spec.completion_tool_name,
+                    "column.await",
+                }:
                     continue
                 if item.get("effect_kind") not in {"write", "process", "control"}:
                     continue
@@ -584,7 +637,11 @@ class AgentCore:
                     or "a failed Column action has not been repaired"
                 )
                 raise RuntimeError(message)
-        return ToolResult(ok=True, capability="column.complete", output={"accepted": True}), True
+        return ToolResult(
+            ok=True,
+            capability=spec.completion_tool_name,
+            output={"accepted": True},
+        ), True
 
     @staticmethod
     def _await_column(arguments: dict[str, Any], allowed: list[str]) -> tuple[ToolResult, bool]:
@@ -594,11 +651,16 @@ class AgentCore:
         return ToolResult(ok=True, capability="column.await", output={"accepted": True}), True
 
 
-def _column_complete_schema(outcomes: set[str], output_contract: dict[str, Any]) -> dict[str, Any]:
+def _column_complete_schema(
+    outcomes: set[str],
+    output_contract: dict[str, Any],
+    *,
+    tool_name: str = "column.complete",
+) -> dict[str, Any]:
     return {
         "type": "function",
         "function": {
-            "name": "column.complete",
+            "name": tool_name,
             "description": "Finish this Column Run with one declared outcome and contract-valid structured output.",
             "parameters": {
                 "type": "object",
@@ -613,7 +675,11 @@ def _column_complete_schema(outcomes: set[str], output_contract: dict[str, Any])
                         "items": {
                             "type": "string",
                             "minLength": 1,
-                            "description": "Canonical evidence_id from a Column tool result.",
+                            "description": (
+                                "Canonical evidence_id from a successful business capability result. "
+                                "Include every successful write, process, and control action from this Run; "
+                                "do not include rejected completion-tool calls."
+                            ),
                         },
                     },
                 },
@@ -663,6 +729,25 @@ def _ledger_entry(
     return entry
 
 
+def _unsupported_mutation_claims(
+    text: str,
+    effect_kinds: dict[str, str],
+    logical_ledger: list[dict[str, Any]],
+) -> list[str]:
+    successful = {
+        str(item.get("capability") or "")
+        for item in logical_ledger
+        if item.get("ok") and item.get("status") == "completed"
+    }
+    return sorted(
+        capability
+        for capability, effect_kind in effect_kinds.items()
+        if effect_kind in {"write", "process", "control"}
+        and capability in text
+        and capability not in successful
+    )
+
+
 def _evidence_id(agent_run_id: str, tool_call_id: str) -> str:
     return f"{agent_run_id}:{tool_call_id}"
 
@@ -710,30 +795,33 @@ def _column_await_schema(allowed: list[str], wait_config: dict[str, Any]) -> dic
     }
 
 
-def _column_completion_protocol_error(tool_calls: list[Any]) -> str | None:
+def _column_completion_protocol_error(
+    tool_calls: list[Any],
+    completion_tool_name: str = "column.complete",
+) -> str | None:
     complete_indices = [
         index
         for index, call in enumerate(tool_calls)
-        if call.name == "column.complete"
+        if call.name == completion_tool_name
     ]
     if not complete_indices:
         return None
     if len(complete_indices) > 1:
         return (
-            "A model response may contain only one column.complete call. "
-            "Combine outcome, output, summary, and evidence_ids into one final column.complete call. "
+            f"A model response may contain only one {completion_tool_name} call. "
+            f"Combine outcome, output, summary, and evidence_ids into one final {completion_tool_name} call. "
             "No tool call from this response was executed."
         )
     if complete_indices[0] != len(tool_calls) - 1:
         return (
-            "column.complete must be the final tool call in its model response. "
-            "Move all required tool calls before one final column.complete call. "
+            f"{completion_tool_name} must be the final tool call in its model response. "
+            f"Move all required tool calls before one final {completion_tool_name} call. "
             "No tool call from this response was executed."
         )
     if any(call.name == "column.await" for call in tool_calls):
         return (
-            "column.complete and column.await are mutually exclusive in one model response. "
-            "Return either one final column.complete call or one column.await call. "
+            f"{completion_tool_name} and column.await are mutually exclusive in one model response. "
+            f"Return either one final {completion_tool_name} call or one column.await call. "
             "No tool call from this response was executed."
         )
     return None

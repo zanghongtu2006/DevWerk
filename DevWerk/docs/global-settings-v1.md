@@ -28,7 +28,7 @@ The Web workbench exposes a `Settings` page backed by the same validated schema:
 - The server validates the request before atomically replacing `config/global-settings.yaml`.
 - Arbitrary YAML keys are not accepted and are not rendered as editable settings.
 
-Settings that affect startup behavior are marked `restart_required`. When DevWerk is launched through `startup.bat`, saving such a change writes one restart request, stops the current Uvicorn process, and lets the same script start it again with `venv\\Scripts\\python.exe`. The Web page waits for `/v1/health` and reloads after the service is available. Saving an unchanged value does not restart the service.
+Settings that affect startup behavior are marked `restart_required`. When DevWerk is launched through `startup.bat` or `startup.sh`, saving such a change writes one restart request, stops the current Uvicorn process, and lets the same script start it again with the project `venv`. The Web page waits for `/v1/health` and reloads after the service is available. Saving an unchanged value does not restart the service.
 
 If DevWerk was launched by another process manager, the value is still saved, but the API reports that no managed restart was scheduled. That process manager remains responsible for restarting DevWerk.
 

@@ -23,6 +23,20 @@ class EventRepository:
             rows = db.execute(f"SELECT * FROM v1_events WHERE {' AND '.join(where)} ORDER BY id LIMIT ?", values).fetchall()
         return [self.store._decode(dict(row), "data_json") for row in rows]  # type: ignore[misc]
 
+    def recent_events(self, project_id: str, limit: int | None = None) -> list[dict[str, Any]]:
+        limit = limit or self.store.policy.service_limits.default_page_size
+        bounded_limit = min(
+            max(limit, 1),
+            self.store.policy.service_limits.max_page_size,
+        )
+        with self.store.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM (SELECT * FROM v1_events WHERE project_id=? "
+                "ORDER BY id DESC LIMIT ?) ORDER BY id",
+                (project_id, bounded_limit),
+            ).fetchall()
+        return [self.store._decode(dict(row), "data_json") for row in rows]  # type: ignore[misc]
+
 
     def record_external_event(self, project_id: str, event_type: str, correlation_key: str, output: dict[str, Any]) -> dict[str, Any]:
         self.store.get_project(project_id)

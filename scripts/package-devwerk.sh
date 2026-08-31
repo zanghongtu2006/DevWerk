@@ -12,7 +12,9 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE" "$DIST"
 
 tar -C "$APP" \
+  --exclude='.idea' \
   --exclude='.pytest_cache' \
+  --exclude='.venv' \
   --exclude='__pycache__' \
   --exclude='data' \
   --exclude='.env' \
@@ -22,54 +24,23 @@ tar -C "$APP" \
   --exclude='.env.test' \
   --exclude='config/llm.json' \
   --exclude='tests' \
+  --exclude='venv' \
   -cf - . | tar -C "$STAGE" -xf -
 
-cat > "$STAGE/install.sh" <<'EOF'
-#!/usr/bin/env sh
-set -eu
-cd "$(dirname "$0")"
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-echo "DevWerk installed. Copy config/llm.example.json to config/llm.json and set credentials before starting."
-EOF
-
-cat > "$STAGE/start.sh" <<'EOF'
-#!/usr/bin/env sh
-set -eu
-cd "$(dirname "$0")"
-if [ ! -x .venv/bin/python ]; then
-  sh ./install.sh
-fi
-. .venv/bin/activate
-exec python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
-EOF
-
-cat > "$STAGE/install.bat" <<'EOF'
-@echo off
-setlocal
-cd /d "%~dp0"
-py -3 -m venv .venv || python -m venv .venv
-call .venv\Scripts\python.exe -m pip install --upgrade pip
-call .venv\Scripts\pip.exe install -r requirements.txt
-echo DevWerk installed. Copy config\llm.example.json to config\llm.json and set credentials before starting.
-EOF
-
-cat > "$STAGE/start.bat" <<'EOF'
-@echo off
-setlocal
-cd /d "%~dp0"
-if not exist .venv\Scripts\python.exe call install.bat
-call .venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000
-EOF
-
-chmod +x "$STAGE/install.sh" "$STAGE/start.sh"
+chmod +x "$STAGE/install.sh" "$STAGE/startup.sh" "$STAGE/shutdown.sh"
 rm -f "$PACKAGE"
 if command -v zip >/dev/null 2>&1; then
   (cd "$STAGE" && zip -qr "$PACKAGE" .)
 else
-  python3 - <<'PY' "$STAGE" "$PACKAGE"
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON=python3
+  elif command -v python >/dev/null 2>&1; then
+    PYTHON=python
+  else
+    echo "zip or Python is required to create $PACKAGE" >&2
+    exit 1
+  fi
+  "$PYTHON" - <<'PY' "$STAGE" "$PACKAGE"
 from pathlib import Path
 import sys, zipfile
 stage = Path(sys.argv[1])

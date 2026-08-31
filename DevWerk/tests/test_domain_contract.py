@@ -31,8 +31,14 @@ def test_runtime_status_catalog_is_the_single_public_status_definition():
     ]
     assert "recovering" in catalog["task"]["transitions"]["running"]
     assert set(catalog) == {
-        "task", "column_run", "attempt", "agent_run", "tool_invocation"
+        "task", "column_run", "attempt", "agent_run", "tool_invocation", "mailbox"
     }
+    assert catalog["mailbox"]["values"] == [
+        "pending", "delivered", "received", "acknowledged", "failed", "attention"
+    ]
+    assert catalog["mailbox"]["transitions"]["received"] == [
+        "acknowledged", "attention", "failed"
+    ]
 
 
 def test_task_state_machine_rejects_terminal_drift():

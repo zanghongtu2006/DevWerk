@@ -30,7 +30,7 @@ Product name and GitLab repository identity. Each Task Plan supplies its own con
 Versioned design documents, implementation, build and test evidence, independent review, GitLab merge-request and CI evidence, and final acceptance. <br>
 
 ## Loop Version(s): <br>
-1.0.0 <br>
+1.1.0 <br>
 
 ## Loop Key: <br>
 software.gitlab_devops <br>

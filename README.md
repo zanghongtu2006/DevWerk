@@ -22,6 +22,7 @@ Implemented V1 runtime extensions are specified by:
 - [`DevWerk/docs/kanban-recovering-runtime-v1.md`](DevWerk/docs/kanban-recovering-runtime-v1.md)
 - [`DevWerk/docs/agent-tool-rejection-recovery-v1.md`](DevWerk/docs/agent-tool-rejection-recovery-v1.md)
 - [`DevWerk/docs/conversation-session-gateway-v1.md`](DevWerk/docs/conversation-session-gateway-v1.md)
+- [`DevWerk/docs/memory-and-workcell-runtime-v0.1.0.md`](DevWerk/docs/memory-and-workcell-runtime-v0.1.0.md)
 - [`DevWerk/docs/v1-test-contract.md`](DevWerk/docs/v1-test-contract.md)
 
 ## Version 1 Boundaries
@@ -38,20 +39,20 @@ Implemented V1 runtime extensions are specified by:
 - A user objective becomes an immutable Task Plan that selects a Workflow Revision and owns concrete Task inputs, dependencies, conflicts, readiness, and Agent policy.
 - A Task is materialized only from `task_plan_id + proposed_task_ref` and remains pinned to that Task Plan's Workflow Revision.
 - Column Definitions declare repeatable process stages, context boundaries, execution, contracts, outcomes, transitions, and retry limits.
-- Conversation Agent and ephemeral Column Agents share one general-purpose AgentCore and Capability Registry.
+- Conversation Agent, single-Agent Columns, and Workcell Agent participants share one general-purpose AgentCore and Capability Registry.
 - Reusable business process knowledge lives in version-controlled `loops/<name>/loop.meta` and `loop.json` files; SQLite stores only applied Project instances and source provenance, while Python runtime code contains no domain-routing branch.
 - A Project's initial Workflow can only be materialized by `loop.apply`; subsequent immutable revisions may be published through `workflow.publish`.
-- Columns select either a generic `agent` executor or a generic `capability_sequence` executor.
+- Columns select a generic `agent`, `capability_sequence`, or directed `workcell` executor. Workcells support arbitrary named Agent or deterministic participants, stable participant Sessions, receiver-scoped handoffs, and inner rework without falsely failing the Task.
 - Every Column visit creates a Column Run; retry creates an immutable Attempt under that Run.
-- Runtime execution may be deterministic or use an ephemeral agent.
+- Runtime execution may be deterministic, use one logical Agent, or coordinate persistent Workcell participants.
 - Only `done` and `failed` are Task terminal states; both are reserved Workflow sentinels, not executable Columns.
 - V1RuntimePolicy centralizes scheduling, leases, recovery delay, context windows, page sizes, and SQLite limits. V1 does not impose model-iteration, tool-call, or wall-clock budgets on Agent execution.
 - Recoverable provider infrastructure failures move the same Task to non-terminal `recovering`; Kanban reclaims the same Column after `next_retry_at` without rebuilding the Task.
 - Tool calls rejected before producing a side effect remain visible evidence but do not prevent the Agent from choosing a valid alternative and completing the Column.
 - Task dispatch rechecks declared dependencies and conflict domains atomically before execution.
-- SQLite is the structured source of truth and uses WAL plus short transactions.
+- SQLite is the transactional Runtime source of truth and uses WAL plus short transactions. Human-readable semantic Memory is Project-local Markdown under `.devwerk/memory`; optional search indexes are rebuildable providers rather than the authority.
 - Large deliverables remain files; SQLite stores Artifact metadata, hashes, sizes, and relationships.
-- Conversation memory in V1 is the persistent transcript, Agent/tool evidence, and structured Project facts. Semantic/vector memory providers, IDEA Plugin development, user approval boundaries, and multiple active Workflows are outside the current implementation scope.
+- Conversation history remains durable execution evidence. File-first semantic Memory and a replaceable index boundary are included in the v0.1.0 design; vector indexing remains an optional provider. IDEA Plugin development, user approval boundaries, and multiple active Workflows remain outside the current implementation scope.
 
 ## Repository Layout
 
@@ -59,7 +60,7 @@ Implemented V1 runtime extensions are specified by:
 DevWerk/
   app/
     main.py       FastAPI application assembly
-    v1/           current domain, store, runtime, Conversation Agent, API
+    v1/           current domain, File Memory, Workcell runtime, Conversation Agent, API
     services/     LLM provider adapters, error classification, usage accounting
     core/         service configuration and logging
     web/          modular native-ES-module Web workbench
@@ -68,7 +69,10 @@ DevWerk/
   config/         LLM routing
   loops/          discoverable Loop cards and declarative Workflow bundles
   scripts/        current V1 operational helpers
-  startup.bat     project-venv-only service launcher
+  Dockerfile      Linux container definition
+  install.*       portable release installers
+  startup.*       project-venv-only service launchers
+  shutdown.*      project-scoped service shutdown helpers
 
 idea-plugin/      suspended; not part of the standalone V1 release gate
 ```
@@ -80,6 +84,24 @@ Download the current standalone ZIP package from [GitHub Releases](https://githu
 ```text
 https://github.com/zanghongtu2006/DevWerk/releases/download/v0.0.5/devwerk-release.zip
 ```
+
+The ZIP contains checked-in Linux and Windows launchers. After extraction, start it with:
+
+```bash
+sh ./install.sh
+sh ./startup.sh
+```
+
+or on Windows:
+
+```powershell
+.\install.bat
+.\startup.bat
+```
+
+The installer creates `venv` and installs `requirements.txt`; both startup scripts then use only that project environment. These files are maintained under `DevWerk/`; release packaging copies them unchanged and does not generate launch scripts.
+
+Stop the corresponding local service with `sh ./shutdown.sh` or `.\shutdown.bat`. The shutdown helper only targets the Uvicorn process running from this DevWerk directory's `venv`.
 
 Docker Hub is the recommended container source:
 
@@ -143,7 +165,7 @@ cd D:\workspace\DevWerk\DevWerk
 .\venv\Scripts\python.exe -m compileall app tests
 ```
 
-The tests cover declarative graph validation, filesystem Loop discovery/application without implicit Task creation, separate immutable Workflow Plan and Task Plan persistence, Task materialization from plan references, initial-Workflow admission, Capability Registry dispatch, Project isolation, persistent Conversation Agent identity and Session replay across Gateway restarts, failed-Turn isolation, immutable Workflow revisions, shared AgentCore tool loops, deterministic and ephemeral-agent Columns, persistent Writer sessions, explicit terminal paths, Kanban recovery, rejected-before-effect tool handling, SQLite indexes, Artifact boundaries, provider error classification and tool-call normalization, full debug logging, API behavior, and the read-only Web governance boundary.
+The tests cover declarative outer and Workcell graph validation, filesystem Loop discovery, immutable planning and Task materialization, Capability Registry dispatch, Project isolation, File Memory provider substitution/versioning/search, persistent Conversation and Workcell participant Sessions, receiver-scoped feedback, provider recovery, deterministic participants, explicit terminal paths, SQLite indexes, Artifact boundaries, provider contracts, logging, APIs, and the read-only Web governance boundary.
 
 Conversation messages are stored with stable message IDs and timestamps and are rendered as normal user/Agent turns. Runtime status and tool audit evidence remain outside the human conversation bubbles and update over the Project SSE stream.
 

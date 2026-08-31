@@ -76,6 +76,10 @@ def test_runtime_artifact_context_is_bounded_and_deduplicated_across_globs(store
     assert sum(len(item["content"]) for item in context["artifacts"]) <= (
         store.policy.context.artifact_context_max_characters
     )
+    manifest = context["context_manifest"]
+    assert manifest["preloaded_content_is_authoritative"] is True
+    assert [item["path"] for item in manifest["preloaded_project_artifacts"]] == paths
+    assert all(item["sha256"] for item in manifest["preloaded_project_artifacts"])
 
 
 def test_each_completed_column_makes_the_next_column_runnable(store, tmp_path):
@@ -907,6 +911,139 @@ def test_agent_can_repair_invalid_column_complete_arguments(store, tmp_path):
 
     assert result.status == "succeeded"
     assert result.iterations == 2
+
+
+def test_agent_can_repair_invalid_custom_completion_without_poisoning_evidence(
+    store,
+    tmp_path,
+):
+    project = store.create_project(
+        "repair custom completion",
+        "",
+        str(tmp_path / "project"),
+    )
+    turn = 0
+    write_evidence = ""
+
+    def model(messages, _tools, **_kwargs):
+        nonlocal turn, write_evidence
+        turn += 1
+        if turn == 1:
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id="write",
+                name="project.files.write",
+                arguments={"path": "candidate.txt", "content": "ready"},
+            )])
+        if turn == 2:
+            write_evidence = json.loads(messages[-1]["content"])["evidence"]["evidence_id"]
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id="invalid-signal",
+                name="workcell.signal",
+                arguments={
+                    "outcome": "ready",
+                    "output": {},
+                    "summary": "missing evidence",
+                    "evidence_ids": [],
+                },
+            )])
+        rejected = json.loads(messages[-1]["content"])
+        assert rejected["error"]["message"] == (
+            "successful Column completion requires capability evidence"
+        )
+        return AgentModelResponse(tool_calls=[AgentToolCall(
+            id="repaired-signal",
+            name="workcell.signal",
+            arguments={
+                "outcome": "ready",
+                "output": {},
+                "summary": "grounded",
+                "evidence_ids": [write_evidence],
+            },
+        )])
+
+    registry = build_core_registry()
+    result = AgentCore(store, registry, model).run(AgentRunSpec(
+        kind="column",
+        project=project,
+        instruction="",
+        instruction_revision=1,
+        context={},
+        capability_ids=["project.files.write"],
+        completion_outcomes={"ready"},
+        completion_targets={"ready": "next"},
+        completion_tool_name="workcell.signal",
+        completion_requires_evidence=True,
+    ))
+
+    assert result.status == "succeeded"
+    assert result.iterations == 3
+    assert (tmp_path / "project" / "candidate.txt").read_text(encoding="utf-8") == "ready"
+
+
+def test_logical_agent_session_replays_only_latest_structured_checkpoint(store, tmp_path):
+    project = store.create_project("session checkpoint", "", str(tmp_path / "project"))
+    workflow = sequence_workflow()
+    publish_planned_workflow(store, project["id"], workflow)
+    task = create_planned_task(store, project["id"], "session task")
+    session = store.get_or_create_agent_session(
+        project["id"],
+        task["id"],
+        "participant",
+    )
+    activation = 0
+
+    def model(messages, _tools, **_kwargs):
+        nonlocal activation
+        activation += 1
+        history_messages = [
+            json.loads(item["content"])
+            for item in messages
+            if item.get("role") == "user"
+            and "logical_agent_session_history" in item.get("content", "")
+        ]
+        if activation == 1:
+            assert history_messages == []
+        else:
+            assert len(history_messages) == 1
+            checkpoints = history_messages[0]["logical_agent_session_history"]
+            assert len(checkpoints) == 1
+            previous_run = json.loads(checkpoints[0]["content"])
+            previous = json.loads(previous_run["final_text"])
+            assert previous["summary"] == f"checkpoint-{activation - 1}"
+            assert f"checkpoint-{activation - 2}" not in checkpoints[0]["content"]
+        return AgentModelResponse(tool_calls=[AgentToolCall(
+            id=f"signal-{activation}",
+            name="workcell.signal",
+            arguments={
+                "outcome": "ready",
+                "output": {"revision": activation},
+                "summary": f"checkpoint-{activation}",
+                "evidence_ids": [],
+            },
+        )])
+
+    registry = build_core_registry()
+    core = AgentCore(store, registry, model)
+    for _ in range(3):
+        result = core.run(AgentRunSpec(
+            kind="column",
+            project=project,
+            instruction="",
+            instruction_revision=1,
+            context={},
+            capability_ids=[],
+            task_id=task["id"],
+            agent_session_id=session["id"],
+            completion_outcomes={"ready"},
+            completion_targets={"ready": "next"},
+            completion_tool_name="workcell.signal",
+        ))
+        assert result.status == "succeeded"
+
+    checkpoints = store.agent_session_messages(project["id"], session["id"])
+    assert len(checkpoints) == 1
+    latest_run = json.loads(checkpoints[0]["content"])
+    assert json.loads(latest_run["final_text"])["summary"] == "checkpoint-3"
 
 
 def test_expired_task_lease_interrupts_old_attempt_and_becomes_runnable(store, tmp_path):

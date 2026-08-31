@@ -455,6 +455,7 @@ def test_real_workflow_publish_provider_schema_keeps_executor_fields_visible(sto
     assert set(executor["properties"]["kind"]["enum"]) == {
         "agent",
         "capability_sequence",
+        "workcell",
     }
     assert {"capabilities", "steps", "completed_outcome", "outcome_from"} <= set(
         executor["properties"]

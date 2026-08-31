@@ -16,11 +16,12 @@ def test_daily_log_archive_has_one_human_readable_name():
 
 
 def test_logging_rejects_additional_business_log_names(tmp_path):
+    log_dir = tmp_path / "logs"
     config = SimpleNamespace(
         log_level="info",
         log_format="%(message)s",
         log_file_enabled=True,
-        log_dir=str(tmp_path),
+        log_dir=str(log_dir),
         log_file_name="startup.stdout.log",
         log_retention_days=30,
     )
@@ -28,15 +29,16 @@ def test_logging_rejects_additional_business_log_names(tmp_path):
     with pytest.raises(ValueError, match="must be devwerk.log"):
         configure_logging(config)
 
-    assert list(tmp_path.iterdir()) == []
+    assert not log_dir.exists() or list(log_dir.iterdir()) == []
 
 
 def test_current_business_log_is_devwerk_log(tmp_path):
+    log_dir = tmp_path / "logs"
     config = SimpleNamespace(
         log_level="info",
         log_format="%(message)s",
         log_file_enabled=True,
-        log_dir=str(tmp_path),
+        log_dir=str(log_dir),
         log_file_name="devwerk.log",
         log_retention_days=30,
     )
@@ -46,7 +48,7 @@ def test_current_business_log_is_devwerk_log(tmp_path):
     for handler in logging.getLogger().handlers:
         handler.flush()
 
-    assert (tmp_path / "devwerk.log").read_text(encoding="utf-8").endswith(
+    assert (log_dir / "devwerk.log").read_text(encoding="utf-8").endswith(
         "written to the single business log\n"
     )
-    assert [path.name for path in tmp_path.iterdir()] == ["devwerk.log"]
+    assert [path.name for path in log_dir.iterdir()] == ["devwerk.log"]

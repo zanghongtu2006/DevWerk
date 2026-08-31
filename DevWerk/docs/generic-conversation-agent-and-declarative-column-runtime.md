@@ -497,7 +497,7 @@ Version 1 canonical event catalog 使用以下点分名称。监督相关事件�
 - `project.recovery.started`
 - `supervision.review.due`
 
-Mailbox 使用 claim lease 与 at-least-once delivery。读取事件只产生 claimed 状态；Conversation Agent 必须在治理决定或显式 audited no-op 持久化后，于同一短事务写 `observed_at/acknowledged_at`。Agent Run 失败或 claim lease 过期时事件自动重新投递。
+Mailbox 生命周期以 [`mailbox-lifecycle-p0-design.md`](./mailbox-lifecycle-p0-design.md) 为准。消息按 `pending -> delivered -> received -> acknowledged|failed|attention` 留下投递证据；Conversation Agent 必须在治理决定或显式 audited no-op 持久化后确认消息。消费失败或进程中断形成明确失败状态，不自动重新投递；`failed/attention -> pending` 只允许显式、可审计的 redelivery。
 
 ## 10. SQLite 持久化与性能
 

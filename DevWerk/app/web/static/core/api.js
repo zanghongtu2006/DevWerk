@@ -44,7 +44,7 @@ export async function loadProjectBundle(projectId) {
     api.get(`/projects/${projectId}/conversation?limit=150`),
     api.get(`/projects/${projectId}/conversation-state`),
     api.get(`/projects/${projectId}/projection`),
-    api.get(`/projects/${projectId}/events?limit=500`),
+    api.get(`/projects/${projectId}/events?recent=true&limit=20`),
   ]);
   const board = {
     project,

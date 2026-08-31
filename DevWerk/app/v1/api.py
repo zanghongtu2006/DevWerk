@@ -18,6 +18,7 @@ from app.core.global_settings import (
     save_global_settings,
 )
 from app.v1.domain import ConversationRequest, ExternalEventSignal, LoopApplyRequest, ProjectCreate, TaskCreate, TaskPlanCreate, WorkflowPlanCreate, WorkflowRevisionPublishRequest
+from app.v1.memory import MemoryRecord
 from app.v1.capabilities import (
     CapabilityContext,
 )
@@ -123,6 +124,55 @@ def project_capabilities(project_id: str, request: Request) -> list[dict[str, An
         raise not_found(exc) from exc
 
 
+@router.get("/projects/{project_id}/memory")
+def project_memory(
+    project_id: str,
+    request: Request,
+    query: str | None = None,
+    scope: str | None = None,
+    scope_id: str | None = None,
+    kind: list[str] = Query(default=[]),
+    include_inactive: bool = False,
+) -> list[dict[str, Any]]:
+    try:
+        store(request).get_project(project_id)
+        if query is not None:
+            return store(request).memory_search(
+                project_id,
+                query,
+                scope=scope,
+                scope_id=scope_id,
+                kinds=kind,
+                limit=None,
+            )
+        return store(request).memory_list(
+            project_id,
+            scope=scope,
+            scope_id=scope_id,
+            kinds=kind,
+            include_inactive=include_inactive,
+        )
+    except KeyError as exc:
+        raise not_found(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/projects/{project_id}/memory", status_code=201)
+def write_project_memory(
+    project_id: str,
+    payload: MemoryRecord,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        store(request).get_project(project_id)
+        return store(request).memory_write(project_id, payload.model_dump(mode="json"))
+    except KeyError as exc:
+        raise not_found(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @router.post("/projects/{project_id}/conversation", status_code=202)
 async def converse(project_id: str, payload: ConversationRequest, request: Request) -> dict[str, Any]:
     trace_json(
@@ -163,6 +213,7 @@ def conversation(
             limit,
             after_id=after_id,
             before_id=before_id,
+            visible_only=True,
         )
     except KeyError as exc:
         raise not_found(exc) from exc
@@ -334,6 +385,10 @@ def get_task(project_id: str, task_id: str, request: Request) -> dict[str, Any]:
         task["attempts"] = store(request).attempts(project_id, task_id)
         task["artifacts"] = store(request).artifacts(project_id, task_id)
         task["agent_runs"] = store(request).agent_runs(project_id=project_id, task_id=task_id, limit=DETAIL_PAGE)
+        task["workcells"] = store(request).workcells(project_id, task_id=task_id)
+        for workcell in task["workcells"]:
+            workcell["participants"] = store(request).workcell_participants(project_id, workcell["id"])
+            workcell["handoffs"] = store(request).workcell_handoffs(project_id, workcell["id"])
         return task
     except KeyError as exc:
         raise not_found(exc) from exc
@@ -367,9 +422,17 @@ def task_events(project_id: str, task_id: str, request: Request, after: int = Qu
 
 
 @router.get("/projects/{project_id}/events")
-def project_events(project_id: str, request: Request, after: int = Query(0, ge=0), limit: int = Query(DETAIL_PAGE, ge=1, le=MAX_PAGE)) -> list[dict[str, Any]]:
+def project_events(
+    project_id: str,
+    request: Request,
+    after: int = Query(0, ge=0),
+    limit: int = Query(DETAIL_PAGE, ge=1, le=MAX_PAGE),
+    recent: bool = False,
+) -> list[dict[str, Any]]:
     try:
         store(request).get_project(project_id)
+        if recent:
+            return store(request).recent_events(project_id, limit)
         return store(request).events(project_id=project_id, after=after, limit=limit)
     except KeyError as exc:
         raise not_found(exc) from exc
@@ -400,6 +463,30 @@ def get_agent_run(project_id: str, agent_run_id: str, request: Request, after_se
         run["messages"] = store(request).agent_messages(project_id, agent_run_id, limit, after_sequence)
         run["tool_invocations"] = store(request).tool_invocations(project_id, agent_run_id, limit, after_sequence)
         return run
+    except KeyError as exc:
+        raise not_found(exc) from exc
+
+
+@router.get("/projects/{project_id}/workcells")
+def project_workcells(
+    project_id: str,
+    request: Request,
+    task_id: str | None = None,
+) -> list[dict[str, Any]]:
+    try:
+        store(request).get_project(project_id)
+        return store(request).workcells(project_id, task_id=task_id)
+    except KeyError as exc:
+        raise not_found(exc) from exc
+
+
+@router.get("/projects/{project_id}/workcells/{workcell_id}")
+def get_workcell(project_id: str, workcell_id: str, request: Request) -> dict[str, Any]:
+    try:
+        value = store(request).get_workcell(project_id, workcell_id)
+        value["participants"] = store(request).workcell_participants(project_id, workcell_id)
+        value["handoffs"] = store(request).workcell_handoffs(project_id, workcell_id)
+        return value
     except KeyError as exc:
         raise not_found(exc) from exc
 

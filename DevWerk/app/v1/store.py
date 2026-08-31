@@ -13,6 +13,7 @@ from app.v1.domain import (
     CapabilitySequenceExecutor,
     ReadinessDecision,
     TaskPlan,
+    WorkcellExecutor,
     WorkflowPlan,
     WorkflowDefinition,
 )
@@ -25,6 +26,7 @@ from app.v1.capabilities import (
 )
 from app.v1.files import ProjectFiles
 from app.v1.loops import LoopCatalog
+from app.v1.memory import MemoryIndex, MemoryManager, MemoryRecord, MemoryStore
 from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, PlatformPolicySnapshot, V1RuntimePolicy
 from app.v1.states import (
     AGENT_RUN_STATE_MACHINE,
@@ -44,6 +46,7 @@ from app.v1.repositories.planning_repository import PlanningRepository
 from app.v1.repositories.schema_repository import SchemaRepository
 from app.v1.services.scheduler import SchedulerService
 from app.v1.services.recovery_manager import RecoveryManager
+from app.v1.services.mailbox import MailboxService
 
 
 def _resolve_loop_parameters(value: Any, parameters: dict[str, Any]) -> Any:
@@ -193,16 +196,20 @@ class V1Store:
         policy: V1RuntimePolicy | None = None,
         *,
         registry: CapabilityRegistry,
+        memory_store: MemoryStore | None = None,
+        memory_index: MemoryIndex | None = None,
     ):
         self.policy = policy or DEFAULT_V1_RUNTIME_POLICY
         self.registry = registry
         self.loops = LoopCatalog()
+        self.memory = MemoryManager(memory_store, memory_index)
         self.projects = ProjectRepository(self)
         self.planning = PlanningRepository(self)
         self.artifact_repository = ArtifactRepository(self)
         self.event_repository = EventRepository(self)
         self.scheduler = SchedulerService(self)
         self.recovery_manager = RecoveryManager(self)
+        self.mailbox_service = MailboxService(self)
         self.schema_repository = SchemaRepository(self)
         self.path = Path(db_path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -413,7 +420,107 @@ class V1Store:
         return self.planning.list_task_plans(project_id, limit)
 
     def create_project(self, name: str, description: str, base_dir: str, agent_instruction: str = "") -> dict[str, Any]:
-        return self.projects.create_project(name, description, base_dir, agent_instruction)
+        project = self.projects.create_project(name, description, base_dir, agent_instruction)
+        self.memory.initialize_project(project)
+        return project
+
+    def memory_write(self, project_id: str, value: dict[str, Any]) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        record = MemoryRecord.model_validate(value)
+        written = self.memory.store.write(project, record)
+        self.memory.index.index(self.memory.store, project, written["reference"])
+        return written
+
+    def memory_read(self, project_id: str, reference: str) -> dict[str, Any]:
+        return self.memory.store.read(self.get_project(project_id), reference)
+
+    def memory_snapshot(
+        self,
+        project_id: str,
+        *,
+        scope: str,
+        scope_id: str,
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.memory.store.snapshot(
+            self.get_project(project_id),
+            scope=scope,
+            scope_id=scope_id,
+            state=state,
+        )
+
+    def memory_append(
+        self,
+        project_id: str,
+        reference: str,
+        content: str,
+        *,
+        source_type: str,
+        source_id: str | None = None,
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        written = self.memory.store.append(
+            project,
+            reference,
+            content,
+            source_type=source_type,
+            source_id=source_id,
+        )
+        self.memory.index.index(self.memory.store, project, written["reference"])
+        return written
+
+    def memory_list(
+        self,
+        project_id: str,
+        *,
+        scope: str | None = None,
+        scope_id: str | None = None,
+        kinds: list[str] | None = None,
+        include_inactive: bool = False,
+    ) -> list[dict[str, Any]]:
+        return self.memory.store.list(
+            self.get_project(project_id),
+            scope=scope,
+            scope_id=scope_id,
+            kinds=kinds or [],
+            include_inactive=include_inactive,
+        )
+
+    def memory_search(
+        self,
+        project_id: str,
+        query: str,
+        *,
+        scope: str | None = None,
+        scope_id: str | None = None,
+        kinds: list[str] | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        return self.memory.index.search(
+            self.memory.store,
+            self.get_project(project_id),
+            query,
+            scope=scope,
+            scope_id=scope_id,
+            kinds=kinds or [],
+            limit=limit,
+        )
+
+    def memory_supersede(
+        self,
+        project_id: str,
+        reference: str,
+        replacement: dict[str, Any],
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        self.memory.index.remove(self.memory.store, project, reference)
+        written = self.memory.store.supersede(
+            project,
+            reference,
+            MemoryRecord.model_validate(replacement),
+        )
+        self.memory.index.index(self.memory.store, project, written["reference"])
+        return written
 
     def conversation_agent(self, project_id: str) -> dict[str, Any]:
         return self.projects.conversation_agent(project_id)
@@ -466,31 +573,33 @@ class V1Store:
         *,
         after_id: int | None = None,
         before_id: int | None = None,
+        visible_only: bool = False,
     ) -> list[dict[str, Any]]:
         if after_id is not None and before_id is not None:
             raise ValueError("after_id and before_id are mutually exclusive")
+        visibility = " AND role IN ('user','assistant') AND TRIM(content)<>''" if visible_only else ""
         with self.connect() as db:
             if limit is None and after_id is None and before_id is None:
                 rows = db.execute(
-                    "SELECT * FROM v1_conversations WHERE project_id=? ORDER BY id",
+                    f"SELECT * FROM v1_conversations WHERE project_id=?{visibility} ORDER BY id",
                     (project_id,),
                 ).fetchall()
                 return [self._decode(dict(row), "meta_json") for row in rows]  # type: ignore[misc]
             bounded_limit = min(max(limit or self.policy.service_limits.default_page_size, 1), self.policy.service_limits.max_page_size)
             if after_id is not None:
                 rows = db.execute(
-                    "SELECT * FROM v1_conversations WHERE project_id=? AND id>? ORDER BY id LIMIT ?",
+                    f"SELECT * FROM v1_conversations WHERE project_id=? AND id>?{visibility} ORDER BY id LIMIT ?",
                     (project_id, after_id, bounded_limit),
                 ).fetchall()
             elif before_id is not None:
                 rows = db.execute(
-                    "SELECT * FROM (SELECT * FROM v1_conversations WHERE project_id=? AND id<? "
+                    f"SELECT * FROM (SELECT * FROM v1_conversations WHERE project_id=? AND id<?{visibility} "
                     "ORDER BY id DESC LIMIT ?) ORDER BY id",
                     (project_id, before_id, bounded_limit),
                 ).fetchall()
             else:
                 rows = db.execute(
-                    "SELECT * FROM (SELECT * FROM v1_conversations WHERE project_id=? ORDER BY id DESC LIMIT ?) ORDER BY id",
+                    f"SELECT * FROM (SELECT * FROM v1_conversations WHERE project_id=?{visibility} ORDER BY id DESC LIMIT ?) ORDER BY id",
                     (project_id, bounded_limit),
                 ).fetchall()
         return [self._decode(dict(row), "meta_json") for row in rows]  # type: ignore[misc]
@@ -617,6 +726,30 @@ class V1Store:
                     "VALUES(?,?,?,?,?,1,'queued',?,?,?,?,?,?)",
                     (job_id, project_id, session[0], int(cursor.lastrowid), "", trigger_kind, json.dumps(trigger, ensure_ascii=False), json.dumps(mailbox_ids), review[0] if review else None, now, now),
                 )
+                delivered_ids = self.mailbox_service.deliver_pending(
+                    db,
+                    project_id,
+                    job_id,
+                    limit=self.policy.context.mailbox_limit,
+                    mailbox_ids=mailbox_ids,
+                )
+                if delivered_ids != mailbox_ids:
+                    mailbox_ids = delivered_ids
+                    trigger["mailbox_ids"] = mailbox_ids
+                    db.execute(
+                        "UPDATE v1_conversation_jobs SET mailbox_ids_json=?,trigger_json=? WHERE id=?",
+                        (
+                            json.dumps(mailbox_ids),
+                            json.dumps(trigger, ensure_ascii=False),
+                            job_id,
+                        ),
+                    )
+                if review:
+                    db.execute(
+                        "UPDATE v1_scheduled_reviews SET state='delivered',conversation_job_id=?,"
+                        "delivered_at=?,last_error=NULL WHERE id=? AND state='pending'",
+                        (job_id, now, review[0]),
+                    )
                 db.execute("UPDATE v1_conversation_agents SET state='planning',updated_at=? WHERE project_id=?", (now, project_id))
                 self._event(
                     db,
@@ -658,18 +791,39 @@ class V1Store:
             row = db.execute("SELECT * FROM v1_conversation_jobs WHERE id=?", (job_id,)).fetchone()
             assert row is not None
             captured = json.loads(row["mailbox_ids_json"] or "[]")
-            if not captured:
-                captured = [item[0] for item in db.execute(
-                    "SELECT id FROM v1_project_mailbox WHERE project_id=? AND state='pending' ORDER BY id LIMIT ?",
-                    (row["project_id"], self.policy.context.mailbox_limit),
-                ).fetchall()]
-                db.execute("UPDATE v1_conversation_jobs SET mailbox_ids_json=? WHERE id=?", (json.dumps(captured), job_id))
+            self.mailbox_service.deliver_pending(
+                db,
+                row["project_id"],
+                job_id,
+                limit=self.policy.context.mailbox_limit,
+                mailbox_ids=captured or None,
+            )
+            captured = [
+                int(item[0])
+                for item in db.execute(
+                    "SELECT id FROM v1_project_mailbox WHERE project_id=? "
+                    "AND last_delivery_job_id=? AND state='delivered' ORDER BY id",
+                    (row["project_id"], job_id),
+                ).fetchall()
+            ]
+            db.execute(
+                "UPDATE v1_conversation_jobs SET mailbox_ids_json=? WHERE id=?",
+                (json.dumps(captured), job_id),
+            )
             lease_until = (datetime.now(timezone.utc) + timedelta(seconds=self.policy.scheduling.conversation_lease_seconds)).isoformat(timespec="milliseconds")
-            if captured:
-                placeholders = ",".join("?" for _ in captured)
+            self.mailbox_service.receive_for_job(
+                db,
+                row["project_id"],
+                job_id,
+                captured,
+                claim_owner,
+                lease_until,
+            )
+            if row["scheduled_review_id"]:
                 db.execute(
-                    f"UPDATE v1_project_mailbox SET state='claimed',claim_owner=?,claim_expires_at=? WHERE project_id=? AND state='pending' AND id IN ({placeholders})",
-                    [claim_owner, lease_until, row["project_id"], *captured],
+                    "UPDATE v1_scheduled_reviews SET state='received',received_at=? "
+                    "WHERE id=? AND conversation_job_id=? AND state='delivered'",
+                    (now, row["scheduled_review_id"], job_id),
                 )
             db.execute(
                 "UPDATE v1_conversation_agents SET lease_owner=?,lease_until=?,state='planning',updated_at=? WHERE project_id=?",
@@ -765,21 +919,29 @@ class V1Store:
                     "INSERT INTO v1_governance_decisions(id,project_id,kind,subject_id,decision,data_json,created_at) VALUES(?,?,?,?,?,?,?)",
                     (decision_id, project_id, "mailbox_ack", job_id, decision, json.dumps(result or {}, ensure_ascii=False), now),
                 )
-                db.execute(
-                    f"UPDATE v1_project_mailbox SET state='acknowledged',observed_at=?,acknowledged_at=?,governance_decision_id=?,claim_owner=NULL,claim_expires_at=NULL WHERE project_id=? AND state='claimed' AND claim_owner=? AND id IN ({placeholders})",
-                    [now, now, decision_id, project_id, row[3], *mailbox_ids],
+                acknowledged_ids = self.mailbox_service.acknowledge_for_job(
+                    db,
+                    project_id,
+                    job_id,
+                    mailbox_ids,
+                    claim_owner=row[3],
+                    governance_decision_id=decision_id,
+                    reported_message_id=notification_message_id,
                 )
-                if notification_message_id is not None:
+                if acknowledged_ids:
+                    acknowledged_placeholders = ",".join("?" for _ in acknowledged_ids)
                     db.execute(
-                        f"UPDATE v1_project_mailbox SET reported_message_id=COALESCE(reported_message_id,?),reported_at=COALESCE(reported_at,?) WHERE project_id=? AND id IN ({placeholders})",
-                        [notification_message_id, now, project_id, *mailbox_ids],
+                        f"UPDATE v1_tasks SET observed_at=?,supervision_action=COALESCE(supervision_action,'observed_no_intervention') "
+                        f"WHERE project_id=? AND id IN (SELECT task_id FROM v1_project_mailbox "
+                        f"WHERE id IN ({acknowledged_placeholders}) AND task_id IS NOT NULL)",
+                        [now, project_id, *acknowledged_ids],
                     )
-                db.execute(
-                    f"UPDATE v1_tasks SET observed_at=?,supervision_action=COALESCE(supervision_action,'observed_no_intervention') WHERE project_id=? AND id IN (SELECT task_id FROM v1_project_mailbox WHERE id IN ({placeholders}) AND task_id IS NOT NULL)",
-                    [now, project_id, *mailbox_ids],
-                )
             if row[2]:
-                db.execute("UPDATE v1_scheduled_reviews SET state='observed',observed_at=? WHERE id=?", (now, row[2]))
+                db.execute(
+                    "UPDATE v1_scheduled_reviews SET state='observed',observed_at=?,last_error=NULL "
+                    "WHERE id=? AND conversation_job_id=? AND state IN ('delivered','received')",
+                    (now, row[2], job_id),
+                )
             db.execute("UPDATE v1_conversation_agents SET lease_owner=NULL,lease_until=NULL WHERE project_id=?", (project_id,))
             self._event(db, project_id, task_id, None, "conversation.planning_succeeded", {"job_id": job_id})
             if resolved_failure_job_ids:
@@ -842,19 +1004,22 @@ class V1Store:
             )
             mailbox_ids = json.loads(row[2] or "[]")
             if mailbox_ids:
-                placeholders = ",".join("?" for _ in mailbox_ids)
-                mailbox_state = "attention" if attention else "pending"
+                self.mailbox_service.fail_for_job(
+                    db,
+                    project_id,
+                    job_id,
+                    mailbox_ids,
+                    safe_error,
+                    attention=attention,
+                )
+            if row[4]:
+                review_state = "attention" if attention else "failed"
                 db.execute(
-                    f"UPDATE v1_project_mailbox SET state=?,claim_owner=NULL,claim_expires_at=NULL "
-                    f"WHERE project_id=? AND state='claimed' AND claim_owner=? AND id IN ({placeholders})",
-                    [mailbox_state, project_id, row[3], *mailbox_ids],
+                    "UPDATE v1_scheduled_reviews SET state=?,failed_at=?,last_error=? "
+                    "WHERE id=? AND conversation_job_id=? AND state IN ('delivered','received')",
+                    (review_state, now, safe_error, row[4], job_id),
                 )
             if attention:
-                if row[4]:
-                    db.execute(
-                        "UPDATE v1_scheduled_reviews SET state='attention' WHERE id=? AND state='pending'",
-                        (row[4],),
-                    )
                 db.execute(
                     "UPDATE v1_conversation_agents SET state='attention',updated_at=? WHERE project_id=?",
                     (now, project_id),
@@ -868,6 +1033,33 @@ class V1Store:
     def startup_conversation_jobs(self) -> list[dict[str, Any]]:
         now = utcnow()
         with self.tx(immediate=True) as db:
+            interrupted = db.execute(
+                "SELECT id,project_id,mailbox_ids_json,scheduled_review_id FROM v1_conversation_jobs "
+                "WHERE status='running'"
+            ).fetchall()
+            for row in interrupted:
+                mailbox_ids = json.loads(row[2] or "[]")
+                self.mailbox_service.fail_for_job(
+                    db,
+                    row[1],
+                    row[0],
+                    mailbox_ids,
+                    "process interrupted",
+                )
+                if mailbox_ids:
+                    placeholders = ",".join("?" for _ in mailbox_ids)
+                    db.execute(
+                        f"UPDATE v1_project_mailbox SET state='failed',failed_at=?,last_error='process interrupted',"
+                        f"claim_owner=NULL,claim_expires_at=NULL WHERE project_id=? AND state='received' "
+                        f"AND id IN ({placeholders})",
+                        [now, row[1], *mailbox_ids],
+                    )
+                if row[3]:
+                    db.execute(
+                        "UPDATE v1_scheduled_reviews SET state='failed',failed_at=?,last_error='process interrupted' "
+                        "WHERE id=? AND state IN ('delivered','received')",
+                        (now, row[3]),
+                    )
             db.execute(
                 "UPDATE v1_conversation_jobs SET status='failed',error='process interrupted',"
                 "updated_at=?,finished_at=? WHERE status='running'",
@@ -878,10 +1070,6 @@ class V1Store:
                 "error_code='interrupted',error_category='runtime_interrupted',"
                 "finished_at=? WHERE status='running'",
                 (now,),
-            )
-            db.execute(
-                "UPDATE v1_project_mailbox SET state='pending',claim_owner=NULL,claim_expires_at=NULL "
-                "WHERE state='claimed'"
             )
             db.execute("UPDATE v1_conversation_agents SET lease_owner=NULL,lease_until=NULL")
             rows = db.execute(
@@ -1846,6 +2034,398 @@ class V1Store:
                 })
         return dict(row)
 
+    def get_or_create_workcell(
+        self,
+        project_id: str,
+        task_id: str,
+        column_run_id: str,
+        executor: WorkcellExecutor,
+        input_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = utcnow()
+        created = False
+        with self.tx(immediate=True) as db:
+            row = db.execute(
+                "SELECT * FROM v1_workcells WHERE project_id=? AND column_run_id=?",
+                (project_id, column_run_id),
+            ).fetchone()
+            if row is None:
+                row = db.execute(
+                    "SELECT w.* FROM v1_workcells w "
+                    "JOIN v1_column_runs previous_run ON previous_run.id=w.column_run_id "
+                    "JOIN v1_column_runs current_run ON current_run.id=? "
+                    "WHERE w.project_id=? AND w.task_id=? AND w.status='recovering' "
+                    "AND previous_run.column_key=current_run.column_key "
+                    "ORDER BY w.updated_at DESC LIMIT 1",
+                    (column_run_id, project_id, task_id),
+                ).fetchone()
+                if row is not None:
+                    db.execute(
+                        "UPDATE v1_workcells SET column_run_id=?,status='active',updated_at=? WHERE id=?",
+                        (column_run_id, now, row["id"]),
+                    )
+                    self._event(
+                        db,
+                        project_id,
+                        task_id,
+                        column_run_id,
+                        "workcell.resumed",
+                        {"workcell_id": row["id"], "state": row["current_state"]},
+                    )
+                    row = db.execute(
+                        "SELECT * FROM v1_workcells WHERE id=?",
+                        (row["id"],),
+                    ).fetchone()
+            if row is None:
+                workcell_id = new_id("wcell")
+                db.execute(
+                    "INSERT INTO v1_workcells(id,project_id,task_id,column_run_id,status,current_state,definition_json,input_json,output_json,created_at,updated_at) "
+                    "VALUES(?,?,?,?,'active',?,?,?,'{}',?,?)",
+                    (
+                        workcell_id,
+                        project_id,
+                        task_id,
+                        column_run_id,
+                        executor.entry,
+                        self._pack_json(executor.model_dump(mode="json")),
+                        self._pack_json(input_data),
+                        now,
+                        now,
+                    ),
+                )
+                for participant in executor.participants:
+                    db.execute(
+                        "INSERT INTO v1_workcell_participants(id,project_id,workcell_id,participant_key,kind,lifecycle,status,config_json,created_at,updated_at) "
+                        "VALUES(?,?,?,?,?,?,'ready',?,?,?)",
+                        (
+                            new_id("wpart"),
+                            project_id,
+                            workcell_id,
+                            participant.key,
+                            participant.kind,
+                            participant.lifecycle,
+                            self._pack_json(participant.model_dump(mode="json")),
+                            now,
+                            now,
+                        ),
+                    )
+                self._event(
+                    db,
+                    project_id,
+                    task_id,
+                    column_run_id,
+                    "workcell.started",
+                    {"workcell_id": workcell_id, "entry": executor.entry},
+                )
+                row = db.execute("SELECT * FROM v1_workcells WHERE id=?", (workcell_id,)).fetchone()
+                created = True
+            elif row["status"] == "recovering":
+                db.execute(
+                    "UPDATE v1_workcells SET status='active',updated_at=? WHERE id=?",
+                    (now, row["id"]),
+                )
+                self._event(
+                    db,
+                    project_id,
+                    task_id,
+                    column_run_id,
+                    "workcell.resumed",
+                    {"workcell_id": row["id"], "state": row["current_state"]},
+                )
+                row = db.execute("SELECT * FROM v1_workcells WHERE id=?", (row["id"],)).fetchone()
+        workcell = self._decode(dict(row), "definition_json", "input_json", "output_json")
+        if created:
+            for participant in executor.participants:
+                if participant.kind != "agent" or participant.lifecycle == "invocation":
+                    continue
+                session_key = (
+                    f"task-participant:{participant.key}"
+                    if participant.lifecycle == "task"
+                    else f"workcell:{workcell['id']}:{participant.key}"
+                )
+                session = self.get_or_create_agent_session(
+                    project_id,
+                    task_id,
+                    session_key,
+                )
+                with self.tx(immediate=True) as db:
+                    db.execute(
+                        "UPDATE v1_workcell_participants SET agent_session_id=?,updated_at=? "
+                        "WHERE workcell_id=? AND participant_key=?",
+                        (session["id"], utcnow(), workcell["id"], participant.key),
+                    )
+        return self.get_workcell(project_id, str(workcell["id"]))
+
+    def mark_workcell_recovering(
+        self,
+        project_id: str,
+        column_run_id: str,
+        error: str,
+    ) -> dict[str, Any] | None:
+        now = utcnow()
+        with self.tx(immediate=True) as db:
+            row = db.execute(
+                "SELECT id,task_id,current_state,status FROM v1_workcells "
+                "WHERE project_id=? AND column_run_id=?",
+                (project_id, column_run_id),
+            ).fetchone()
+            if row is None:
+                return None
+            if row[3] == "active":
+                db.execute(
+                    "UPDATE v1_workcells SET status='recovering',updated_at=? WHERE id=?",
+                    (now, row[0]),
+                )
+                self._event(
+                    db,
+                    project_id,
+                    row[1],
+                    column_run_id,
+                    "workcell.recovering",
+                    {"workcell_id": row[0], "state": row[2], "error": error},
+                )
+            workcell_id = row[0]
+        return self.get_workcell(project_id, workcell_id)
+
+    def get_workcell(self, project_id: str, workcell_id: str) -> dict[str, Any]:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM v1_workcells WHERE project_id=? AND id=?",
+                (project_id, workcell_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(workcell_id)
+        return self._decode(dict(row), "definition_json", "input_json", "output_json")
+
+    def workcells(
+        self,
+        project_id: str,
+        *,
+        task_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            if task_id is None:
+                rows = db.execute(
+                    "SELECT * FROM v1_workcells WHERE project_id=? ORDER BY created_at,id",
+                    (project_id,),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT * FROM v1_workcells WHERE project_id=? AND task_id=? ORDER BY created_at,id",
+                    (project_id, task_id),
+                ).fetchall()
+        return [
+            self._decode(dict(row), "definition_json", "input_json", "output_json")
+            for row in rows
+        ]
+
+    def workcell_participants(self, project_id: str, workcell_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM v1_workcell_participants WHERE project_id=? AND workcell_id=? "
+                "ORDER BY created_at,participant_key",
+                (project_id, workcell_id),
+            ).fetchall()
+        return [self._decode(dict(row), "config_json") for row in rows]
+
+    def workcell_handoffs(
+        self,
+        project_id: str,
+        workcell_id: str,
+        *,
+        receiver: str | None = None,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM v1_workcell_handoffs WHERE project_id=? AND workcell_id=? "
+                "ORDER BY sequence",
+                (project_id, workcell_id),
+            ).fetchall()
+        handoffs = [
+            self._decode(
+                dict(row),
+                "receivers_json",
+                "payload_json",
+                "artifact_refs_json",
+                "memory_refs_json",
+            )
+            for row in rows
+        ]
+        if receiver is None:
+            return handoffs
+        return [
+            item
+            for item in handoffs
+            if not item["receivers"] or receiver in item["receivers"]
+        ]
+
+    def snapshot_workcell(self, project_id: str, workcell_id: str) -> dict[str, Any]:
+        workcell = self.get_workcell(project_id, workcell_id)
+        participants = self.workcell_participants(project_id, workcell_id)
+        handoffs = self.workcell_handoffs(project_id, workcell_id)
+        return self.memory_snapshot(
+            project_id,
+            scope="workcell",
+            scope_id=workcell_id,
+            state={
+                "workcell": {
+                    key: workcell.get(key)
+                    for key in (
+                        "id",
+                        "task_id",
+                        "column_run_id",
+                        "status",
+                        "current_state",
+                        "updated_at",
+                        "finished_at",
+                    )
+                },
+                "participants": [
+                    {
+                        key: item.get(key)
+                        for key in (
+                            "participant_key",
+                            "kind",
+                            "lifecycle",
+                            "agent_session_id",
+                            "status",
+                        )
+                    }
+                    for item in participants
+                ],
+                "handoffs": [
+                    {
+                        key: item.get(key)
+                        for key in (
+                            "sequence",
+                            "sender_key",
+                            "receivers",
+                            "signal",
+                            "artifact_refs",
+                            "memory_refs",
+                        )
+                    }
+                    for item in handoffs
+                ],
+            },
+        )
+
+    def activate_workcell_participant(
+        self,
+        project_id: str,
+        workcell_id: str,
+        participant_key: str,
+        state_key: str,
+    ) -> None:
+        now = utcnow()
+        with self.tx(immediate=True) as db:
+            workcell = db.execute(
+                "SELECT task_id,column_run_id,status FROM v1_workcells WHERE project_id=? AND id=?",
+                (project_id, workcell_id),
+            ).fetchone()
+            if workcell is None:
+                raise KeyError(workcell_id)
+            if workcell[2] != "active":
+                raise ValueError(f"workcell {workcell_id!r} is not active")
+            changed = db.execute(
+                "UPDATE v1_workcell_participants SET status='running',updated_at=? "
+                "WHERE workcell_id=? AND participant_key=?",
+                (now, workcell_id, participant_key),
+            ).rowcount
+            if changed != 1:
+                raise KeyError(participant_key)
+            self._event(
+                db,
+                project_id,
+                workcell[0],
+                workcell[1],
+                "workcell.participant.activated",
+                {
+                    "workcell_id": workcell_id,
+                    "participant": participant_key,
+                    "state": state_key,
+                },
+            )
+
+    def advance_workcell(
+        self,
+        project_id: str,
+        workcell_id: str,
+        *,
+        sender_key: str,
+        signal: str,
+        payload: dict[str, Any],
+        receivers: list[str],
+        target: str,
+        terminal_outcome: str | None,
+    ) -> dict[str, Any]:
+        now = utcnow()
+        with self.tx(immediate=True) as db:
+            row = db.execute(
+                "SELECT task_id,column_run_id,status,current_state FROM v1_workcells "
+                "WHERE project_id=? AND id=?",
+                (project_id, workcell_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(workcell_id)
+            if row[2] != "active":
+                raise ValueError(f"workcell {workcell_id!r} is not active")
+            sequence = db.execute(
+                "SELECT COALESCE(MAX(sequence),0)+1 FROM v1_workcell_handoffs WHERE workcell_id=?",
+                (workcell_id,),
+            ).fetchone()[0]
+            db.execute(
+                "INSERT INTO v1_workcell_handoffs(project_id,task_id,workcell_id,sequence,sender_key,receivers_json,signal,payload_json,artifact_refs_json,memory_refs_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    project_id,
+                    row[0],
+                    workcell_id,
+                    sequence,
+                    sender_key,
+                    self._pack_json(receivers),
+                    signal,
+                    self._pack_json(payload),
+                    self._pack_json(payload.get("artifact_refs") or []),
+                    self._pack_json(payload.get("memory_refs") or []),
+                    now,
+                ),
+            )
+            status = "completed" if terminal_outcome is not None else "active"
+            db.execute(
+                "UPDATE v1_workcells SET status=?,current_state=?,output_json=?,updated_at=?,finished_at=? WHERE id=?",
+                (
+                    status,
+                    target,
+                    self._pack_json(payload),
+                    now,
+                    now if terminal_outcome is not None else None,
+                    workcell_id,
+                ),
+            )
+            db.execute(
+                "UPDATE v1_workcell_participants SET status=?,updated_at=? "
+                "WHERE workcell_id=? AND participant_key=?",
+                ("completed" if terminal_outcome is not None else "ready", now, workcell_id, sender_key),
+            )
+            self._event(
+                db,
+                project_id,
+                row[0],
+                row[1],
+                "workcell.handoff" if terminal_outcome is None else "workcell.completed",
+                {
+                    "workcell_id": workcell_id,
+                    "sequence": sequence,
+                    "sender": sender_key,
+                    "receivers": receivers,
+                    "signal": signal,
+                    "target": target,
+                    "outcome": terminal_outcome,
+                },
+            )
+        return self.get_workcell(project_id, workcell_id)
+
     def conversation_session_has_messages(
         self,
         project_id: str,
@@ -1864,31 +2444,65 @@ class V1Store:
         self,
         project_id: str,
         conversation_session_id: str,
+        *,
+        before_message_id: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Return the exact persisted transcript for one Project Session."""
+        """Return the human dialogue projection for one Project Session.
+
+        Complete internal Agent and tool messages remain in their execution tables. Active
+        Conversation context replays only public user messages and user-facing replies because
+        current Workflow, Task, mailbox, and Memory state is rebuilt separately.
+        """
         with self.connect() as db:
-            rows = db.execute(
-                "SELECT m.agent_run_id,m.sequence,m.role,m.content,m.tool_calls_json,m.tool_call_id "
-                "FROM v1_agent_runs r JOIN v1_agent_messages m ON m.agent_run_id=r.id "
-                "WHERE r.project_id=? AND r.agent_session_id=? AND r.kind='conversation' "
-                "AND r.status IN ('succeeded','failed') "
-                "ORDER BY r.created_at,r.id,m.sequence",
+            identity = db.execute(
+                "SELECT 1 FROM v1_conversation_agents WHERE project_id=? AND logical_id=?",
                 (project_id, conversation_session_id),
-            ).fetchall()
-        return [
-            self._decode(dict(row), "tool_calls_json")
-            for row in rows
-            if row["role"] != "system"
-        ]  # type: ignore[misc]
+            ).fetchone()
+            if identity is None:
+                raise KeyError(conversation_session_id)
+            if before_message_id is None:
+                rows = db.execute(
+                    "SELECT role,content,meta_json FROM v1_conversations "
+                    "WHERE project_id=? ORDER BY id",
+                    (project_id,),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT role,content,meta_json FROM v1_conversations "
+                    "WHERE project_id=? AND id<? ORDER BY id",
+                    (project_id, int(before_message_id)),
+                ).fetchall()
+        projected: list[dict[str, Any]] = []
+        for row in rows:
+            meta = json.loads(row["meta_json"] or "{}")
+            role = str(row["role"])
+            if role == "assistant" and (
+                meta.get("kind") == "notification"
+                or meta.get("status") == "failed"
+            ):
+                continue
+            if role in {"user", "assistant"}:
+                projected.append({"role": role, "content": str(row["content"] or "")})
+        return projected
 
     def agent_session_messages(self, project_id: str, agent_session_id: str) -> list[dict[str, Any]]:
         with self.connect() as db:
             rows = db.execute(
-                "SELECT id,final_text,error,status FROM v1_agent_runs "
+                "SELECT id,final_text,error,status,created_at FROM v1_agent_runs "
                 "WHERE project_id=? AND agent_session_id=? AND status IN ('succeeded','failed') "
                 "ORDER BY created_at,id",
                 (project_id, agent_session_id),
             ).fetchall()
+        selected: list[sqlite3.Row] = []
+        if rows:
+            latest = rows[-1]
+            latest_success = next(
+                (row for row in reversed(rows) if row[3] == "succeeded"),
+                None,
+            )
+            if latest_success is not None and latest_success[0] != latest[0]:
+                selected.append(latest_success)
+            selected.append(latest)
         return [
             {
                 "role": "prior_run",
@@ -1902,7 +2516,7 @@ class V1Store:
                 "tool_calls": [],
                 "tool_call_id": None,
             }
-            for row in rows
+            for row in selected
         ]
 
     def suspend_agent_session(self, project_id: str, agent_session_id: str, task_id: str) -> None:
@@ -2130,6 +2744,9 @@ class V1Store:
     def events(self, project_id: str | None = None, task_id: str | None = None, after: int = 0, limit: int | None = None) -> list[dict[str, Any]]:
         return self.event_repository.events(project_id, task_id, after, limit)
 
+    def recent_events(self, project_id: str, limit: int | None = None) -> list[dict[str, Any]]:
+        return self.event_repository.recent_events(project_id, limit)
+
     def record_external_event(self, project_id: str, event_type: str, correlation_key: str, output: dict[str, Any]) -> dict[str, Any]:
         return self.event_repository.record_external_event(project_id, event_type, correlation_key, output)
 
@@ -2138,12 +2755,17 @@ class V1Store:
 
     def mailbox(self, project_id: str, *, state: str = "pending", limit: int | None = None) -> list[dict[str, Any]]:
         limit = limit or self.policy.context.mailbox_limit
-        with self.connect() as db:
-            rows = db.execute(
-                "SELECT * FROM v1_project_mailbox WHERE project_id=? AND state=? ORDER BY id LIMIT ?",
-                (project_id, state, min(max(limit, 1), self.policy.service_limits.max_page_size)),
-            ).fetchall()
-        return [self._decode(dict(row), "payload_json") for row in rows]  # type: ignore[misc]
+        return self.mailbox_service.list(
+            project_id,
+            state=state,
+            limit=min(max(limit, 1), self.policy.service_limits.max_page_size),
+        )
+
+    def mailbox_deliveries(self, project_id: str, message_id: int) -> list[dict[str, Any]]:
+        return self.mailbox_service.deliveries(project_id, message_id)
+
+    def redeliver_mailbox(self, project_id: str, message_id: int, reason: str) -> dict[str, Any]:
+        return self.mailbox_service.redeliver(project_id, message_id, reason)
 
     def schedule_review(self, project_id: str, reason: str, due_at: str) -> dict[str, Any]:
         self.get_project(project_id)
@@ -2285,7 +2907,7 @@ class V1Store:
             pending_mailbox = int(
                 db.execute(
                     "SELECT COUNT(*) FROM v1_project_mailbox "
-                    "WHERE project_id=? AND state IN ('pending','claimed')",
+                    "WHERE project_id=? AND state IN ('pending','delivered','received')",
                     (project_id,),
                 ).fetchone()[0]
             )
@@ -2352,20 +2974,7 @@ class V1Store:
         }
 
     def observe_mailbox(self, project_id: str, message_id: int) -> bool:
-        now = utcnow()
-        with self.tx(immediate=True) as db:
-            decision_id = new_id("gdec")
-            cursor = db.execute(
-                "UPDATE v1_project_mailbox SET state='acknowledged',observed_at=?,acknowledged_at=?,governance_decision_id=? "
-                "WHERE id=? AND project_id=? AND state='pending'",
-                (now, now, decision_id, message_id, project_id),
-            )
-            if cursor.rowcount == 1:
-                db.execute(
-                    "INSERT INTO v1_governance_decisions(id,project_id,kind,subject_id,decision,data_json,created_at) VALUES(?,?,?,?,?,?,?)",
-                    (decision_id, project_id, "mailbox_ack", str(message_id), "observed_no_intervention", "{}", now),
-                )
-        return cursor.rowcount == 1
+        return self.mailbox_service.acknowledge_pending_noop(project_id, message_id)
 
     def _event(self, db: sqlite3.Connection, project_id: str, task_id: str | None, run_id: str | None, event_type: str, data: dict[str, Any]) -> None:
         db.execute(
@@ -2436,12 +3045,4 @@ class V1Store:
         run_id: str | None,
         payload: dict[str, Any],
     ) -> None:
-        event = db.execute(
-            "SELECT id FROM v1_events WHERE project_id=? AND type=? AND task_id IS ? AND run_id IS ? ORDER BY id DESC LIMIT 1",
-            (project_id, event_type, task_id, run_id),
-        ).fetchone()
-        db.execute(
-            "INSERT INTO v1_project_mailbox(project_id,event_id,event_type,task_id,run_id,payload_json,state,created_at) "
-            "VALUES(?,?,?,?,?,?,'pending',?)",
-            (project_id, event[0] if event else None, event_type, task_id, run_id, json.dumps(payload, ensure_ascii=False, default=str), utcnow()),
-        )
+        self.mailbox_service.append(db, project_id, event_type, task_id, run_id, payload)

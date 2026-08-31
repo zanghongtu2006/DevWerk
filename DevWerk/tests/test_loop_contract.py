@@ -71,10 +71,18 @@ def test_filesystem_loops_are_discoverable_and_novel_is_a_directed_graph(store):
         for column in workflow.columns
         for transition in column.transitions
     }
-    assert ("review", "chapter_rejected", "write") in transitions
-    assert ("review", "recap_rejected", "recap") in transitions
-    assert ("review", "foundation_invalid", "foundation") in transitions
-    assert workflow.column("write").metadata["agent_session_key"] == "chapter_writer"
+    assert ("authoring", "recap_rejected", "recap") in transitions
+    assert ("authoring", "foundation_invalid", "foundation") in transitions
+    authoring = workflow.column("authoring").executor
+    assert authoring.kind == "workcell"
+    workcell_transitions = {
+        (state.key, transition.signal, transition.target)
+        for state in authoring.states
+        for transition in state.transitions
+    }
+    assert ("review", "chapter_rejected", "write") in workcell_transitions
+    writer = next(item for item in authoring.participants if item.key == "writer")
+    assert writer.lifecycle == "task"
 
 
 def test_preset_loop_definitions_are_not_stored_in_sqlite(store):

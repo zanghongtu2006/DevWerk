@@ -74,6 +74,18 @@ class ContextSelection(BaseModel):
     include_task: bool = True
     upstream_outputs: list[str] = Field(default_factory=list)
     artifact_globs: list[str] = Field(default_factory=list)
+    memory: list["MemorySelector"] = Field(default_factory=list)
+
+
+class MemorySelector(BaseModel):
+    """A provider-neutral semantic Memory query declared by a Loop."""
+
+    model_config = ConfigDict(extra="forbid")
+    scope: Literal["project", "conversation", "workflow", "task", "workcell", "participant"]
+    query: str = Field(default="", max_length=4_000)
+    kinds: list[str] = Field(default_factory=list, max_length=100)
+    required: bool = False
+    limit: int | None = Field(default=None, ge=1)
 
 
 class CapabilityStep(BaseModel):
@@ -119,8 +131,170 @@ class CapabilitySequenceExecutor(BaseModel):
         return self
 
 
+class WorkcellAgentParticipant(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    key: str = Field(pattern=KEY_PATTERN)
+    kind: Literal["agent"] = "agent"
+    instruction: str = Field(default="", max_length=60_000)
+    capabilities: list[str] = Field(min_length=1)
+    lifecycle: Literal["invocation", "column_visit", "task"] = "column_visit"
+    context: ContextSelection = Field(default_factory=ContextSelection)
+
+
+class WorkcellCapabilityParticipant(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    key: str = Field(pattern=KEY_PATTERN)
+    kind: Literal["capability_sequence"] = "capability_sequence"
+    steps: list[CapabilityStep] = Field(min_length=1, max_length=200)
+    lifecycle: Literal["invocation", "column_visit", "task"] = "invocation"
+    completed_signal: str | None = Field(default=None, pattern=KEY_PATTERN)
+    signal_from: str | None = Field(default=None, pattern=r"^/.*")
+
+    @model_validator(mode="after")
+    def select_signal_source(self) -> "WorkcellCapabilityParticipant":
+        if (self.completed_signal is None) == (self.signal_from is None):
+            raise ValueError(
+                "workcell capability participant requires exactly one of completed_signal or signal_from"
+            )
+        return self
+
+
+WorkcellParticipant = Annotated[
+    WorkcellAgentParticipant | WorkcellCapabilityParticipant,
+    Field(discriminator="kind"),
+]
+
+
+class WorkcellTransition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    signal: str = Field(pattern=KEY_PATTERN)
+    target: str = Field(pattern=KEY_PATTERN)
+    receivers: list[str] = Field(default_factory=list, max_length=200)
+
+
+class WorkcellState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    key: str = Field(pattern=KEY_PATTERN)
+    participant: str = Field(pattern=KEY_PATTERN)
+    instruction: str = Field(default="", max_length=60_000)
+    input_contract: dict[str, Any] = Field(default_factory=dict)
+    output_contract: dict[str, Any] = Field(default_factory=dict)
+    require_evidence: bool = True
+    transitions: list[WorkcellTransition] = Field(min_length=1, max_length=200)
+
+
+class WorkcellTerminal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    key: str = Field(pattern=KEY_PATTERN)
+    outcome: str = Field(pattern=KEY_PATTERN)
+
+
+class WorkcellExecutor(BaseModel):
+    """A domain-neutral directed collaboration graph inside one Column Run."""
+
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["workcell"] = "workcell"
+    participants: list[WorkcellParticipant] = Field(min_length=1, max_length=100)
+    entry: str = Field(pattern=KEY_PATTERN)
+    states: list[WorkcellState] = Field(min_length=1, max_length=200)
+    terminals: list[WorkcellTerminal] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_graph(self) -> "WorkcellExecutor":
+        participant_keys = [item.key for item in self.participants]
+        if len(participant_keys) != len(set(participant_keys)):
+            raise ValueError("workcell participant keys must be unique")
+        state_keys = [item.key for item in self.states]
+        if len(state_keys) != len(set(state_keys)):
+            raise ValueError("workcell state keys must be unique")
+        terminal_keys = [item.key for item in self.terminals]
+        if len(terminal_keys) != len(set(terminal_keys)):
+            raise ValueError("workcell terminal keys must be unique")
+        if set(state_keys) & set(terminal_keys):
+            raise ValueError("workcell state and terminal keys must not overlap")
+        if self.entry not in set(state_keys):
+            raise ValueError("workcell entry must reference a state")
+        known_participants = set(participant_keys)
+        participant_map = {item.key: item for item in self.participants}
+        known_targets = set(state_keys) | set(terminal_keys)
+        by_state = {item.key: item for item in self.states}
+        for state in self.states:
+            if state.participant not in known_participants:
+                raise ValueError(
+                    f"workcell state {state.key!r} references unknown participant {state.participant!r}"
+                )
+            signals = [item.signal for item in state.transitions]
+            if len(signals) != len(set(signals)):
+                raise ValueError(f"workcell state {state.key!r} has duplicate signals")
+            for transition in state.transitions:
+                if transition.target not in known_targets:
+                    raise ValueError(
+                        f"workcell state {state.key!r} references unknown target {transition.target!r}"
+                    )
+                unknown_receivers = sorted(set(transition.receivers) - known_participants)
+                if unknown_receivers:
+                    raise ValueError(
+                        f"workcell state {state.key!r} references unknown receivers {unknown_receivers}"
+                    )
+            participant = participant_map[state.participant]
+            if (
+                isinstance(participant, WorkcellCapabilityParticipant)
+                and participant.completed_signal is not None
+                and participant.completed_signal not in set(signals)
+            ):
+                raise ValueError(
+                    f"workcell state {state.key!r} has no transition for capability participant "
+                    f"signal {participant.completed_signal!r}"
+                )
+        reachable: set[str] = set()
+        pending = [self.entry]
+        while pending:
+            key = pending.pop()
+            if key in reachable:
+                continue
+            reachable.add(key)
+            if key in set(terminal_keys):
+                continue
+            pending.extend(item.target for item in by_state[key].transitions)
+        unreachable = set(state_keys) - reachable
+        if unreachable:
+            raise ValueError(f"workcell contains unreachable states: {sorted(unreachable)}")
+        for state in self.states:
+            seen: set[str] = set()
+            frontier = [state.key]
+            while frontier and not (seen & set(terminal_keys)):
+                key = frontier.pop()
+                if key in seen:
+                    continue
+                seen.add(key)
+                if key in set(terminal_keys):
+                    continue
+                frontier.extend(item.target for item in by_state[key].transitions)
+            if not (seen & set(terminal_keys)):
+                raise ValueError(f"workcell state {state.key!r} has no path to a terminal")
+        return self
+
+    def state(self, key: str) -> WorkcellState:
+        for item in self.states:
+            if item.key == key:
+                return item
+        raise KeyError(key)
+
+    def participant(self, key: str) -> WorkcellParticipant:
+        for item in self.participants:
+            if item.key == key:
+                return item
+        raise KeyError(key)
+
+    def terminal_outcome(self, key: str) -> str | None:
+        for item in self.terminals:
+            if item.key == key:
+                return item.outcome
+        return None
+
+
 ColumnExecutor = Annotated[
-    AgentExecutor | CapabilitySequenceExecutor,
+    AgentExecutor | CapabilitySequenceExecutor | WorkcellExecutor,
     Field(discriminator="kind"),
 ]
 
@@ -167,6 +341,13 @@ class ColumnDefinition(BaseModel):
                         f"column {self.key!r} capability_sequence output_contract rejects "
                         f"Runtime envelope fields: {missing}"
                     )
+        if isinstance(self.executor, WorkcellExecutor):
+            declared = {item.outcome for item in self.transitions}
+            unknown = sorted({item.outcome for item in self.executor.terminals} - declared)
+            if unknown:
+                raise ValueError(
+                    f"column {self.key!r} Workcell terminals use undeclared outcomes: {unknown}"
+                )
         required_roots = self.input_contract.get("required")
         if isinstance(required_roots, list):
             available_roots = {"column", "planning"}
@@ -178,6 +359,8 @@ class ColumnDefinition(BaseModel):
                 available_roots.add("upstream_outputs")
             if self.context.artifact_globs:
                 available_roots.add("artifacts")
+            if self.context.memory:
+                available_roots.add("memory")
             impossible = sorted(
                 str(item)
                 for item in required_roots
@@ -307,10 +490,10 @@ class WorkflowColumnPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
     key: str = Field(pattern=KEY_PATTERN)
     responsibility: str = Field(min_length=1, max_length=4_000)
-    execution_mode: Literal["agent", "capability_sequence"] = Field(
+    execution_mode: Literal["agent", "capability_sequence", "workcell"] = Field(
         description=(
             "How this reusable process stage executes when a Task enters it: create one "
-            "ephemeral Agent or run a deterministic capability sequence."
+            "logical Agent, deterministic capability sequence, or declared Workcell."
         ),
     )
     entry_evidence: list[str] = Field(min_length=1, max_length=200)
@@ -507,6 +690,13 @@ class TaskPlanItem(BaseModel):
             column.key
             for column in workflow.columns
             if isinstance(column.executor, AgentExecutor)
+            or (
+                isinstance(column.executor, WorkcellExecutor)
+                and any(
+                    isinstance(participant, WorkcellAgentParticipant)
+                    for participant in column.executor.participants
+                )
+            )
         ]
         if self.agent_execution == "forbidden" and agent_columns:
             raise ValueError(

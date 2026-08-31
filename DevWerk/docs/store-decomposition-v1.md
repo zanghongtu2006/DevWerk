@@ -25,6 +25,7 @@ Repositories own SQL persistence for one data family. Services own decisions and
 - `repositories/event_repository.py`: Event persistence and correlation queries.
 - `repositories/schema_repository.py`: SQLite schema creation, migrations, and persisted-status validation.
 - `services/scheduler.py`: admission, dependency resolution, WIP/resource eligibility, Task claiming, and lease renewal.
+- `services/mailbox.py`: durable message creation, delivery/receipt/acknowledgement/failure transitions, delivery-attempt evidence, and explicit redelivery.
 
 `V1Store` retains connection/transaction ownership and delegates these operations. A repository or service does not import `V1Store`; it depends on a narrow host protocol, preventing a circular module dependency.
 
@@ -38,4 +39,4 @@ Repositories own SQL persistence for one data family. Services own decisions and
 
 ## Later extraction
 
-After the first extraction is stable, the remaining areas can move independently: Workflow repository, Conversation repository, Task repository, Run repository, Recovery manager, Mailbox service, Projection service, Governance repository, and Execution Receipt repository.
+After the first extraction is stable, the remaining areas can move independently: Workflow repository, Conversation repository, Task repository, Run repository, Projection service, Governance repository, and Execution Receipt repository.

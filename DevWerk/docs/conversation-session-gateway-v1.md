@@ -91,6 +91,8 @@ queued -> running -> succeeded
 
 Conversation Job 失败是一次 Turn 的终态，不是 Conversation Session 的终态。Session 在 Job 结算后恢复为 `idle`、`planning` 或 `attention`，并能够接受下一条用户消息或监督事件。
 
+Mailbox delivery 同时形成明确终态：成功为 `acknowledged`，失败为 `failed` 或 `attention`。Gateway 不把失败消息自动恢复为 pending；只有显式、可审计的 redelivery 可以再次投递，具体状态机以 [`mailbox-lifecycle-p0-design.md`](./mailbox-lifecycle-p0-design.md) 为准。
+
 Provider 超时、Token Plan 不可用、工具协议失败和模型输出错误必须原样进入日志与失败记录。Gateway 只隔离失败边界，不伪造成功、不隐藏错误、不执行业务兜底。
 
 ## 8. Web 与可观察性

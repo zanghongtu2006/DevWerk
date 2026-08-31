@@ -23,7 +23,8 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/devwerk
-ExecStart=/opt/devwerk/start.sh
+ExecStart=/opt/devwerk/startup.sh production
+ExecStop=/opt/devwerk/shutdown.sh
 Restart=on-failure
 RestartSec=5
 
@@ -54,7 +55,7 @@ EOF
 cat > "$PACKAGING/postinstall.sh" <<'EOF'
 #!/usr/bin/env sh
 set -eu
-chmod +x /opt/devwerk/install.sh /opt/devwerk/start.sh || true
+chmod +x /opt/devwerk/install.sh /opt/devwerk/startup.sh /opt/devwerk/shutdown.sh || true
 if command -v systemctl >/dev/null 2>&1; then
   systemctl daemon-reload || true
 fi

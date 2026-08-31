@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -56,6 +57,8 @@ class ProjectFiles:
             if not textual.is_file():
                 continue
             relative = self._relative_resolved(textual, source=str(textual))
+            if relative.parts and relative.parts[0] == ".devwerk":
+                continue
             matches.append((textual.resolve(), relative))
         return matches
 
@@ -85,6 +88,11 @@ class ProjectFiles:
         return {
             "path": target.relative_to(self.root).as_posix(),
             "size": len(data),
+            "utf8_characters": len(content),
+            "non_whitespace_characters": sum(
+                1 for character in content if not character.isspace()
+            ),
+            "line_count": len(content.splitlines()),
             "sha256": hashlib.sha256(data).hexdigest(),
         }
 
@@ -198,8 +206,8 @@ class ProjectFiles:
         *,
         limit: int | None = None,
         exclude_paths: set[str] | None = None,
-    ) -> list[dict[str, str]]:
-        result: list[dict[str, str]] = []
+    ) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
         remaining = max_total_chars
         maximum_files = max(1, limit or self.policy.context.artifact_context_max_files)
         excluded = exclude_paths or set()
@@ -227,7 +235,18 @@ class ProjectFiles:
                 continue
             if remaining is not None:
                 remaining -= len(text)
-            result.append({"path": relative_path, "content": text})
+            encoded = text.encode("utf-8")
+            result.append({
+                "path": relative_path,
+                "content": text,
+                "size_bytes": len(encoded),
+                "utf8_characters": len(text),
+                "non_whitespace_characters": sum(
+                    1 for character in text if not character.isspace()
+                ),
+                "line_count": len(text.splitlines()),
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+            })
             if len(result) >= maximum_files:
                 break
         return result
@@ -248,6 +267,122 @@ class ProjectFiles:
         return {
             "command": argv,
             "cwd": str(working_dir.relative_to(self.root)),
+            "exit_code": process.returncode,
+            "stdout": process.stdout,
+            "stderr": process.stderr,
+        }
+
+
+class SystemFiles:
+    """Conversation Agent filesystem access outside a Project boundary.
+
+    Relative paths are resolved from the DevWerk process working directory;
+    absolute paths remain absolute. Column agents never receive these tools.
+    """
+
+    def __init__(self, working_dir: str | Path | None = None):
+        self.root = Path(working_dir or Path.cwd()).expanduser().resolve()
+
+    def resolve(self, path: str) -> Path:
+        candidate = Path(str(path or ".")).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.root / candidate
+        return candidate.resolve()
+
+    def list_paths(
+        self,
+        path: str = ".",
+        pattern: str = "**/*",
+        *,
+        limit: int,
+    ) -> list[str]:
+        directory = self.resolve(path)
+        if not directory.is_dir():
+            raise FileNotFoundError(f"system directory does not exist: {directory}")
+        paths: list[str] = []
+        for item in sorted(directory.glob(pattern)):
+            if item.is_file():
+                paths.append(str(item.resolve()))
+                if len(paths) >= limit:
+                    break
+        return paths
+
+    def read_text(self, path: str, max_chars: int | None = None) -> str:
+        text = self.resolve(path).read_text(encoding="utf-8")
+        return text if max_chars is None else text[:max_chars]
+
+    def write_text(self, path: str, content: str) -> dict[str, Any]:
+        target = self.resolve(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = content.encode("utf-8")
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return {
+            "path": str(target),
+            "size_bytes": len(data),
+            "utf8_characters": len(content),
+            "line_count": len(content.splitlines()),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+
+    def search_text(
+        self,
+        path: str,
+        pattern: str,
+        glob: str,
+        *,
+        limit: int,
+    ) -> dict[str, Any]:
+        expression = re.compile(pattern)
+        matches: list[dict[str, Any]] = []
+        directory = self.resolve(path)
+        if not directory.is_dir():
+            raise FileNotFoundError(f"system directory does not exist: {directory}")
+        for item in sorted(directory.glob(glob)):
+            if not item.is_file():
+                continue
+            try:
+                text = item.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            for number, line in enumerate(text.splitlines(), 1):
+                if expression.search(line):
+                    matches.append({
+                        "path": str(item.resolve()),
+                        "line": number,
+                        "text": line[:1000],
+                    })
+                    if len(matches) >= limit:
+                        return {"matches": matches, "truncated": True}
+        return {"matches": matches, "truncated": False}
+
+    def run(self, argv: list[str], cwd: str = ".") -> dict[str, Any]:
+        working_dir = self.resolve(cwd)
+        if not working_dir.is_dir():
+            raise FileNotFoundError(f"system command cwd does not exist: {working_dir}")
+        process = subprocess.run(
+            argv,
+            cwd=working_dir,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+            env=os.environ.copy(),
+        )
+        return {
+            "command": argv,
+            "cwd": str(working_dir),
             "exit_code": process.returncode,
             "stdout": process.stdout,
             "stderr": process.stderr,

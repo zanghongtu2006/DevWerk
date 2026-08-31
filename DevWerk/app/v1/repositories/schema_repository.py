@@ -7,6 +7,7 @@ from app.v1.states import (
     AGENT_RUN_STATE_MACHINE,
     ATTEMPT_STATE_MACHINE,
     COLUMN_RUN_STATE_MACHINE,
+    MAILBOX_STATE_MACHINE,
     TASK_STATE_MACHINE,
 )
 class SchemaRepository:
@@ -173,6 +174,42 @@ class SchemaRepository:
                     FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
                     FOREIGN KEY(task_id) REFERENCES v1_tasks(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS v1_workcells (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task_id TEXT NOT NULL,
+                    column_run_id TEXT NOT NULL UNIQUE, status TEXT NOT NULL,
+                    current_state TEXT NOT NULL, definition_json TEXT NOT NULL,
+                    input_json TEXT NOT NULL DEFAULT '{}', output_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, finished_at TEXT,
+                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
+                    FOREIGN KEY(task_id) REFERENCES v1_tasks(id) ON DELETE CASCADE,
+                    FOREIGN KEY(column_run_id) REFERENCES v1_column_runs(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_v1_workcells_task
+                    ON v1_workcells(task_id, created_at);
+                CREATE TABLE IF NOT EXISTS v1_workcell_participants (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, workcell_id TEXT NOT NULL,
+                    participant_key TEXT NOT NULL, kind TEXT NOT NULL, lifecycle TEXT NOT NULL,
+                    agent_session_id TEXT, status TEXT NOT NULL, config_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    UNIQUE(workcell_id, participant_key),
+                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
+                    FOREIGN KEY(workcell_id) REFERENCES v1_workcells(id) ON DELETE CASCADE,
+                    FOREIGN KEY(agent_session_id) REFERENCES v1_agent_sessions(id)
+                );
+                CREATE TABLE IF NOT EXISTS v1_workcell_handoffs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL, workcell_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+                    sender_key TEXT NOT NULL, receivers_json TEXT NOT NULL DEFAULT '[]',
+                    signal TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}',
+                    artifact_refs_json TEXT NOT NULL DEFAULT '[]',
+                    memory_refs_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL,
+                    UNIQUE(workcell_id, sequence),
+                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
+                    FOREIGN KEY(task_id) REFERENCES v1_tasks(id) ON DELETE CASCADE,
+                    FOREIGN KEY(workcell_id) REFERENCES v1_workcells(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_v1_workcell_handoffs
+                    ON v1_workcell_handoffs(workcell_id, sequence);
                 CREATE INDEX IF NOT EXISTS idx_v1_agent_runs_project
                     ON v1_agent_runs(project_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_v1_agent_runs_task
@@ -226,11 +263,34 @@ class SchemaRepository:
                     id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL,
                     event_type TEXT NOT NULL, task_id TEXT, run_id TEXT,
                     payload_json TEXT NOT NULL DEFAULT '{}', state TEXT NOT NULL DEFAULT 'pending',
-                    created_at TEXT NOT NULL, observed_at TEXT,
+                    created_at TEXT NOT NULL, observed_at TEXT, delivery_count INTEGER NOT NULL DEFAULT 0,
+                    last_delivery_job_id TEXT, delivered_at TEXT, received_at TEXT,
+                    failed_at TEXT, last_error TEXT, redelivered_at TEXT,
                     FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
                 );
                 CREATE INDEX IF NOT EXISTS idx_v1_mailbox_pending
                     ON v1_project_mailbox(project_id, state, id);
+                CREATE TABLE IF NOT EXISTS v1_mailbox_deliveries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id TEXT NOT NULL,
+                    mailbox_id INTEGER NOT NULL,
+                    attempt_no INTEGER NOT NULL,
+                    conversation_job_id TEXT NOT NULL,
+                    consumer_kind TEXT NOT NULL DEFAULT 'conversation_job',
+                    state TEXT NOT NULL,
+                    delivered_at TEXT NOT NULL,
+                    received_at TEXT,
+                    finished_at TEXT,
+                    error TEXT,
+                    UNIQUE(mailbox_id, attempt_no),
+                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
+                    FOREIGN KEY(mailbox_id) REFERENCES v1_project_mailbox(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_v1_mailbox_deliveries_job
+                    ON v1_mailbox_deliveries(project_id, conversation_job_id, state);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_v1_mailbox_active_delivery
+                    ON v1_mailbox_deliveries(mailbox_id)
+                    WHERE state IN ('delivered','received');
                 CREATE TABLE IF NOT EXISTS v1_governance_decisions (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL, kind TEXT NOT NULL,
                     subject_id TEXT, decision TEXT NOT NULL, data_json TEXT NOT NULL,
@@ -374,7 +434,20 @@ class SchemaRepository:
             self._ensure_column(db, "v1_project_mailbox", "event_id", "INTEGER")
             self._ensure_column(db, "v1_project_mailbox", "reported_message_id", "INTEGER")
             self._ensure_column(db, "v1_project_mailbox", "reported_at", "TEXT")
+            self._ensure_column(db, "v1_project_mailbox", "delivery_count", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(db, "v1_project_mailbox", "last_delivery_job_id", "TEXT")
+            self._ensure_column(db, "v1_project_mailbox", "delivered_at", "TEXT")
+            self._ensure_column(db, "v1_project_mailbox", "received_at", "TEXT")
+            self._ensure_column(db, "v1_project_mailbox", "failed_at", "TEXT")
+            self._ensure_column(db, "v1_project_mailbox", "last_error", "TEXT")
+            self._ensure_column(db, "v1_project_mailbox", "redelivered_at", "TEXT")
+            db.execute("UPDATE v1_project_mailbox SET state='received' WHERE state='claimed'")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_v1_mailbox_event ON v1_project_mailbox(event_id) WHERE event_id IS NOT NULL")
+            self._ensure_column(db, "v1_scheduled_reviews", "conversation_job_id", "TEXT")
+            self._ensure_column(db, "v1_scheduled_reviews", "delivered_at", "TEXT")
+            self._ensure_column(db, "v1_scheduled_reviews", "received_at", "TEXT")
+            self._ensure_column(db, "v1_scheduled_reviews", "failed_at", "TEXT")
+            self._ensure_column(db, "v1_scheduled_reviews", "last_error", "TEXT")
             self._ensure_column(db, "v1_workflows", "source_loop_key", "TEXT")
             self._ensure_column(db, "v1_workflows", "source_loop_version", "TEXT")
             self._ensure_column(db, "v1_workflows", "source_loop_digest", "TEXT")
@@ -424,13 +497,15 @@ class SchemaRepository:
     @staticmethod
     def _validate_persisted_runtime_statuses(db: sqlite3.Connection) -> None:
         definitions = (
-            ("v1_tasks", TASK_STATE_MACHINE),
-            ("v1_column_runs", COLUMN_RUN_STATE_MACHINE),
-            ("v1_column_attempts", ATTEMPT_STATE_MACHINE),
-            ("v1_agent_runs", AGENT_RUN_STATE_MACHINE),
+            ("v1_tasks", "status", TASK_STATE_MACHINE),
+            ("v1_column_runs", "status", COLUMN_RUN_STATE_MACHINE),
+            ("v1_column_attempts", "status", ATTEMPT_STATE_MACHINE),
+            ("v1_agent_runs", "status", AGENT_RUN_STATE_MACHINE),
+            ("v1_project_mailbox", "state", MAILBOX_STATE_MACHINE),
+            ("v1_mailbox_deliveries", "state", MAILBOX_STATE_MACHINE),
         )
-        for table, machine in definitions:
-            for row in db.execute(f"SELECT DISTINCT status FROM {table}").fetchall():
+        for table, field, machine in definitions:
+            for row in db.execute(f"SELECT DISTINCT {field} FROM {table}").fetchall():
                 try:
                     machine.parse(row[0])
                 except ValueError as exc:

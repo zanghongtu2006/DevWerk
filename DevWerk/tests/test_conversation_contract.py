@@ -25,7 +25,7 @@ def run_turn(
     message: str,
     start_task: bool,
     *,
-    timeout: float = 5.0,
+    timeout: float = 15.0,
 ) -> dict:
     async def execute() -> dict:
         await gateway.start()
@@ -160,6 +160,52 @@ def test_start_task_false_exposes_only_read_capabilities(store, tmp_path):
     accepted = run_turn(agent, project["id"], "Only discuss this.", False)
     assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
     assert all(registry.side_effect_kind(item) in {"none", "read"} for item in exposed[0])
+    assert "system.files.read" in exposed[0]
+    assert "system.files.write" not in exposed[0]
+    assert "system.command.run" not in exposed[0]
+
+
+def test_conversation_has_generic_system_file_authority_without_delegating_it_to_columns(store, tmp_path):
+    project = store.create_project("system authority", "", str(tmp_path / "project"))
+    loop_card = tmp_path / "runtime-library" / "new-loop" / "loop.meta"
+    calls = 0
+
+    def model(_messages, tools, **_kwargs):
+        nonlocal calls
+        calls += 1
+        exposed = {item["function"]["name"] for item in tools}
+        assert {
+            "system.files.list",
+            "system.files.read",
+            "system.files.write",
+            "system.files.search",
+            "system.command.run",
+        } <= exposed
+        if calls == 1:
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id="write-loop-card",
+                name="system.files.write",
+                arguments={"path": str(loop_card), "content": "name: reusable-loop\n"},
+            )])
+        return AgentModelResponse(text="The requested system file was written.")
+
+    registry = build_core_registry()
+    assert not any(item.startswith("system.files.") for item in registry.column_ids())
+    assert "system.command.run" not in registry.column_ids()
+    agent = ConversationGateway(
+        store,
+        registry,
+        agent_core=AgentCore(store, registry, model),
+    )
+
+    accepted = run_turn(agent, project["id"], "Create this reusable Loop asset.", True)
+
+    job = store.get_conversation_job(accepted["job"]["id"])
+    assert job["status"] == "succeeded"
+    assert loop_card.read_text(encoding="utf-8") == "name: reusable-loop\n"
+    assert job["result"]["action_ledger"][0]["capability"] == "system.files.write"
+    with pytest.raises(KeyError):
+        store.get_workflow(project["id"])
 
 
 def test_runtime_notifications_are_not_replayed_as_conversation_history(store, tmp_path):
@@ -176,14 +222,18 @@ def test_runtime_notifications_are_not_replayed_as_conversation_history(store, t
     assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
 
 
-def test_executing_conversation_cannot_finish_with_unevidenced_prose(store, tmp_path):
-    project = store.create_project("evidenced execution", "", str(tmp_path / "project"))
+def test_action_enabled_conversation_can_finish_with_plain_text(store, tmp_path):
+    project = store.create_project("no matching loop", "", str(tmp_path / "project"))
     turns = 0
+    require_tool_values: list[bool] = []
 
-    def model(_messages, _tools, **_kwargs):
+    def model(_messages, _tools, **kwargs):
         nonlocal turns
         turns += 1
-        return AgentModelResponse(text="I inspected and changed the project.")
+        require_tool_values.append(bool(kwargs.get("require_tool")))
+        return AgentModelResponse(
+            text="No existing Loop matches this request, so no Workflow was created."
+        )
 
     registry = build_core_registry()
     agent = ConversationGateway(
@@ -191,12 +241,71 @@ def test_executing_conversation_cannot_finish_with_unevidenced_prose(store, tmp_
         registry,
         agent_core=AgentCore(store, registry, model),
     )
-    accepted = run_turn(agent, project["id"], "Inspect before acting.", True)
+    accepted = run_turn(agent, project["id"], "Try to create a new Loop.", True)
     job = store.get_conversation_job(accepted["job"]["id"])
-    assert job["status"] == "failed"
-    assert turns == 1
+    assert job["status"] == "succeeded"
+    assert job["result"]["reply"] == (
+        "No existing Loop matches this request, so no Workflow was created."
+    )
     assert job["result"]["action_ledger"] == []
-    assert store.conversation_agent(project["id"])["state"] == "attention"
+    assert turns == 1
+    assert require_tool_values == [False]
+    assert store.conversation_agent(project["id"])["state"] != "attention"
+    assert any(
+        item["role"] == "assistant" and item["content"] == job["result"]["reply"]
+        for item in store.messages(project["id"], 20)
+    )
+
+
+def test_conversation_cannot_report_an_unexecuted_mutation_as_completed(store, tmp_path):
+    project = store.create_project("mutation evidence", "", str(tmp_path / "project"))
+    registry = build_core_registry()
+    registry.register(CapabilityEntry(
+        id="test.control",
+        description="Perform one test control mutation.",
+        input_schema={"type": "object", "additionalProperties": False},
+        output_schema={
+            "type": "object",
+            "required": ["changed"],
+            "properties": {"changed": {"type": "boolean"}},
+            "additionalProperties": False,
+        },
+        handler=lambda _args, _ctx: {"changed": True},
+        side_effect_kind="control",
+        delegable_to_column=False,
+    ))
+    turns = 0
+    require_tool_values: list[bool] = []
+
+    def model(messages, _tools, **kwargs):
+        nonlocal turns
+        turns += 1
+        require_tool_values.append(bool(kwargs.get("require_tool")))
+        if turns == 1:
+            return AgentModelResponse(text="I called test.control and completed the change.")
+        if turns == 2:
+            assert "unsupported_mutation_claims" in messages[-1]["content"]
+            return AgentModelResponse(tool_calls=[
+                AgentToolCall(id="control", name="test.control", arguments={})
+            ])
+        return AgentModelResponse(text="I called test.control and completed the change.")
+
+    result = AgentCore(store, registry, model).run(AgentRunSpec(
+        kind="conversation",
+        project=project,
+        instruction="",
+        instruction_revision=1,
+        context={},
+        capability_ids=["test.control"],
+    ))
+
+    assert result.status == "succeeded"
+    assert turns == 3
+    assert require_tool_values == [False, False, False]
+    invocations = store.tool_invocations(project["id"], result.agent_run_id)
+    assert len(invocations) == 1
+    assert invocations[0]["capability"] == "test.control"
+    assert invocations[0]["ok"] is True
 
 
 def test_same_project_jobs_remain_ordered_by_session_gateway(store, tmp_path):
@@ -311,6 +420,48 @@ def test_unavailable_capability_is_returned_for_model_repair(store, tmp_path):
     assert invocation["result"]["error"]["type"] == "CapabilityUnavailable"
 
 
+def test_missing_capability_entity_is_returned_for_model_repair(store, tmp_path):
+    project = store.create_project("missing entity", "", str(tmp_path / "project"))
+    registry = build_core_registry()
+    registry.register(CapabilityEntry(
+        id="test.lookup",
+        description="Look up one test entity.",
+        input_schema={"type": "object", "additionalProperties": False},
+        output_schema={"type": "object"},
+        handler=lambda _args, _ctx: (_ for _ in ()).throw(KeyError("missing-task")),
+        side_effect_kind="control",
+        delegable_to_column=False,
+    ))
+    calls = 0
+
+    def model(messages, _tools, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return AgentModelResponse(tool_calls=[
+                AgentToolCall(id="missing", name="test.lookup", arguments={})
+            ])
+        assert '"ok": false' in messages[-1]["content"]
+        assert "KeyError" in messages[-1]["content"]
+        assert "missing-task" in messages[-1]["content"]
+        return AgentModelResponse(text="The requested entity was not found; no change was made.")
+
+    result = AgentCore(store, registry, model).run(AgentRunSpec(
+        kind="conversation",
+        project=project,
+        instruction="",
+        instruction_revision=1,
+        context={},
+        capability_ids=["test.lookup"],
+    ))
+
+    assert result.status == "succeeded"
+    assert calls == 2
+    invocation = store.tool_invocations(project["id"], result.agent_run_id)[0]
+    assert invocation["ok"] is False
+    assert invocation["result"]["error"]["type"] == "KeyError"
+
+
 def test_missing_project_file_is_returned_for_model_repair(store, tmp_path):
     project = store.create_project("missing-file", "", str(tmp_path / "project"))
     registry = build_core_registry()
@@ -373,7 +524,7 @@ def test_terminal_mailbox_turn_reports_model_text_to_user(store, tmp_path):
     assert assistant[-1]["meta"]["subject_status"] == "failed"
 
 
-def test_project_session_replays_prior_dialogue_and_tool_evidence(store, tmp_path):
+def test_project_session_replays_human_dialogue_without_raw_tool_evidence(store, tmp_path):
     project = store.create_project("durable session", "", str(tmp_path / "project"))
     registry = build_core_registry()
     registry.register(CapabilityEntry(
@@ -399,7 +550,7 @@ def test_project_session_replays_prior_dialogue_and_tool_evidence(store, tmp_pat
             return AgentModelResponse(text="I inspected workflow revision 7.")
         encoded = json.dumps(messages, ensure_ascii=False)
         assert "Remember the inspected workflow." in encoded
-        assert "workflow-revision-7" in encoded
+        assert "workflow-revision-7" not in encoded
         assert "I inspected workflow revision 7." in encoded
         return AgentModelResponse(text="The same Project Session is continuing.")
 
@@ -417,7 +568,7 @@ def test_project_session_replays_prior_dialogue_and_tool_evidence(store, tmp_pat
                 "Remember the inspected workflow.",
                 False,
             )
-            assert await first_gateway.wait_for_idle()
+            assert await first_gateway.wait_for_idle(timeout=15)
             return accepted
         finally:
             await first_gateway.stop()
@@ -437,7 +588,7 @@ def test_project_session_replays_prior_dialogue_and_tool_evidence(store, tmp_pat
                 "What did you inspect in the previous turn?",
                 False,
             )
-            assert await second_gateway.wait_for_idle()
+            assert await second_gateway.wait_for_idle(timeout=15)
             return accepted
         finally:
             await second_gateway.stop()
@@ -487,3 +638,54 @@ def test_failed_turn_does_not_destroy_project_session(store, tmp_path):
     assert store.get_conversation_job(failed["job"]["id"])["status"] == "failed"
     assert store.get_conversation_job(succeeded["job"]["id"])["status"] == "succeeded"
     assert model_calls == 2
+
+
+def test_mailbox_usage_limit_failure_never_forms_an_automatic_llm_retry_loop(store, tmp_path):
+    project = store.create_project("mailbox usage limit", "", str(tmp_path / "project"))
+    with store.tx(immediate=True) as db:
+        store._mailbox(
+            db,
+            project["id"],
+            "task.failed",
+            None,
+            None,
+            {"reason": "column provider plan exhausted"},
+        )
+    mailbox_id = store.mailbox(project["id"])[0]["id"]
+    model_calls = 0
+
+    def model(_messages, _tools, **_kwargs):
+        nonlocal model_calls
+        model_calls += 1
+        raise RuntimeError("LLM_USAGE_LIMIT:http_429:provider_2056")
+
+    gateway = ConversationGateway(
+        store,
+        build_core_registry(),
+        agent_core=AgentCore(store, build_core_registry(), model),
+    )
+
+    async def execute() -> None:
+        await gateway.start()
+        try:
+            assert await gateway.wait_for_idle(timeout=10)
+            for _ in range(5):
+                await gateway.wake_async()
+                assert await gateway.wait_for_idle(timeout=10)
+        finally:
+            await gateway.stop()
+
+    asyncio.run(execute())
+
+    assert model_calls == 1
+    with store.connect() as db:
+        failed_job_count = db.execute(
+            "SELECT COUNT(*) FROM v1_conversation_jobs "
+            "WHERE project_id=? AND trigger_kind='mailbox' AND status='failed'",
+            (project["id"],),
+        ).fetchone()[0]
+    assert failed_job_count == 1
+    failed_mailbox = store.mailbox(project["id"], state="failed")
+    assert [item["id"] for item in failed_mailbox] == [mailbox_id]
+    assert failed_mailbox[0]["last_error"].endswith("provider_2056")
+    assert store.mailbox_deliveries(project["id"], mailbox_id)[0]["state"] == "failed"

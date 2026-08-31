@@ -889,7 +889,7 @@ conversation_agent_acknowledged_at
 conversation_agent_action
 ```
 
-Mailbox 使用 claim lease 与 at-least-once delivery。读取只进入 claimed；只有治理决定或显式 audited no-op 成功持久化后，才在同一短事务写 `observed_at/acknowledged_at`。失败或 claim lease 过期自动重新投递。
+Mailbox 生命周期以 [`mailbox-lifecycle-p0-design.md`](./mailbox-lifecycle-p0-design.md) 为准。读取依次记录 delivered 与 received；只有治理决定或显式 audited no-op 成功持久化后，才在同一短事务写 acknowledged。消费失败或进程中断形成 failed/attention，不自动重新投递；重投只能由显式审计操作触发。Scheduler 与 Runtime 不等待 Mailbox acknowledgement，Workflow 继续按 Task dependency、WIP 和 resource 状态自驱。
 
 ## 33. SQLite 单库设计
 

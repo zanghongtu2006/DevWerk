@@ -7,7 +7,7 @@ import time
 from collections import defaultdict, deque
 from typing import Any, Callable
 
-from app.v1.agent import AgentCore, AgentRunSpec, ConversationEvidenceRequiredError, _ledger_entry
+from app.v1.agent import AgentCore, AgentRunSpec, _ledger_entry
 from app.v1.capabilities import CapabilityRegistry
 from app.v1.domain import ToolResult
 from app.v1.store import V1Store
@@ -268,7 +268,7 @@ class ConversationGateway:
                 captured_ids = set(job.get("mailbox_ids") or [])
                 mailbox = [
                     item
-                    for item in self.store.mailbox(project_id, state="claimed", limit=self.policy.context.mailbox_limit)
+                    for item in self.store.mailbox(project_id, state="received", limit=self.policy.context.mailbox_limit)
                     if item["id"] in captured_ids
                 ]
                 mailbox_requires_user_update = _mailbox_requires_user_update(mailbox)
@@ -290,6 +290,7 @@ class ConversationGateway:
                 context = {
                     "active_workflow": workflow,
                     "global_settings": self.global_settings,
+                    "memory": self.store.memory.build_context(project),
                     "loops": self.store.list_loops(limit=20),
                     "workflow_plans": self.store.list_workflow_plans(project_id) if is_user_turn else [],
                     "task_plans": self.store.list_task_plans(project_id) if is_user_turn else [],
@@ -305,27 +306,6 @@ class ConversationGateway:
                     },
                 }
                 session_id = str(identity["logical_id"])
-                history = []
-                if not self.store.conversation_session_has_messages(
-                    project_id,
-                    session_id,
-                ):
-                    # Import an existing Project's public transcript into its
-                    # first Session-bound Run. Subsequent Turns replay the
-                    # canonical Session transcript without duplicating it.
-                    history = [
-                        item
-                        for item in self.store.messages(project_id, limit=None)
-                        if item.get("id") != job.get("user_message_id")
-                        and not (
-                            item.get("role") == "assistant"
-                            and (item.get("meta") or {}).get("kind") == "notification"
-                        )
-                        and not (
-                            item.get("role") == "assistant"
-                            and (item.get("meta") or {}).get("status") == "failed"
-                        )
-                    ]
                 result = self.agent_core.run(AgentRunSpec(
                     kind="conversation",
                     project=project,
@@ -333,7 +313,6 @@ class ConversationGateway:
                     instruction_revision=int(identity.get("instruction_revision") or 1),
                     context=context,
                     capability_ids=capabilities,
-                    history=history,
                     start_task=bool(job["start_task"]),
                     conversation_job_id=job_id,
                     agent_session_id=session_id,
@@ -450,10 +429,7 @@ class ConversationGateway:
                     ),
                 },
                 notification=None,
-                attention=isinstance(exc, ConversationEvidenceRequiredError),
             )
-            if isinstance(exc, ConversationEvidenceRequiredError):
-                return
             raise
 
 _TASK_TERMINAL_EVENTS = {"task.done", "task.failed"}
