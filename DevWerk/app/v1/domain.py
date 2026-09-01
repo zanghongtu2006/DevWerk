@@ -71,8 +71,15 @@ WaitPolicy = Annotated[
 class ContextSelection(BaseModel):
     model_config = ConfigDict(extra="forbid")
     include_project: bool = True
+    include_loop_bindings: bool = True
+    include_loop_assets: bool = True
     include_task: bool = True
+    include_task_description: bool = True
+    include_current_goal: bool = True
+    include_task_context: bool = True
     upstream_outputs: list[str] = Field(default_factory=list)
+    accepted_artifact_globs: list[str] = Field(default_factory=list)
+    working_artifact_globs: list[str] = Field(default_factory=list)
     artifact_globs: list[str] = Field(default_factory=list)
     memory: list["MemorySelector"] = Field(default_factory=list)
 
@@ -350,15 +357,25 @@ class ColumnDefinition(BaseModel):
                 )
         required_roots = self.input_contract.get("required")
         if isinstance(required_roots, list):
-            available_roots = {"column", "planning"}
-            if self.context.include_project:
+            available_roots = {"column", "planning", "dependencies"}
+            if (
+                self.context.include_project
+                or self.context.include_loop_bindings
+                or self.context.include_loop_assets
+            ):
                 available_roots.add("project")
             if self.context.include_task:
                 available_roots.add("task")
+            if self.context.include_current_goal:
+                available_roots.add("current_goal")
             if self.context.upstream_outputs:
                 available_roots.add("upstream_outputs")
+            if self.context.accepted_artifact_globs:
+                available_roots.add("accepted_artifacts")
+            if self.context.working_artifact_globs:
+                available_roots.add("working_artifacts")
             if self.context.artifact_globs:
-                available_roots.add("artifacts")
+                available_roots.add("reference_artifacts")
             if self.context.memory:
                 available_roots.add("memory")
             impossible = sorted(

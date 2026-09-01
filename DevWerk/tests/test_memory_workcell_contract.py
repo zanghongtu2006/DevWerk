@@ -303,15 +303,15 @@ def test_workcell_routes_typed_handoffs_and_keeps_participant_sessions(store, tm
         sum(item["agent_session_id"] == session_id for item in agent_runs)
         for session_id in {item["agent_session_id"] for item in agent_runs}
     ) == [2, 2]
-    assert activation_inputs[0]["artifacts"][0]["content"] == "version-one"
-    assert activation_inputs[1]["artifacts"][0]["content"] == "version-two"
+    assert activation_inputs[0]["reference_artifacts"][0]["content"] == "version-one"
+    assert activation_inputs[1]["reference_artifacts"][0]["content"] == "version-two"
     assert [item["context_manifest"]["projection"] for item in activation_inputs] == [
         "full_activation",
         "full_activation",
         "session_resume_delta",
         "session_resume_delta",
     ]
-    assert "artifacts" not in activation_inputs[2]
+    assert "reference_artifacts" not in activation_inputs[2]
     assert activation_inputs[2]["context_manifest"]["preloaded_project_artifacts"][0]["path"] == "shared.md"
 
 

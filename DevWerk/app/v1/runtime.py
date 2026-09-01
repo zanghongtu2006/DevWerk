@@ -6,6 +6,7 @@ import logging
 import threading
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import PurePosixPath
 from typing import Any
 
 from app.core.debug_trace import trace_json
@@ -44,12 +45,14 @@ log = logging.getLogger("devwerk.v1.runtime")
 trace_log = logging.getLogger("devwerk.runtime.trace")
 
 _CONTEXT_CONSUMPTION_CONTRACT = (
-    "Runtime context is authoritative for this activation. Use embedded "
-    "project.loop.assets and artifacts content directly; do not list or read a path "
-    "already named in context_manifest unless it is absent, known to have changed, "
-    "or independent verification is explicitly required. Loop asset paths are not "
-    "Project filesystem paths. On a Session resume, use the logical checkpoint and "
-    "directed Handoffs, then fetch only the specific missing or changed Project files."
+    "Runtime context is partitioned by provenance. accepted_artifacts are immutable facts "
+    "from transitive done Task dependencies. working_artifacts belong to the current Task "
+    "and are not accepted facts. reference_artifacts are unverified Project workspace "
+    "content. current_goal is desired future state, never historical fact. Use embedded "
+    "project.loop.assets and preloaded content directly; do not reread a manifest path "
+    "unless it is missing, known to have changed, or independent verification is required. "
+    "Loop asset paths are not Project filesystem paths. On a Session resume, use the logical "
+    "checkpoint and directed Handoffs, then fetch only specific missing or changed files."
 )
 
 
@@ -229,8 +232,9 @@ class WorkflowRuntime:
             "task_plan_id": task_plan_row["id"],
             "task_plan_hash": task_plan_row["plan_hash"],
             "column": column_plan,
-            "task": planned_task,
         }
+        if selection.include_current_goal:
+            data["current_goal"] = planned_task
         data["dependencies"] = self.store.task_dependency_context(
             task["project_id"],
             task["id"],
@@ -242,35 +246,41 @@ class WorkflowRuntime:
                 "description": project["description"],
                 "base_dir": project["base_dir"],
             }
+        if selection.include_loop_bindings or selection.include_loop_assets:
             loop_binding = self.store.get_project_loop_binding(task["project_id"])
             if loop_binding:
-                loop_assets = self.store.get_project_loop_assets(task["project_id"])
-                preloaded_loop_assets = [
-                    {
-                        "path": item["path"],
-                        "utf8_characters": len(item["content"]),
-                        "sha256": hashlib.sha256(
-                            item["content"].encode("utf-8")
-                        ).hexdigest(),
-                    }
-                    for item in loop_assets
-                ]
-                data["project"]["loop"] = {
+                loop_context = {
                     "key": loop_binding["loop_key"],
                     "version": loop_binding["loop_version"],
                     "digest": loop_binding["loop_digest"],
-                    "bindings": loop_binding["bindings"],
-                    "assets": loop_assets,
-                    "asset_manifest": preloaded_loop_assets,
                 }
+                if selection.include_loop_bindings:
+                    loop_context["bindings"] = loop_binding["bindings"]
+                if selection.include_loop_assets:
+                    loop_assets = self.store.get_project_loop_assets(task["project_id"])
+                    preloaded_loop_assets = [
+                        {
+                            "path": item["path"],
+                            "utf8_characters": len(item["content"]),
+                            "sha256": hashlib.sha256(
+                                item["content"].encode("utf-8")
+                            ).hexdigest(),
+                        }
+                        for item in loop_assets
+                    ]
+                    loop_context["assets"] = loop_assets
+                    loop_context["asset_manifest"] = preloaded_loop_assets
+                data.setdefault("project", {})["loop"] = loop_context
         if selection.include_task:
             data["task"] = {
                 "id": task["id"],
-                "title": task["title"],
-                "brief": task["brief"],
                 "input": task["input"],
-                "context": task["context"],
             }
+            if selection.include_task_description:
+                data["task"]["title"] = task["title"]
+                data["task"]["brief"] = task["brief"]
+            if selection.include_task_context:
+                data["task"]["context"] = task["context"]
         if selection.upstream_outputs:
             selected = set(selection.upstream_outputs)
             data["upstream_outputs"] = {
@@ -278,12 +288,83 @@ class WorkflowRuntime:
                 for item in self.store.runs(task["project_id"], task["id"])
                 if item["column_key"] in selected and item["status"] == "succeeded"
             }
+        artifact_channels: dict[str, list[dict[str, Any]]] = {
+            "accepted_artifacts": [],
+            "working_artifacts": [],
+            "reference_artifacts": [],
+        }
+        excluded_artifacts: list[dict[str, str]] = []
+        files = ProjectFiles(project["base_dir"], self.policy)
+        seen_paths: set[str] = set()
+        remaining_chars = self.policy.context.artifact_context_max_characters
+        remaining_files = self.policy.context.artifact_context_max_files
+
+        def preload_registered(
+            rows: list[dict[str, Any]],
+            patterns: list[str],
+            channel: str,
+            provenance: str,
+        ) -> None:
+            nonlocal remaining_chars, remaining_files
+            for pattern in patterns:
+                for row in rows:
+                    path = str(row.get("path") or "")
+                    if not path or path in seen_paths or not PurePosixPath(path).match(pattern):
+                        continue
+                    if remaining_chars <= 0 or remaining_files <= 0:
+                        return
+                    try:
+                        measured = files.measure_text(path)
+                        expected_sha256 = str(row.get("sha256") or "")
+                        if expected_sha256 and measured["sha256"] != expected_sha256:
+                            excluded_artifacts.append({
+                                "path": path,
+                                "provenance": provenance,
+                                "reason": "registered_hash_mismatch",
+                            })
+                            continue
+                        content = files.read_text(path)
+                    except (OSError, UnicodeDecodeError, ValueError) as exc:
+                        excluded_artifacts.append({
+                            "path": path,
+                            "provenance": provenance,
+                            "reason": f"unreadable:{type(exc).__name__}",
+                        })
+                        continue
+                    if len(content) > remaining_chars:
+                        excluded_artifacts.append({
+                            "path": path,
+                            "provenance": provenance,
+                            "reason": "context_character_limit",
+                        })
+                        continue
+                    artifact_channels[channel].append({
+                        **measured,
+                        "content": content,
+                        "artifact_id": row.get("id"),
+                        "source_task_id": row.get("task_id"),
+                        "source_run_id": row.get("run_id"),
+                        "provenance": provenance,
+                    })
+                    seen_paths.add(path)
+                    remaining_chars -= len(content)
+                    remaining_files -= 1
+
+        if selection.working_artifact_globs:
+            preload_registered(
+                self.store.current_task_artifacts(task["project_id"], task["id"]),
+                selection.working_artifact_globs,
+                "working_artifacts",
+                "current_task",
+            )
+        if selection.accepted_artifact_globs:
+            preload_registered(
+                self.store.accepted_dependency_artifacts(task["project_id"], task["id"]),
+                selection.accepted_artifact_globs,
+                "accepted_artifacts",
+                "accepted_dependency",
+            )
         if selection.artifact_globs:
-            files = ProjectFiles(project["base_dir"], self.policy)
-            artifacts: list[dict[str, str]] = []
-            seen_paths: set[str] = set()
-            remaining_chars = self.policy.context.artifact_context_max_characters
-            remaining_files = self.policy.context.artifact_context_max_files
             for pattern in selection.artifact_globs:
                 selected = files.existing_texts(
                     pattern,
@@ -292,27 +373,38 @@ class WorkflowRuntime:
                     exclude_paths=seen_paths,
                 )
                 for item in selected:
-                    artifacts.append(item)
+                    artifact_channels["reference_artifacts"].append({
+                        **item,
+                        "provenance": "project_workspace",
+                    })
                     seen_paths.add(item["path"])
                     remaining_chars -= len(item["content"])
                     remaining_files -= 1
                 if remaining_chars <= 0 or remaining_files <= 0:
                     break
-            data["artifacts"] = artifacts
-            preloaded_artifacts = [
-                {
-                    key: item[key]
-                    for key in (
-                        "path",
-                        "size_bytes",
-                        "utf8_characters",
-                        "non_whitespace_characters",
-                        "line_count",
-                        "sha256",
-                    )
-                }
-                for item in artifacts
-            ]
+        for channel, artifacts in artifact_channels.items():
+            if artifacts:
+                data[channel] = artifacts
+        preloaded_artifacts = [
+            {
+                key: item.get(key)
+                for key in (
+                    "path",
+                    "size_bytes",
+                    "utf8_characters",
+                    "non_whitespace_characters",
+                    "line_count",
+                    "sha256",
+                    "artifact_id",
+                    "source_task_id",
+                    "source_run_id",
+                    "provenance",
+                )
+                if item.get(key) is not None
+            }
+            for artifacts in artifact_channels.values()
+            for item in artifacts
+        ]
         if selection.memory:
             data["memory"] = self.store.memory.build_context(
                 project,
@@ -323,7 +415,14 @@ class WorkflowRuntime:
         data["context_manifest"] = {
             "preloaded_project_artifacts": preloaded_artifacts,
             "preloaded_loop_assets": preloaded_loop_assets,
-            "preloaded_content_is_authoritative": True,
+            "artifact_channels": {
+                "accepted_artifacts": "transitive done Task dependency facts",
+                "working_artifacts": "mutable current Task work",
+                "reference_artifacts": "unverified Project workspace reference",
+            },
+            "excluded_artifacts": excluded_artifacts,
+            "accepted_content_is_authoritative": True,
+            "working_and_reference_content_is_authoritative": False,
             "read_preloaded_path_only_when_missing_or_changed": True,
             "write_receipt_contains_text_metrics": True,
             "consumption_contract": _CONTEXT_CONSUMPTION_CONTRACT,
@@ -342,6 +441,9 @@ class WorkflowRuntime:
             project["loop"] = loop
             projected["project"] = project
         projected.pop("artifacts", None)
+        projected.pop("accepted_artifacts", None)
+        projected.pop("working_artifacts", None)
+        projected.pop("reference_artifacts", None)
         manifest = dict(projected.get("context_manifest") or {})
         manifest["projection"] = "session_resume_delta"
         projected["context_manifest"] = manifest

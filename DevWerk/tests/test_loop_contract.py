@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 
 import pytest
 
@@ -83,6 +84,20 @@ def test_filesystem_loops_are_discoverable_and_novel_is_a_directed_graph(store):
     assert ("review", "chapter_rejected", "write") in workcell_transitions
     writer = next(item for item in authoring.participants if item.key == "writer")
     assert writer.lifecycle == "task"
+    recap = workflow.column("recap")
+    assert recap.context.include_current_goal is False
+    assert recap.context.include_task_description is False
+    assert recap.context.include_task_context is False
+    assert recap.context.include_project is False
+    assert recap.context.include_loop_bindings is False
+    assert recap.context.include_loop_assets is True
+    assert recap.context.accepted_artifact_globs == ["chapters/*.md"]
+    assert recap.context.working_artifact_globs == ["baseline/*.md"]
+    assert recap.context.artifact_globs == []
+    assert recap.context.upstream_outputs == []
+    assert recap.executor.capabilities == ["project.files.write", "project.files.measure"]
+    assert "旧提要" in recap.instruction
+    assert "current_goal" in recap.instruction
 
 
 def test_preset_loop_definitions_are_not_stored_in_sqlite(store):
@@ -226,6 +241,82 @@ def test_linear_task_plan_extends_project_graph_without_recreating_predecessor(s
         "status": "done",
         "satisfied": True,
     }]
+
+
+def test_novel_recap_activation_excludes_future_plans_and_unaccepted_files(store, tmp_path):
+    project_dir = tmp_path / "recap-boundary"
+    project = store.create_project(
+        "recap boundary", "future chapter events in project description", str(project_dir)
+    )
+    store.apply_loop(project["id"], "novel.production", NOVEL_BINDINGS)
+    active = store.get_workflow(project["id"])
+    workflow = WorkflowDefinition.model_validate(active["definition"])
+
+    first_plan = store.create_task_plan(
+        project["id"],
+        task_plan(
+            active["id"], workflow, task_ref="chapter_01", title="chapter 1",
+            brief="future plan must not become history", input_data=novel_task_input(1),
+        ),
+    )
+    first = store.materialize_task_plan(
+        project["id"], task_plan_id=first_plan["id"], proposed_task_ref="chapter_01"
+    )
+    chapter_path = project_dir / "chapters" / "01.md"
+    chapter_path.parent.mkdir(parents=True)
+    chapter_path.write_text("Only this event has happened.", encoding="utf-8")
+    chapter_bytes = chapter_path.read_bytes()
+    store.register_artifact(
+        project["id"], first["id"], None, "chapter", "chapters/01.md",
+        hashlib.sha256(chapter_bytes).hexdigest(), len(chapter_bytes),
+    )
+    baseline_path = project_dir / "baseline" / "outline.md"
+    baseline_path.parent.mkdir(parents=True)
+    baseline_path.write_text("A future event planned for chapter nine.", encoding="utf-8")
+    baseline_bytes = baseline_path.read_bytes()
+    store.register_artifact(
+        project["id"], first["id"], None, "baseline", "baseline/outline.md",
+        hashlib.sha256(baseline_bytes).hexdigest(), len(baseline_bytes),
+    )
+    with store.tx(immediate=True) as db:
+        db.execute(
+            "UPDATE v1_tasks SET status='done',current_column='done',finished_at=?,updated_at=? "
+            "WHERE id=?",
+            ("2026-09-01T00:00:00+00:00", "2026-09-01T00:00:00+00:00", first["id"]),
+        )
+
+    second_plan = store.create_task_plan(
+        project["id"],
+        task_plan(
+            active["id"], workflow, task_ref="chapter_02", title="future chapter title",
+            brief="future chapter objective", input_data=novel_task_input(2),
+        ),
+    )
+    second = store.materialize_task_plan(
+        project["id"], task_plan_id=second_plan["id"], proposed_task_ref="chapter_02"
+    )
+    stale_path = project_dir / "chapters" / "09.md"
+    stale_path.write_text("Unaccepted future workspace draft.", encoding="utf-8")
+
+    recap = workflow.column("recap")
+    context = WorkflowRuntime(store, build_core_registry(), "recap-context")._input_for(
+        store.get_task(second["id"]), workflow, recap
+    )
+
+    assert "current_goal" not in context
+    assert set(context["task"]) == {"id", "input"}
+    assert set(context["project"]) == {"loop"}
+    assert "bindings" not in context["project"]["loop"]
+    assert context["project"]["loop"]["assets"]
+    assert [item["path"] for item in context["accepted_artifacts"]] == ["chapters/01.md"]
+    assert "working_artifacts" not in context
+    assert "reference_artifacts" not in context
+    serialized = str(context)
+    assert "future chapter events in project description" not in serialized
+    assert "future chapter objective" not in serialized
+    assert "future plan must not become history" not in serialized
+    assert "chapter nine" not in serialized
+    assert "Unaccepted future workspace draft" not in serialized
 
 
 def test_linear_task_plan_rejects_duplicate_project_work_item(store, tmp_path):

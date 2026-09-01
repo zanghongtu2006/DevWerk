@@ -2826,6 +2826,12 @@ class V1Store:
     def artifacts(self, project_id: str, task_id: str, limit: int | None = None, after: str = "") -> list[dict[str, Any]]:
         return self.artifact_repository.artifacts(project_id, task_id, limit, after)
 
+    def accepted_dependency_artifacts(self, project_id: str, task_id: str) -> list[dict[str, Any]]:
+        return self.artifact_repository.accepted_dependency_artifacts(project_id, task_id)
+
+    def current_task_artifacts(self, project_id: str, task_id: str) -> list[dict[str, Any]]:
+        return self.artifact_repository.current_task_artifacts(project_id, task_id)
+
     def events(self, project_id: str | None = None, task_id: str | None = None, after: int = 0, limit: int | None = None) -> list[dict[str, Any]]:
         return self.event_repository.events(project_id, task_id, after, limit)
 

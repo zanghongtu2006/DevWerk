@@ -121,8 +121,15 @@ column:
     max_tool_calls:
   context:
     include_task: true
+    include_task_description: true
+    include_task_context: true
     include_project: true
+    include_loop_bindings: true
+    include_loop_assets: true
+    include_current_goal: true
     upstream_outputs: []
+    accepted_artifact_globs: []
+    working_artifact_globs: []
     artifact_globs: []
   input_contract:
   output_contract:
@@ -149,6 +156,8 @@ column:
 - Executor 是按 kind 判别的联合：Agent 使用 capabilities/budget；Sequence 使用 steps，并在 completed outcome/outcome reference 中二选一。不同 kind 的字段不能混用。
 
 Instruction 不替代结构化 contract、transition 和 policy。
+
+`accepted_artifact_globs` 只从已到达 `done` 的传递依赖 Task 的 Artifact receipt 中选择内容；`working_artifact_globs` 只选择当前 Task 已登记的可变产物；兼容字段 `artifact_globs` 直接扫描 Project 工作区，其结果进入非可信的 `reference_artifacts`。三者不得合并为一个无来源的文件列表。历史提取、验收、代码审查等阶段应显式选择其事实来源，并可通过 `include_current_goal`、`include_task_description`、`include_task_context`、`include_loop_bindings` 等字段排除会污染判断的未来目标或规划文本。
 
 ### Column Flow
 

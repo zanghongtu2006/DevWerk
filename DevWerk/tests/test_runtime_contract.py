@@ -70,16 +70,100 @@ def test_runtime_artifact_context_is_bounded_and_deduplicated_across_globs(store
         workflow.columns[0],
     )
 
-    paths = [item["path"] for item in context["artifacts"]]
+    paths = [item["path"] for item in context["reference_artifacts"]]
     assert paths == ["a.md", "nested/b.md"]
     assert len(paths) == len(set(paths))
-    assert sum(len(item["content"]) for item in context["artifacts"]) <= (
+    assert sum(len(item["content"]) for item in context["reference_artifacts"]) <= (
         store.policy.context.artifact_context_max_characters
     )
     manifest = context["context_manifest"]
-    assert manifest["preloaded_content_is_authoritative"] is True
+    assert manifest["working_and_reference_content_is_authoritative"] is False
     assert [item["path"] for item in manifest["preloaded_project_artifacts"]] == paths
     assert all(item["sha256"] for item in manifest["preloaded_project_artifacts"])
+
+
+def test_runtime_separates_accepted_working_and_reference_artifact_provenance(store, tmp_path):
+    project = store.create_project("provenance", "future project goal", str(tmp_path / "project"))
+    workflow = sequence_workflow()
+    selection = workflow.columns[0].context
+    selection.include_project = False
+    selection.include_loop_bindings = False
+    selection.include_loop_assets = False
+    selection.include_current_goal = False
+    selection.include_task_description = False
+    selection.include_task_context = False
+    selection.accepted_artifact_globs = ["*.md"]
+    selection.working_artifact_globs = ["*.md"]
+    selection.artifact_globs = ["stale.md"]
+    _plan, revision = publish_planned_workflow(store, project["id"], workflow)
+    base = task_plan(revision["id"], workflow, task_ref="prior", title="prior")
+    current_item = base.tasks[0].model_copy(update={
+        "proposed_task_ref": "current",
+        "title": "future title must stay hidden",
+        "brief": "future event must stay hidden",
+        "dependencies": ["prior"],
+    })
+    concrete = store.create_task_plan(
+        project["id"],
+        base.model_copy(update={"tasks": [base.tasks[0], current_item]}),
+    )
+    prior = store.create_task(
+        project["id"], task_plan_id=concrete["id"], proposed_task_ref="prior"
+    )
+    current = store.create_task(
+        project["id"], task_plan_id=concrete["id"], proposed_task_ref="current"
+    )
+
+    project_dir = tmp_path / "project"
+    prior_path = project_dir / "prior.md"
+    prior_path.write_text("accepted history", encoding="utf-8")
+    prior_bytes = prior_path.read_bytes()
+    store.register_artifact(
+        project["id"], prior["id"], None, "history", "prior.md",
+        hashlib.sha256(prior_bytes).hexdigest(), len(prior_bytes),
+    )
+    tampered_path = project_dir / "tampered.md"
+    tampered_path.write_text("registered history", encoding="utf-8")
+    tampered_bytes = tampered_path.read_bytes()
+    store.register_artifact(
+        project["id"], prior["id"], None, "history", "tampered.md",
+        hashlib.sha256(tampered_bytes).hexdigest(), len(tampered_bytes),
+    )
+    WorkflowRuntime(store, build_core_registry(store.policy), "prior-worker").step(prior["id"])
+    assert current["id"] in store.runnable_task_ids()
+    tampered_path.write_text("changed outside accepted execution", encoding="utf-8")
+
+    draft_path = project_dir / "draft.md"
+    draft_path.write_text("current mutable draft", encoding="utf-8")
+    draft_bytes = draft_path.read_bytes()
+    store.register_artifact(
+        project["id"], current["id"], None, "draft", "draft.md",
+        hashlib.sha256(draft_bytes).hexdigest(), len(draft_bytes),
+    )
+    (project_dir / "stale.md").write_text("unverified workspace file", encoding="utf-8")
+
+    context = WorkflowRuntime(store, build_core_registry(), "context-worker")._input_for(
+        store.get_task(current["id"]), workflow, workflow.columns[0]
+    )
+
+    assert store.task_dependency_context(project["id"], current["id"])[0]["status"] == "done"
+    assert {
+        item["path"]
+        for item in store.accepted_dependency_artifacts(project["id"], current["id"])
+    } >= {"prior.md", "tampered.md"}
+    assert [item["path"] for item in context["accepted_artifacts"]] == ["prior.md"]
+    assert context["accepted_artifacts"][0]["provenance"] == "accepted_dependency"
+    assert [item["path"] for item in context["working_artifacts"]] == ["draft.md"]
+    assert context["working_artifacts"][0]["provenance"] == "current_task"
+    assert [item["path"] for item in context["reference_artifacts"]] == ["stale.md"]
+    assert "current_goal" not in context
+    assert "project" not in context
+    assert set(context["task"]) == {"id", "input"}
+    assert context["task"]["input"] == {}
+    assert {
+        (item["path"], item["reason"])
+        for item in context["context_manifest"]["excluded_artifacts"]
+    } == {("tampered.md", "registered_hash_mismatch")}
 
 
 def test_each_completed_column_makes_the_next_column_runnable(store, tmp_path):

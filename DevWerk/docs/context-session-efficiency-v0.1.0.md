@@ -12,22 +12,28 @@ Full conversation, Agent, tool, event, and Artifact evidence remains durable and
 
 ## 2. Active Context Projection
 
-An Agent receives the smallest authoritative projection needed for its current activation:
+An Agent receives the smallest provenance-aware projection needed for its current activation:
 
 1. immutable runtime and Loop definition;
 2. current Project bindings and Task input;
 3. declared upstream outputs;
-4. Loop-selected preloaded Artifacts and Memory records;
+4. Loop-selected accepted, working, and reference Artifacts plus Memory records;
 5. the current Workcell node and subscribed Handoffs;
 6. a compact logical Session checkpoint when the participant is reactivated.
 
-Preloaded text carries path, content hash, character count, and content. The context manifest explicitly identifies it as authoritative for the frozen activation. An Agent does not list or read the same path again unless it is missing, was modified after the snapshot, or an independent post-write verification is required.
+Preloaded text carries path, content hash, character count, source Task/Run where available, and content. Runtime does not treat every file found on disk as a fact. It projects three distinct channels:
 
-The consumption rule is part of the Runtime protocol, not an optional hint. A preloaded Loop asset is read from `project.loop.assets`; it is not a Project filesystem path. A preloaded Project Artifact is read from the activation projection. File capabilities are reserved for paths absent from the projection, paths known to have changed, or explicit independent verification.
+- `accepted_artifacts`: registered files owned by transitive Task dependencies that reached `done`; these are accepted facts for the activation;
+- `working_artifacts`: registered files owned by the current Task; these are mutable work and may still be rejected;
+- `reference_artifacts`: text selected directly from the Project workspace; these are unverified references and never become accepted merely because a glob matched them.
+
+Registered content is injected only when its current filesystem hash still matches the Artifact receipt. A mismatch is recorded in `context_manifest.excluded_artifacts` instead of silently passing changed content as accepted evidence.
+
+The consumption rule is part of the Runtime protocol, not an optional hint. A preloaded Loop asset is read from `project.loop.assets`; it is not a Project filesystem path. A preloaded Project Artifact is read from its named provenance channel. File capabilities are reserved for paths absent from the projection, paths known to have changed, or explicit independent verification.
 
 Workcell context is projected again before every participant activation so that newly written Artifacts and their hashes are visible to the next participant. Runtime does not reuse the stale Column-entry projection for the entire Workcell.
 
-Loops continue to choose Artifact globs and Memory selectors. Runtime does not choose files based on a domain, Column name, or prompt text.
+Loops choose `accepted_artifact_globs`, `working_artifact_globs`, optional unverified `artifact_globs`, Memory selectors, and whether Project metadata, Loop bindings/assets, current Task description/context, or the planned current goal is visible. Runtime does not choose files based on a domain, Column name, or prompt text.
 
 ## 3. Capability Receipts
 
@@ -81,7 +87,7 @@ The Runtime records which Memory records and preloaded Artifacts entered each ac
 ## 7. Acceptance Invariants
 
 1. Text write receipts make redundant measure calls unnecessary.
-2. Preloaded Artifact manifests are hash-addressed and visible to every executor kind.
+2. Preloaded Artifact manifests are hash-addressed, provenance-labelled, and visible to every executor kind.
 3. Conversation replay preserves human dialogue and excludes raw tool traces.
 4. Participant reactivation receives a non-empty compact checkpoint for tool-based completion.
 5. Active participant history is bounded by semantic role rather than an arbitrary turn count.
@@ -94,3 +100,5 @@ The Runtime records which Memory records and preloaded Artifacts entered each ac
 12. Conversation identity, instruction, platform policy, and capability schemas form a stable Session prefix; current Project state is supplied as the authoritative Turn input.
 13. An unsupported Conversation mutation claim may continue only after a new successful state-changing tool receipt. Repeated prose or read-only calls at the same execution progress fail explicitly without an arbitrary retry count.
 14. The first unsupported mutation claim changes the next Provider request to a required-tool continuation and exposes only the claimed capabilities. Ordinary discussion remains tool-optional. A Provider that ignores the required tool choice, or repeats the same failed operation without materially different arguments, terminates with an explicit protocol failure and a human-readable Conversation reply.
+15. Only artifacts from transitive `done` dependencies may enter `accepted_artifacts`; current Task output and arbitrary workspace files remain separate channels.
+16. A Loop may hide the planned current goal, Task prose, Project metadata, or Loop bindings from a history-extraction stage while retaining the exact Task input and fixed Loop method assets.

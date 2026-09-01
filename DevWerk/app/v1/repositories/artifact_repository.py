@@ -26,3 +26,45 @@ class ArtifactRepository:
         with self.store.connect() as db:
             rows = db.execute("SELECT * FROM v1_artifacts WHERE project_id=? AND task_id=? AND created_at>? ORDER BY created_at LIMIT ?", (project_id, task_id, after, min(max(limit, 1), self.store.policy.service_limits.max_page_size))).fetchall()
         return [self.store._decode(dict(row), "meta_json") for row in rows]  # type: ignore[misc]
+
+    def accepted_dependency_artifacts(
+        self,
+        project_id: str,
+        task_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return current artifact records owned by transitive done dependencies."""
+        with self.store.connect() as db:
+            rows = db.execute(
+                "WITH RECURSIVE dependency_tasks(task_id) AS ("
+                " SELECT depends_on_task_id FROM v1_task_dependencies "
+                " WHERE project_id=? AND task_id=? "
+                " UNION "
+                " SELECT dependency.depends_on_task_id FROM v1_task_dependencies dependency "
+                " JOIN dependency_tasks parent ON dependency.task_id=parent.task_id "
+                " WHERE dependency.project_id=?"
+                ") "
+                "SELECT artifact.* FROM dependency_tasks dependency "
+                "JOIN v1_tasks task ON task.id=dependency.task_id AND task.project_id=? "
+                "JOIN v1_artifacts artifact ON artifact.task_id=task.id AND artifact.project_id=task.project_id "
+                "WHERE task.status='done' ORDER BY artifact.path",
+                (project_id, task_id, project_id, project_id),
+            ).fetchall()
+        return [
+            self.store._decode(dict(row), "meta_json")
+            for row in rows
+        ]  # type: ignore[misc]
+
+    def current_task_artifacts(
+        self,
+        project_id: str,
+        task_id: str,
+    ) -> list[dict[str, Any]]:
+        with self.store.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM v1_artifacts WHERE project_id=? AND task_id=? ORDER BY path",
+                (project_id, task_id),
+            ).fetchall()
+        return [
+            self.store._decode(dict(row), "meta_json")
+            for row in rows
+        ]  # type: ignore[misc]

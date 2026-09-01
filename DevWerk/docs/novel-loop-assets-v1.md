@@ -28,6 +28,12 @@ The baseline lives under `baseline/`. It must not prescribe a current chapter's 
 
 Each chapter Task owns its chapter number and artifact paths. The recap, current objective, scene choices, emotional movement, permitted characters, clues, draft, and review feedback remain chapter-local. Rework follows the Workflow graph and preserves the Writer session and Reviewer feedback.
 
+## Historical truth boundary
+
+The recap Column is deliberately narrower than the Writer and Reviewer contexts. For chapter one it receives the baseline written by the same Task as `working_artifacts`. For later chapters it receives only chapter bodies registered by transitive `done` dependencies as `accepted_artifacts`. It does not receive the planned current goal, Task title/brief, Project premise bindings, long-arc plans, old recaps, or arbitrary workspace files. Therefore a future chapter plan cannot be restated as past history merely because it exists somewhere in the Project.
+
+Writer and Reviewer activations receive accepted prior bodies and stable baseline separately from the current Task's mutable recap, draft, and review. The distinction is supplied by the generic Runtime; the file patterns and creative meaning remain owned by this Loop.
+
 ## Scheduling meaning
 
 `TaskPlanReadiness.queue` means planned automatic waiting. A Task is admitted immediately when dependencies are already satisfied, or receives `auto_admit` while dependencies remain. A deliberate human or operational stop uses the existing explicit `hold` scheduling state.
@@ -45,4 +51,6 @@ Starting a Task Plan materializes its complete Task graph exactly once. The requ
 - Loop method assets are read-only runtime context.
 - Project baseline is chapter-independent.
 - Chapter decisions and feedback remain Task-owned.
+- Historical recap facts come only from accepted predecessor bodies (or the first Task's working baseline).
+- Future goals and unverified workspace files are excluded from the recap activation.
 - Dependency/WIP queueing progresses without Conversation Agent intervention.
