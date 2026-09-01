@@ -14,6 +14,7 @@ def complete(
     task_id: str | None = None,
     agent: str = "project",
     require_tool: bool = False,
+    required_tool_name: str | None = None,
 ) -> AgentModelResponse:
     client = get_llm_client(agent)
     result = client.complete(
@@ -22,5 +23,6 @@ def complete(
         project_id=project_id,
         task_id=task_id,
         require_tool=require_tool,
+        required_tool_name=required_tool_name,
     )
     return AgentModelResponse.model_validate(result)

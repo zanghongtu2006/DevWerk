@@ -20,6 +20,7 @@
       "entry_meaning": "需求已经过充分用户沟通并明确确认。",
       "terminal_meaning": "done 表示交付验收；failed 表示明确执行失败，可 reopen 原 Task。",
       "task_contract": {
+        "identity_pointer": "/requirements_path",
         "input_schema": {
           "type": "object",
           "required": ["requirements_path", "requirements_confirmed"],

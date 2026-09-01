@@ -166,6 +166,93 @@ def test_novel_task_plan_requires_and_materializes_strict_chapter_dependencies(s
     assert tasks["chapter_02"]["status"] == "pending"
 
 
+def test_linear_task_plan_extends_project_graph_without_recreating_predecessor(store, tmp_path):
+    project = store.create_project("incremental novel", "", str(tmp_path / "incremental-novel"))
+    store.apply_loop(project["id"], "novel.production", NOVEL_BINDINGS)
+    active = store.get_workflow(project["id"])
+    workflow = WorkflowDefinition.model_validate(active["definition"])
+
+    first_plan = store.create_task_plan(
+        project["id"],
+        task_plan(
+            active["id"],
+            workflow,
+            task_ref="chapter_01",
+            title="chapter 1",
+            input_data=novel_task_input(1),
+        ),
+    )
+    first = store.materialize_task_plan(
+        project["id"],
+        task_plan_id=first_plan["id"],
+        proposed_task_ref="chapter_01",
+    )
+    with store.tx(immediate=True) as db:
+        db.execute(
+            "UPDATE v1_tasks SET status='done',current_column='done',finished_at=?,updated_at=? "
+            "WHERE id=?",
+            ("2026-09-01T00:00:00+00:00", "2026-09-01T00:00:00+00:00", first["id"]),
+        )
+
+    second_plan = store.create_task_plan(
+        project["id"],
+        task_plan(
+            active["id"],
+            workflow,
+            task_ref="chapter_02",
+            title="chapter 2",
+            input_data=novel_task_input(2),
+        ),
+    )
+    second = store.materialize_task_plan(
+        project["id"],
+        task_plan_id=second_plan["id"],
+        proposed_task_ref="chapter_02",
+    )
+
+    tasks = store.list_tasks(project["id"])
+    assert len(tasks) == 2
+    assert {item["logical_task_key"] for item in tasks} == {
+        "/chapter_number=1",
+        "/chapter_number=2",
+    }
+    scheduling = store.task_scheduling(project["id"], second["id"])
+    assert scheduling["state"] == "admitted"
+    assert scheduling["dependencies"] == [{
+        "reference": first["id"],
+        "task_ref": "chapter_01",
+        "resolved_task_id": first["id"],
+        "required_terminal": "done",
+        "status": "done",
+        "satisfied": True,
+    }]
+
+
+def test_linear_task_plan_rejects_duplicate_project_work_item(store, tmp_path):
+    project = store.create_project("identity guard", "", str(tmp_path / "identity-guard"))
+    store.apply_loop(project["id"], "novel.production", NOVEL_BINDINGS)
+    active = store.get_workflow(project["id"])
+    workflow = WorkflowDefinition.model_validate(active["definition"])
+    first = task_plan(
+        active["id"],
+        workflow,
+        task_ref="chapter_01",
+        title="chapter 1",
+        input_data=novel_task_input(1),
+    )
+    planned = store.create_task_plan(project["id"], first)
+    store.materialize_task_plan(
+        project["id"],
+        task_plan_id=planned["id"],
+        proposed_task_ref="chapter_01",
+    )
+
+    duplicate = first.model_copy(deep=True)
+    duplicate.objective = "Try to duplicate the same logical work item"
+    with pytest.raises(ValueError, match="continue the Project Task graph from 2"):
+        store.create_task_plan(project["id"], duplicate)
+
+
 def test_loop_rejects_duplicate_project_and_task_parameter_ownership(store, monkeypatch):
     invalid = copy.deepcopy(store.loops.get("novel.production"))
     task_schema = invalid["bundle"]["workflow_plan"]["task_contract"]["input_schema"]

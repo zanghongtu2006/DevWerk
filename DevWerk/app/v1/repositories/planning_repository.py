@@ -8,6 +8,7 @@ from app.v1.contracts import canonicalize_contract_value, validate_contract
 from app.v1.domain import LinearTaskDependencyContract, TaskPlan, WorkflowPlan
 from app.v1.repositories.base import StoreHost
 from app.v1.storage_support import new_id, utcnow
+from app.v1.task_identity import resolve_input_pointer
 
 
 class PlanningRepository:
@@ -87,43 +88,54 @@ class PlanningRepository:
                 method.task_contract.input_schema,
                 label=f"Task Plan {item.proposed_task_ref} input",
             )
-        _validate_task_dependency_contract(plan, method.task_contract.dependency_contract)
         payload = plan.model_dump_json()
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-        now = utcnow()
-        with self.store.tx(immediate=True) as db:
+        with self.store.connect() as db:
             existing = db.execute(
                 "SELECT id FROM v1_task_plans WHERE project_id=? AND plan_hash=?",
                 (project_id, digest),
             ).fetchone()
-            plan_id = str(existing[0]) if existing else new_id("tplan")
-            if not existing:
-                db.execute(
-                    "INSERT INTO v1_task_plans(id,project_id,workflow_revision_id,schema_version,objective,plan_json,plan_hash,created_at) "
-                    "VALUES(?,?,?,?,?,?,?,?)",
-                    (
-                        plan_id,
-                        project_id,
-                        plan.workflow_revision_id,
-                        plan.schema_version,
-                        plan.objective,
-                        payload,
-                        digest,
-                        now,
-                    ),
-                )
-                self.store._event(
-                    db,
+        if existing:
+            return self.get_task_plan(project_id, str(existing[0]))
+        existing_order_values = _existing_linear_order_values(
+            self.store,
+            project_id,
+            method.task_contract.dependency_contract,
+        )
+        _validate_task_dependency_contract(
+            plan,
+            method.task_contract.dependency_contract,
+            existing_order_values=existing_order_values,
+        )
+        now = utcnow()
+        with self.store.tx(immediate=True) as db:
+            plan_id = new_id("tplan")
+            db.execute(
+                "INSERT INTO v1_task_plans(id,project_id,workflow_revision_id,schema_version,objective,plan_json,plan_hash,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    plan_id,
                     project_id,
-                    None,
-                    None,
-                    "task.plan_created",
-                    {
-                        "task_plan_id": plan_id,
-                        "workflow_revision_id": plan.workflow_revision_id,
-                        "task_refs": [item.proposed_task_ref for item in plan.tasks],
-                    },
-                )
+                    plan.workflow_revision_id,
+                    plan.schema_version,
+                    plan.objective,
+                    payload,
+                    digest,
+                    now,
+                ),
+            )
+            self.store._event(
+                db,
+                project_id,
+                None,
+                None,
+                "task.plan_created",
+                {
+                    "task_plan_id": plan_id,
+                    "workflow_revision_id": plan.workflow_revision_id,
+                    "task_refs": [item.proposed_task_ref for item in plan.tasks],
+                },
+            )
         return self.get_task_plan(project_id, plan_id)
 
     def get_task_plan(self, project_id: str, plan_id: str) -> dict[str, Any]:
@@ -154,20 +166,20 @@ class PlanningRepository:
 def _validate_task_dependency_contract(
     plan: TaskPlan,
     contract: LinearTaskDependencyContract | None,
+    *,
+    existing_order_values: set[int] | None = None,
 ) -> None:
     if contract is None:
         return
     ordered: list[tuple[int, str, set[str]]] = []
     for task in plan.tasks:
-        value: Any = task.input
-        for raw_token in contract.order_pointer[1:].split("/"):
-            token = raw_token.replace("~1", "/").replace("~0", "~")
-            if not isinstance(value, dict) or token not in value:
-                raise ValueError(
-                    f"task {task.proposed_task_ref!r} cannot resolve dependency order "
-                    f"pointer {contract.order_pointer!r}"
-                )
-            value = value[token]
+        try:
+            value: Any = resolve_input_pointer(task.input, contract.order_pointer)
+        except ValueError as exc:
+            raise ValueError(
+                f"task {task.proposed_task_ref!r} cannot resolve dependency order "
+                f"pointer {contract.order_pointer!r}"
+            ) from exc
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(
                 f"task {task.proposed_task_ref!r} dependency order value must be an integer"
@@ -175,11 +187,17 @@ def _validate_task_dependency_contract(
         ordered.append((value, task.proposed_task_ref, set(task.dependencies)))
     ordered.sort(key=lambda item: item[0])
     values = [item[0] for item in ordered]
-    expected_values = list(range(contract.first_value, contract.first_value + len(ordered)))
+    next_value = contract.first_value
+    for existing_value in sorted(existing_order_values or set()):
+        if existing_value == next_value:
+            next_value += 1
+        elif existing_value > next_value:
+            break
+    expected_values = list(range(next_value, next_value + len(ordered)))
     if values != expected_values:
         raise ValueError(
-            "linear Task dependency order must be contiguous from "
-            f"{contract.first_value}: expected {expected_values}, got {values}"
+            "linear Task dependency order must continue the Project Task graph from "
+            f"{next_value}: expected {expected_values}, got {values}"
         )
     for index, (_, task_ref, actual_dependencies) in enumerate(ordered):
         expected_dependencies = set() if index == 0 else {ordered[index - 1][1]}
@@ -188,3 +206,27 @@ def _validate_task_dependency_contract(
                 f"task {task_ref!r} must depend exactly on its linear predecessor: "
                 f"expected {sorted(expected_dependencies)}, got {sorted(actual_dependencies)}"
             )
+
+
+def _existing_linear_order_values(
+    store: StoreHost,
+    project_id: str,
+    contract: LinearTaskDependencyContract | None,
+) -> set[int]:
+    if contract is None:
+        return set()
+    with store.connect() as db:
+        rows = db.execute(
+            "SELECT input_json FROM v1_tasks WHERE project_id=?",
+            (project_id,),
+        ).fetchall()
+    values: set[int] = set()
+    for row in rows:
+        try:
+            input_data = json.loads(row[0] or "{}")
+            value = resolve_input_pointer(input_data, contract.order_pointer)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(value, int) and not isinstance(value, bool):
+            values.add(value)
+    return values

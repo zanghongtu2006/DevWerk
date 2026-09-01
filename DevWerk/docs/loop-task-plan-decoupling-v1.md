@@ -34,7 +34,7 @@ Workflow Revision 是不可变的可执行 Column 有向图。它引用同一次
 
 ### Task Plan
 
-Task Plan 是针对当前用户目标形成的不可变工作组合，包含：
+Task Plan 是针对当前用户目标形成的不可变工作组合，也可以是对 Project 既有 Task Graph 的增量扩展，包含：
 
 - 绑定的 `workflow_revision_id`；
 - 具体 Task 标识、标题、输入和 readiness；
@@ -45,7 +45,9 @@ Task Plan 是针对当前用户目标形成的不可变工作组合，包含：
 
 ### Task
 
-Task 通过 `task_plan_id + task_ref` 从 Task Plan 中实例化。标题、输入、依赖、冲突域和 readiness 以 Task Plan 为唯一来源，避免 Provider 在 `task.create` 时重复抄写和漂移。
+Task 通过 `task_plan_id + task_ref` 从 Task Plan 中实例化。标题、输入、依赖、冲突域和 readiness 以 Task Plan 为唯一来源，避免 Provider 在 `task.create` 时重复抄写和漂移。Workflow Plan 的 Task Contract 可声明 `identity_pointer`；线性契约默认使用 `order_pointer`。Runtime 从 Task input 派生 Project 级 `logical_task_key`，用于跨 Plan 识别同一工作单元。
+
+增量线性 Task Plan 只声明尚未物化的连续工作单元。其首项不伪造同 Plan 前驱；Repository 根据稳定逻辑身份找到 Project 中的紧邻前驱 Task ID，并把依赖直接写入 Scheduling Entry。相同逻辑工作单元不能通过新 Plan 静默复制；重做必须显式使用 rerun/reopen。
 
 ## 生命周期
 
@@ -70,8 +72,9 @@ Task 通过 `task_plan_id + task_ref` 从 Task Plan 中实例化。标题、输�
 - Workflow Column 必须与 Workflow Plan 的阶段声明一致。
 - Loop 参数声明 Project Workflow 的稳定绑定；Task Contract 只声明每个工作单元变化的输入，两者不得拥有同名字段。
 - Task Plan 必须引用同项目存在的 Workflow Revision。
-- Task Plan 的依赖必须是无环图，且只能引用同一计划内的 Task。
-- Task Plan 必须满足 Workflow Plan Task Contract 声明的依赖形状；线性依赖契约要求序号连续，首个 Task 无前驱，其余 Task 只依赖紧邻前驱。
+- Task Plan 显式依赖必须是无环图，且只能引用同一计划内的 Task；增量 Plan 的 Project 级前驱由 Repository 根据 Task Contract 身份确定，不能由 Provider伪造。
+- Task Plan 必须满足 Workflow Plan Task Contract 声明的依赖形状；线性依赖契约要求相对 Project 已有连续序列继续递增，增量首项由 Repository 连接 Project 紧邻前驱，其余 Task 只依赖同 Plan 紧邻前驱。
+- `logical_task_key` 在 Project 内表示稳定工作身份；重复创建被拒绝，只有显式 rerun/reopen 可以产生同一逻辑 Task 的后继执行。
 - 每个 Task 输入必须满足 Workflow Plan 的 Task Contract。
 - Task 的 Agent 使用约束和精确输入绑定必须与固定 Workflow Revision 兼容。
 - `loop.apply` 和 `task_plan.save` 分别形成独立、明确的持久化边界。

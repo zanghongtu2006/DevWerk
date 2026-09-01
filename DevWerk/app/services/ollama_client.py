@@ -29,7 +29,7 @@ class OllamaClient:
         self.session = http_requests.Session()
         self.session.trust_env = bool(config.get("trust_env_proxy", False))
 
-    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, *, trace_id: str | None = None, require_tool: bool = False) -> dict[str, Any]:
+    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, *, trace_id: str | None = None, require_tool: bool = False, required_tool_name: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
             "stream": False,

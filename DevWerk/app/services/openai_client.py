@@ -36,14 +36,24 @@ class OpenAIClient:
         if not self.api_key:
             raise ValueError(f"api_key is not set for LLM provider {self.api_name!r}.")
 
-    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, *, trace_id: str | None = None, require_tool: bool = False) -> dict[str, Any]:
+    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, *, trace_id: str | None = None, require_tool: bool = False, required_tool_name: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
         }
         if tools:
-            payload.update({"tools": tools, "tool_choice": "required" if require_tool else "auto"})
+            tool_choice: Any = "required" if require_tool else "auto"
+            if required_tool_name:
+                if required_tool_name not in {
+                    str(item.get("function", {}).get("name") or "") for item in tools
+                }:
+                    raise ValueError(f"required tool is not exposed: {required_tool_name}")
+                tool_choice = {
+                    "type": "function",
+                    "function": {"name": required_tool_name},
+                }
+            payload.update({"tools": tools, "tool_choice": tool_choice})
         if self.top_p is not None:
             payload["top_p"] = float(self.top_p)
         trace_json(

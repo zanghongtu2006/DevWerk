@@ -23,6 +23,7 @@
       "entry_meaning": "章节依赖已经满足，可以验证或建立冻结创作基线。",
       "terminal_meaning": "done 表示该章及所需项目级文件已验收；failed 仅表示明确的执行失败，可由 Conversation Agent 对原 Task reopen。",
       "task_contract": {
+        "identity_pointer": "/chapter_number",
         "input_schema": {
           "type": "object",
           "required": ["chapter_number", "summary_path", "body_path", "review_path"],

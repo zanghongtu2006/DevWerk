@@ -37,7 +37,7 @@ class AnthropicClient:
         if not self.api_key:
             raise ValueError(f"api_key is not set for LLM provider {self.api_name!r}.")
 
-    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, *, trace_id: str | None = None, require_tool: bool = False) -> dict[str, Any]:
+    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, *, trace_id: str | None = None, require_tool: bool = False, required_tool_name: str | None = None) -> dict[str, Any]:
         system, provider_messages = self._to_provider_messages(messages)
         payload: dict[str, Any] = {
             "model": self.model,
@@ -59,7 +59,11 @@ class AnthropicClient:
                 }
                 for item in tools
             ]
-            if require_tool:
+            if required_tool_name:
+                if required_tool_name not in {item["name"] for item in payload["tools"]}:
+                    raise ValueError(f"required tool is not exposed: {required_tool_name}")
+                payload["tool_choice"] = {"type": "tool", "name": required_tool_name}
+            elif require_tool:
                 payload["tool_choice"] = {"type": "any"}
         headers = {
             "x-api-key": str(self.api_key),

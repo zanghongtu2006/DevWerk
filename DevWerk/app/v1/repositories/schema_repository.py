@@ -113,6 +113,7 @@ class SchemaRepository:
                 CREATE TABLE IF NOT EXISTS v1_tasks (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL, workflow_revision_id TEXT NOT NULL,
                     task_plan_id TEXT NOT NULL, proposed_task_ref TEXT NOT NULL,
+                    logical_task_key TEXT,
                     title TEXT NOT NULL, brief TEXT NOT NULL, input_json TEXT NOT NULL DEFAULT '{}',
                     context_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL,
                     control_state TEXT NOT NULL DEFAULT 'active',
@@ -390,7 +391,13 @@ class SchemaRepository:
             self._ensure_column(db, "v1_tasks", "resolved_by_task_id", "TEXT")
             self._ensure_column(db, "v1_tasks", "task_plan_id", "TEXT")
             self._ensure_column(db, "v1_tasks", "proposed_task_ref", "TEXT")
+            self._ensure_column(db, "v1_tasks", "logical_task_key", "TEXT")
             self._ensure_column(db, "v1_tasks", "conflict_domains_json", "TEXT NOT NULL DEFAULT '[]'")
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_v1_tasks_logical_identity "
+                "ON v1_tasks(project_id,logical_task_key,created_at DESC) "
+                "WHERE logical_task_key IS NOT NULL"
+            )
             self._ensure_column(db, "v1_scheduling_entries", "auto_admit", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(db, "v1_task_dependencies", "required_terminal", "TEXT NOT NULL DEFAULT 'done'")
             self._ensure_column(db, "v1_column_runs", "error_category", "TEXT")

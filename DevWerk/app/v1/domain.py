@@ -808,6 +808,15 @@ class LinearTaskDependencyContract(BaseModel):
 class TaskContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
     input_schema: dict[str, Any] = Field(default_factory=dict)
+    identity_pointer: str | None = Field(
+        default=None,
+        pattern=r"^/.*",
+        max_length=2_000,
+        description=(
+            "Optional Task-input JSON pointer that defines stable Project-level work-item "
+            "identity across immutable Task Plans. Linear contracts default to order_pointer."
+        ),
+    )
     dependency_contract: LinearTaskDependencyContract | None = None
     required_context: list[str] = Field(default_factory=list, max_length=200)
     expected_outputs: list[str] = Field(min_length=1, max_length=200)

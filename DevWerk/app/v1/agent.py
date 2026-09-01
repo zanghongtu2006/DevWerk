@@ -8,7 +8,7 @@ from typing import Any, Callable, Literal
 
 from app.core.debug_trace import trace_json
 from app.v1.capabilities import CapabilityContext, CapabilityRegistry, tool_result_json
-from app.v1.agent_protocol import ConversationTurnProtocol
+from app.v1.agent_protocol import ConversationProtocolStalled, ConversationTurnProtocol
 from app.v1.contracts import validate_contract
 from app.v1.domain import AgentModelResponse, ToolResult
 from app.v1.llm import complete as provider_complete
@@ -143,6 +143,14 @@ class AgentCore:
             if isinstance(spec.context, dict)
             else None
         )
+        requested_mutations = (
+            _requested_mutation_capabilities(
+                str(current_request.get("content") or ""),
+                effect_kinds,
+            )
+            if spec.kind == "conversation" and isinstance(current_request, dict)
+            else []
+        )
         if spec.agent_session_id:
             if spec.kind == "conversation":
                 history = _replayable_session_messages(
@@ -199,6 +207,17 @@ class AgentCore:
                     "new inspection or state change."
                 ),
             }
+            if requested_mutations:
+                turn_payload["execution_obligation"] = {
+                    "required_successful_receipts": requested_mutations,
+                    "text_cannot_complete_turn": True,
+                    "instruction": (
+                        "This request explicitly requires a Project state change. "
+                        "Call the available inspection or prerequisite tools as needed, then continue "
+                        "until every required successful receipt exists. Do not answer with a plan, "
+                        "promise, explanation, or future action before those receipts exist."
+                    ),
+                }
             if messages and messages[-1].get("role") == "user":
                 prior = messages.pop()
                 turn_payload["unanswered_prior_user_message"] = str(
@@ -221,12 +240,23 @@ class AgentCore:
         seen_tool_call_ids: set[str] = set()
         latest_text = ""
         current_iteration = 0
-        conversation_protocol = ConversationTurnProtocol()
+        conversation_protocol = ConversationTurnProtocol(
+            required_capabilities=tuple(requested_mutations)
+        )
         try:
             iteration = 0
             while True:
                 iteration += 1
                 current_iteration = iteration
+                model_tools = (
+                    conversation_protocol.select_tools(tools)
+                    if spec.kind == "conversation"
+                    else tools
+                )
+                require_tool = (
+                    spec.kind == "conversation"
+                    and conversation_protocol.requires_tool
+                )
                 if spec.kind == "conversation":
                     self.store.record_conversation_progress(
                         run["id"],
@@ -246,15 +276,18 @@ class AgentCore:
                     agent_kind=spec.kind,
                     iteration=iteration,
                     messages=messages,
-                    tools=tools,
+                    tools=model_tools,
+                    require_tool=require_tool,
+                    required_tool_name=conversation_protocol.forced_tool_name,
                 )
                 response = self.model_complete(
                     messages,
-                    tools,
+                    model_tools,
                     project_id=spec.project["id"],
                     task_id=spec.task_id,
                     agent="conversation" if spec.kind == "conversation" else "column",
-                    require_tool=False,
+                    require_tool=require_tool,
+                    required_tool_name=conversation_protocol.forced_tool_name,
                 )
                 trace_json(
                     trace_log,
@@ -271,6 +304,23 @@ class AgentCore:
                 )
                 if not isinstance(response, AgentModelResponse):
                     response = AgentModelResponse.model_validate(response)
+                forced_selection: str | None = None
+                if spec.kind == "conversation" and require_tool:
+                    if response.tool_calls:
+                        conversation_protocol.validate_forced_response(
+                            [call.name for call in response.tool_calls]
+                        )
+                    else:
+                        proposed = _unsupported_mutation_claims(
+                            response.text,
+                            effect_kinds,
+                            logical_ledger,
+                        )
+                        forced_selection = conversation_protocol.select_forced_tool(
+                            proposed
+                        )
+                        if forced_selection is None:
+                            conversation_protocol.validate_forced_response([])
                 if response.text.strip():
                     latest_text = response.text.strip()
                 for index, call in enumerate(response.tool_calls):
@@ -294,10 +344,33 @@ class AgentCore:
                     progress_details={"iteration": iteration},
                 )
 
+                if forced_selection is not None:
+                    correction_message = {
+                        "role": "user",
+                        "content": _stable_json({
+                            "execution_correction": "call_selected_capability_now",
+                            "selected_capability": forced_selection,
+                            "instruction": (
+                                "Your preceding text selected this capability but did not call it. "
+                                "The next Provider request forces that exact tool. Supply its arguments now."
+                            ),
+                        }),
+                    }
+                    messages.append(correction_message)
+                    self.store.add_agent_message(
+                        run["id"],
+                        "user",
+                        correction_message["content"],
+                        [],
+                        emit_progress=False,
+                    )
+                    continue
+
                 if response.tool_calls:
                     calls_used += len(response.tool_calls)
                     completion: dict[str, Any] | None = None
                     wait_request: dict[str, Any] | None = None
+                    ledger_start = len(logical_ledger)
                     completion_protocol_error = (
                         _column_completion_protocol_error(
                             response.tool_calls,
@@ -367,6 +440,18 @@ class AgentCore:
                                     ),
                                 },
                                 checkpoint={"failure_disposition": "rejected_before_effect"},
+                            )
+                        elif (
+                            spec.kind == "conversation"
+                            and _repeats_failed_operation(
+                                call.name,
+                                call.arguments,
+                                logical_ledger,
+                            )
+                        ):
+                            raise ConversationProtocolStalled(
+                                "Conversation Agent repeated an identical failed tool operation "
+                                f"without changing its arguments: {call.name}"
                             )
                         else:
                             result = self.registry.dispatch(call.name, call.arguments, replace(capability_context, execution_key=f"{run['id']}:{call.id}"))
@@ -444,6 +529,10 @@ class AgentCore:
                         )
                         if wait_request is not None:
                             break
+                    if spec.kind == "conversation":
+                        conversation_protocol.observe_results(
+                            logical_ledger[ledger_start:]
+                        )
                     if completion is not None:
                         completed_text = _stable_json({
                             "outcome": completion.get("outcome"),
@@ -575,7 +664,10 @@ class AgentCore:
             "turn_protocol": {
                 "state": "authoritative Project state is supplied in the current user Turn",
                 "execution": "state changes exist only after successful tool receipts",
-                "completion": "a tool-free assistant response completes the current Turn",
+                "completion": (
+                    "a tool-free assistant response completes the current Turn only when the "
+                    "authoritative current request has no execution_obligation"
+                ),
             },
         }
 
@@ -791,12 +883,6 @@ def _ledger_entry(
 ) -> dict[str, Any]:
     payload = result.model_dump(mode="json")
     payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
-    operation_json = json.dumps(
-        {"capability": capability, "arguments": arguments or {}},
-        ensure_ascii=False,
-        sort_keys=True,
-        default=str,
-    )
     entity_ids = sorted(_entity_ids(payload))
     entity_digest = hashlib.sha256(
         json.dumps(entity_ids, ensure_ascii=False).encode("utf-8")
@@ -809,7 +895,7 @@ def _ledger_entry(
         "effect_kind": effect_kind,
         "ok": result.ok,
         "status": result.status,
-        "operation_sha256": hashlib.sha256(operation_json.encode("utf-8")).hexdigest(),
+        "operation_sha256": _operation_sha256(capability, arguments or {}),
         "entity_ids": entity_ids,
         "result_sha256": hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
     }
@@ -818,6 +904,30 @@ def _ledger_entry(
     entry["entity_ids_sha256"] = entity_digest
     entry["facts"] = facts
     return entry
+
+
+def _operation_sha256(capability: str, arguments: dict[str, Any]) -> str:
+    operation_json = json.dumps(
+        {"capability": capability, "arguments": arguments},
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(operation_json.encode("utf-8")).hexdigest()
+
+
+def _repeats_failed_operation(
+    capability: str,
+    arguments: dict[str, Any],
+    logical_ledger: list[dict[str, Any]],
+) -> bool:
+    operation_hash = _operation_sha256(capability, arguments)
+    return any(
+        str(item.get("capability") or "") == capability
+        and str(item.get("operation_sha256") or "") == operation_hash
+        and (not item.get("ok") or item.get("status") != "completed")
+        for item in logical_ledger
+    )
 
 
 def _unsupported_mutation_claims(
@@ -830,13 +940,84 @@ def _unsupported_mutation_claims(
         for item in logical_ledger
         if item.get("ok") and item.get("status") == "completed"
     }
-    return sorted(
+    explicit = {
         capability
         for capability, effect_kind in effect_kinds.items()
         if effect_kind in {"write", "process", "control"}
         and capability in text
         and capability not in successful
+    }
+    implied = {
+        capability
+        for capability, aliases in _MUTATION_CLAIM_ALIASES.items()
+        if capability in effect_kinds
+        and effect_kinds[capability] in {"write", "process", "control"}
+        and capability not in successful
+        and _contains_positive_action_claim(text, aliases)
+    }
+    return sorted(explicit | implied)
+
+
+def _requested_mutation_capabilities(
+    text: str,
+    effect_kinds: dict[str, str],
+) -> list[str]:
+    return sorted(
+        capability
+        for capability, aliases in _MUTATION_CLAIM_ALIASES.items()
+        if capability in effect_kinds
+        and effect_kinds[capability] in {"write", "process", "control"}
+        and _contains_positive_action_claim(text, aliases)
     )
+
+
+_MUTATION_CLAIM_ALIASES: dict[str, tuple[str, ...]] = {
+    "task.create": (
+        "派发",
+        "创建任务",
+        "创建 task",
+        "dispatch",
+        "dispatch task",
+        "dispatch the task",
+        "create task",
+        "create the task",
+    ),
+}
+
+
+def _contains_positive_action_claim(text: str, aliases: tuple[str, ...]) -> bool:
+    normalized = text.lower()
+    chinese_negative_before = (
+        "没有",
+        "尚未",
+        "未能",
+        "不能",
+        "无法",
+        "并未",
+        "不要",
+        "暂不",
+        "无需",
+        "不必",
+        "禁止",
+        "未",
+    )
+    english_negative_before = ("not ", "didn't ", "cannot ", "can't ")
+    negative_after = ("失败", "未成功", "failed", "blocked")
+    for alias in aliases:
+        start = normalized.find(alias)
+        while start >= 0:
+            chinese_prefix = normalized[max(0, start - 4):start]
+            english_prefix = normalized[max(0, start - 16):start]
+            suffix = normalized[start + len(alias):start + len(alias) + 12]
+            negated = (
+                any(token in chinese_prefix for token in chinese_negative_before)
+                or any(token in english_prefix for token in english_negative_before)
+                or any(token in suffix for token in negative_after)
+            )
+            if not negated:
+                return True
+            start = normalized.find(alias, start + len(alias))
+    return False
 
 
 def _evidence_id(agent_run_id: str, tool_call_id: str) -> str:

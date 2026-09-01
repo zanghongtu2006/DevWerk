@@ -23,7 +23,7 @@
   "models": {
     "main": {
       "provider": "minimax",
-      "model": "M3",
+      "model": "MiniMax-M2.7",
       "request_timeout_seconds": 600,
       "temperature": 0.2,
       "max_tokens": 65535,

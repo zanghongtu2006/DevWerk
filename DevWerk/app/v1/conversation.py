@@ -8,6 +8,7 @@ from collections import defaultdict, deque
 from typing import Any, Callable
 
 from app.v1.agent import AgentCore, AgentRunSpec, _ledger_entry
+from app.v1.agent_protocol import ConversationProtocolStalled
 from app.v1.capabilities import CapabilityRegistry
 from app.v1.domain import ToolResult
 from app.v1.store import V1Store
@@ -414,17 +415,65 @@ class ConversationGateway:
         except Exception as exc:  # noqa: BLE001
             error = f"{type(exc).__name__}: {exc}"
             log.exception("conversation turn failed project_id=%s job_id=%s", project_id, job_id)
+            failed_run = next(
+                (
+                    item
+                    for item in self.store.agent_runs(project_id=project_id)
+                    if str(item.get("conversation_job_id") or "") == str(job_id)
+                ),
+                None,
+            )
+            if failed_run is not None:
+                invocations = self.store.tool_invocations(
+                    project_id,
+                    str(failed_run["id"]),
+                    hydrate_payloads=True,
+                )
+                action_ledger = [
+                    _ledger_entry(
+                        str(failed_run["id"]),
+                        str(item["tool_call_id"]),
+                        str(item["capability"]),
+                        self.registry.side_effect_kind(str(item["capability"])),
+                        ToolResult.model_validate(item["result"]),
+                        arguments=dict(item.get("arguments") or {}),
+                    )
+                    for item in invocations
+                ]
+            durable_progress = _has_durable_governance_progress(action_ledger)
+            notification = None
+            if isinstance(exc, ConversationProtocolStalled) and str(job.get("trigger_kind") or "user") == "user":
+                notification = {
+                    "content": (
+                        (
+                            "本轮操作未完成：Conversation Agent 没有完成全部所需的项目工具调用；"
+                            "已经成功执行的操作及其回执已保留。"
+                        )
+                        if durable_progress
+                        else (
+                            "本轮操作未执行：Conversation Agent 没有完成所需的项目工具调用，"
+                            "项目状态未改变。"
+                        )
+                    ),
+                    "meta": {
+                        "status": "failed",
+                        "kind": "reply",
+                        "job_id": job_id,
+                        "agent_run_id": failed_run["id"] if failed_run else None,
+                        "error_code": "conversation_protocol_stalled",
+                        "durable_progress": durable_progress,
+                    },
+                }
             self.store.fail_conversation_job(
                 job_id,
                 error,
+                agent_run_id=(str(failed_run["id"]) if failed_run else None),
                 result={
                     "error_code": "conversation_processing_failed",
                     "action_ledger": action_ledger,
-                    "durable_progress": _has_durable_governance_progress(
-                        action_ledger
-                    ),
+                    "durable_progress": durable_progress,
                 },
-                notification=None,
+                notification=notification,
             )
             raise
 

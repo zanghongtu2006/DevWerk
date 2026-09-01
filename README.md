@@ -2,7 +2,7 @@
 
 DevWerk is a pre-1.0 multi-agent workflow system. Each Project has one long-lived logical Conversation Agent that communicates with the user, shapes requirements, publishes the Project workflow, dispatches formal Tasks, supervises execution, and handles recovery. Tasks run through a Column-based Kanban state machine until they explicitly reach `done` or `failed`.
 
-The current public release is `v0.0.5`. The repository carries one active architecture only; historical implementations and compatibility contracts are intentionally not retained in the working tree.
+The current public release is `v0.1.0`. The repository carries one active architecture only; historical implementations and compatibility contracts are intentionally not retained in the working tree.
 
 ## Authoritative Design
 
@@ -79,10 +79,10 @@ idea-plugin/      suspended; not part of the standalone V1 release gate
 
 ## Download and Docker
 
-Download the current standalone ZIP package from [GitHub Releases](https://github.com/zanghongtu2006/DevWerk/releases/latest), or download the `v0.0.5` asset directly:
+Download the current standalone ZIP package from [GitHub Releases](https://github.com/zanghongtu2006/DevWerk/releases/latest), or download the `v0.1.0` asset directly:
 
 ```text
-https://github.com/zanghongtu2006/DevWerk/releases/download/v0.0.5/devwerk-release.zip
+https://github.com/zanghongtu2006/DevWerk/releases/download/v0.1.0/devwerk-release.zip
 ```
 
 The ZIP contains checked-in Linux and Windows launchers. After extraction, start it with:
@@ -103,16 +103,42 @@ The installer creates `venv` and installs `requirements.txt`; both startup scrip
 
 Stop the corresponding local service with `sh ./shutdown.sh` or `.\shutdown.bat`. The shutdown helper only targets the Uvicorn process running from this DevWerk directory's `venv`.
 
+### Configure the LLM
+
+`config/llm.json` is intentionally absent from Git, the standalone ZIP, and the Docker image. The release includes only the safe template `config/llm.example.json`. Before starting an LLM-backed local installation, create the runtime configuration from that template:
+
+```bash
+cp config/llm.example.json config/llm.json
+```
+
+```powershell
+Copy-Item .\config\llm.example.json .\config\llm.json
+```
+
+Edit `config/llm.json` to select the provider, model, and `conversation`/`column`/`default` routes. Provider secrets are not stored in this JSON. Each provider's `api_key_env` names the environment variable that must contain its key, for example:
+
+```bash
+export DEVWERK_MINIMAX_API_KEY="your-key"
+sh ./startup.sh
+```
+
+```powershell
+$env:DEVWERK_MINIMAX_API_KEY="your-key"
+.\startup.bat
+```
+
+You may instead supply the complete validated JSON through `DEVWERK_LLM_CONFIG_JSON`. Never commit `config/llm.json`, `.env`, or provider credentials.
+
 Docker Hub is the recommended container source:
 
 ```bash
-docker pull zanghongtu2006/devwerk:v0.0.5
+docker pull zanghongtu2006/devwerk:v0.1.0
 ```
 
 The same image is also published to GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/zanghongtu2006/devwerk:v0.0.5
+docker pull ghcr.io/zanghongtu2006/devwerk:v0.1.0
 ```
 
 Create persistent volumes and start DevWerk:
@@ -120,15 +146,21 @@ Create persistent volumes and start DevWerk:
 ```bash
 docker volume create devwerk-data
 docker volume create devwerk-projects
-docker run -d --name devwerk --restart unless-stopped -p 8000:8000 -v devwerk-data:/opt/devwerk/data -v devwerk-projects:/workspace zanghongtu2006/devwerk:v0.0.5
+docker run -d --name devwerk --restart unless-stopped -p 8000:8000 -v devwerk-data:/opt/devwerk/data -v devwerk-projects:/workspace zanghongtu2006/devwerk:v0.1.0
 ```
 
 Open `http://127.0.0.1:8000/workbench`. Project base directories created inside the container should use `/workspace/...` so generated files remain in the `devwerk-projects` volume.
 
-For LLM-backed Conversation and Column Agents, copy `DevWerk/config/llm.example.json` to a host `llm.json`, configure the provider credentials, and mount that individual file without hiding the image's remaining configuration:
+For LLM-backed Conversation and Column Agents, copy `DevWerk/config/llm.example.json` from the repository to a host `llm.json`, edit its model routes, put the referenced provider key in an environment file, and mount only the JSON file. Mounting the whole host `config` directory would hide configuration shipped in the image.
+
+Example `.env`:
+
+```dotenv
+DEVWERK_MINIMAX_API_KEY=your-key
+```
 
 ```bash
-docker run -d --name devwerk --restart unless-stopped -p 8000:8000 -v devwerk-data:/opt/devwerk/data -v devwerk-projects:/workspace --mount type=bind,source=/absolute/path/to/llm.json,target=/opt/devwerk/config/llm.json,readonly zanghongtu2006/devwerk:v0.0.5
+docker run -d --name devwerk --restart unless-stopped -p 8000:8000 --env-file /absolute/path/to/.env -v devwerk-data:/opt/devwerk/data -v devwerk-projects:/workspace --mount type=bind,source=/absolute/path/to/llm.json,target=/opt/devwerk/config/llm.json,readonly zanghongtu2006/devwerk:v0.1.0
 ```
 
 Follow runtime logs with:

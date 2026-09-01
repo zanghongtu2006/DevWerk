@@ -39,6 +39,11 @@ from app.v1.states import (
     ToolInvocationStatus,
 )
 from app.v1.storage_support import new_id, utcnow
+from app.v1.task_identity import (
+    logical_task_key,
+    logical_task_key_for_value,
+    resolve_input_pointer,
+)
 from app.v1.repositories.artifact_repository import ArtifactRepository
 from app.v1.repositories.event_repository import EventRepository
 from app.v1.repositories.project_repository import ProjectRepository
@@ -963,6 +968,7 @@ class V1Store:
         job_id: str,
         error: str,
         *,
+        agent_run_id: str | None = None,
         result: dict[str, Any] | None = None,
         notification: dict[str, Any] | None = None,
         attention: bool = False,
@@ -993,8 +999,9 @@ class V1Store:
                 )
                 persisted_result["conversation_message_id"] = notification_message_id
             db.execute(
-                "UPDATE v1_conversation_jobs SET status='failed',error=?,result_json=?,updated_at=?,finished_at=? WHERE id=?",
+                "UPDATE v1_conversation_jobs SET status='failed',agent_run_id=?,error=?,result_json=?,updated_at=?,finished_at=? WHERE id=?",
                 (
+                    agent_run_id,
                     safe_error,
                     self._pack_json(persisted_result),
                     now,
@@ -1338,6 +1345,54 @@ class V1Store:
             ],
         }).model_dump(mode="json")
         _validate_deterministic_deliverable_coverage(definition, readiness)
+        task_logical_key = logical_task_key(workflow_plan.task_contract, input_data)
+        external_dependency: dict[str, str] | None = None
+        dependency_contract = workflow_plan.task_contract.dependency_contract
+        if dependency_contract is not None and not proposed.dependencies:
+            order_value = resolve_input_pointer(input_data, dependency_contract.order_pointer)
+            if (
+                isinstance(order_value, int)
+                and not isinstance(order_value, bool)
+                and order_value > dependency_contract.first_value
+            ):
+                predecessor_key = logical_task_key_for_value(
+                    dependency_contract.order_pointer,
+                    order_value - 1,
+                )
+                with self.connect() as db:
+                    predecessor_row = db.execute(
+                        "SELECT id,status FROM v1_tasks "
+                        "WHERE project_id=? AND logical_task_key=? "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (project_id, predecessor_key),
+                    ).fetchone()
+                    if predecessor_row is None:
+                        legacy_rows = db.execute(
+                            "SELECT id,status,input_json FROM v1_tasks "
+                            "WHERE project_id=? ORDER BY created_at DESC",
+                            (project_id,),
+                        ).fetchall()
+                        for legacy_row in legacy_rows:
+                            try:
+                                legacy_input = json.loads(legacy_row[2] or "{}")
+                                legacy_value = resolve_input_pointer(
+                                    legacy_input,
+                                    dependency_contract.order_pointer,
+                                )
+                            except (TypeError, ValueError, json.JSONDecodeError):
+                                continue
+                            if legacy_value == order_value - 1:
+                                predecessor_row = legacy_row
+                                break
+                if predecessor_row is None:
+                    raise ValueError(
+                        "incremental linear Task Plan cannot resolve its Project-level "
+                        f"predecessor {predecessor_key!r}"
+                    )
+                external_dependency = {
+                    "id": str(predecessor_row[0]),
+                    "status": str(predecessor_row[1]),
+                }
         if rerun_of_task_id:
             predecessor = self.get_project_task(project_id, rerun_of_task_id)
             if predecessor["status"] not in {"done", "failed"}:
@@ -1355,6 +1410,8 @@ class V1Store:
             "input_data": input_data,
             "readiness": readiness,
             "rerun_of_task_id": rerun_of_task_id,
+            "logical_task_key": task_logical_key,
+            "external_dependency": external_dependency,
         }
 
     def _insert_prepared_task(
@@ -1371,6 +1428,8 @@ class V1Store:
         input_data = dict(prepared["input_data"])
         readiness = dict(prepared["readiness"])
         rerun_of_task_id = prepared.get("rerun_of_task_id")
+        task_logical_key = prepared.get("logical_task_key")
+        external_dependency = prepared.get("external_dependency")
         now = utcnow()
         if rerun_of_task_id:
             existing_successor = db.execute(
@@ -1380,6 +1439,19 @@ class V1Store:
             if existing_successor:
                 raise ValueError("The terminal predecessor already has a materialized successor")
         else:
+            if task_logical_key:
+                logical_predecessor = db.execute(
+                    "SELECT id,status FROM v1_tasks "
+                    "WHERE project_id=? AND logical_task_key=? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (project_id, task_logical_key),
+                ).fetchone()
+                if logical_predecessor:
+                    raise ValueError(
+                        "The Project already contains logical Task "
+                        f"{task_logical_key!r} as {logical_predecessor[0]}; "
+                        "use task.rerun or task.reopen instead of creating a duplicate"
+                    )
             latest = db.execute(
                 "SELECT id,status,resolved_by_task_id FROM v1_tasks "
                 "WHERE project_id=? AND task_plan_id=? AND proposed_task_ref=? "
@@ -1396,6 +1468,10 @@ class V1Store:
 
         resolved_dependencies: list[str] = []
         unresolved_dependencies: list[str] = []
+        external_dependency_pending = False
+        if external_dependency:
+            resolved_dependencies.append(str(external_dependency["id"]))
+            external_dependency_pending = external_dependency["status"] != "done"
         for ref in proposed.dependencies:
             dependency = db.execute(
                 "SELECT id FROM v1_tasks WHERE project_id=? AND task_plan_id=? "
@@ -1407,7 +1483,11 @@ class V1Store:
                 resolved_dependencies.append(str(dependency[0]))
             else:
                 unresolved_dependencies.append(str(ref))
-        schedule_state = "queued" if unresolved_dependencies else "admitted"
+        schedule_state = (
+            "queued"
+            if unresolved_dependencies or external_dependency_pending
+            else "admitted"
+        )
         task_id = new_id("tsk")
         conflict_domains = [item.canonical_key for item in proposed.conflict_domains]
         initial_context = {
@@ -1421,12 +1501,13 @@ class V1Store:
             }
         }
         db.execute(
-            "INSERT INTO v1_tasks(id,project_id,workflow_revision_id,task_plan_id,proposed_task_ref,"
+            "INSERT INTO v1_tasks(id,project_id,workflow_revision_id,task_plan_id,proposed_task_ref,logical_task_key,"
             "title,brief,input_json,context_json,readiness_json,conflict_domains_json,status,control_state,"
             "rerun_of_task_id,current_column,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,'pending','active',?,?,?,?)",
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'pending','active',?,?,?,?)",
             (
                 task_id, project_id, workflow["id"], task_plan_id, proposed.proposed_task_ref,
+                task_logical_key,
                 proposed.title, proposed.brief, json.dumps(input_data, ensure_ascii=False),
                 json.dumps(initial_context, ensure_ascii=False), json.dumps(readiness, ensure_ascii=False),
                 json.dumps(conflict_domains, ensure_ascii=False), rerun_of_task_id, definition.entry, now, now,
@@ -1457,7 +1538,7 @@ class V1Store:
             (
                 task_id, project_id, schedule_state, 0, workflow_plan.wip_group, workflow_plan.wip_limit,
                 json.dumps(dependency_tokens), json.dumps(conflict_domains), now, now,
-                int(bool(unresolved_dependencies)),
+                int(bool(unresolved_dependencies or external_dependency_pending)),
             ),
         )
         for dependency_id in resolved_dependencies:
@@ -1486,17 +1567,21 @@ class V1Store:
                 "schedule_state": schedule_state,
                 "task_plan_id": task_plan_id,
                 "proposed_task_ref": proposed.proposed_task_ref,
+                "logical_task_key": task_logical_key,
                 "rerun_of_task_id": rerun_of_task_id,
             },
         )
-        if unresolved_dependencies:
+        if unresolved_dependencies or external_dependency_pending:
             self._event(
                 db,
                 project_id,
                 task_id,
                 None,
                 "task.dependency_waiting",
-                {"dependencies": unresolved_dependencies, "pending_reason": "waiting_dependency"},
+                {
+                    "dependencies": dependency_tokens,
+                    "pending_reason": "waiting_dependency",
+                },
             )
         return task_id
 
@@ -1567,7 +1652,7 @@ class V1Store:
         with self.connect() as db:
             rows = db.execute(
                 "SELECT id,title,status,control_state,current_column,attempt,error,state_version,"
-                "terminal_artifact_id,notified_at,observed_at,supervision_action,"
+                "terminal_artifact_id,notified_at,observed_at,supervision_action,logical_task_key,"
                 "rerun_of_task_id,resolved_by_task_id,updated_at "
                 "FROM v1_tasks WHERE project_id=? ORDER BY created_at DESC LIMIT ?",
                 (project_id, min(max(limit, 1), self.policy.service_limits.max_page_size)),

@@ -114,6 +114,30 @@ def test_openai_adapter_returns_canonical_native_tool_call(caplog):
     assert "total_tokens" in caplog.text
 
 
+def test_openai_adapter_can_force_one_selected_tool():
+    client = OpenAIClient({"api_name": "test", "base_url": "https://provider.invalid/v1", "api_key": "token", "model": "m", "temperature": 0.2})
+    sent = []
+    client.session.post = lambda _url, **kwargs: sent.append(kwargs) or Response(
+        {"choices": [{"message": {"content": "", "tool_calls": []}}], "usage": {}}
+    )
+    tools = [
+        {"type": "function", "function": {"name": name, "description": "", "parameters": {"type": "object"}}}
+        for name in ("project.inspect", "task.create")
+    ]
+
+    client.complete(
+        [{"role": "user", "content": "go"}],
+        tools,
+        require_tool=True,
+        required_tool_name="task.create",
+    )
+
+    assert sent[0]["json"]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "task.create"},
+    }
+
+
 def test_provider_request_uses_transport_timeout_and_reports_timeout_error():
     client = OpenAIClient({
         "api_name": "test",
@@ -215,6 +239,30 @@ def test_anthropic_adapter_can_require_a_native_tool_call():
     client.complete([{"role": "user", "content": "go"}], [tool], require_tool=True)
 
     assert sent[0]["json"]["tool_choice"] == {"type": "any"}
+
+
+def test_anthropic_adapter_can_force_one_selected_tool():
+    client = AnthropicClient({"api_name": "test", "base_url": "https://provider.invalid", "api_key": "token", "model": "m", "temperature": 0.2, "max_tokens": 65535})
+    sent = []
+    client.session.post = lambda _url, **kwargs: sent.append(kwargs) or Response(
+        {"content": [], "usage": {}}
+    )
+    tools = [
+        {"type": "function", "function": {"name": name, "description": "", "parameters": {"type": "object"}}}
+        for name in ("project.inspect", "task.create")
+    ]
+
+    client.complete(
+        [{"role": "user", "content": "go"}],
+        tools,
+        require_tool=True,
+        required_tool_name="task.create",
+    )
+
+    assert sent[0]["json"]["tool_choice"] == {
+        "type": "tool",
+        "name": "task.create",
+    }
 
 
 def test_anthropic_adapter_materializes_provider_schema_and_scalar_wrappers():

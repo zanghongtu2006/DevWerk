@@ -796,7 +796,11 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         (
             "Persist one immutable concrete Task Plan for an existing Workflow Revision. The plan owns every Task's "
             "title, input, readiness, dependencies, conflict domains, acceptance facts, and Agent-use policy. "
-            "Dependencies reference Task refs in the same plan and must be acyclic. Saving the plan creates no Tasks. "
+            "Dependencies reference Task refs in the same plan and must be acyclic. A Project-level stable Task "
+            "identity is derived from the Workflow Task Contract. For an incremental linear plan, include only the "
+            "new contiguous work items; the first new item has no same-plan dependency because DevWerk links it to "
+            "the existing Project predecessor. Never repeat an already materialized work item merely to make a new "
+            "plan start at the configured first value. Saving the plan creates no Tasks. "
             "This is a mutating capability, never a schema probe: do not submit placeholder, test, TODO, or partial "
             "plans. If validation rejects a call before persistence, correct and resubmit the same complete user-owned "
             "plan. A queue readiness decision is automatically admitted when dependencies and WIP constraints allow."
@@ -857,6 +861,8 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
             "Start one immutable Task Plan. Supply its task_plan_id and the item that should be returned as the "
             "requested Task; DevWerk materializes every planned Task exactly once with the authoritative title, "
             "input, readiness, dependencies, conflict domains, exact strings, and fixed Workflow Revision. "
+            "Stable Project-level Task identity prevents a later immutable Plan from silently duplicating existing "
+            "work; use task.rerun or task.reopen when the intent is to execute an existing work item again. "
             "Dependency/WIP-queued Tasks then advance automatically without further task.create calls. Use "
             "scheduling.decide hold only for deliberate manual waiting."
         ),
@@ -1915,6 +1921,7 @@ def _task_inspect(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any
         raise PermissionError("task is outside the current Project")
     task_fields = (
         "id", "project_id", "workflow_revision_id", "task_plan_id", "proposed_task_ref",
+        "logical_task_key",
         "title", "status", "control_state", "current_column", "attempt", "error",
         "created_at", "updated_at", "finished_at", "state_version", "terminal_artifact_id",
         "terminal_event_id", "notified_at", "observed_at", "supervision_action",

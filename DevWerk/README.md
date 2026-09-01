@@ -103,7 +103,7 @@ A valid Workflow Revision is bound to an immutable Workflow Plan and:
 - gives every non-terminal Column an explicit transition path to a terminal;
 - rejects duplicate outcomes and unknown transition targets.
 
-The Workflow Plan describes the reusable method and Task Contract but contains no concrete Task list. Loop bindings own Project-wide facts and are exposed to every Column as `project.loop`; Task input owns only facts that vary between Tasks. A Loop is rejected when the two schemas claim the same field. A Task Plan binds one user objective to an immutable Workflow Revision and owns concrete Task inputs, dependencies, conflict domains, readiness, and Agent policy. `task.create` starts the immutable plan: it accepts only a Task Plan ID and requested item reference, preflights the complete graph, atomically materializes every planned Task exactly once, and returns the requested Task. A failed preflight or transaction exposes zero runnable Tasks. Provider calls cannot restate or drift plan facts, and Kanban owns all later dependency/WIP admission. Publishing a new Workflow Revision never rewrites an existing Task or Task Plan.
+The Workflow Plan describes the reusable method and Task Contract but contains no concrete Task list. Loop bindings own Project-wide facts and are exposed to every Column as `project.loop`; Task input owns only facts that vary between Tasks. A Loop is rejected when the two schemas claim the same field. The Task Contract may declare an input identity pointer; linear contracts use their order pointer by default. DevWerk derives a stable Project-level logical Task key from that input, so later immutable Task Plans can extend the existing Project graph without recreating completed work. A Task Plan binds one user objective to an immutable Workflow Revision and owns concrete Task inputs, same-plan dependencies, conflict domains, readiness, and Agent policy. `task.create` starts the immutable plan: it accepts only a Task Plan ID and requested item reference, preflights the complete graph, atomically materializes every new planned Task exactly once, links an incremental plan's first item to its existing Project predecessor, and returns the requested Task. A failed preflight or transaction exposes zero runnable Tasks. Re-executing an existing logical work item requires explicit rerun/reopen semantics. Provider calls cannot restate or drift plan facts, and Kanban owns all later dependency/WIP admission. Publishing a new Workflow Revision never rewrites an existing Task or Task Plan.
 
 ### Runtime and Evidence
 
@@ -203,7 +203,19 @@ The primary trace event names are `web.conversation_input`, `web.conversation_ou
 
 ## LLM Configuration
 
-Copy `config/llm.example.json` to the ignored `config/llm.json`, or set `DEVWERK_LLM_CONFIG_JSON`. The strict configuration schema has four top-level sections: `providers`, `models`, `routes`, and `runtime`. Runtime routes are `conversation`, `column`, and `default`. Request timeouts belong to model entries as `request_timeout_seconds`; unknown or legacy fields fail startup validation instead of being ignored. Supported protocols are Anthropic-compatible Messages, OpenAI-compatible Chat Completions, and Ollama Chat.
+`config/llm.json` is local runtime state and is deliberately excluded from Git, release ZIP files, and Docker images. Releases contain only `config/llm.example.json`. Create the real configuration before starting DevWerk:
+
+```bash
+cp config/llm.example.json config/llm.json
+```
+
+```powershell
+Copy-Item .\config\llm.example.json .\config\llm.json
+```
+
+Edit the copied file, then export the environment variable named by the selected provider's `api_key_env` (for example `DEVWERK_MINIMAX_API_KEY`). For Docker, keep `llm.json` on the host, pass secrets with `--env-file` or `-e`, and bind-mount the file to `/opt/devwerk/config/llm.json`; do not mount over the complete `/opt/devwerk/config` directory.
+
+Alternatively set `DEVWERK_LLM_CONFIG_JSON` to the complete validated JSON. The strict configuration schema has four top-level sections: `providers`, `models`, `routes`, and `runtime`. Runtime routes are `conversation`, `column`, and `default`. Request timeouts belong to model entries as `request_timeout_seconds`; unknown or legacy fields fail startup validation instead of being ignored. Supported protocols are Anthropic-compatible Messages, OpenAI-compatible Chat Completions, and Ollama Chat.
 
 Do not commit provider credentials.
 
