@@ -33,6 +33,18 @@ def test_release_launchers_are_checked_in_assets() -> None:
     assert "DevWerk/Dockerfile text eol=lf" in attributes
 
 
+def test_startup_launchers_bound_graceful_shutdown() -> None:
+    windows = (APP_ROOT / "startup.bat").read_text(encoding="utf-8")
+    shell = (APP_ROOT / "startup.sh").read_text(encoding="utf-8")
+    environment = (APP_ROOT / ".env.example").read_text(encoding="utf-8")
+
+    assert "GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS=5" in environment
+    assert 'GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS=5' in windows
+    assert "--timeout-graceful-shutdown %GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS%" in windows
+    assert 'GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS="${GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS:-5}"' in shell
+    assert '--timeout-graceful-shutdown "$GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS"' in shell
+
+
 def test_release_packagers_copy_launchers_without_generating_them() -> None:
     shell_packager = (REPOSITORY_ROOT / "scripts" / "package-devwerk.sh").read_text(
         encoding="utf-8"

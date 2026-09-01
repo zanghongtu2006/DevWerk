@@ -144,25 +144,41 @@ def test_conversation_with_loop_workflow_can_revise_but_cannot_reapply_loop(stor
     agent = ConversationGateway(store, registry, agent_core=AgentCore(store, registry, model))
     accepted = run_turn(agent, project["id"], "Inspect the existing Workflow.", True)
     assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
-    assert "loop.apply" not in exposed[0]
+    # Main-Agent Sessions keep one stable tool surface. The existing
+    # Workflow invariant is enforced when loop.apply executes, not by hiding
+    # the capability from the model on later Turns.
+    assert "loop.apply" in exposed[0]
 
 
-def test_start_task_false_exposes_only_read_capabilities(store, tmp_path):
+def test_start_task_false_keeps_stable_tools_but_rejects_mutation_execution(store, tmp_path):
     project = store.create_project("discussion", "", str(tmp_path / "project"))
     exposed: list[set[str]] = []
+    calls = 0
 
-    def model(_messages, tools, **_kwargs):
+    def model(messages, tools, **_kwargs):
+        nonlocal calls
+        calls += 1
         exposed.append({item["function"]["name"] for item in tools})
+        if calls == 1:
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id="blocked-write",
+                name="system.files.write",
+                arguments={"path": str(tmp_path / "blocked.txt"), "content": "blocked"},
+            )])
+        tool_result = json.loads(messages[-1]["content"])
+        assert tool_result["error"]["type"] == "ConversationMutationDisabled"
         return AgentModelResponse(text="Discussion complete.")
 
     registry = build_core_registry()
     agent = ConversationGateway(store, registry, agent_core=AgentCore(store, registry, model))
     accepted = run_turn(agent, project["id"], "Only discuss this.", False)
     assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
-    assert all(registry.side_effect_kind(item) in {"none", "read"} for item in exposed[0])
+    assert calls == 2
     assert "system.files.read" in exposed[0]
-    assert "system.files.write" not in exposed[0]
-    assert "system.command.run" not in exposed[0]
+    assert "system.files.write" in exposed[0]
+    assert "system.command.run" in exposed[0]
+    assert exposed[0] == exposed[1]
+    assert not (tmp_path / "blocked.txt").exists()
 
 
 def test_conversation_has_generic_system_file_authority_without_delegating_it_to_columns(store, tmp_path):
@@ -308,6 +324,141 @@ def test_conversation_cannot_report_an_unexecuted_mutation_as_completed(store, t
     assert invocations[0]["ok"] is True
 
 
+def test_conversation_repeated_unsupported_mutation_claim_fails_without_execution_progress(
+    store,
+    tmp_path,
+):
+    project = store.create_project("bounded correction", "", str(tmp_path / "project"))
+    registry = build_core_registry()
+    registry.register(CapabilityEntry(
+        id="test.control",
+        description="Perform one test control mutation.",
+        input_schema={"type": "object", "additionalProperties": False},
+        output_schema={"type": "object", "additionalProperties": True},
+        handler=lambda _args, _ctx: {"changed": True},
+        side_effect_kind="control",
+        delegable_to_column=False,
+    ))
+    turns = 0
+
+    def model(messages, _tools, **_kwargs):
+        nonlocal turns
+        turns += 1
+        if turns == 2:
+            assert "unsupported_mutation_claims" in messages[-1]["content"]
+        return AgentModelResponse(text="I called test.control and completed the change.")
+
+    with pytest.raises(RuntimeError, match="without a new successful state-changing tool receipt"):
+        AgentCore(store, registry, model).run(AgentRunSpec(
+            kind="conversation",
+            project=project,
+            instruction="",
+            instruction_revision=1,
+            context={},
+            capability_ids=["test.control"],
+        ))
+
+    assert turns == 2
+    run = store.agent_runs(project_id=project["id"])[0]
+    assert run["status"] == "failed"
+    assert "without a new successful state-changing tool receipt" in str(run["error"])
+
+
+def test_conversation_allows_staged_corrections_when_mutation_receipts_advance(
+    store,
+    tmp_path,
+):
+    project = store.create_project("progress correction", "", str(tmp_path / "project"))
+    registry = build_core_registry()
+    for capability in ("test.first", "test.second"):
+        registry.register(CapabilityEntry(
+            id=capability,
+            description=f"Perform {capability}.",
+            input_schema={"type": "object", "additionalProperties": False},
+            output_schema={"type": "object", "additionalProperties": True},
+            handler=lambda _args, _ctx, name=capability: {"changed": name},
+            side_effect_kind="control",
+            delegable_to_column=False,
+        ))
+    turns = 0
+
+    def model(messages, _tools, **_kwargs):
+        nonlocal turns
+        turns += 1
+        if turns == 1:
+            return AgentModelResponse(text="test.first and test.second completed.")
+        if turns == 2:
+            assert "unsupported_mutation_claims" in messages[-1]["content"]
+            return AgentModelResponse(tool_calls=[
+                AgentToolCall(id="first", name="test.first", arguments={})
+            ])
+        if turns == 3:
+            return AgentModelResponse(text="test.first and test.second completed.")
+        if turns == 4:
+            correction = json.loads(messages[-1]["content"])
+            assert correction["unsupported_mutation_claims"] == ["test.second"]
+            assert len(correction["successful_mutation_evidence"]) == 1
+            return AgentModelResponse(tool_calls=[
+                AgentToolCall(id="second", name="test.second", arguments={})
+            ])
+        return AgentModelResponse(text="test.first and test.second completed.")
+
+    result = AgentCore(store, registry, model).run(AgentRunSpec(
+        kind="conversation",
+        project=project,
+        instruction="",
+        instruction_revision=1,
+        context={},
+        capability_ids=["test.first", "test.second"],
+    ))
+
+    assert result.status == "succeeded"
+    assert turns == 5
+    assert [
+        item["capability"]
+        for item in store.tool_invocations(project["id"], result.agent_run_id)
+    ] == ["test.first", "test.second"]
+
+
+def test_conversation_system_prefix_is_stable_and_project_state_is_turn_input(
+    store,
+    tmp_path,
+):
+    project = store.create_project("stable session", "", str(tmp_path / "project"))
+    registry = build_core_registry()
+    observed: list[list[dict]] = []
+
+    def model(messages, _tools, **_kwargs):
+        observed.append([dict(item) for item in messages])
+        return AgentModelResponse(text="Observed current state.")
+
+    core = AgentCore(store, registry, model)
+    session_id = store.conversation_agent(project["id"])["logical_id"]
+    for message_id, state in ((1, "before"), (2, "after")):
+        core.run(AgentRunSpec(
+            kind="conversation",
+            project=project,
+            instruction="main agent",
+            instruction_revision=1,
+            context={
+                "current_request": {
+                    "message_id": message_id,
+                    "content": f"request {message_id}",
+                },
+                "tasks": [{"id": "task", "status": state}],
+            },
+            capability_ids=["project.inspect"],
+            agent_session_id=session_id,
+        ))
+
+    assert observed[0][0]["content"] == observed[1][0]["content"]
+    assert "authoritative_project_state" not in observed[0][0]["content"]
+    first_turn = json.loads(observed[0][-1]["content"])
+    second_turn = json.loads(observed[1][-1]["content"])
+    assert first_turn["authoritative_project_state"]["tasks"][0]["status"] == "before"
+    assert second_turn["authoritative_project_state"]["tasks"][0]["status"] == "after"
+
+
 def test_same_project_jobs_remain_ordered_by_session_gateway(store, tmp_path):
     project = store.create_project("ordered", "", str(tmp_path / "project"))
     first_entered = threading.Event()
@@ -315,7 +466,7 @@ def test_same_project_jobs_remain_ordered_by_session_gateway(store, tmp_path):
     observed: list[str] = []
 
     def model(messages, _tools, **_kwargs):
-        current = json.loads(messages[0]["content"])["context"]["current_request"]["content"]
+        current = json.loads(messages[-1]["content"])["authoritative_current_request"]["content"]
         observed.append(current)
         if current == "first":
             first_entered.set()
@@ -490,7 +641,7 @@ def test_current_request_is_authoritative_and_not_duplicated(store, tmp_path):
     accepted = run_turn(agent, project["id"], "current instruction", False)
     assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
     encoded = json.dumps(captured[0], ensure_ascii=False)
-    assert encoded.count("current instruction") == 2
+    assert encoded.count("current instruction") == 1
 
 
 def test_terminal_mailbox_turn_reports_model_text_to_user(store, tmp_path):

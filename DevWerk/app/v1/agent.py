@@ -8,6 +8,7 @@ from typing import Any, Callable, Literal
 
 from app.core.debug_trace import trace_json
 from app.v1.capabilities import CapabilityContext, CapabilityRegistry, tool_result_json
+from app.v1.agent_protocol import ConversationTurnProtocol
 from app.v1.contracts import validate_contract
 from app.v1.domain import AgentModelResponse, ToolResult
 from app.v1.llm import complete as provider_complete
@@ -41,6 +42,7 @@ class AgentRunSpec:
     user_initiated: bool = False
     completion_tool_name: str = "column.complete"
     completion_requires_evidence: bool = False
+    completion_auto_evidence: bool = False
 
 
 @dataclass(frozen=True)
@@ -91,6 +93,7 @@ class AgentCore:
                     spec.completion_outcomes,
                     spec.output_contract,
                     tool_name=spec.completion_tool_name,
+                    include_evidence=not spec.completion_auto_evidence,
                 )
             )
             if spec.wait_config:
@@ -128,7 +131,12 @@ class AgentCore:
             user_initiated=spec.user_initiated,
         )
 
-        messages: list[dict[str, Any]] = [{"role": "system", "content": _stable_json(envelope)}]
+        provider_envelope = (
+            self._conversation_system_envelope(spec, platform_policy)
+            if spec.kind == "conversation"
+            else envelope
+        )
+        messages: list[dict[str, Any]] = [{"role": "system", "content": _stable_json(provider_envelope)}]
         self.store.add_agent_message(run["id"], "system", messages[0]["content"], [])
         current_request = (
             spec.context.get("current_request")
@@ -173,17 +181,32 @@ class AgentCore:
                     emit_progress=False,
                 )
         if isinstance(current_request, dict):
+            turn_context = {
+                key: value
+                for key, value in spec.context.items()
+                if key != "current_request"
+            }
+            turn_payload: dict[str, Any] = {
+                "authoritative_current_request": current_request,
+                "authoritative_project_state": {
+                    "project": spec.project,
+                    **turn_context,
+                },
+                "instruction": (
+                    "This immutable request created the current Conversation Job. "
+                    "It is authoritative over historical conversation instructions. "
+                    "The accompanying Project state is the current Turn projection; use tools for any "
+                    "new inspection or state change."
+                ),
+            }
+            if messages and messages[-1].get("role") == "user":
+                prior = messages.pop()
+                turn_payload["unanswered_prior_user_message"] = str(
+                    prior.get("content") or ""
+                )
             item = {
                 "role": "user",
-                "content": _stable_json(
-                    {
-                        "authoritative_current_request": current_request,
-                        "instruction": (
-                            "This immutable request created the current Conversation Job. "
-                            "It is authoritative over historical conversation instructions."
-                        ),
-                    }
-                ),
+                "content": _stable_json(turn_payload),
             }
             messages.append(item)
             self.store.add_agent_message(run["id"], item["role"], item["content"], [])
@@ -198,6 +221,7 @@ class AgentCore:
         seen_tool_call_ids: set[str] = set()
         latest_text = ""
         current_iteration = 0
+        conversation_protocol = ConversationTurnProtocol()
         try:
             iteration = 0
             while True:
@@ -278,6 +302,7 @@ class AgentCore:
                         _column_completion_protocol_error(
                             response.tool_calls,
                             spec.completion_tool_name,
+                            include_evidence=not spec.completion_auto_evidence,
                         )
                         if spec.kind == "column"
                         else None
@@ -295,7 +320,7 @@ class AgentCore:
                             )
                         elif call.name == spec.completion_tool_name:
                             try:
-                                result, accepted = self._complete_column(
+                                result, accepted, normalized_completion = self._complete_column(
                                     call.arguments,
                                     spec,
                                     logical_ledger,
@@ -308,7 +333,7 @@ class AgentCore:
                                 )
                                 accepted = False
                             if accepted:
-                                completion = call.arguments
+                                completion = normalized_completion
                         elif call.name == "column.await":
                             if not spec.wait_config:
                                 raise RuntimeError("Column has no declarative wait policy")
@@ -323,6 +348,23 @@ class AgentCore:
                                 error={
                                     "type": "CapabilityUnavailable",
                                     "message": f"capability is not available in this Agent Run: {call.name}",
+                                },
+                                checkpoint={"failure_disposition": "rejected_before_effect"},
+                            )
+                        elif (
+                            spec.kind == "conversation"
+                            and not spec.start_task
+                            and effect_kinds.get(call.name) in {"write", "process", "control"}
+                        ):
+                            result = ToolResult(
+                                ok=False,
+                                capability=call.name,
+                                error={
+                                    "type": "ConversationMutationDisabled",
+                                    "message": (
+                                        "This Conversation Turn is discussion-only; state-changing capabilities "
+                                        "remain visible for a stable Session tool surface but cannot execute."
+                                    ),
                                 },
                                 checkpoint={"failure_disposition": "rejected_before_effect"},
                             )
@@ -441,14 +483,11 @@ class AgentCore:
                     logical_ledger,
                 )
                 if unsupported_claims:
-                    correction = {
-                        "unsupported_mutation_claims": unsupported_claims,
-                        "instruction": (
-                            "The response reports state-changing capabilities without successful execution receipts. "
-                            "Call those capabilities now, or return a corrected concise reply that clearly says the "
-                            "changes were not executed. Do not report an intended action as completed."
-                        ),
-                    }
+                    correction = conversation_protocol.correction_for(
+                        unsupported_claims,
+                        logical_ledger,
+                    )
+                    assert correction is not None
                     correction_message = {
                         "role": "user",
                         "content": _stable_json(correction),
@@ -511,6 +550,36 @@ class AgentCore:
         }
 
     @staticmethod
+    def _conversation_system_envelope(
+        spec: AgentRunSpec,
+        platform_policy: PlatformPolicySnapshot,
+    ) -> dict[str, Any]:
+        """Return the byte-stable prefix for one logical Project Session."""
+        return {
+            "protocol_version": "devwerk.conversation-session.v1",
+            "agent": {
+                "kind": "conversation",
+                "project_id": spec.project["id"],
+                "agent_session_id": spec.agent_session_id,
+                "instruction_revision": spec.instruction_revision,
+            },
+            "project": {
+                "id": spec.project["id"],
+            },
+            "instruction": spec.instruction,
+            "platform_policy": {
+                "revision": platform_policy.revision,
+                "content_hash": platform_policy.content_hash,
+                "content": platform_policy.content,
+            },
+            "turn_protocol": {
+                "state": "authoritative Project state is supplied in the current user Turn",
+                "execution": "state changes exist only after successful tool receipts",
+                "completion": "a tool-free assistant response completes the current Turn",
+            },
+        }
+
+    @staticmethod
     def _checkpoint(
         iterations: int,
         tool_calls: int,
@@ -529,15 +598,29 @@ class AgentCore:
         arguments: dict[str, Any],
         spec: AgentRunSpec,
         logical_ledger: list[dict[str, Any]],
-    ) -> tuple[ToolResult, bool]:
+    ) -> tuple[ToolResult, bool, dict[str, Any]]:
+        normalized = dict(arguments)
         outcome = str(arguments.get("outcome") or "")
         if outcome not in spec.completion_outcomes:
             raise ValueError(f"undeclared Column outcome: {outcome!r}")
         output = arguments.get("output")
         if not isinstance(output, dict):
-            raise ValueError("column.complete output must be an object")
+            raise ValueError(f"{spec.completion_tool_name} output must be an object")
         validate_contract(output, spec.output_contract, label="Column output")
-        evidence_ids = [str(item) for item in arguments.get("evidence_ids") or []]
+        if spec.completion_auto_evidence:
+            normalized["evidence_ids"] = [
+                str(item["evidence_id"])
+                for item in logical_ledger
+                if item.get("evidence_id")
+                and item.get("ok")
+                and item.get("status") == "completed"
+                and item.get("effect_kind") in {"write", "process", "control"}
+                and item.get("capability") not in {
+                    spec.completion_tool_name,
+                    "column.await",
+                }
+            ]
+        evidence_ids = [str(item) for item in normalized.get("evidence_ids") or []]
         if len(evidence_ids) != len(set(evidence_ids)):
             raise ValueError("column.complete evidence references must be unique")
         by_evidence = {
@@ -553,7 +636,10 @@ class AgentCore:
         )
         if success_completion:
             if not evidence_ids:
-                raise ValueError("successful Column completion requires capability evidence")
+                raise ValueError(
+                    "successful completion requires at least one successful write, process, or control action "
+                    f"before {spec.completion_tool_name}"
+                )
             referenced = []
             for evidence_id in evidence_ids:
                 entry = by_evidence.get(evidence_id)
@@ -641,7 +727,7 @@ class AgentCore:
             ok=True,
             capability=spec.completion_tool_name,
             output={"accepted": True},
-        ), True
+        ), True, normalized
 
     @staticmethod
     def _await_column(arguments: dict[str, Any], allowed: list[str]) -> tuple[ToolResult, bool]:
@@ -656,33 +742,38 @@ def _column_complete_schema(
     output_contract: dict[str, Any],
     *,
     tool_name: str = "column.complete",
+    include_evidence: bool = True,
 ) -> dict[str, Any]:
+    required = ["outcome", "output", "summary"]
+    properties: dict[str, Any] = {
+        "outcome": {"type": "string", "enum": sorted(outcomes)},
+        "output": output_contract or {"type": "object"},
+        "summary": {"type": "string", "maxLength": 4000},
+    }
+    if include_evidence:
+        required.append("evidence_ids")
+        properties["evidence_ids"] = {
+            "type": "array",
+            "maxItems": 500,
+            "items": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Canonical evidence_id from a successful business capability result. "
+                    "Include every successful write, process, and control action from this Run; "
+                    "do not include rejected completion-tool calls."
+                ),
+            },
+        }
     return {
         "type": "function",
         "function": {
             "name": tool_name,
-            "description": "Finish this Column Run with one declared outcome and contract-valid structured output.",
+            "description": "Finish this agent assignment with one declared outcome and contract-valid structured output.",
             "parameters": {
                 "type": "object",
-                "required": ["outcome", "output", "summary", "evidence_ids"],
-                "properties": {
-                    "outcome": {"type": "string", "enum": sorted(outcomes)},
-                    "output": output_contract or {"type": "object"},
-                    "summary": {"type": "string", "maxLength": 4000},
-                    "evidence_ids": {
-                        "type": "array",
-                        "maxItems": 500,
-                        "items": {
-                            "type": "string",
-                            "minLength": 1,
-                            "description": (
-                                "Canonical evidence_id from a successful business capability result. "
-                                "Include every successful write, process, and control action from this Run; "
-                                "do not include rejected completion-tool calls."
-                            ),
-                        },
-                    },
-                },
+                "required": required,
+                "properties": properties,
                 "additionalProperties": False,
             },
         },
@@ -798,6 +889,8 @@ def _column_await_schema(allowed: list[str], wait_config: dict[str, Any]) -> dic
 def _column_completion_protocol_error(
     tool_calls: list[Any],
     completion_tool_name: str = "column.complete",
+    *,
+    include_evidence: bool = True,
 ) -> str | None:
     complete_indices = [
         index
@@ -807,9 +900,12 @@ def _column_completion_protocol_error(
     if not complete_indices:
         return None
     if len(complete_indices) > 1:
+        fields = "outcome, output, and summary"
+        if include_evidence:
+            fields += ", plus evidence_ids"
         return (
             f"A model response may contain only one {completion_tool_name} call. "
-            f"Combine outcome, output, summary, and evidence_ids into one final {completion_tool_name} call. "
+            f"Combine {fields} into one final {completion_tool_name} call. "
             "No tool call from this response was executed."
         )
     if complete_indices[0] != len(tool_calls) - 1:
@@ -836,11 +932,24 @@ def _replayable_session_messages(history: list[dict[str, Any]]) -> list[dict[str
         role = str(item.get("role") or "")
         if role != "assistant" or not item.get("tool_calls"):
             if role in {"user", "assistant", "tool"}:
-                replay.append({
+                projected = {
                     key: item[key]
                     for key in ("role", "content", "tool_calls", "tool_call_id")
                     if key in item and item[key] not in (None, [])
-                })
+                }
+                if (
+                    role in {"user", "assistant"}
+                    and replay
+                    and replay[-1].get("role") == role
+                    and not replay[-1].get("tool_calls")
+                ):
+                    replay[-1]["content"] = (
+                        str(replay[-1].get("content") or "").rstrip()
+                        + "\n\n"
+                        + str(projected.get("content") or "").lstrip()
+                    )
+                else:
+                    replay.append(projected)
             index += 1
             continue
 

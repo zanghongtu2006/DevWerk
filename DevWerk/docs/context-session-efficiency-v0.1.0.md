@@ -53,9 +53,13 @@ Internal assistant tool-call messages, raw tool results, silent mailbox processi
 
 This preserves a complete long-lived Project conversation while preventing internal execution evidence from becoming conversational context.
 
+The provider-visible Session has a stable prefix: Conversation identity, instruction revision, platform policy, and capability schemas. Mutable Project metadata and rebuilt authoritative state are appended in the current Turn input rather than embedded in the system message. Capabilities are not hidden when Project state changes; a discussion-only Turn and other authority rules are enforced at dispatch and returned as structured tool results. This preserves the same main-Agent identity and improves provider prompt-prefix reuse.
+
+The structure follows the common boundary verified in the reference agents: Codex separates a durable Session from a Turn and continues a Turn whenever tool output requires follow-up; Hermes keeps a byte-stable conversation prefix, persists complete tool-call/result history, and treats gateway input as new Turns; Claude Code's public repository does not expose its production loop source, but its published behavior confirms resumable sessions, streamed tool activity, and recovery that removes malformed tool output from retry context. DevWerk adopts these boundaries without importing their product-specific safety, UI, or autonomous-agent policies.
+
 ## 5. Participant Session Checkpoint
 
-When a Column or Workcell participant completes through a tool call, Runtime persists a compact checkpoint containing its declared outcome, summary, and structured output even if the provider returned no natural-language text.
+When a Column or Workcell participant completes through a tool call, Runtime persists a compact checkpoint containing its declared outcome, summary, and structured output even if the provider returned no natural-language text. A Workcell participant reports semantic completion through `workcell.complete`; it does not emit a routing signal or assemble evidence identifiers. Runtime collects successful action evidence from the current Agent Run, maps the declared outcome to the Workcell transition, persists the directed Handoff, and advances the Workcell state machine internally.
 
 On reactivation, active context includes:
 
@@ -86,3 +90,6 @@ The Runtime records which Memory records and preloaded Artifacts entered each ac
 8. Existing Loop graphs and terminal semantics remain unchanged.
 9. Every Workcell participant sees an activation-time Artifact projection rather than a stale Column-entry snapshot.
 10. A persistent participant reactivation does not re-inject unchanged static content.
+11. Workcell routing signals and action-evidence assembly are Runtime responsibilities, not model-generated protocol data.
+12. Conversation identity, instruction, platform policy, and capability schemas form a stable Session prefix; current Project state is supplied as the authoritative Turn input.
+13. An unsupported Conversation mutation claim may continue only after a new successful state-changing tool receipt. Repeated prose or read-only calls at the same execution progress fail explicitly without an arbitrary retry count.

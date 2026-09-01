@@ -276,15 +276,11 @@ class ConversationGateway:
                     workflow = self.store.get_workflow(project_id)
                 except KeyError:
                     workflow = None
+                # A Project Session keeps one stable model-visible capability
+                # surface. Turn-specific authority is enforced at dispatch;
+                # changing tool schemas between turns destroys prompt-prefix
+                # reuse and makes the same logical Agent appear to lose tools.
                 capabilities = self.registry.all_ids()
-                if workflow is not None:
-                    capabilities = [item for item in capabilities if item != "loop.apply"]
-                if not job["start_task"]:
-                    capabilities = [
-                        item
-                        for item in capabilities
-                        if self.registry.side_effect_kind(item) in {"none", "read"}
-                    ]
                 trigger_kind = str(job.get("trigger_kind") or "user")
                 is_user_turn = trigger_kind == "user"
                 context = {

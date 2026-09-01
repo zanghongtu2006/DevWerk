@@ -29,7 +29,8 @@ PORT="${PORT:-8000}"
 RELOAD="${RELOAD:-false}"
 LOG_LEVEL="${LOG_LEVEL:-debug}"
 UVICORN_ACCESS_LOG="${UVICORN_ACCESS_LOG:-true}"
-export APP_ENV HOST PORT RELOAD LOG_LEVEL UVICORN_ACCESS_LOG
+GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS="${GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS:-5}"
+export APP_ENV HOST PORT RELOAD LOG_LEVEL UVICORN_ACCESS_LOG GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS
 
 case "$APP_ENV" in
   development|production|test) ;;
@@ -91,6 +92,7 @@ echo "[DevWerk] Starting in $APP_ENV mode..."
 echo "[DevWerk] Python:             $PYTHON_EXE"
 echo "[DevWerk] Starting uvicorn on http://$HOST:$PORT ..."
 echo "[DevWerk] Log level:          $LOG_LEVEL"
+echo "[DevWerk] Shutdown timeout:   $GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS seconds"
 echo "[DevWerk] API docs:           http://localhost:$PORT/docs"
 echo "[DevWerk] Alternative docs:   http://localhost:$PORT/redoc"
 echo "[DevWerk] Web workbench:      http://localhost:$PORT/"
@@ -103,6 +105,7 @@ while :; do
   set -- -m uvicorn app.main:app --host "$HOST" --port "$PORT" --log-level "$LOG_LEVEL"
   case "$RELOAD" in true|TRUE|1|yes|YES) set -- "$@" --reload ;; esac
   case "$UVICORN_ACCESS_LOG" in false|FALSE|0|no|NO) set -- "$@" --no-access-log ;; *) set -- "$@" --access-log ;; esac
+  set -- "$@" --timeout-graceful-shutdown "$GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS"
 
   "$PYTHON_EXE" "$@" &
   SERVICE_PID=$!

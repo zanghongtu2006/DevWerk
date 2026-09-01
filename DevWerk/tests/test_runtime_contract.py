@@ -913,7 +913,7 @@ def test_agent_can_repair_invalid_column_complete_arguments(store, tmp_path):
     assert result.iterations == 2
 
 
-def test_agent_can_repair_invalid_custom_completion_without_poisoning_evidence(
+def test_workcell_completion_collects_action_evidence_without_model_retries(
     store,
     tmp_path,
 ):
@@ -923,10 +923,9 @@ def test_agent_can_repair_invalid_custom_completion_without_poisoning_evidence(
         str(tmp_path / "project"),
     )
     turn = 0
-    write_evidence = ""
 
     def model(messages, _tools, **_kwargs):
-        nonlocal turn, write_evidence
+        nonlocal turn
         turn += 1
         if turn == 1:
             return AgentModelResponse(tool_calls=[AgentToolCall(
@@ -934,30 +933,13 @@ def test_agent_can_repair_invalid_custom_completion_without_poisoning_evidence(
                 name="project.files.write",
                 arguments={"path": "candidate.txt", "content": "ready"},
             )])
-        if turn == 2:
-            write_evidence = json.loads(messages[-1]["content"])["evidence"]["evidence_id"]
-            return AgentModelResponse(tool_calls=[AgentToolCall(
-                id="invalid-signal",
-                name="workcell.signal",
-                arguments={
-                    "outcome": "ready",
-                    "output": {},
-                    "summary": "missing evidence",
-                    "evidence_ids": [],
-                },
-            )])
-        rejected = json.loads(messages[-1]["content"])
-        assert rejected["error"]["message"] == (
-            "successful Column completion requires capability evidence"
-        )
         return AgentModelResponse(tool_calls=[AgentToolCall(
-            id="repaired-signal",
-            name="workcell.signal",
+            id="participant-complete",
+            name="workcell.complete",
             arguments={
                 "outcome": "ready",
                 "output": {},
                 "summary": "grounded",
-                "evidence_ids": [write_evidence],
             },
         )])
 
@@ -971,12 +953,15 @@ def test_agent_can_repair_invalid_custom_completion_without_poisoning_evidence(
         capability_ids=["project.files.write"],
         completion_outcomes={"ready"},
         completion_targets={"ready": "next"},
-        completion_tool_name="workcell.signal",
+        completion_tool_name="workcell.complete",
         completion_requires_evidence=True,
+        completion_auto_evidence=True,
     ))
 
     assert result.status == "succeeded"
-    assert result.iterations == 3
+    assert result.iterations == 2
+    assert result.completion is not None
+    assert len(result.completion["evidence_ids"]) == 1
     assert (tmp_path / "project" / "candidate.txt").read_text(encoding="utf-8") == "ready"
 
 
@@ -1013,12 +998,11 @@ def test_logical_agent_session_replays_only_latest_structured_checkpoint(store, 
             assert f"checkpoint-{activation - 2}" not in checkpoints[0]["content"]
         return AgentModelResponse(tool_calls=[AgentToolCall(
             id=f"signal-{activation}",
-            name="workcell.signal",
+            name="workcell.complete",
             arguments={
                 "outcome": "ready",
                 "output": {"revision": activation},
                 "summary": f"checkpoint-{activation}",
-                "evidence_ids": [],
             },
         )])
 
@@ -1036,7 +1020,8 @@ def test_logical_agent_session_replays_only_latest_structured_checkpoint(store, 
             agent_session_id=session["id"],
             completion_outcomes={"ready"},
             completion_targets={"ready": "next"},
-            completion_tool_name="workcell.signal",
+            completion_tool_name="workcell.complete",
+            completion_auto_evidence=True,
         ))
         assert result.status == "succeeded"
 

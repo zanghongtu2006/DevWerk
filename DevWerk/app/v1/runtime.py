@@ -583,8 +583,9 @@ class WorkflowRuntime:
                         },
                         output_contract=state.output_contract,
                         agent_session_id=participant_session_id,
-                        completion_tool_name="workcell.signal",
+                        completion_tool_name="workcell.complete",
                         completion_requires_evidence=state.require_evidence,
+                        completion_auto_evidence=True,
                     )
                 )
                 if result.status != "succeeded" or not result.completion:

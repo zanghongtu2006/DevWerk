@@ -223,40 +223,40 @@ def test_workcell_routes_typed_handoffs_and_keeps_participant_sessions(store, tm
     def model(messages, tools, **_kwargs):
         nonlocal calls
         calls += 1
-        assert any(item["function"]["name"] == "workcell.signal" for item in tools)
+        completion_tool = next(
+            item for item in tools if item["function"]["name"] == "workcell.complete"
+        )
+        assert "evidence_ids" not in completion_tool["function"]["parameters"]["properties"]
         activation_inputs.append(json.loads(messages[0]["content"])["context"]["input"])
         if calls in {1, 3}:
             if calls == 1:
                 shared.write_text("version-two", encoding="utf-8")
             return AgentModelResponse(tool_calls=[AgentToolCall(
                 id=f"candidate-{calls}",
-                name="workcell.signal",
+                name="workcell.complete",
                 arguments={
                     "outcome": "candidate_ready",
                     "output": {"candidate": f"implementation-v{1 if calls == 1 else 2}"},
                     "summary": "candidate ready",
-                    "evidence_ids": [],
                 },
             )])
         if calls == 2:
             return AgentModelResponse(tool_calls=[AgentToolCall(
                 id="revision",
-                name="workcell.signal",
+                name="workcell.complete",
                 arguments={
                     "outcome": "revision_requested",
                     "output": {"delivered": False},
                     "summary": "revise the candidate",
-                    "evidence_ids": [],
                 },
             )])
         return AgentModelResponse(tool_calls=[AgentToolCall(
             id="accepted",
-            name="workcell.signal",
+            name="workcell.complete",
             arguments={
                 "outcome": "accepted",
                 "output": {"delivered": True},
                 "summary": "accepted",
-                "evidence_ids": [],
             },
         )])
 
@@ -338,12 +338,11 @@ def test_workcell_recovers_same_node_and_participant_session_after_provider_time
             outcome, output = "accepted", {"delivered": True}
         return AgentModelResponse(tool_calls=[AgentToolCall(
             id=f"signal-{call}",
-            name="workcell.signal",
+            name="workcell.complete",
             arguments={
                 "outcome": outcome,
                 "output": output,
                 "summary": outcome,
-                "evidence_ids": [],
             },
         )])
 

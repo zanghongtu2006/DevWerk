@@ -31,6 +31,7 @@ if not defined PORT set "PORT=8000"
 if not defined RELOAD set "RELOAD=false"
 if not defined LOG_LEVEL set "LOG_LEVEL=debug"
 if not defined UVICORN_ACCESS_LOG set "UVICORN_ACCESS_LOG=true"
+if not defined GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS set "GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS=5"
 
 if not "%APP_ENV%"=="development" if not "%APP_ENV%"=="production" if not "%APP_ENV%"=="test" (
     echo [DevWerk] Invalid APP_ENV: %APP_ENV%
@@ -92,6 +93,7 @@ echo [DevWerk] Starting in %APP_ENV% mode...
 echo [DevWerk] Python:             %CD%\%PYTHON_EXE%
 echo [DevWerk] Starting uvicorn on http://%HOST%:%PORT% ...
 echo [DevWerk] Log level:          %LOG_LEVEL%
+echo [DevWerk] Shutdown timeout:   %GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS% seconds
 echo [DevWerk] API docs:           http://localhost:%PORT%/docs
 echo [DevWerk] Alternative docs:   http://localhost:%PORT%/redoc
 echo [DevWerk] Web workbench:      http://localhost:%PORT%/
@@ -101,7 +103,7 @@ echo [DevWerk] Press Ctrl+C to stop.
 echo.
 
 :run_service
-"%PYTHON_EXE%" -m uvicorn app.main:app %UVICORN_RELOAD% --host %HOST% --port %PORT% --log-level %LOG_LEVEL% %UVICORN_ACCESS_FLAG%
+"%PYTHON_EXE%" -m uvicorn app.main:app %UVICORN_RELOAD% --host %HOST% --port %PORT% --log-level %LOG_LEVEL% %UVICORN_ACCESS_FLAG% --timeout-graceful-shutdown %GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS%
 
 if exist "%DEVWERK_RESTART_MARKER%" (
     del /q "%DEVWERK_RESTART_MARKER%"
