@@ -2,11 +2,19 @@
 
 ## P0 runtime correction
 
+- [`DEVWERK_Scope_Extension_Implementation_2026-09-10.md`](DEVWERK_Scope_Extension_Implementation_2026-09-10.md): implemented same-project scope revision, sole Conversation Agent, persistent Worker continuation, verified reply reports, and read-only source database replay; hard character-limit repair is deferred.
+- [`DEVWERK_Novel_Combined_Remediation_Plan_2026-09-10.md`](DEVWERK_Novel_Combined_Remediation_Plan_2026-09-10.md): scope-extension A–E implementation and deferred hard character-limit F, with separate verification boundaries.
+- [`bugs/2026-09-10-conversation-scope-extension-review-and-plan.md`](bugs/2026-09-10-conversation-scope-extension-review-and-plan.md): real-project continuation failure, single Conversation Agent identity, scope revision and fact-based reporting repair proposal; awaiting review.
+- [`DEVWERK_P0_Runtime_Implementation_2026-09-10.md`](DEVWERK_P0_Runtime_Implementation_2026-09-10.md): R1–R9 implementation, fresh regression evidence, persistent Main/Worker lifecycle, migration and remaining verification boundaries.
+- [`DEVWERK_P0_Runtime_Bug_Register_2026-09-09.md`](DEVWERK_P0_Runtime_Bug_Register_2026-09-09.md): original fault evidence and per-item remediation status.
+- [`DEVWERK_P0_Runtime_Remediation_Plan_2026-09-09.md`](DEVWERK_P0_Runtime_Remediation_Plan_2026-09-09.md): reviewed Hermes architecture plan and release acceptance checklist.
 - [`mailbox-lifecycle-p0-design.md`](mailbox-lifecycle-p0-design.md): durable Mailbox message/delivery lifecycle, single automatic delivery, explicit redelivery, and the Scheduler/Conversation boundary.
+- [`agent-core-completion-evolution-v0.1.0.md`](agent-core-completion-evolution-v0.1.0.md): approved staged separation of Agent protocol, completion admission, execution evidence, and Workflow transition responsibilities.
+- [`conversation-agent-generic-tool-loop-v0.1.0.md`](conversation-agent-generic-tool-loop-v0.1.0.md): removes business-language parsing and forced capability sequences from the Conversation kernel while retaining durable receipts and generic no-progress detection.
 
 ## v0.1.0 normative extension
 
-- [`memory-and-workcell-runtime-v0.1.0.md`](memory-and-workcell-runtime-v0.1.0.md): File-first pluggable semantic Memory, context manifests, persistent Participant Sessions, and generic declarative Workcell execution. It supersedes earlier statements that Memory is postponed or every Agent Column is necessarily a one-Attempt ephemeral instance.
+- [`single-agent-column-runtime-v0.1.0.md`](single-agent-column-runtime-v0.1.0.md): File-first Memory and the single-Agent Column invariant; collaboration and rework live in the observable Workflow graph.
 
 ## Architecture authority
 

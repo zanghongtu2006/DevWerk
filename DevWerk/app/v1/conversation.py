@@ -4,13 +4,16 @@ import asyncio
 import logging
 import threading
 import time
+from uuid import uuid4
 from collections import defaultdict, deque
 from typing import Any, Callable
 
-from app.v1.agent import AgentCore, AgentRunSpec, _ledger_entry
+from app.v1.agent import AgentCore, AgentRunSpec
 from app.v1.agent_protocol import ConversationProtocolStalled
+from app.v1.execution_control import ExecutionControl
 from app.v1.capabilities import CapabilityRegistry
 from app.v1.domain import ToolResult
+from app.v1.execution_ledger import ledger_entry
 from app.v1.store import V1Store
 from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, PlatformPolicySnapshot, V1RuntimePolicy
 
@@ -128,20 +131,26 @@ class ConversationGateway:
             except asyncio.TimeoutError:
                 pass
             self._wake_event.clear()
-            await self._enqueue_governance_jobs()
+            try:
+                await self._enqueue_governance_jobs()
+            except Exception:
+                log.exception("conversation dispatcher tick failed; retrying")
 
     async def _enqueue_governance_jobs(self) -> None:
         for job_id in await asyncio.to_thread(self.store.enqueue_governance_jobs):
             job = await asyncio.to_thread(self.store.get_conversation_job, job_id)
             self._enqueue_job(job)
+        # The database is the queue. A failed claim or lost process-local wakeup
+        # must not orphan an accepted request until the next server restart.
+        for job in await asyncio.to_thread(self.store.queued_conversation_jobs):
+            self._enqueue_job(job)
 
     def _enqueue_job(self, job: dict[str, Any]) -> None:
         job_id = str(job["id"])
-        if job_id in self._pending_ids:
-            return
         project_id = str(job["project_id"])
-        self._pending_ids.add(job_id)
-        self._pending[project_id].append(job_id)
+        if job_id not in self._pending_ids:
+            self._pending_ids.add(job_id)
+            self._pending[project_id].append(job_id)
         task = self._session_tasks.get(project_id)
         if task is None or task.done():
             task = asyncio.create_task(
@@ -164,7 +173,7 @@ class ConversationGateway:
                 project_id,
                 exc_info=(type(error), error, error.__traceback__),
             )
-        if self._pending.get(project_id) and not self._stopping:
+        if self._pending.get(project_id) and not self._stopping and not task.cancelled() and task.exception() is None:
             next_task = asyncio.create_task(
                 self._drain_session(project_id),
                 name=f"conversation-session-{project_id}",
@@ -176,10 +185,10 @@ class ConversationGateway:
 
     async def _drain_session(self, project_id: str) -> None:
         identity = await asyncio.to_thread(self.store.conversation_agent, project_id)
-        session_owner = f"conversation-session:{identity['logical_id']}"
+        session_owner = f"conversation-session:{identity['logical_id']}:{uuid4().hex}"
         while self._pending[project_id] and not self._stopping:
-            job_id = self._pending[project_id].popleft()
-            settled = True
+            job_id = self._pending[project_id][0]
+            settled = False
             try:
                 job = await asyncio.to_thread(
                     self.store.claim_conversation_job,
@@ -193,12 +202,13 @@ class ConversationGateway:
                     )
                     if queued["status"] == "queued":
                         settled = False
-                        self._pending[project_id].appendleft(job_id)
                         await asyncio.sleep(
                             self.policy.service_limits.event_poll_interval_seconds
                         )
                         continue
+                    settled = True
                 else:
+                    settled = True
                     try:
                         await self._run_turn(job, session_owner)
                     except Exception:  # noqa: BLE001
@@ -207,18 +217,22 @@ class ConversationGateway:
                         pass
             finally:
                 if settled:
+                    self._pending[project_id].popleft()
                     self._pending_ids.discard(job_id)
         if not self._pending[project_id]:
             self._pending.pop(project_id, None)
 
     async def _run_turn(self, job: dict[str, Any], session_owner: str) -> None:
+        control = ExecutionControl(time.monotonic()+self.policy.execution.agent_wall_seconds,
+                                   validate_owner=lambda: self.store.assert_conversation_owner(job))
         lease_task = asyncio.create_task(
-            self._renew_session_lease(str(job["project_id"]), session_owner),
+            self._renew_session_lease(str(job["project_id"]), session_owner, control),
             name=f"conversation-lease-{job['project_id']}",
         )
         try:
-            await asyncio.to_thread(self._process, job)
+            await asyncio.to_thread(self._process, job, control)
         finally:
+            control.cancelled.set()
             lease_task.cancel()
             await asyncio.gather(lease_task, return_exceptions=True)
 
@@ -226,17 +240,22 @@ class ConversationGateway:
         self,
         project_id: str,
         session_owner: str,
+        control: ExecutionControl | None = None,
     ) -> None:
         while True:
             await asyncio.sleep(
                 self.policy.scheduling.conversation_lease_renew_seconds
             )
-            renewed = await asyncio.to_thread(
-                self.store.renew_conversation_lease,
-                project_id,
-                session_owner,
-            )
+            try:
+                renewed = await asyncio.to_thread(self.store.renew_conversation_lease, project_id, session_owner)
+            except Exception:
+                if control:
+                    control.cancelled.set()
+                log.exception("conversation lease renewal failed project=%s", project_id)
+                return
             if not renewed:
+                if control:
+                    control.cancelled.set()
                 return
 
     async def wait_for_idle(self, timeout: float = 5.0) -> bool:
@@ -250,14 +269,14 @@ class ConversationGateway:
 
     def status(self) -> dict[str, Any]:
         return {
-            "status": "running" if self._started and not self._stopping else "stopped",
+            "status": "running" if self._started and not self._stopping and self._dispatcher_task and not self._dispatcher_task.done() else "stopped",
             "active_sessions": sum(
                 1 for task in self._session_tasks.values() if not task.done()
             ),
             "pending_jobs": len(self._pending_ids),
         }
 
-    def _process(self, job: dict[str, Any]) -> None:
+    def _process(self, job: dict[str, Any], control: ExecutionControl | None = None) -> None:
         job_id = job["id"]
         project_id = job["project_id"]
         action_ledger: list[dict[str, Any]] = []
@@ -284,16 +303,44 @@ class ConversationGateway:
                 capabilities = self.registry.all_ids()
                 trigger_kind = str(job.get("trigger_kind") or "user")
                 is_user_turn = trigger_kind == "user"
+                main = self.store.agents.main(project_id)
+                requirement = self.store.agents.turn_requirement(job, mailbox)
+                graph_mutation_allowed = bool(requirement and requirement['status'] == 'active' and (job['start_task'] or not is_user_turn))
+                if requirement and not is_user_turn:
+                    current_requirement = self.store.agents.get_requirement(project_id, requirement['id'])
+                    graph_mutation_allowed = graph_mutation_allowed and current_requirement['status'] == 'active' and current_requirement['revision'] == requirement['revision']
                 context = {
+                    "requirement": requirement,
+                    "workers": self.store.agents.list_workers(project_id),
                     "active_workflow": workflow,
                     "global_settings": self.global_settings,
                     "memory": self.store.memory.build_context(project),
                     "loops": self.store.list_loops(limit=20),
-                    "workflow_plans": self.store.list_workflow_plans(project_id) if is_user_turn else [],
-                    "task_plans": self.store.list_task_plans(project_id) if is_user_turn else [],
+                    "workflow_plans": self.store.list_workflow_plans(project_id),
+                    "task_plans": self.store.list_task_plans(project_id),
                     "tasks": self.store.task_summaries(project_id, self.policy.context.task_summary_limit),
                     "mailbox": mailbox,
-                    "conversation_job": {"id": job_id, "start_task": bool(job["start_task"]), "trigger_kind": job.get("trigger_kind", "user"), "trigger": job.get("trigger", {})},
+                    "conversation_job": {
+                        "id": job_id,
+                        "start_task": bool(job["start_task"]),
+                        "trigger_kind": job.get("trigger_kind", "user"),
+                        "trigger": job.get("trigger", {}),
+                        "task_graph_mutation_allowed": graph_mutation_allowed,
+                    },
+                    "turn_authority": {
+                        "task_graph_mutation_allowed": graph_mutation_allowed,
+                        "instruction": (
+                            "You are this Project's sole persistent Conversation Agent, equivalent to its main agent. There is no higher System Main Agent. Within the active Requirement, use "
+                            "Worker results to continue planning, create repair work and deliver the goal. "
+                            "Use existing plan/task references before creating work; repeated facts do not "
+                            "require duplicate Tasks. Closed Requirements cannot be revived by late events. "
+                            "For a user-requested scope extension use project.scope.inspect then project.scope.revise, never close/create the old scope. "
+                            "Save a new TaskPlan against the returned Workflow and create only additional Tasks. Scope revision itself creates no Tasks. "
+                            "If a frozen method must change, inspect its current Loop digest and pass loop_digest explicitly. "
+                            "For continued novels use ending_policy=continue; do not raise chapter length limits without the user's request. "
+                            "Columns execute one leaf Worker each; collaboration belongs in the workflow."
+                        ),
+                    },
                     "current_request": {
                         "message_id": job.get("user_message_id"),
                         "content": str(job.get("message") or ""),
@@ -310,10 +357,15 @@ class ConversationGateway:
                     instruction_revision=int(identity.get("instruction_revision") or 1),
                     context=context,
                     capability_ids=capabilities,
-                    start_task=bool(job["start_task"]),
+                    start_task=graph_mutation_allowed,
+                    agent_instance_id=main['id'],
+                    requirement_id=requirement['id'] if requirement else None,
                     conversation_job_id=job_id,
                     agent_session_id=session_id,
                     user_initiated=is_user_turn,
+                    execution_control=control,
+                    supervision_turn=not is_user_turn,
+                    require_conversation_report=True,
                 ))
                 run_ids = [result.agent_run_id]
                 invocations = self.store.tool_invocations(
@@ -323,7 +375,7 @@ class ConversationGateway:
                 )
                 all_invocations = list(invocations)
                 action_ledger = [
-                    _ledger_entry(
+                    ledger_entry(
                         result.agent_run_id,
                         str(item["tool_call_id"]),
                         str(item["capability"]),
@@ -352,6 +404,8 @@ class ConversationGateway:
                     and item["ok"]
                     and isinstance(item.get("result", {}).get("output"), dict)
                 ]
+                created_plan_ids = {item.get('task_plan_id') for item in tasks if item.get('task_plan_id')}
+                tasks.extend(item for item in self.store.list_tasks(project_id) if item.get('task_plan_id') in created_plan_ids)
                 tasks = list({item["id"]: item for item in tasks if item.get("id")}.values())
                 workflow_publications = [
                     item["result"]["output"]
@@ -359,7 +413,7 @@ class ConversationGateway:
                     if item["capability"] == "workflow.publish"
                     and item["ok"]
                     and isinstance(item.get("result", {}).get("output"), dict)
-                ] if is_user_turn else []
+                ]
                 workflow_publications.extend(
                     item["result"]["output"]["workflow"]
                     for item in all_invocations
@@ -367,6 +421,10 @@ class ConversationGateway:
                     and item["ok"]
                     and isinstance(item.get("result", {}).get("output"), dict)
                     and isinstance(item["result"]["output"].get("workflow"), dict)
+                )
+                workflow_publications.extend(
+                    self.store.get_workflow_revision(project_id, item['result']['output']['workflow_revision_id'])
+                    for item in all_invocations if item['capability'] == 'project.scope.revise' and item['ok']
                 )
                 direct_artifact_ids = [
                     item["result"]["output"]["artifact"]["id"]
@@ -430,7 +488,7 @@ class ConversationGateway:
                     hydrate_payloads=True,
                 )
                 action_ledger = [
-                    _ledger_entry(
+                    ledger_entry(
                         str(failed_run["id"]),
                         str(item["tool_call_id"]),
                         str(item["capability"]),
@@ -446,13 +504,13 @@ class ConversationGateway:
                 notification = {
                     "content": (
                         (
-                            "本轮操作未完成：Conversation Agent 没有完成全部所需的项目工具调用；"
-                            "已经成功执行的操作及其回执已保留。"
+                            "本轮已停止：Conversation Agent 重复提交相同且失败的工具操作；"
+                            "此前成功操作及其回执已保留。"
                         )
                         if durable_progress
                         else (
-                            "本轮操作未执行：Conversation Agent 没有完成所需的项目工具调用，"
-                            "项目状态未改变。"
+                            "本轮未完成：Conversation Agent 重复提交相同且失败的工具操作，"
+                            "Runtime 已停止重复调用；项目状态未改变。"
                         )
                     ),
                     "meta": {
@@ -461,6 +519,18 @@ class ConversationGateway:
                         "job_id": job_id,
                         "agent_run_id": failed_run["id"] if failed_run else None,
                         "error_code": "conversation_protocol_stalled",
+                        "durable_progress": durable_progress,
+                    },
+                }
+            elif str(job.get("trigger_kind") or "user") == "user":
+                notification = {
+                    "content": f"本轮未完成：{error}",
+                    "meta": {
+                        "status": "failed",
+                        "kind": "reply",
+                        "job_id": job_id,
+                        "agent_run_id": failed_run["id"] if failed_run else None,
+                        "error_code": "conversation_processing_failed",
                         "durable_progress": durable_progress,
                     },
                 }

@@ -20,6 +20,8 @@ class Transition(BaseModel):
     model_config = ConfigDict(extra="forbid")
     outcome: str = Field(default="success", pattern=KEY_PATTERN)
     target: str = Field(pattern=KEY_PATTERN)
+    evidence_requirement: Literal["required", "optional", "forbidden"] | None = None
+    allows_unresolved_failures: bool = False
 
 
 class WaitPolicyBase(BaseModel):
@@ -88,7 +90,7 @@ class MemorySelector(BaseModel):
     """A provider-neutral semantic Memory query declared by a Loop."""
 
     model_config = ConfigDict(extra="forbid")
-    scope: Literal["project", "conversation", "workflow", "task", "workcell", "participant"]
+    scope: Literal["project", "conversation", "workflow", "task"]
     query: str = Field(default="", max_length=4_000)
     kinds: list[str] = Field(default_factory=list, max_length=100)
     required: bool = False
@@ -106,6 +108,8 @@ class AgentExecutor(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: Literal["agent"] = "agent"
     capabilities: list[str] = Field(min_length=1)
+    worker_key: str | None = Field(default=None, min_length=1, max_length=200)
+    worker_role: str = Field(default="worker", min_length=1, max_length=100)
 
 
 class CapabilitySequenceExecutor(BaseModel):
@@ -138,172 +142,18 @@ class CapabilitySequenceExecutor(BaseModel):
         return self
 
 
-class WorkcellAgentParticipant(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    key: str = Field(pattern=KEY_PATTERN)
-    kind: Literal["agent"] = "agent"
-    instruction: str = Field(default="", max_length=60_000)
-    capabilities: list[str] = Field(min_length=1)
-    lifecycle: Literal["invocation", "column_visit", "task"] = "column_visit"
-    context: ContextSelection = Field(default_factory=ContextSelection)
-
-
-class WorkcellCapabilityParticipant(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    key: str = Field(pattern=KEY_PATTERN)
-    kind: Literal["capability_sequence"] = "capability_sequence"
-    steps: list[CapabilityStep] = Field(min_length=1, max_length=200)
-    lifecycle: Literal["invocation", "column_visit", "task"] = "invocation"
-    completed_signal: str | None = Field(default=None, pattern=KEY_PATTERN)
-    signal_from: str | None = Field(default=None, pattern=r"^/.*")
-
-    @model_validator(mode="after")
-    def select_signal_source(self) -> "WorkcellCapabilityParticipant":
-        if (self.completed_signal is None) == (self.signal_from is None):
-            raise ValueError(
-                "workcell capability participant requires exactly one of completed_signal or signal_from"
-            )
-        return self
-
-
-WorkcellParticipant = Annotated[
-    WorkcellAgentParticipant | WorkcellCapabilityParticipant,
-    Field(discriminator="kind"),
-]
-
-
-class WorkcellTransition(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    signal: str = Field(pattern=KEY_PATTERN)
-    target: str = Field(pattern=KEY_PATTERN)
-    receivers: list[str] = Field(default_factory=list, max_length=200)
-
-
-class WorkcellState(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    key: str = Field(pattern=KEY_PATTERN)
-    participant: str = Field(pattern=KEY_PATTERN)
-    instruction: str = Field(default="", max_length=60_000)
-    input_contract: dict[str, Any] = Field(default_factory=dict)
-    output_contract: dict[str, Any] = Field(default_factory=dict)
-    require_evidence: bool = True
-    transitions: list[WorkcellTransition] = Field(min_length=1, max_length=200)
-
-
-class WorkcellTerminal(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    key: str = Field(pattern=KEY_PATTERN)
-    outcome: str = Field(pattern=KEY_PATTERN)
-
-
-class WorkcellExecutor(BaseModel):
-    """A domain-neutral directed collaboration graph inside one Column Run."""
-
-    model_config = ConfigDict(extra="forbid")
-    kind: Literal["workcell"] = "workcell"
-    participants: list[WorkcellParticipant] = Field(min_length=1, max_length=100)
-    entry: str = Field(pattern=KEY_PATTERN)
-    states: list[WorkcellState] = Field(min_length=1, max_length=200)
-    terminals: list[WorkcellTerminal] = Field(min_length=1, max_length=100)
-
-    @model_validator(mode="after")
-    def validate_graph(self) -> "WorkcellExecutor":
-        participant_keys = [item.key for item in self.participants]
-        if len(participant_keys) != len(set(participant_keys)):
-            raise ValueError("workcell participant keys must be unique")
-        state_keys = [item.key for item in self.states]
-        if len(state_keys) != len(set(state_keys)):
-            raise ValueError("workcell state keys must be unique")
-        terminal_keys = [item.key for item in self.terminals]
-        if len(terminal_keys) != len(set(terminal_keys)):
-            raise ValueError("workcell terminal keys must be unique")
-        if set(state_keys) & set(terminal_keys):
-            raise ValueError("workcell state and terminal keys must not overlap")
-        if self.entry not in set(state_keys):
-            raise ValueError("workcell entry must reference a state")
-        known_participants = set(participant_keys)
-        participant_map = {item.key: item for item in self.participants}
-        known_targets = set(state_keys) | set(terminal_keys)
-        by_state = {item.key: item for item in self.states}
-        for state in self.states:
-            if state.participant not in known_participants:
-                raise ValueError(
-                    f"workcell state {state.key!r} references unknown participant {state.participant!r}"
-                )
-            signals = [item.signal for item in state.transitions]
-            if len(signals) != len(set(signals)):
-                raise ValueError(f"workcell state {state.key!r} has duplicate signals")
-            for transition in state.transitions:
-                if transition.target not in known_targets:
-                    raise ValueError(
-                        f"workcell state {state.key!r} references unknown target {transition.target!r}"
-                    )
-                unknown_receivers = sorted(set(transition.receivers) - known_participants)
-                if unknown_receivers:
-                    raise ValueError(
-                        f"workcell state {state.key!r} references unknown receivers {unknown_receivers}"
-                    )
-            participant = participant_map[state.participant]
-            if (
-                isinstance(participant, WorkcellCapabilityParticipant)
-                and participant.completed_signal is not None
-                and participant.completed_signal not in set(signals)
-            ):
-                raise ValueError(
-                    f"workcell state {state.key!r} has no transition for capability participant "
-                    f"signal {participant.completed_signal!r}"
-                )
-        reachable: set[str] = set()
-        pending = [self.entry]
-        while pending:
-            key = pending.pop()
-            if key in reachable:
-                continue
-            reachable.add(key)
-            if key in set(terminal_keys):
-                continue
-            pending.extend(item.target for item in by_state[key].transitions)
-        unreachable = set(state_keys) - reachable
-        if unreachable:
-            raise ValueError(f"workcell contains unreachable states: {sorted(unreachable)}")
-        for state in self.states:
-            seen: set[str] = set()
-            frontier = [state.key]
-            while frontier and not (seen & set(terminal_keys)):
-                key = frontier.pop()
-                if key in seen:
-                    continue
-                seen.add(key)
-                if key in set(terminal_keys):
-                    continue
-                frontier.extend(item.target for item in by_state[key].transitions)
-            if not (seen & set(terminal_keys)):
-                raise ValueError(f"workcell state {state.key!r} has no path to a terminal")
-        return self
-
-    def state(self, key: str) -> WorkcellState:
-        for item in self.states:
-            if item.key == key:
-                return item
-        raise KeyError(key)
-
-    def participant(self, key: str) -> WorkcellParticipant:
-        for item in self.participants:
-            if item.key == key:
-                return item
-        raise KeyError(key)
-
-    def terminal_outcome(self, key: str) -> str | None:
-        for item in self.terminals:
-            if item.key == key:
-                return item.outcome
-        return None
-
-
 ColumnExecutor = Annotated[
-    AgentExecutor | CapabilitySequenceExecutor | WorkcellExecutor,
+    AgentExecutor | CapabilitySequenceExecutor,
     Field(discriminator="kind"),
 ]
+
+
+class AcceptanceCheck(BaseModel):
+    """A frozen, executable obligation selected by the workflow author."""
+    model_config = ConfigDict(extra="forbid")
+    key: str = Field(pattern=KEY_PATTERN)
+    capability: Literal["project.command.run", "project.files.read"]
+    arguments: dict[str, Any]
 
 
 class ColumnDefinition(BaseModel):
@@ -315,12 +165,15 @@ class ColumnDefinition(BaseModel):
     context: ContextSelection = Field(default_factory=ContextSelection)
     input_contract: dict[str, Any] = Field(default_factory=dict)
     output_contract: dict[str, Any] = Field(default_factory=dict)
+    acceptance_checks: list[AcceptanceCheck] = Field(default_factory=list, max_length=30)
     transitions: list[Transition] = Field(default_factory=list)
     wait_policy: WaitPolicy | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_execution(self) -> "ColumnDefinition":
+        if len({check.key for check in self.acceptance_checks}) != len(self.acceptance_checks):
+            raise ValueError('Acceptance check keys must be unique')
         if self.executor is None:
             raise ValueError(f"column {self.key!r} requires an executor")
         if not self.transitions:
@@ -348,13 +201,6 @@ class ColumnDefinition(BaseModel):
                         f"column {self.key!r} capability_sequence output_contract rejects "
                         f"Runtime envelope fields: {missing}"
                     )
-        if isinstance(self.executor, WorkcellExecutor):
-            declared = {item.outcome for item in self.transitions}
-            unknown = sorted({item.outcome for item in self.executor.terminals} - declared)
-            if unknown:
-                raise ValueError(
-                    f"column {self.key!r} Workcell terminals use undeclared outcomes: {unknown}"
-                )
         required_roots = self.input_contract.get("required")
         if isinstance(required_roots, list):
             available_roots = {"column", "planning", "dependencies"}
@@ -507,10 +353,11 @@ class WorkflowColumnPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
     key: str = Field(pattern=KEY_PATTERN)
     responsibility: str = Field(min_length=1, max_length=4_000)
-    execution_mode: Literal["agent", "capability_sequence", "workcell"] = Field(
+    execution_mode: Literal["agent", "capability_sequence"] = Field(
         description=(
-            "How this reusable process stage executes when a Task enters it: create one "
-            "logical Agent, deterministic capability sequence, or declared Workcell."
+            "How this reusable process stage executes when a Task enters it: run exactly "
+            "one logical Agent or one deterministic capability sequence. Multi-Agent "
+            "collaboration must be represented by separate Workflow Columns."
         ),
     )
     entry_evidence: list[str] = Field(min_length=1, max_length=200)
@@ -707,13 +554,6 @@ class TaskPlanItem(BaseModel):
             column.key
             for column in workflow.columns
             if isinstance(column.executor, AgentExecutor)
-            or (
-                isinstance(column.executor, WorkcellExecutor)
-                and any(
-                    isinstance(participant, WorkcellAgentParticipant)
-                    for participant in column.executor.participants
-                )
-            )
         ]
         if self.agent_execution == "forbidden" and agent_columns:
             raise ValueError(
@@ -815,11 +655,42 @@ class WorkflowWalkthroughStep(BaseModel):
     )
 
 
-class LinearTaskDependencyContract(BaseModel):
+class TaskContractValueReference(BaseModel):
+    """A value used by deterministic Task admission.
+
+    Project facts and Task facts remain separate sources so a Task cannot
+    silently override the Project scope declared when its Loop was applied.
+    """
+
     model_config = ConfigDict(extra="forbid")
-    kind: Literal["linear_by_integer_input"] = "linear_by_integer_input"
+    source: Literal["task_input", "loop_binding", "literal"]
+    pointer: str | None = Field(default=None, pattern=r"^/.*", max_length=2_000)
+    value: Any = None
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "TaskContractValueReference":
+        if self.source == "literal":
+            if self.pointer is not None:
+                raise ValueError("literal Task contract reference cannot declare pointer")
+        elif self.pointer is None:
+            raise ValueError(f"{self.source} Task contract reference requires pointer")
+        return self
+
+
+class TaskAdmissionConstraint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    left: TaskContractValueReference
+    operator: Literal["eq", "ne", "lt", "lte", "gt", "gte", "in"]
+    right: TaskContractValueReference
+    message: str = Field(min_length=1, max_length=2_000)
+
+
+class OrderedTaskDependencyContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["previous_in_order"] = "previous_in_order"
     order_pointer: str = Field(pattern=r"^/.*", max_length=2_000)
-    first_value: int = 1
+    continuity: Literal["contiguous_integer", "strictly_increasing"] = "strictly_increasing"
+    first_value: int | str | None = None
 
 
 class TaskContract(BaseModel):
@@ -834,7 +705,8 @@ class TaskContract(BaseModel):
             "identity across immutable Task Plans. Linear contracts default to order_pointer."
         ),
     )
-    dependency_contract: LinearTaskDependencyContract | None = None
+    dependency_contract: OrderedTaskDependencyContract | None = None
+    admission_constraints: list[TaskAdmissionConstraint] = Field(default_factory=list, max_length=200)
     required_context: list[str] = Field(default_factory=list, max_length=200)
     expected_outputs: list[str] = Field(min_length=1, max_length=200)
     acceptance_contract: list[str] = Field(min_length=1, max_length=200)

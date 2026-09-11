@@ -1,0 +1,40 @@
+# DDD Software Delivery
+
+## Description: <br>
+Deliver a confirmed client-server software requirement through requirement validation, domain-driven design, separate backend and frontend implementation, integration review, independent testing, operable packaging, and final acceptance. <br>
+
+## Publisher: <br>
+DevWerk <br>
+
+## Category: <br>
+software_delivery <br>
+
+## Tags: <br>
+- software-development <br>
+- domain-driven-design <br>
+- pair-programming <br>
+- frontend-backend-collaboration <br>
+- automated-testing <br>
+- devops <br>
+- release-readiness <br>
+
+## Use Case: <br>
+Use for a client-server software delivery scope whose user-visible requirement and acceptance criteria have been confirmed. Backend, frontend, and integration review are separate observable Workflow Columns; implementation Columns can retain their own logical sessions across directed rework. The delivery may target a local package, container, source repository, or an external CI/CD platform. <br>
+
+## Selection Guide: <br>
+Select when the work must produce runnable software and verifiable engineering evidence. Continue user conversation instead when product behavior, acceptance criteria, or delivery target remains materially ambiguous. <br>
+
+## Loop Input: <br>
+Project name and delivery target are Project bindings. Each Task identifies one confirmed requirement file and its delivery scope. <br>
+
+## Loop Output: <br>
+Traceable requirements, domain and interface design, reviewed source code, automated test evidence, operable delivery assets, and final acceptance. <br>
+
+## Loop Version(s): <br>
+1.2.0 <br>
+
+## Loop Key: <br>
+software.ddd_delivery <br>
+
+## Reference(s): <br>
+- [Executable bundle](loop.json) <br>

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import json
 
 from fastapi.testclient import TestClient
 
@@ -103,9 +104,8 @@ def test_web_routes_and_modular_assets_are_served():
         assert "失败阶段" in tasks
         assert "查看原始 Runtime 错误" in tasks
         assert "task.error" in tasks
-        assert "WORKCELLS" in tasks
-        assert "Participant collaboration" in tasks
-        assert "workcell.participants" in tasks
+        assert "Column Agent audit" in tasks
+        assert "WORKCELLS" not in tasks
         settings_page = web.get("/web/static/pages/settings.js").text
         assert "global-settings-form" in settings_page
         assert "data-setting-key" in settings_page
@@ -287,7 +287,7 @@ def test_declarative_api_workflow_reaches_done_without_llm(tmp_path, monkeypatch
             return AgentModelResponse(tool_calls=[
                 {"id": "inspect", "name": "project.inspect", "arguments": {}}
             ])
-        return AgentModelResponse(text="The deterministic Task reached its terminal state.")
+        return AgentModelResponse(text=json.dumps({'mode': 'discussion', 'message': 'Received the project update.'}))
 
     monkeypatch.setattr("app.v1.agent.provider_complete", conversation_model)
     with client() as web:
@@ -346,7 +346,7 @@ def test_api_rejects_unknown_declared_capability(tmp_path):
 def test_conversation_and_agent_audit_endpoints(tmp_path, monkeypatch):
     traces = []
     monkeypatch.setattr("app.v1.api.trace_json", lambda _logger, event, **payload: traces.append((event, payload)))
-    monkeypatch.setattr("app.v1.agent.provider_complete", lambda *_args, **_kwargs: AgentModelResponse(text="I inspected the Project."))
+    monkeypatch.setattr("app.v1.agent.provider_complete", lambda *_args, **_kwargs: AgentModelResponse(text=json.dumps({'mode': 'discussion', 'message': 'Ready to discuss the Project.'})))
     with client() as web:
         project = web.post(
             "/v1/projects",
@@ -364,7 +364,7 @@ def test_conversation_and_agent_audit_endpoints(tmp_path, monkeypatch):
                 break
             time.sleep(0.02)
         assert job["status"] == "succeeded"
-        assert job["result"]["reply"] == "I inspected the Project."
+        assert job["result"]["reply"] == "Ready to discuss the Project."
         assert job["result"]["task_ids"] == []
         runs = web.get(f"/v1/projects/{project['id']}/agent-runs").json()
         assert len(runs) == 1

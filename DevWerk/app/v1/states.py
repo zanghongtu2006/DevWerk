@@ -186,7 +186,8 @@ AGENT_RUN_STATE_MACHINE = StateMachine(
 MAILBOX_STATE_MACHINE = StateMachine(
     MailboxStatus,
     {
-        MailboxStatus.PENDING: {MailboxStatus.DELIVERED},
+        # Addressed input can expire before consumption when its Assignment ends.
+        MailboxStatus.PENDING: {MailboxStatus.DELIVERED, MailboxStatus.FAILED},
         MailboxStatus.DELIVERED: {
             MailboxStatus.RECEIVED,
             MailboxStatus.FAILED,

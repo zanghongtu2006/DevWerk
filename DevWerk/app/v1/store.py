@@ -13,7 +13,6 @@ from app.v1.domain import (
     CapabilitySequenceExecutor,
     ReadinessDecision,
     TaskPlan,
-    WorkcellExecutor,
     WorkflowPlan,
     WorkflowDefinition,
 )
@@ -41,7 +40,6 @@ from app.v1.states import (
 from app.v1.storage_support import new_id, utcnow
 from app.v1.task_identity import (
     logical_task_key,
-    logical_task_key_for_value,
     resolve_input_pointer,
 )
 from app.v1.repositories.artifact_repository import ArtifactRepository
@@ -49,9 +47,16 @@ from app.v1.repositories.event_repository import EventRepository
 from app.v1.repositories.project_repository import ProjectRepository
 from app.v1.repositories.planning_repository import PlanningRepository
 from app.v1.repositories.schema_repository import SchemaRepository
+from app.v1.repositories.agent_repository import AgentRepository
+from app.v1.repositories.scope_repository import ScopeRepository
 from app.v1.services.scheduler import SchedulerService
 from app.v1.services.recovery_manager import RecoveryManager
 from app.v1.services.mailbox import MailboxService
+from app.v1.services.task_graph_admission import (
+    existing_task_orders,
+    immediate_predecessor,
+    validate_task_scope,
+)
 
 
 def _resolve_loop_parameters(value: Any, parameters: dict[str, Any]) -> Any:
@@ -194,6 +199,32 @@ def _validate_deterministic_deliverable_coverage(
         )
 
 
+class _StoreConnection(sqlite3.Connection):
+    def __exit__(self, *args):
+        try:
+            return super().__exit__(*args)
+        finally:
+            self.close()
+
+
+class _BorrowedConnection:
+    """Reads nested in a Store transaction cannot commit or close their owner."""
+    def __init__(self, connection):
+        self.connection = connection
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+    def __enter__(self):
+        return self.connection
+
+    def __exit__(self, *args):
+        return False
+
+    def close(self):
+        pass
+
+
 class V1Store:
     def __init__(
         self,
@@ -216,14 +247,21 @@ class V1Store:
         self.recovery_manager = RecoveryManager(self)
         self.mailbox_service = MailboxService(self)
         self.schema_repository = SchemaRepository(self)
+        self.agents = AgentRepository(self)
+        self.scopes = ScopeRepository(self)
         self.path = Path(db_path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._schema_lock = threading.Lock()
+        self._transaction_local = threading.local()
+        self._revoked_owners: set[tuple[str, str, int]] = set()
         self.init_schema()
 
     def connect(self) -> sqlite3.Connection:
+        active = getattr(self._transaction_local, "connection", None)
+        if active is not None:
+            return _BorrowedConnection(active)
         timeout_seconds = self.policy.service_limits.sqlite_busy_timeout_milliseconds / 1_000
-        connection = sqlite3.connect(self.path, timeout=timeout_seconds, isolation_level=None)
+        connection = sqlite3.connect(self.path, timeout=timeout_seconds, isolation_level=None, factory=_StoreConnection)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute(f"PRAGMA busy_timeout={self.policy.service_limits.sqlite_busy_timeout_milliseconds}")
@@ -231,19 +269,35 @@ class V1Store:
 
     @contextmanager
     def tx(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+        active = getattr(self._transaction_local, "connection", None)
+        if active is not None:
+            savepoint = new_id("sp")
+            active.execute(f"SAVEPOINT {savepoint}")
+            try:
+                yield active
+                active.execute(f"RELEASE SAVEPOINT {savepoint}")
+            except BaseException:
+                active.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                active.execute(f"RELEASE SAVEPOINT {savepoint}")
+                raise
+            return
         connection = self.connect()
         try:
             connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            self._transaction_local.connection = connection
             yield connection
             connection.commit()
         except Exception:
             connection.rollback()
             raise
         finally:
+            self._transaction_local.connection = None
             connection.close()
 
     def init_schema(self) -> None:
         self.schema_repository.init_schema()
+        self.agents.init_schema()
+        self.scopes.init_schema()
 
     def _validate_persisted_runtime_statuses(self, db: sqlite3.Connection) -> None:
         self.schema_repository._validate_persisted_runtime_statuses(db)
@@ -275,7 +329,9 @@ class V1Store:
                 "defaults, workflow_plan, and workflow"
             )
         if defaults:
-            validate_contract(defaults, parameter_schema, label=f"Loop {loop_key} defaults")
+            # Defaults may cover only optional parameters; required user input
+            # is validated after merging bindings at application time.
+            validate_contract(defaults, {**parameter_schema, 'required': []}, label=f"Loop {loop_key} defaults")
             materialized = _resolve_loop_parameters(bundle, defaults)
             workflow_plan = WorkflowPlan.model_validate(materialized["workflow_plan"])
             check_schema(workflow_plan.task_contract.input_schema, label=f"Loop {loop_key} task input_schema")
@@ -288,6 +344,12 @@ class V1Store:
         return loop
 
     def apply_loop(
+        self, project_id: str, loop_key: str, bindings: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self.tx(immediate=True):
+            return self._apply_loop(project_id, loop_key, bindings)
+
+    def _apply_loop(
         self,
         project_id: str,
         loop_key: str,
@@ -322,8 +384,8 @@ class V1Store:
             db.execute(
                 "INSERT INTO v1_project_loop_bindings("
                 "id,project_id,loop_key,loop_version,loop_digest,bindings_json,"
-                "workflow_plan_id,workflow_revision_id,created_at"
-                ") VALUES(?,?,?,?,?,?,?,?,?)",
+                "workflow_plan_id,workflow_revision_id,created_at,package_json"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
                     application_id,
                     project_id,
@@ -334,6 +396,7 @@ class V1Store:
                     plan_row["id"],
                     workflow_row["id"],
                     now,
+                    json.dumps(loop, ensure_ascii=False),
                 ),
             )
             self._event(db, project_id, None, None, "workflow.loop.applied", {
@@ -344,6 +407,7 @@ class V1Store:
                 "workflow_revision_id": workflow_row["id"],
                 "workflow_plan_id": plan_row["id"],
             })
+            self.scopes.bind_workflow(workflow_row['id'], application_id)
         return {
             "id": application_id,
             "project_id": project_id,
@@ -675,14 +739,20 @@ class V1Store:
             )
         return self.get_conversation_job(job_id)
 
+    def queued_conversation_jobs(self) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            ids = [row[0] for row in db.execute("SELECT id FROM v1_conversation_jobs WHERE status='queued' ORDER BY created_at,rowid")]
+        return [self.get_conversation_job(identity) for identity in ids]
+
     def enqueue_governance_jobs(self) -> list[str]:
         """Create one durable supervision turn per Project when facts require it."""
+        self.recover_expired_conversation_jobs()
         now = utcnow()
         created: list[str] = []
         with self.tx(immediate=True) as db:
             projects = db.execute(
                 "SELECT DISTINCT p.id FROM v1_projects p JOIN v1_conversation_agents a ON a.project_id=p.id "
-                "LEFT JOIN v1_project_mailbox m ON m.project_id=p.id AND m.state='pending' "
+                "LEFT JOIN v1_project_mailbox m ON m.project_id=p.id AND m.state='pending' AND m.recipient_agent_id IS NULL "
                 "LEFT JOIN v1_scheduled_reviews s ON s.project_id=p.id AND s.state='pending' AND s.due_at<=? "
                 "WHERE m.id IS NOT NULL OR s.id IS NOT NULL",
                 (now,),
@@ -696,7 +766,7 @@ class V1Store:
                 if busy:
                     continue
                 mailbox_ids = [row[0] for row in db.execute(
-                    "SELECT id FROM v1_project_mailbox WHERE project_id=? AND state='pending' ORDER BY id LIMIT ?",
+                    "SELECT id FROM v1_project_mailbox WHERE project_id=? AND state='pending' AND recipient_agent_id IS NULL ORDER BY id LIMIT ?",
                     (project_id, self.policy.context.mailbox_limit),
                 ).fetchall()]
                 review = db.execute(
@@ -728,7 +798,7 @@ class V1Store:
                 )
                 db.execute(
                     "INSERT INTO v1_conversation_jobs(id,project_id,conversation_session_id,user_message_id,message,start_task,status,trigger_kind,trigger_json,mailbox_ids_json,scheduled_review_id,created_at,updated_at) "
-                    "VALUES(?,?,?,?,?,1,'queued',?,?,?,?,?,?)",
+                    "VALUES(?,?,?,?,?,0,'queued',?,?,?,?,?,?)",
                     (job_id, project_id, session[0], int(cursor.lastrowid), "", trigger_kind, json.dumps(trigger, ensure_ascii=False), json.dumps(mailbox_ids), review[0] if review else None, now, now),
                 )
                 delivered_ids = self.mailbox_service.deliver_pending(
@@ -861,8 +931,9 @@ class V1Store:
             if not row:
                 raise KeyError(job_id)
             project_id = row[0]
-            owner = db.execute("SELECT lease_owner FROM v1_conversation_agents WHERE project_id=?", (project_id,)).fetchone()
-            if not owner or owner[0] != row[3]:
+            owner = db.execute("SELECT lease_owner,lease_until FROM v1_conversation_agents WHERE project_id=?", (project_id,)).fetchone()
+            job_status = db.execute("SELECT status FROM v1_conversation_jobs WHERE id=?", (job_id,)).fetchone()[0]
+            if not owner or owner[0] != row[3] or not owner[1] or owner[1] <= now or job_status != 'running':
                 raise RuntimeError("Conversation governance lease ownership was lost")
             persisted_result = dict(result or {})
             notification_message_id = None
@@ -985,6 +1056,9 @@ class V1Store:
                 raise KeyError(job_id)
             project_id = row[0]
             persisted_result = dict(result or {})
+            status = db.execute("SELECT status FROM v1_conversation_jobs WHERE id=?", (job_id,)).fetchone()[0]
+            if status not in {'queued', 'running'}:
+                return self.get_conversation_job(job_id)
             notification_message_id = None
             if notification:
                 notification_meta = dict(notification.get("meta") or {})
@@ -1026,16 +1100,29 @@ class V1Store:
                     "WHERE id=? AND conversation_job_id=? AND state IN ('delivered','received')",
                     (review_state, now, safe_error, row[4], job_id),
                 )
-            if attention:
+            owner = db.execute("SELECT lease_owner FROM v1_conversation_agents WHERE project_id=?", (project_id,)).fetchone()
+            owns_agent = bool(owner and owner[0] == row[3])
+            if attention and owns_agent:
                 db.execute(
                     "UPDATE v1_conversation_agents SET state='attention',updated_at=? WHERE project_id=?",
                     (now, project_id),
                 )
-            else:
+            elif owns_agent:
                 self._settle_conversation_agent(db, project_id, now)
-            db.execute("UPDATE v1_conversation_agents SET lease_owner=NULL,lease_until=NULL WHERE project_id=?", (project_id,))
+            db.execute("UPDATE v1_conversation_agents SET lease_owner=NULL,lease_until=NULL WHERE project_id=? AND lease_owner IS ?", (project_id, row[3]))
             self._event(db, project_id, None, None, "conversation.planning_failed", {"job_id": job_id, "error": safe_error})
         return self.get_conversation_job(job_id)
+
+    def recover_expired_conversation_jobs(self):
+        now = utcnow()
+        with self.tx(immediate=True) as db:
+            rows = db.execute(
+                "SELECT j.id FROM v1_conversation_jobs j JOIN v1_conversation_agents a ON a.project_id=j.project_id "
+                "WHERE j.status='running' AND (a.lease_until IS NULL OR a.lease_until<=?)", (now,),
+            ).fetchall()
+            for row in rows:
+                self.fail_conversation_job(row[0], "ConversationLeaseExpired: execution interrupted; previous receipts were preserved", attention=True)
+        return [row[0] for row in rows]
 
     def startup_conversation_jobs(self) -> list[dict[str, Any]]:
         now = utcnow()
@@ -1088,7 +1175,7 @@ class V1Store:
         lease_seconds = lease_seconds or self.policy.scheduling.conversation_lease_seconds
         now = utcnow(); lease = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat(timespec="milliseconds")
         with self.tx(immediate=True) as db:
-            changed = db.execute("UPDATE v1_conversation_agents SET lease_until=?,updated_at=? WHERE project_id=? AND lease_owner=? AND state='planning'", (lease, now, project_id, claim_owner)).rowcount
+            changed = db.execute("UPDATE v1_conversation_agents SET lease_until=?,updated_at=? WHERE project_id=? AND lease_owner=? AND state='planning' AND lease_until>?", (lease, now, project_id, claim_owner, now)).rowcount
         return changed == 1
 
     @staticmethod
@@ -1137,6 +1224,7 @@ class V1Store:
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         with self.tx(immediate=True) as db:
             identity = db.execute("SELECT id FROM v1_workflows WHERE project_id=?", (project_id,)).fetchone()
+            previous = db.execute('SELECT active_revision_id FROM v1_workflows WHERE project_id=?', (project_id,)).fetchone()
             workflow_id = identity[0] if identity else new_id("workflow")
             if not identity:
                 if initial_loop is None:
@@ -1179,6 +1267,7 @@ class V1Store:
                 "source_loop_key": initial_loop["loop_key"] if initial_loop else None,
             })
             self._refresh_projection(db, project_id)
+            self.scopes.inherit(revision_id, previous[0] if previous else None)
         return self.get_workflow(project_id)
 
     def get_workflow(self, project_id: str) -> dict[str, Any]:
@@ -1188,38 +1277,44 @@ class V1Store:
                 "w.source_loop_key,w.source_loop_version,w.source_loop_digest "
                 "FROM v1_workflows w JOIN v1_workflow_revisions r ON r.id=w.active_revision_id WHERE w.project_id=?", (project_id,)
             ).fetchone())
-            binding = db.execute(
-                "SELECT bindings_json FROM v1_project_loop_bindings WHERE project_id=? "
-                "ORDER BY created_at DESC LIMIT 1",
-                (project_id,),
-            ).fetchone()
         if not row:
             raise KeyError(f"no active workflow for {project_id}")
         row["definition"] = json.loads(row.pop("definition_json"))
-        row["loop_bindings"] = json.loads(binding[0]) if binding else {}
+        binding = self.get_project_loop_binding(project_id, row['id'])
+        row["loop_bindings"] = binding['bindings'] if binding else {}
+        if binding:
+            row.update(source_loop_key=binding['loop_key'], source_loop_version=binding['loop_version'], source_loop_digest=binding['loop_digest'])
         return row
 
-    def get_project_loop_binding(self, project_id: str) -> dict[str, Any] | None:
+    def get_project_loop_binding(self, project_id: str, workflow_revision_id: str | None = None) -> dict[str, Any] | None:
         with self.connect() as db:
+            if workflow_revision_id is None:
+                active = db.execute('SELECT active_revision_id FROM v1_workflows WHERE project_id=?', (project_id,)).fetchone()
+                workflow_revision_id = active[0] if active else None
             row = self._dict(db.execute(
-                "SELECT * FROM v1_project_loop_bindings WHERE project_id=? "
-                "ORDER BY created_at DESC LIMIT 1",
-                (project_id,),
+                "SELECT b.* FROM v1_project_loop_bindings b JOIN v1_workflow_scopes s ON s.binding_id=b.id "
+                "WHERE b.project_id=? AND s.workflow_revision_id=?",
+                (project_id, workflow_revision_id),
             ).fetchone())
         if not row:
             return None
         row["bindings"] = json.loads(row.pop("bindings_json"))
         return row
 
-    def get_project_loop_assets(self, project_id: str) -> list[dict[str, str]]:
-        binding = self.get_project_loop_binding(project_id)
+    def get_project_loop_assets(self, project_id: str, workflow_revision_id: str | None = None) -> list[dict[str, str]]:
+        binding = self.get_project_loop_binding(project_id, workflow_revision_id)
         if not binding:
             return []
+        if binding.get("package_json"):
+            return [dict(asset) for asset in json.loads(binding["package_json"]).get("assets", [])]
         loop = self.get_loop(binding["loop_key"])
         if loop["digest"] != binding["loop_digest"]:
             raise ValueError(
                 f"Loop assets for {binding['loop_key']!r} no longer match the Project binding digest"
             )
+        with self.tx(immediate=True) as db:
+            db.execute("UPDATE v1_project_loop_bindings SET package_json=? WHERE id=? AND package_json IS NULL",
+                       (json.dumps(loop, ensure_ascii=False), binding["id"]))
         return [dict(asset) for asset in loop.get("assets", [])]
 
     def workflow_by_id(self, project_id: str, workflow_id: str) -> WorkflowDefinition:
@@ -1323,16 +1418,31 @@ class V1Store:
         *,
         rerun_of_task_id: str | None = None,
     ) -> dict[str, Any]:
-        input_data = validate_task_capability_bindings(
-            definition,
-            self.registry,
-            dict(proposed.input),
-            exact_strings=task_binding_exact_strings(
-                self,
-                project_id,
-                task_plan_id,
-                proposed.proposed_task_ref,
+        input_data = canonicalize_contract_value(
+            validate_task_capability_bindings(
+                definition,
+                self.registry,
+                dict(proposed.input),
+                exact_strings=task_binding_exact_strings(
+                    self,
+                    project_id,
+                    task_plan_id,
+                    proposed.proposed_task_ref,
+                ),
             ),
+            workflow_plan.task_contract.input_schema,
+        )
+        validate_contract(
+            input_data,
+            workflow_plan.task_contract.input_schema,
+            label=f"Task {proposed.proposed_task_ref} input",
+        )
+        binding = self.get_project_loop_binding(project_id, workflow['id'])
+        validate_task_scope(
+            str(proposed.proposed_task_ref),
+            input_data,
+            workflow_plan.task_contract.admission_constraints,
+            loop_bindings=dict(binding.get("bindings") or {}) if binding else {},
         )
         proposed.validate_agent_execution_workflow(definition)
         readiness = ReadinessDecision.model_validate({
@@ -1350,48 +1460,14 @@ class V1Store:
         dependency_contract = workflow_plan.task_contract.dependency_contract
         if dependency_contract is not None and not proposed.dependencies:
             order_value = resolve_input_pointer(input_data, dependency_contract.order_pointer)
-            if (
-                isinstance(order_value, int)
-                and not isinstance(order_value, bool)
-                and order_value > dependency_contract.first_value
-            ):
-                predecessor_key = logical_task_key_for_value(
-                    dependency_contract.order_pointer,
-                    order_value - 1,
-                )
-                with self.connect() as db:
-                    predecessor_row = db.execute(
-                        "SELECT id,status FROM v1_tasks "
-                        "WHERE project_id=? AND logical_task_key=? "
-                        "ORDER BY created_at DESC LIMIT 1",
-                        (project_id, predecessor_key),
-                    ).fetchone()
-                    if predecessor_row is None:
-                        legacy_rows = db.execute(
-                            "SELECT id,status,input_json FROM v1_tasks "
-                            "WHERE project_id=? ORDER BY created_at DESC",
-                            (project_id,),
-                        ).fetchall()
-                        for legacy_row in legacy_rows:
-                            try:
-                                legacy_input = json.loads(legacy_row[2] or "{}")
-                                legacy_value = resolve_input_pointer(
-                                    legacy_input,
-                                    dependency_contract.order_pointer,
-                                )
-                            except (TypeError, ValueError, json.JSONDecodeError):
-                                continue
-                            if legacy_value == order_value - 1:
-                                predecessor_row = legacy_row
-                                break
-                if predecessor_row is None:
-                    raise ValueError(
-                        "incremental linear Task Plan cannot resolve its Project-level "
-                        f"predecessor {predecessor_key!r}"
-                    )
+            predecessor = immediate_predecessor(
+                existing_task_orders(self, project_id, dependency_contract),
+                order_value,
+            )
+            if predecessor is not None:
                 external_dependency = {
-                    "id": str(predecessor_row[0]),
-                    "status": str(predecessor_row[1]),
+                    "id": predecessor.task_id,
+                    "status": predecessor.status,
                 }
         if rerun_of_task_id:
             predecessor = self.get_project_task(project_id, rerun_of_task_id)
@@ -1513,6 +1589,9 @@ class V1Store:
                 json.dumps(conflict_domains, ensure_ascii=False), rerun_of_task_id, definition.entry, now, now,
             ),
         )
+        owner = db.execute('SELECT requirement_id,requirement_revision FROM v1_task_plans WHERE id=?', (task_plan_id,)).fetchone()
+        if owner and owner['requirement_id']:
+            db.execute('UPDATE v1_tasks SET requirement_id=?,requirement_revision=? WHERE id=?', (owner['requirement_id'], owner['requirement_revision'], task_id))
         run_id = new_id("run")
         db.execute(
             "INSERT INTO v1_column_runs(id,project_id,task_id,column_key,sequence,status,attempt,input_json,created_at) "
@@ -1731,6 +1810,7 @@ class V1Store:
     def begin_run(self, task: dict[str, Any], input_data: dict[str, Any]) -> dict[str, Any]:
         now = utcnow()
         with self.tx(immediate=True) as db:
+            self.assert_execution_owner(task, db=db)
             pending = db.execute(
                 "SELECT id,sequence FROM v1_column_runs WHERE task_id=? AND column_key=? AND status IN ('pending','interrupted') ORDER BY sequence DESC LIMIT 1",
                 (task["id"], task["current_column"]),
@@ -1763,6 +1843,30 @@ class V1Store:
             self._refresh_projection(db, task["project_id"])
         return {"id": run_id, "attempt_id": attempt_id, "attempt_no": attempt_no, "sequence": sequence, "column_key": task["current_column"], "status": "running", "started_at": now}
 
+    def assert_execution_owner(self, task, *, db=None):
+        from app.v1.execution_control import ExecutionOwnershipLost
+        if (task["id"], task.get("lease_owner"), task["state_version"]) in self._revoked_owners:
+            raise ExecutionOwnershipLost("Lease keeper revoked this execution after a renewal failure")
+        if db is None:
+            with self.connect() as connection:
+                return self.assert_execution_owner(task, db=connection)
+        row = db.execute("SELECT status,state_version,lease_owner,lease_until FROM v1_tasks WHERE id=? AND project_id=?",
+                         (task["id"], task["project_id"])).fetchone()
+        if (not row or row[0] not in {"running", "waiting"}
+                or row[1] != task["state_version"] or row[2] != task.get("lease_owner")
+                or not row[3] or row[3] <= utcnow()):
+            raise ExecutionOwnershipLost("Task lease/generation no longer owns this execution")
+
+    def assert_conversation_owner(self, job):
+        from app.v1.execution_control import ExecutionOwnershipLost
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT j.status,j.claim_owner,a.lease_owner,a.lease_until FROM v1_conversation_jobs j "
+                "JOIN v1_conversation_agents a ON a.project_id=j.project_id WHERE j.id=?", (job["id"],),
+            ).fetchone()
+        if not row or row[0] != 'running' or row[1] != job.get('claim_owner') or row[2] != row[1] or not row[3] or row[3] <= utcnow():
+            raise ExecutionOwnershipLost("Conversation no longer owns its Project lease")
+
     def prepare_terminal_evidence(self, task: dict[str, Any], run_id: str, terminal: str, output: dict[str, Any], error: str | None) -> dict[str, Any]:
         payload = {
             "schema": "devwerk.task-terminal.v1",
@@ -1770,10 +1874,13 @@ class V1Store:
             "terminal": terminal, "output": output, "error": error, "recorded_at": utcnow(),
         }
         files = ProjectFiles(self.get_project(task["project_id"])["base_dir"], self.policy)
-        info = files.write_text(
-            f".devwerk/terminal/{task['id']}.json",
-            json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
-        )
+        with self.tx(immediate=True) as db:
+            if task.get("lease_owner") or task["status"] == "running":
+                self.assert_execution_owner(task, db=db)
+            info = files.write_text(
+                f".devwerk/terminal/{task['id']}/{run_id}-{task['state_version']}-{new_id('evidence')}.json",
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
+            )
         return {**info, "kind": "task_terminal", "meta": {"terminal": terminal, "schema": payload["schema"]}}
 
     @staticmethod
@@ -1818,6 +1925,7 @@ class V1Store:
         persisted_output = dict(output)
         task_context = persisted_output.pop("context", task["context"])
         with self.tx(immediate=True) as db:
+            self.assert_execution_owner(task, db=db)
             attempt = db.execute(
                 "SELECT id FROM v1_column_attempts WHERE column_run_id=? AND status IN ('running','waiting') ORDER BY attempt_no DESC LIMIT 1", (run_id,)
             ).fetchone()
@@ -1830,6 +1938,7 @@ class V1Store:
             COLUMN_RUN_STATE_MACHINE.require(run_row[0], run_status)
             ATTEMPT_STATE_MACHINE.require(attempt_row[0], run_status)
             TASK_STATE_MACHINE.require(task["status"], task_status)
+            self.agents.settle_column(task, run_id, "failed" if error else "completed", persisted_output)
             db.execute(
                 "UPDATE v1_column_attempts SET status=?,output_json=?,error=?,finished_at=? WHERE id=?",
                 (run_status, json.dumps(persisted_output, ensure_ascii=False), error, now, attempt[0]),
@@ -1858,6 +1967,7 @@ class V1Store:
                 ).rowcount
             if changed != 1:
                 raise RuntimeError("stale Task state_version while finishing Column Run")
+            db.execute("UPDATE v1_tasks SET failure_origin=NULL,failure_code=NULL,failure_disposition=NULL,next_retry_at=NULL WHERE id=?", (task["id"],))
             resolved_task_ids = (
                 self._resolve_failed_task_ancestors(db, task["id"], now)
                 if terminal == "done"
@@ -1919,6 +2029,7 @@ class V1Store:
         instant = datetime.now(timezone.utc)
         next_check = resume_at or (instant + timedelta(seconds=next_check_seconds)).isoformat(timespec="milliseconds")
         with self.tx(immediate=True) as db:
+            self.assert_execution_owner(task, db=db)
             attempt = db.execute(
                 "SELECT id FROM v1_column_attempts WHERE column_run_id=? AND status IN ('running','waiting') ORDER BY attempt_no DESC LIMIT 1", (run_id,)
             ).fetchone()
@@ -1950,6 +2061,7 @@ class V1Store:
             )
             db.execute("UPDATE v1_column_runs SET status='waiting',last_progress_at=? WHERE id=?", (now, run_id))
             db.execute("UPDATE v1_column_attempts SET status='waiting',checkpoint_json=? WHERE id=?", (self._pack_json({**(checkpoint or {}), "await_handle_id": handle_id}), attempt[0]))
+            self.agents.settle_column(task, run_id, "waiting", {"await_handle_id": handle_id})
             db.execute("UPDATE v1_tasks SET status='waiting',lease_owner=NULL,lease_until=NULL,state_version=state_version+1,updated_at=? WHERE id=?", (now, task["id"]))
             self._event(db, task["project_id"], task["id"], run_id, "column.waiting", {"await_handle_id": handle_id, "next_check_at": next_check})
             self._mailbox(db, task["project_id"], "column.waiting", task["id"], run_id, {"await_handle_id": handle_id})
@@ -1968,11 +2080,46 @@ class V1Store:
         with self.connect() as db:
             rows = db.execute(
                 "SELECT h.* FROM v1_await_handles h JOIN v1_tasks t ON t.id=h.task_id "
-                "WHERE h.status='pending' AND h.next_check_at<=? AND t.control_state='active' "
+                "WHERE h.status='pending' AND h.next_check_at<=? AND t.control_state='active' AND t.status='waiting' "
+                "AND (t.lease_until IS NULL OR t.lease_until<=?) "
                 "ORDER BY h.next_check_at LIMIT ?",
-                (utcnow(), min(limit, self.policy.service_limits.max_page_size)),
+                (utcnow(), utcnow(), min(limit, self.policy.service_limits.max_page_size)),
             ).fetchall()
         return [self._decode(dict(row), "progress_json", "poll_arguments_json", "result_json", "resume_condition_json", "cancel_arguments_json", "cleanup_arguments_json", "checkpoint_json") for row in rows]  # type: ignore[misc]
+
+    def claim_await(self, handle_id: str, owner: str):
+        now = utcnow()
+        lease = (datetime.now(timezone.utc)+timedelta(seconds=self.policy.scheduling.task_lease_seconds)).isoformat(timespec="milliseconds")
+        with self.tx(immediate=True) as db:
+            handle = db.execute("SELECT task_id FROM v1_await_handles WHERE id=? AND status='pending'", (handle_id,)).fetchone()
+            if not handle:
+                return None
+            binding = db.execute('SELECT w.lifecycle,w.active_assignment_id,a.id FROM v1_agent_assignments a JOIN v1_agent_instances w ON w.id=a.agent_instance_id JOIN v1_await_handles h ON h.run_id=a.column_run_id WHERE h.id=?', (handle_id,)).fetchone()
+            if binding and (binding[0] != 'available' or binding[1] not in (None, binding[2])):
+                return None
+            changed = db.execute(
+                "UPDATE v1_tasks SET lease_owner=?,lease_until=?,state_version=state_version+1 WHERE id=? "
+                "AND status='waiting' AND control_state='active' AND (lease_until IS NULL OR lease_until<=?)",
+                (owner, lease, handle[0], now),
+            ).rowcount
+            return self.get_task(handle[0]) if changed else None
+
+    def release_await_claim(self, task):
+        with self.tx(immediate=True) as db:
+            db.execute("UPDATE v1_tasks SET lease_owner=NULL,lease_until=NULL WHERE id=? AND status='waiting' AND lease_owner=? AND state_version=?",
+                       (task["id"], task["lease_owner"], task["state_version"]))
+
+    def checkpoint_await(self, task, handle_id, key, value):
+        with self.tx(immediate=True) as db:
+            self.assert_execution_owner(task, db=db)
+            row = db.execute("SELECT checkpoint_json FROM v1_await_handles WHERE id=? AND task_id=? AND status='pending'",
+                             (handle_id, task["id"])).fetchone()
+            if not row:
+                raise RuntimeError("Await is no longer pending")
+            checkpoint = json.loads(row[0] or '{}')
+            checkpoint[key] = value
+            db.execute("UPDATE v1_await_handles SET checkpoint_json=?,updated_at=? WHERE id=?",
+                       (self._pack_json(checkpoint), utcnow(), handle_id))
 
     def mark_await_health(self, handle_id: str, health: str, event_type: str) -> None:
         with self.tx(immediate=True) as db:
@@ -1983,13 +2130,15 @@ class V1Store:
             self._event(db, row[0], row[1], row[2], event_type, {"await_handle_id": handle_id, "health": health})
             self._mailbox(db, row[0], event_type, row[1], row[2], {"await_handle_id": handle_id, "health": health})
 
-    def settle_await_handle(self, handle_id: str, status: str, result: dict[str, Any], *, next_check_seconds: int | None = None) -> dict[str, Any]:
+    def settle_await_handle(self, handle_id: str, status: str, result: dict[str, Any], *, next_check_seconds: int | None = None, expected_task=None) -> dict[str, Any]:
         now = utcnow()
         if status in {"failed", "cancelled"}:
             raise ValueError("terminal Await failure must use resolve_await_failure")
         if status == "pending" and next_check_seconds is None:
             raise ValueError("pending await settlement requires an explicit next_check_seconds")
         with self.tx(immediate=True) as db:
+            if expected_task is not None:
+                self.assert_execution_owner(expected_task, db=db)
             row = db.execute("SELECT h.*,t.project_id FROM v1_await_handles h JOIN v1_tasks t ON t.id=h.task_id WHERE h.id=?", (handle_id,)).fetchone()
             if not row:
                 raise KeyError(handle_id)
@@ -2011,6 +2160,7 @@ class V1Store:
         recoverable: bool,
         error_code: str,
         error_category: str,
+        expected_task=None,
     ) -> dict[str, Any]:
         return self.recovery_manager.resolve_await_failure(
             handle_id,
@@ -2018,6 +2168,7 @@ class V1Store:
             recoverable=recoverable,
             error_code=error_code,
             error_category=error_category,
+            expected_task=expected_task,
         )
 
     def runs(self, project_id: str, task_id: str, limit: int | None = None, after_sequence: int = 0) -> list[dict[str, Any]]:
@@ -2118,398 +2269,6 @@ class V1Store:
                     "session_key": session_key,
                 })
         return dict(row)
-
-    def get_or_create_workcell(
-        self,
-        project_id: str,
-        task_id: str,
-        column_run_id: str,
-        executor: WorkcellExecutor,
-        input_data: dict[str, Any],
-    ) -> dict[str, Any]:
-        now = utcnow()
-        created = False
-        with self.tx(immediate=True) as db:
-            row = db.execute(
-                "SELECT * FROM v1_workcells WHERE project_id=? AND column_run_id=?",
-                (project_id, column_run_id),
-            ).fetchone()
-            if row is None:
-                row = db.execute(
-                    "SELECT w.* FROM v1_workcells w "
-                    "JOIN v1_column_runs previous_run ON previous_run.id=w.column_run_id "
-                    "JOIN v1_column_runs current_run ON current_run.id=? "
-                    "WHERE w.project_id=? AND w.task_id=? AND w.status='recovering' "
-                    "AND previous_run.column_key=current_run.column_key "
-                    "ORDER BY w.updated_at DESC LIMIT 1",
-                    (column_run_id, project_id, task_id),
-                ).fetchone()
-                if row is not None:
-                    db.execute(
-                        "UPDATE v1_workcells SET column_run_id=?,status='active',updated_at=? WHERE id=?",
-                        (column_run_id, now, row["id"]),
-                    )
-                    self._event(
-                        db,
-                        project_id,
-                        task_id,
-                        column_run_id,
-                        "workcell.resumed",
-                        {"workcell_id": row["id"], "state": row["current_state"]},
-                    )
-                    row = db.execute(
-                        "SELECT * FROM v1_workcells WHERE id=?",
-                        (row["id"],),
-                    ).fetchone()
-            if row is None:
-                workcell_id = new_id("wcell")
-                db.execute(
-                    "INSERT INTO v1_workcells(id,project_id,task_id,column_run_id,status,current_state,definition_json,input_json,output_json,created_at,updated_at) "
-                    "VALUES(?,?,?,?,'active',?,?,?,'{}',?,?)",
-                    (
-                        workcell_id,
-                        project_id,
-                        task_id,
-                        column_run_id,
-                        executor.entry,
-                        self._pack_json(executor.model_dump(mode="json")),
-                        self._pack_json(input_data),
-                        now,
-                        now,
-                    ),
-                )
-                for participant in executor.participants:
-                    db.execute(
-                        "INSERT INTO v1_workcell_participants(id,project_id,workcell_id,participant_key,kind,lifecycle,status,config_json,created_at,updated_at) "
-                        "VALUES(?,?,?,?,?,?,'ready',?,?,?)",
-                        (
-                            new_id("wpart"),
-                            project_id,
-                            workcell_id,
-                            participant.key,
-                            participant.kind,
-                            participant.lifecycle,
-                            self._pack_json(participant.model_dump(mode="json")),
-                            now,
-                            now,
-                        ),
-                    )
-                self._event(
-                    db,
-                    project_id,
-                    task_id,
-                    column_run_id,
-                    "workcell.started",
-                    {"workcell_id": workcell_id, "entry": executor.entry},
-                )
-                row = db.execute("SELECT * FROM v1_workcells WHERE id=?", (workcell_id,)).fetchone()
-                created = True
-            elif row["status"] == "recovering":
-                db.execute(
-                    "UPDATE v1_workcells SET status='active',updated_at=? WHERE id=?",
-                    (now, row["id"]),
-                )
-                self._event(
-                    db,
-                    project_id,
-                    task_id,
-                    column_run_id,
-                    "workcell.resumed",
-                    {"workcell_id": row["id"], "state": row["current_state"]},
-                )
-                row = db.execute("SELECT * FROM v1_workcells WHERE id=?", (row["id"],)).fetchone()
-        workcell = self._decode(dict(row), "definition_json", "input_json", "output_json")
-        if created:
-            for participant in executor.participants:
-                if participant.kind != "agent" or participant.lifecycle == "invocation":
-                    continue
-                session_key = (
-                    f"task-participant:{participant.key}"
-                    if participant.lifecycle == "task"
-                    else f"workcell:{workcell['id']}:{participant.key}"
-                )
-                session = self.get_or_create_agent_session(
-                    project_id,
-                    task_id,
-                    session_key,
-                )
-                with self.tx(immediate=True) as db:
-                    db.execute(
-                        "UPDATE v1_workcell_participants SET agent_session_id=?,updated_at=? "
-                        "WHERE workcell_id=? AND participant_key=?",
-                        (session["id"], utcnow(), workcell["id"], participant.key),
-                    )
-        return self.get_workcell(project_id, str(workcell["id"]))
-
-    def mark_workcell_recovering(
-        self,
-        project_id: str,
-        column_run_id: str,
-        error: str,
-    ) -> dict[str, Any] | None:
-        now = utcnow()
-        with self.tx(immediate=True) as db:
-            row = db.execute(
-                "SELECT id,task_id,current_state,status FROM v1_workcells "
-                "WHERE project_id=? AND column_run_id=?",
-                (project_id, column_run_id),
-            ).fetchone()
-            if row is None:
-                return None
-            if row[3] == "active":
-                db.execute(
-                    "UPDATE v1_workcells SET status='recovering',updated_at=? WHERE id=?",
-                    (now, row[0]),
-                )
-                self._event(
-                    db,
-                    project_id,
-                    row[1],
-                    column_run_id,
-                    "workcell.recovering",
-                    {"workcell_id": row[0], "state": row[2], "error": error},
-                )
-            workcell_id = row[0]
-        return self.get_workcell(project_id, workcell_id)
-
-    def get_workcell(self, project_id: str, workcell_id: str) -> dict[str, Any]:
-        with self.connect() as db:
-            row = db.execute(
-                "SELECT * FROM v1_workcells WHERE project_id=? AND id=?",
-                (project_id, workcell_id),
-            ).fetchone()
-        if row is None:
-            raise KeyError(workcell_id)
-        return self._decode(dict(row), "definition_json", "input_json", "output_json")
-
-    def workcells(
-        self,
-        project_id: str,
-        *,
-        task_id: str | None = None,
-    ) -> list[dict[str, Any]]:
-        with self.connect() as db:
-            if task_id is None:
-                rows = db.execute(
-                    "SELECT * FROM v1_workcells WHERE project_id=? ORDER BY created_at,id",
-                    (project_id,),
-                ).fetchall()
-            else:
-                rows = db.execute(
-                    "SELECT * FROM v1_workcells WHERE project_id=? AND task_id=? ORDER BY created_at,id",
-                    (project_id, task_id),
-                ).fetchall()
-        return [
-            self._decode(dict(row), "definition_json", "input_json", "output_json")
-            for row in rows
-        ]
-
-    def workcell_participants(self, project_id: str, workcell_id: str) -> list[dict[str, Any]]:
-        with self.connect() as db:
-            rows = db.execute(
-                "SELECT * FROM v1_workcell_participants WHERE project_id=? AND workcell_id=? "
-                "ORDER BY created_at,participant_key",
-                (project_id, workcell_id),
-            ).fetchall()
-        return [self._decode(dict(row), "config_json") for row in rows]
-
-    def workcell_handoffs(
-        self,
-        project_id: str,
-        workcell_id: str,
-        *,
-        receiver: str | None = None,
-    ) -> list[dict[str, Any]]:
-        with self.connect() as db:
-            rows = db.execute(
-                "SELECT * FROM v1_workcell_handoffs WHERE project_id=? AND workcell_id=? "
-                "ORDER BY sequence",
-                (project_id, workcell_id),
-            ).fetchall()
-        handoffs = [
-            self._decode(
-                dict(row),
-                "receivers_json",
-                "payload_json",
-                "artifact_refs_json",
-                "memory_refs_json",
-            )
-            for row in rows
-        ]
-        if receiver is None:
-            return handoffs
-        return [
-            item
-            for item in handoffs
-            if not item["receivers"] or receiver in item["receivers"]
-        ]
-
-    def snapshot_workcell(self, project_id: str, workcell_id: str) -> dict[str, Any]:
-        workcell = self.get_workcell(project_id, workcell_id)
-        participants = self.workcell_participants(project_id, workcell_id)
-        handoffs = self.workcell_handoffs(project_id, workcell_id)
-        return self.memory_snapshot(
-            project_id,
-            scope="workcell",
-            scope_id=workcell_id,
-            state={
-                "workcell": {
-                    key: workcell.get(key)
-                    for key in (
-                        "id",
-                        "task_id",
-                        "column_run_id",
-                        "status",
-                        "current_state",
-                        "updated_at",
-                        "finished_at",
-                    )
-                },
-                "participants": [
-                    {
-                        key: item.get(key)
-                        for key in (
-                            "participant_key",
-                            "kind",
-                            "lifecycle",
-                            "agent_session_id",
-                            "status",
-                        )
-                    }
-                    for item in participants
-                ],
-                "handoffs": [
-                    {
-                        key: item.get(key)
-                        for key in (
-                            "sequence",
-                            "sender_key",
-                            "receivers",
-                            "signal",
-                            "artifact_refs",
-                            "memory_refs",
-                        )
-                    }
-                    for item in handoffs
-                ],
-            },
-        )
-
-    def activate_workcell_participant(
-        self,
-        project_id: str,
-        workcell_id: str,
-        participant_key: str,
-        state_key: str,
-    ) -> None:
-        now = utcnow()
-        with self.tx(immediate=True) as db:
-            workcell = db.execute(
-                "SELECT task_id,column_run_id,status FROM v1_workcells WHERE project_id=? AND id=?",
-                (project_id, workcell_id),
-            ).fetchone()
-            if workcell is None:
-                raise KeyError(workcell_id)
-            if workcell[2] != "active":
-                raise ValueError(f"workcell {workcell_id!r} is not active")
-            changed = db.execute(
-                "UPDATE v1_workcell_participants SET status='running',updated_at=? "
-                "WHERE workcell_id=? AND participant_key=?",
-                (now, workcell_id, participant_key),
-            ).rowcount
-            if changed != 1:
-                raise KeyError(participant_key)
-            self._event(
-                db,
-                project_id,
-                workcell[0],
-                workcell[1],
-                "workcell.participant.activated",
-                {
-                    "workcell_id": workcell_id,
-                    "participant": participant_key,
-                    "state": state_key,
-                },
-            )
-
-    def advance_workcell(
-        self,
-        project_id: str,
-        workcell_id: str,
-        *,
-        sender_key: str,
-        signal: str,
-        payload: dict[str, Any],
-        receivers: list[str],
-        target: str,
-        terminal_outcome: str | None,
-    ) -> dict[str, Any]:
-        now = utcnow()
-        with self.tx(immediate=True) as db:
-            row = db.execute(
-                "SELECT task_id,column_run_id,status,current_state FROM v1_workcells "
-                "WHERE project_id=? AND id=?",
-                (project_id, workcell_id),
-            ).fetchone()
-            if row is None:
-                raise KeyError(workcell_id)
-            if row[2] != "active":
-                raise ValueError(f"workcell {workcell_id!r} is not active")
-            sequence = db.execute(
-                "SELECT COALESCE(MAX(sequence),0)+1 FROM v1_workcell_handoffs WHERE workcell_id=?",
-                (workcell_id,),
-            ).fetchone()[0]
-            db.execute(
-                "INSERT INTO v1_workcell_handoffs(project_id,task_id,workcell_id,sequence,sender_key,receivers_json,signal,payload_json,artifact_refs_json,memory_refs_json,created_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    project_id,
-                    row[0],
-                    workcell_id,
-                    sequence,
-                    sender_key,
-                    self._pack_json(receivers),
-                    signal,
-                    self._pack_json(payload),
-                    self._pack_json(payload.get("artifact_refs") or []),
-                    self._pack_json(payload.get("memory_refs") or []),
-                    now,
-                ),
-            )
-            status = "completed" if terminal_outcome is not None else "active"
-            db.execute(
-                "UPDATE v1_workcells SET status=?,current_state=?,output_json=?,updated_at=?,finished_at=? WHERE id=?",
-                (
-                    status,
-                    target,
-                    self._pack_json(payload),
-                    now,
-                    now if terminal_outcome is not None else None,
-                    workcell_id,
-                ),
-            )
-            db.execute(
-                "UPDATE v1_workcell_participants SET status=?,updated_at=? "
-                "WHERE workcell_id=? AND participant_key=?",
-                ("completed" if terminal_outcome is not None else "ready", now, workcell_id, sender_key),
-            )
-            self._event(
-                db,
-                project_id,
-                row[0],
-                row[1],
-                "workcell.handoff" if terminal_outcome is None else "workcell.completed",
-                {
-                    "workcell_id": workcell_id,
-                    "sequence": sequence,
-                    "sender": sender_key,
-                    "receivers": receivers,
-                    "signal": signal,
-                    "target": target,
-                    "outcome": terminal_outcome,
-                },
-            )
-        return self.get_workcell(project_id, workcell_id)
 
     def conversation_session_has_messages(
         self,
@@ -2891,14 +2650,17 @@ class V1Store:
             self._event(db, project_id, subject_id if kind == "intervention" else None, None, f"governance.{kind}", {"decision_id": decision_id, "decision": decision})
         return {"id": decision_id, "project_id": project_id, "kind": kind, "subject_id": subject_id, "decision": decision, "data": data, "created_at": now}
 
-    def start_execution_receipt(self, project_id: str, execution_key: str, capability: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def start_execution_receipt(self, project_id: str, execution_key: str, capability: str, arguments: dict[str, Any], *, retry_failed: bool = True) -> dict[str, Any]:
+        from app.v1.execution_ledger import normalized_operation_arguments
         now = utcnow()
         packed = self._pack_json(arguments)
         with self.tx(immediate=True) as db:
             existing = db.execute("SELECT * FROM v1_execution_receipts WHERE project_id=? AND execution_key=?", (project_id, execution_key)).fetchone()
             if existing:
                 item = self._decode(dict(existing), "arguments_json", "result_json")
-                if item["status"] == "failed":
+                if item["capability"] != capability or normalized_operation_arguments(capability, item["arguments"]) != normalized_operation_arguments(capability, arguments):
+                    raise ValueError("Execution key cannot be reused with different arguments")
+                if item["status"] == "failed" and retry_failed:
                     db.execute("UPDATE v1_execution_receipts SET status='started',arguments_json=?,result_json=NULL,error=NULL,started_at=?,finished_at=NULL WHERE id=?", (packed, now, item["id"]))
                     item.update({"status": "started", "arguments": arguments, "execution_key": execution_key, "claimed": True})
                     return item

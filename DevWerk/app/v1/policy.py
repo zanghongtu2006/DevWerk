@@ -28,6 +28,7 @@ class SchedulingPolicy(_PolicyModel):
 
 
 class ContextPolicy(_PolicyModel):
+    worker_context_max_characters: int = Field(default=80_000, ge=1024)
     task_summary_limit: int = Field(default=100, ge=1)
     mailbox_limit: int = Field(default=100, ge=1)
     artifact_context_max_characters: int = Field(default=200_000, ge=65_535)
@@ -46,12 +47,27 @@ class ServiceLimits(_PolicyModel):
     sqlite_busy_timeout_milliseconds: int = Field(default=15_000, ge=1)
 
 
+class ExecutionLimits(_PolicyModel):
+    requirement_max_planning_actions: int = Field(default=1000, ge=1)
+    assignment_max_resumes: int = Field(default=25, ge=1)
+    assignment_no_progress_awaits: int = Field(default=3, ge=1)
+    agent_wall_seconds: float = Field(default=3600, gt=0)
+    agent_max_iterations: int = Field(default=100, ge=1)
+    agent_max_tool_calls: int = Field(default=300, ge=1)
+    command_timeout_seconds: float = Field(default=600, gt=0)
+    command_max_output_bytes: int = Field(default=1_048_576, ge=1024)
+    max_column_visits: int = Field(default=25, ge=1)
+    max_recovery_attempts: int = Field(default=5, ge=1)
+    recovery_max_elapsed_seconds: float = Field(default=3600, gt=0)
+
+
 class V1RuntimePolicy(_PolicyModel):
     schema_version: str = "devwerk.runtime-policy.v1"
     revision: int = Field(default=1, ge=1)
     scheduling: SchedulingPolicy = Field(default_factory=SchedulingPolicy)
     context: ContextPolicy = Field(default_factory=ContextPolicy)
     service_limits: ServiceLimits = Field(default_factory=ServiceLimits)
+    execution: ExecutionLimits = Field(default_factory=lambda: ExecutionLimits())
 
     @property
     def policy_hash(self) -> str:

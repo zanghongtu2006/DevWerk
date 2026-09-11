@@ -15,6 +15,15 @@ from app.v1.states import (
     TaskStatus,
 )
 from app.v1.storage_support import utcnow
+from app.v1.services.dependency_resolver import canonical_task as _canonical_task
+
+
+def canonical_task(db, project_id, reference):
+    # A corrupt lineage blocks its dependants, not the entire scheduler tick.
+    try:
+        return _canonical_task(db, project_id, reference)
+    except ValueError:
+        return None
 
 def _resource_domains_overlap(left: list[Any], right: list[Any]) -> bool:
     for first in left:
@@ -101,6 +110,8 @@ class SchedulerService:
             for row in rows:
                 TASK_STATE_MACHINE.require(row[2], TaskStatus.PENDING)
             task_ids = [str(row[0]) for row in rows]
+            for task_id in task_ids:
+                self.store.agents.invalidate_task(db, task_id)
             placeholders = ",".join("?" for _ in task_ids)
             run_rows = db.execute(
                 "SELECT id,status FROM v1_column_runs WHERE status IN ('running','waiting') "
@@ -119,21 +130,21 @@ class SchedulerService:
 
             db.execute(
                 "UPDATE v1_column_attempts SET status='interrupted',error=COALESCE(error,?),finished_at=COALESCE(finished_at,?) "
-                f"WHERE status IN ('running','waiting') AND task_id IN ({placeholders})",
+                f"WHERE status IN ('running','waiting') AND task_id IN ({placeholders}) "
+                "AND NOT EXISTS (SELECT 1 FROM v1_await_handles h WHERE h.task_id=v1_column_attempts.task_id AND h.status='pending')",
                 (interruption, now, *task_ids),
             )
             db.execute(
                 "UPDATE v1_column_runs SET status='interrupted',error=COALESCE(error,?),finished_at=COALESCE(finished_at,?) "
-                f"WHERE status IN ('running','waiting') AND task_id IN ({placeholders})",
+                f"WHERE status IN ('running','waiting') AND task_id IN ({placeholders}) "
+                "AND NOT EXISTS (SELECT 1 FROM v1_await_handles h WHERE h.task_id=v1_column_runs.task_id AND h.status='pending')",
                 (interruption, now, *task_ids),
             )
+            # Pause dispatch without discarding durable external job identity.
             db.execute(
-                "UPDATE v1_await_handles SET status='interrupted',result_json=?,updated_at=? "
-                f"WHERE status='pending' AND task_id IN ({placeholders})",
-                (json.dumps({"reason": "startup_auto_resume_disabled"}), now, *task_ids),
-            )
-            db.execute(
-                "UPDATE v1_tasks SET status='pending',control_state='paused',supervision_action='startup_hold',"
+                "UPDATE v1_tasks SET status=CASE WHEN status='waiting' AND EXISTS "
+                "(SELECT 1 FROM v1_await_handles h WHERE h.task_id=v1_tasks.id AND h.status='pending') "
+                "THEN 'waiting' ELSE 'pending' END,control_state='paused',supervision_action='startup_hold',"
                 "error=NULL,lease_owner=NULL,lease_until=NULL,next_retry_at=NULL,finished_at=NULL,"
                 "state_version=state_version+1,updated_at=? "
                 f"WHERE id IN ({placeholders})",
@@ -195,29 +206,16 @@ class SchedulerService:
             dependencies_changed = False
             for dependency in original_dependencies:
                 if not isinstance(dependency, str) or not dependency.startswith("task-plan:"):
+                    canonical = canonical_task(db, project_id, dependency)
+                    canonical_id = canonical["id"] if canonical else dependency
+                    canonical_dependencies.append(canonical_id)
+                    dependencies_changed |= canonical_id != dependency
+                    continue
+                match = canonical_task(db, project_id, dependency)
+                if not match or match["status"] != "done":
                     canonical_dependencies.append(dependency)
                     continue
-                _, plan_id, task_ref = dependency.split(":", 2)
-                match = db.execute(
-                    "SELECT id FROM v1_tasks WHERE project_id=? AND task_plan_id=? "
-                    "AND proposed_task_ref=? AND status='done' "
-                    "ORDER BY finished_at DESC,created_at DESC LIMIT 1",
-                    (project_id, plan_id, task_ref),
-                ).fetchone()
-                if not match:
-                    match = db.execute(
-                        "SELECT successor.id FROM v1_tasks predecessor "
-                        "JOIN v1_tasks successor ON successor.id=predecessor.resolved_by_task_id "
-                        "WHERE predecessor.project_id=? AND predecessor.task_plan_id=? "
-                        "AND predecessor.proposed_task_ref=? AND predecessor.status='failed' "
-                        "AND successor.project_id=predecessor.project_id AND successor.status='done' "
-                        "ORDER BY successor.finished_at DESC,successor.created_at DESC LIMIT 1",
-                        (project_id, plan_id, task_ref),
-                    ).fetchone()
-                if not match:
-                    canonical_dependencies.append(dependency)
-                    continue
-                dependency_id = str(match[0])
+                dependency_id = str(match["id"])
                 canonical_dependencies.append(dependency_id)
                 db.execute(
                     "INSERT OR IGNORE INTO v1_task_dependencies(task_id,depends_on_task_id,project_id,required_terminal,created_at) VALUES(?,?,?,'done',?)",
@@ -257,11 +255,8 @@ class SchedulerService:
                     if not isinstance(dependency, str)
                     or dependency.startswith("task-plan:")
                     or not (
-                        (row := db.execute(
-                            "SELECT status FROM v1_tasks WHERE id=? AND project_id=?",
-                            (dependency, project_id),
-                        ).fetchone())
-                        and row[0] == "done"
+                        (row := canonical_task(db, project_id, dependency))
+                        and row["status"] == "done"
                     )
                 ]
             if unsatisfied:
@@ -278,6 +273,7 @@ class SchedulerService:
 
 
     def task_scheduling(self, project_id: str, task_id: str) -> dict[str, Any]:
+        self._resolve_planned_dependencies()
         task = self.store.get_project_task(project_id, task_id)
         now = utcnow()
         with self.store.connect() as db:
@@ -365,6 +361,17 @@ class SchedulerService:
                 "WHERE d.task_id=? AND d.project_id=? ORDER BY d.created_at,dep.id",
                 (task_id, project_id),
             ).fetchall()
+            canonical_rows = {}
+            for row in rows:
+                task = canonical_task(db, project_id, row[0])
+                if task:
+                    canonical_rows[task["id"]] = db.execute(
+                        "SELECT dep.id,dep.proposed_task_ref,dep.title,dep.status,dep.finished_at,"
+                        "dep.terminal_artifact_id,a.kind,a.path,a.sha256,a.size FROM v1_tasks dep "
+                        "LEFT JOIN v1_artifact_versions a ON a.id=dep.terminal_artifact_id WHERE dep.id=?",
+                        (task["id"],),
+                    ).fetchone()
+            rows = list(canonical_rows.values())
         return [
             {
                 "task_id": row[0],
@@ -389,6 +396,7 @@ class SchedulerService:
 
 
     def claim_task(self, task_id: str, owner: str, lease_seconds: int | None = None) -> dict[str, Any] | None:
+        self._resolve_planned_dependencies()
         now = utcnow()
         lease_seconds = lease_seconds or self.store.policy.scheduling.task_lease_seconds
         lease = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat(timespec="milliseconds")
@@ -399,13 +407,20 @@ class SchedulerService:
             ).fetchone()
             if not requested_row:
                 return None
+            if not self._dispatch_eligible(db, task_id, now):
+                return None
+            # A conversation can perform direct project work. Start workflow
+            # execution only after that project's current turn releases its lease.
+            if db.execute("SELECT 1 FROM v1_conversation_agents WHERE project_id=? AND state='planning' AND lease_until>?",
+                          (requested_row[0], now)).fetchone():
+                return None
             TASK_STATE_MACHINE.parse(requested_row[2])
             if requested_row[2] in {TaskStatus.PENDING.value, TaskStatus.RECOVERING.value}:
                 TASK_STATE_MACHINE.require(requested_row[2], TaskStatus.RUNNING)
             requested = json.loads(requested_row[1] or "[]")
             held_rows = db.execute(
                 "SELECT s.resources_json FROM v1_tasks t JOIN v1_scheduling_entries s ON s.task_id=t.id AND s.project_id=t.project_id "
-                "WHERE t.project_id=? AND t.id!=? AND t.status='running'",
+                "WHERE t.project_id=? AND t.id!=? AND t.status IN ('running','waiting')",
                 (requested_row[0], task_id),
             ).fetchall()
             if any(_resource_domains_overlap(requested, json.loads(row[0] or "[]")) for row in held_rows):
@@ -438,8 +453,8 @@ class SchedulerService:
         lease = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat(timespec="milliseconds")
         with self.store.tx(immediate=True) as db:
             cursor = db.execute(
-                "UPDATE v1_tasks SET lease_until=?,updated_at=? WHERE id=? AND status='running' AND lease_owner=?",
-                (lease, now, task_id, owner),
+                "UPDATE v1_tasks SET lease_until=?,updated_at=? WHERE id=? AND status IN ('running','waiting') AND lease_owner=? AND lease_until>?",
+                (lease, now, task_id, owner, now),
             )
             if cursor.rowcount == 1:
                 db.execute(
@@ -486,10 +501,20 @@ class SchedulerService:
             return False
         if row[1] == "recovering" and row[8] and row[8] > now:
             return False
+        if not self.store.agents.dispatch_available(db, task_id):
+            return False
+        if db.execute("SELECT 1 FROM v1_tasks WHERE project_id=? AND id!=? AND failure_code='effect_outcome_unknown'", (row[0], task_id)).fetchone():
+            # A new Task must not bypass an unresolved external write merely
+            # because its old Assignment released the Python execution slot.
+            return False
         dependencies = json.loads(row[6] or "[]")
         for dependency in dependencies:
             if not isinstance(dependency, str) or dependency.startswith("task-plan:"):
                 return False
+            canonical = canonical_task(db, row[0], dependency)
+            if canonical is None:
+                return False
+            dependency = canonical["id"]
             dependency_row = db.execute(
                 "SELECT status FROM v1_tasks WHERE id=? AND project_id=?",
             (dependency, row[0]),
@@ -506,7 +531,7 @@ class SchedulerService:
         requested = json.loads(row[7] or "[]")
         held_rows = db.execute(
             "SELECT sa.resources_json FROM v1_tasks active JOIN v1_scheduling_entries sa ON sa.task_id=active.id "
-            "WHERE active.project_id=? AND active.status='running' AND active.id!=?",
+            "WHERE active.project_id=? AND active.status IN ('running','waiting') AND active.id!=?",
             (row[0], task_id),
         ).fetchall()
         return not any(_resource_domains_overlap(requested, json.loads(held[0] or "[]")) for held in held_rows)
@@ -518,7 +543,7 @@ class SchedulerService:
             rows = db.execute(
                 "SELECT s.task_id,s.project_id,s.dependencies_json FROM v1_scheduling_entries s "
                 "JOIN v1_tasks t ON t.id=s.task_id AND t.project_id=s.project_id "
-                "WHERE s.state='queued' AND s.auto_admit=1 AND t.status='pending'"
+                "WHERE s.state IN ('queued','admitted') AND t.status IN ('pending','recovering')"
             ).fetchall()
             for row in rows:
                 dependencies = json.loads(row[2] or "[]")
@@ -526,28 +551,16 @@ class SchedulerService:
                 changed = False
                 for value in dependencies:
                     if not isinstance(value, str) or not value.startswith("task-plan:"):
+                        canonical = canonical_task(db, row[1], value)
+                        canonical_id = canonical["id"] if canonical else value
+                        resolved.append(canonical_id)
+                        changed |= canonical_id != value
+                        continue
+                    match = canonical_task(db, row[1], value)
+                    if not match or match["status"] != "done":
                         resolved.append(value)
                         continue
-                    _, plan_id, task_ref = value.split(":", 2)
-                    match = db.execute(
-                        "SELECT id FROM v1_tasks WHERE project_id=? AND task_plan_id=? AND proposed_task_ref=? AND status='done' "
-                        "ORDER BY finished_at DESC,created_at DESC LIMIT 1",
-                        (row[1], plan_id, task_ref),
-                    ).fetchone()
-                    if not match:
-                        match = db.execute(
-                            "SELECT successor.id FROM v1_tasks predecessor "
-                            "JOIN v1_tasks successor ON successor.id=predecessor.resolved_by_task_id "
-                            "WHERE predecessor.project_id=? AND predecessor.task_plan_id=? "
-                            "AND predecessor.proposed_task_ref=? AND predecessor.status='failed' "
-                            "AND successor.project_id=predecessor.project_id AND successor.status='done' "
-                            "ORDER BY successor.finished_at DESC,successor.created_at DESC LIMIT 1",
-                            (row[1], plan_id, task_ref),
-                        ).fetchone()
-                    if not match:
-                        resolved.append(value)
-                        continue
-                    dependency_id = match[0]
+                    dependency_id = match["id"]
                     resolved.append(dependency_id)
                     db.execute(
                         "INSERT OR IGNORE INTO v1_task_dependencies(task_id,depends_on_task_id,project_id,required_terminal,created_at) VALUES(?,?,?,'done',?)",
@@ -559,7 +572,10 @@ class SchedulerService:
                         "UPDATE v1_scheduling_entries SET dependencies_json=?,updated_at=? WHERE task_id=?",
                         (json.dumps(resolved), now, row[0]),
                     )
-                if resolved and all(not value.startswith("task-plan:") for value in resolved):
+                if resolved and all(
+                    (canonical := canonical_task(db, row[1], value)) is not None
+                    and canonical["status"] == "done" for value in resolved
+                ):
                     admitted = db.execute(
                         "UPDATE v1_scheduling_entries SET state='admitted',auto_admit=0,updated_at=? "
                         "WHERE task_id=? AND state='queued' AND auto_admit=1",

@@ -1,0 +1,799 @@
+{
+  "schema_version": "devwerk.loop.bundle.v1",
+  "parameter_schema": {
+    "type": "object",
+    "required": [
+      "product_name",
+      "delivery_target"
+    ],
+    "properties": {
+      "product_name": {
+        "type": "string",
+        "minLength": 1
+      },
+      "delivery_target": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "additionalProperties": false
+  },
+  "bundle": {
+    "defaults": {},
+    "workflow_plan": {
+      "schema_version": "devwerk.workflow-plan.v1",
+      "intent_summary": "把用户确认的客户端—服务端软件需求交付为经过领域设计、前后端分工实现、集成审查、独立测试和可运维验收的可运行软件。",
+      "completion_definition": "需求追踪、领域与接口设计、实现、结对审查、自动化测试、运行与交付证据以及最终验收全部完成，Task 到达 done。",
+      "flow_unit": "一个具备明确验收标准、可以独立构建和验收的软件交付范围。",
+      "lifecycle_summary": "确认需求基线，完成领域与接口设计；后端实现、前端实现和集成审查分别在独立 Column 中完成并通过有向边返修；随后执行独立系统测试、交付验证和最终验收。",
+      "entry_meaning": "需求文件存在，用户已确认其功能边界与验收标准。",
+      "terminal_meaning": "done 表示软件和运行证据均验收通过；failed 表示明确且不可在本轮恢复的执行失败，可 reopen 原 Task。",
+      "task_contract": {
+        "identity_pointer": "/requirements_path",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "requirements_path",
+            "requirements_confirmed"
+          ],
+          "properties": {
+            "requirements_path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "requirements_confirmed": {
+              "const": true
+            }
+          },
+          "additionalProperties": false
+        },
+        "required_context": [
+          "Project Loop bindings",
+          "已确认的需求文件",
+          "当前项目源码和工程配置"
+        ],
+        "expected_outputs": [
+          "需求追踪矩阵",
+          "DDD与接口设计",
+          "前端源码",
+          "后端源码",
+          "集成审查记录",
+          "自动化测试证据",
+          "运行与交付说明",
+          "最终验收"
+        ],
+        "acceptance_contract": [
+          "需求无遗漏",
+          "领域边界与接口明确",
+          "结对审查接受",
+          "自动化测试真实通过",
+          "交付方式可复现",
+          "最终验收通过"
+        ]
+      },
+      "columns": [
+        {
+          "key": "requirements",
+          "responsibility": "核对用户确认的需求、边界、验收标准和交付目标，形成可追踪需求基线。",
+          "execution_mode": "agent",
+          "entry_evidence": [
+            "已确认需求文件",
+            "Project delivery_target"
+          ],
+          "exit_evidence": [
+            "需求追踪矩阵与明确验收标准"
+          ],
+          "context_boundary": "不得自行扩展产品范围；存在实质歧义时报告 requirement_gap。",
+          "review_or_rework_role": "缺口返回用户沟通，不以实现猜测替代需求确认。"
+        },
+        {
+          "key": "domain_design",
+          "responsibility": "使用DDD识别限界上下文、领域语言、模型、用例和接口，并形成最小可实现设计。",
+          "execution_mode": "agent",
+          "entry_evidence": [
+            "需求基线"
+          ],
+          "exit_evidence": [
+            "领域模型、架构、接口和测试设计"
+          ],
+          "context_boundary": "DDD服务于当前复杂度；简单系统允许单一限界上下文，不虚构领域层次。",
+          "review_or_rework_role": "设计无法覆盖需求时返回需求阶段。"
+        },
+        {
+          "key": "backend_development",
+          "responsibility": "由一个 Agent 实现或定向返修后端范围。",
+          "execution_mode": "agent",
+          "entry_evidence": [
+            "冻结需求",
+            "领域设计",
+            "API契约",
+            "既有反馈"
+          ],
+          "exit_evidence": [
+            "后端源码与开发记录"
+          ],
+          "context_boundary": "本 Column 只有一个 Agent，只修改后端范围。",
+          "review_or_rework_role": "后端问题经 Workflow 边返回，并恢复同一逻辑 session。"
+        },
+        {
+          "key": "frontend_development",
+          "responsibility": "由一个 Agent 实现或定向返修前端范围。",
+          "execution_mode": "agent",
+          "entry_evidence": [
+            "冻结需求",
+            "API契约",
+            "已实现后端",
+            "既有反馈"
+          ],
+          "exit_evidence": [
+            "前端源码与开发记录"
+          ],
+          "context_boundary": "本 Column 只有一个 Agent，只修改前端范围。",
+          "review_or_rework_role": "前端问题经 Workflow 边返回，并恢复同一逻辑 session；后端契约问题回后端 Column。"
+        },
+        {
+          "key": "integration_review",
+          "responsibility": "由一个独立 Agent 审查前后端实现和接口对接。",
+          "execution_mode": "agent",
+          "entry_evidence": [
+            "冻结需求",
+            "API契约",
+            "前后端实现"
+          ],
+          "exit_evidence": [
+            "结构化集成审查报告"
+          ],
+          "context_boundary": "本 Column 只有一个 Agent，只写审查报告，不修改实现。",
+          "review_or_rework_role": "按问题责任回到对应开发 Column。"
+        },
+        {
+          "key": "system_test",
+          "responsibility": "独立QA从用户边界执行后端、前端和集成测试，保留真实命令、退出码和结果。",
+          "execution_mode": "agent",
+          "entry_evidence": [
+            "已结对审查的实现",
+            "需求验收标准"
+          ],
+          "exit_evidence": [
+            "自动化测试与集成验证报告"
+          ],
+          "context_boundary": "不得以阅读代码代替运行测试。",
+          "review_or_rework_role": "产品或代码问题携带测试证据返回 integration_review，由其按责任路由。"
+        },
+        {
+          "key": "delivery",
+          "responsibility": "验证构建、启动、配置、健康检查、停止和可选打包/CI资产，形成可复现运行说明。",
+          "execution_mode": "agent",
+          "entry_evidence": [
+            "测试通过的实现",
+            "delivery_target"
+          ],
+          "exit_evidence": [
+            "运行证据与交付说明"
+          ],
+          "context_boundary": "仅执行项目声明的交付目标，不强制绑定GitLab、GitHub、Docker或云平台。",
+          "review_or_rework_role": "交付问题携带命令和日志返回 integration_review。"
+        },
+        {
+          "key": "accept",
+          "responsibility": "逐条核对需求、设计、代码、测试和交付证据并作最终验收。",
+          "execution_mode": "agent",
+          "entry_evidence": [
+            "全部工程证据"
+          ],
+          "exit_evidence": [
+            "最终验收报告"
+          ],
+          "context_boundary": "不得降低需求基线或把未运行验证写成通过。",
+          "review_or_rework_role": "验收不通过携带差距返回 integration_review。"
+        }
+      ],
+      "lifecycle_walkthrough": [
+        {
+          "column_key": "requirements",
+          "receives": [
+            "已确认需求"
+          ],
+          "action": "建立需求追踪和验收基线。",
+          "produces": [
+            "docs/requirements-baseline.md"
+          ],
+          "completion_evidence": [
+            "每项需求具有验收方式"
+          ],
+          "outcome": "requirements_ready"
+        },
+        {
+          "column_key": "domain_design",
+          "receives": [
+            "需求基线"
+          ],
+          "action": "建立适度的DDD、接口、架构和测试设计。",
+          "produces": [
+            "docs/domain-design.md",
+            "docs/architecture.md",
+            "docs/api-contract.md",
+            "docs/test-plan.md"
+          ],
+          "completion_evidence": [
+            "设计可追踪到需求"
+          ],
+          "outcome": "design_ready"
+        },
+        {
+          "column_key": "backend_development",
+          "receives": [
+            "需求、设计和既有反馈"
+          ],
+          "action": "实现或定向返修后端。",
+          "produces": [
+            "后端实现"
+          ],
+          "completion_evidence": [
+            "后端版本可供前端对接"
+          ],
+          "outcome": "backend_ready"
+        },
+        {
+          "column_key": "frontend_development",
+          "receives": [
+            "需求、API契约、后端实现和既有反馈"
+          ],
+          "action": "实现或定向返修前端并验证接口。",
+          "produces": [
+            "前端实现"
+          ],
+          "completion_evidence": [
+            "前端版本可供集成审查"
+          ],
+          "outcome": "frontend_ready"
+        },
+        {
+          "column_key": "integration_review",
+          "receives": [
+            "需求、设计和前后端实现"
+          ],
+          "action": "独立审查集成结果并定向反馈。",
+          "produces": [
+            "审查报告"
+          ],
+          "completion_evidence": [
+            "审查结论对应当前版本"
+          ],
+          "outcome": "accepted"
+        },
+        {
+          "column_key": "system_test",
+          "receives": [
+            "已审查实现"
+          ],
+          "action": "真实执行单元、接口、前端构建和端到端关键路径测试。",
+          "produces": [
+            "docs/test-report.md"
+          ],
+          "completion_evidence": [
+            "测试命令退出码为0且验收行为成立"
+          ],
+          "outcome": "tests_passed"
+        },
+        {
+          "column_key": "delivery",
+          "receives": [
+            "测试通过实现"
+          ],
+          "action": "验证启动、配置、健康检查、停止及目标打包方式。",
+          "produces": [
+            "README.md",
+            "docs/delivery-report.md"
+          ],
+          "completion_evidence": [
+            "新环境可按说明复现运行"
+          ],
+          "outcome": "delivery_ready"
+        },
+        {
+          "column_key": "accept",
+          "receives": [
+            "全部交付证据"
+          ],
+          "action": "逐条执行最终验收。",
+          "produces": [
+            "FINAL_ACCEPTANCE.md"
+          ],
+          "completion_evidence": [
+            "全部已确认标准通过"
+          ],
+          "outcome": "delivered"
+        }
+      ],
+      "wip_group": "software_delivery",
+      "wip_limit": 1,
+      "wip_decision": "同一交付范围串行经历需求、设计、开发、测试和交付；返修返回持续开发上下文。",
+      "concurrency_groups": [],
+      "serialization_reasons": [
+        "后续阶段依赖前序阶段产生的版本化工程证据。"
+      ],
+      "progress_evidence": [
+        "需求、设计、源码、命令、退出码、审查、运行和验收事件"
+      ],
+      "review_points": [
+        "需求基线",
+        "领域与接口设计",
+        "结对代码审查",
+        "独立系统测试",
+        "运行交付",
+        "最终验收"
+      ],
+      "intervention_conditions": [
+        "需求存在实质歧义",
+        "测试环境不可用",
+        "外部交付凭证缺失",
+        "执行失败"
+      ],
+      "self_check": {
+        "every_task_can_start_at_entry": true,
+        "every_column_applies_to_every_task": true,
+        "columns_are_process_stages_not_work_slices": true,
+        "tasks_are_independently_reviewable": true,
+        "context_handoffs_are_explicit": true,
+        "concurrency_conflicts_are_declared": true,
+        "terminal_and_rework_paths_are_explicit": true
+      }
+    },
+    "workflow": {
+      "schema_version": "devwerk.workflow.v1",
+      "name": "DDD 前后端协作交付有向图",
+      "description": "从已确认需求到DDD设计、前后端独立实现、集成审查、系统测试、可运维交付和最终验收的通用客户端—服务端工程流程。",
+      "entry": "requirements",
+      "terminals": {
+        "success": "done",
+        "failure": "failed"
+      },
+      "columns": [
+        {
+          "key": "requirements",
+          "name": "需求基线与验收追踪",
+          "instruction": "读取 project.loop.bindings 与 Task input 指定的 requirements_path。只整理已经确认的产品行为、非目标、接口边界、运行方式和可执行验收标准，写 docs/requirements-baseline.md。不得扩展需求。内容明确时 complete requirements_ready；存在影响实现的歧义 complete requirement_gap；执行失败 complete execution_failed。",
+          "executor": {
+            "kind": "agent",
+            "capabilities": [
+              "project.files.list",
+              "project.files.read",
+              "project.files.write"
+            ]
+          },
+          "context": {
+            "include_project": true,
+            "include_task": true,
+            "upstream_outputs": [],
+            "artifact_globs": []
+          },
+          "input_contract": {},
+          "output_contract": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "transitions": [
+            {
+              "outcome": "requirements_ready",
+              "target": "domain_design"
+            },
+            {
+              "outcome": "requirement_gap",
+              "target": "failed"
+            },
+            {
+              "outcome": "execution_failed",
+              "target": "failed"
+            }
+          ],
+          "metadata": {
+            "purpose": "固定需求事实并建立验收追踪",
+            "derives_agent": true,
+            "writable_paths": [
+              "docs/requirements-baseline.md"
+            ]
+          }
+        },
+        {
+          "key": "domain_design",
+          "name": "DDD、架构与接口设计",
+          "instruction": "读取需求基线和当前工程。用DDD识别限界上下文、统一语言、实体/值对象、应用用例和外部适配器；简单系统使用单一限界上下文，禁止为DDD制造无意义层次。同步定义前后端契约、目录结构、错误行为、测试策略和交付方式，写 docs/domain-design.md、docs/architecture.md、docs/api-contract.md、docs/test-plan.md。设计覆盖需求时 complete design_ready；发现需求缺口 complete requirement_gap；执行失败 complete execution_failed。",
+          "executor": {
+            "kind": "agent",
+            "capabilities": [
+              "project.files.list",
+              "project.files.read",
+              "project.files.search",
+              "project.files.write"
+            ]
+          },
+          "context": {
+            "include_project": true,
+            "include_task": true,
+            "upstream_outputs": [
+              "requirements"
+            ],
+            "artifact_globs": []
+          },
+          "input_contract": {},
+          "output_contract": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "transitions": [
+            {
+              "outcome": "design_ready",
+              "target": "backend_development"
+            },
+            {
+              "outcome": "requirement_gap",
+              "target": "requirements",
+              "allows_unresolved_failures": true
+            },
+            {
+              "outcome": "execution_failed",
+              "target": "failed"
+            }
+          ],
+          "metadata": {
+            "purpose": "形成适度且可实现的领域与工程设计",
+            "derives_agent": true,
+            "writable_paths": [
+              "docs/domain-design.md",
+              "docs/architecture.md",
+              "docs/api-contract.md",
+              "docs/test-plan.md"
+            ]
+          }
+        },
+        {
+          "key": "backend_development",
+          "name": "后端实现与定向返修",
+          "instruction": "读取需求、DDD、架构、API契约、测试设计、当前后端源码和前序 Column 反馈。实现服务端领域、应用和适配器代码并运行后端开发测试；不得修改 frontend/**、交付文件或最终验收文件。完成后 complete backend_ready；需求无法支持实现 complete requirement_gap；无法继续 complete execution_failed。",
+          "executor": {
+            "kind": "agent",
+            "capabilities": [
+              "project.files.list",
+              "project.files.read",
+              "project.files.search",
+              "project.files.write",
+              "project.command.run"
+            ]
+          },
+          "context": {
+            "include_project": true,
+            "include_task": true,
+            "upstream_outputs": [
+              "domain_design",
+              "frontend_development",
+              "integration_review",
+              "system_test",
+              "delivery",
+              "accept"
+            ],
+            "artifact_globs": [],
+            "memory": []
+          },
+          "input_contract": {},
+          "output_contract": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "transitions": [
+            {
+              "outcome": "backend_ready",
+              "target": "frontend_development"
+            },
+            {
+              "outcome": "requirement_gap",
+              "target": "requirements",
+              "allows_unresolved_failures": true
+            },
+            {
+              "outcome": "execution_failed",
+              "target": "failed"
+            }
+          ],
+          "metadata": {
+            "purpose": "实现或依据明确反馈返修后端范围",
+            "derives_agent": true,
+            "agent_session_key": "backend_development",
+            "writable_paths": [
+              "backend/**",
+              "docs/backend-development.md"
+            ]
+          }
+        },
+        {
+          "key": "frontend_development",
+          "name": "前端实现与定向返修",
+          "instruction": "读取需求、架构、API契约、已实现后端、当前前端源码和前序 Column 反馈。实现客户端交互、状态、接口适配和前端开发测试，并用真实命令验证前后端契约；不得修改 backend/**、交付文件或最终验收文件。完成后 complete frontend_ready；发现后端契约问题 complete backend_contract_issue 并给出端点、请求、响应和期望；需求无法支持实现 complete requirement_gap；无法继续 complete execution_failed。",
+          "executor": {
+            "kind": "agent",
+            "capabilities": [
+              "project.files.list",
+              "project.files.read",
+              "project.files.search",
+              "project.files.write",
+              "project.command.run"
+            ]
+          },
+          "context": {
+            "include_project": true,
+            "include_task": true,
+            "upstream_outputs": [
+              "backend_development",
+              "integration_review",
+              "system_test",
+              "delivery",
+              "accept"
+            ],
+            "artifact_globs": [],
+            "memory": []
+          },
+          "input_contract": {},
+          "output_contract": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "transitions": [
+            {
+              "outcome": "frontend_ready",
+              "target": "integration_review"
+            },
+            {
+              "outcome": "backend_contract_issue",
+              "target": "backend_development",
+              "allows_unresolved_failures": true
+            },
+            {
+              "outcome": "requirement_gap",
+              "target": "requirements",
+              "allows_unresolved_failures": true
+            },
+            {
+              "outcome": "execution_failed",
+              "target": "failed"
+            }
+          ],
+          "metadata": {
+            "purpose": "实现或依据明确反馈返修前端范围",
+            "derives_agent": true,
+            "agent_session_key": "frontend_development",
+            "writable_paths": [
+              "frontend/**",
+              "docs/frontend-development.md"
+            ]
+          }
+        },
+        {
+          "key": "integration_review",
+          "name": "独立集成审查",
+          "instruction": "对照冻结需求、领域设计和 API 契约审查当前前后端代码并运行必要的集成检查，重点验证用户行为、接口一致性、错误路径、可维护性和不必要复杂度；不得直接修改实现。必须把问题、文件、行为、依据和期望修改写入 docs/pair-review.md。通过 complete accepted；后端问题 complete backend_changes_requested；前端问题 complete frontend_changes_requested；需求不明确 complete requirement_gap；无法检查 complete execution_failed。",
+          "executor": {
+            "kind": "agent",
+            "capabilities": [
+              "project.files.list",
+              "project.files.read",
+              "project.files.search",
+              "project.files.write",
+              "project.command.run"
+            ]
+          },
+          "context": {
+            "include_project": true,
+            "include_task": true,
+            "upstream_outputs": [
+              "domain_design",
+              "backend_development",
+              "frontend_development"
+            ],
+            "artifact_globs": [],
+            "memory": []
+          },
+          "input_contract": {},
+          "output_contract": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "transitions": [
+            {
+              "outcome": "accepted",
+              "target": "system_test"
+            },
+            {
+              "outcome": "backend_changes_requested",
+              "target": "backend_development",
+              "allows_unresolved_failures": true
+            },
+            {
+              "outcome": "frontend_changes_requested",
+              "target": "frontend_development",
+              "allows_unresolved_failures": true
+            },
+            {
+              "outcome": "requirement_gap",
+              "target": "requirements",
+              "allows_unresolved_failures": true
+            },
+            {
+              "outcome": "execution_failed",
+              "target": "failed"
+            }
+          ],
+          "metadata": {
+            "purpose": "独立审查前后端实现并按责任路由返修",
+            "derives_agent": true,
+            "writable_paths": [
+              "docs/pair-review.md"
+            ]
+          }
+        },
+        {
+          "key": "system_test",
+          "name": "独立自动化与集成测试",
+          "instruction": "作为独立QA读取需求、测试设计和当前实现。真实执行适合项目的单元测试、后端接口测试、前端构建检查和用户关键路径集成测试；记录命令、退出码、环境和结果到 docs/test-report.md。全部通过 complete tests_passed；发现产品或代码问题 complete tests_failed 并给出可执行反馈；环境本身无法验证 complete execution_failed。不得仅凭代码阅读宣称测试通过。",
+          "executor": {
+            "kind": "agent",
+            "capabilities": [
+              "project.files.list",
+              "project.files.read",
+              "project.files.search",
+              "project.files.write",
+              "project.command.run"
+            ]
+          },
+          "context": {
+            "include_project": true,
+            "include_task": true,
+            "upstream_outputs": [
+              "requirements",
+              "domain_design",
+              "backend_development",
+              "frontend_development",
+              "integration_review"
+            ],
+            "artifact_globs": []
+          },
+          "input_contract": {},
+          "output_contract": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "transitions": [
+            {
+              "outcome": "tests_passed",
+              "target": "delivery"
+            },
+            {
+              "outcome": "tests_failed",
+              "target": "integration_review",
+              "allows_unresolved_failures": true
+            },
+            {
+              "outcome": "execution_failed",
+              "target": "failed"
+            }
+          ],
+          "metadata": {
+            "purpose": "以真实执行证明软件行为",
+            "derives_agent": true,
+            "writable_paths": [
+              "docs/test-report.md"
+            ]
+          }
+        },
+        {
+          "key": "delivery",
+          "name": "构建、运行与交付验证",
+          "instruction": "根据 project.loop.bindings.delivery_target 验证安装、构建、配置、启动、健康检查和停止路径；需要时验证容器或CI资产，但不得自行增加未声明的平台绑定。补齐README和必要启动/停止文件，写 docs/delivery-report.md，包含真实命令和退出码。可复现时 complete delivery_ready；实现问题 complete delivery_failed 返回开发；环境无法完成 complete execution_failed。",
+          "executor": {
+            "kind": "agent",
+            "capabilities": [
+              "project.files.list",
+              "project.files.read",
+              "project.files.search",
+              "project.files.write",
+              "project.command.run"
+            ]
+          },
+          "context": {
+            "include_project": true,
+            "include_task": true,
+            "upstream_outputs": [
+              "system_test"
+            ],
+            "artifact_globs": []
+          },
+          "input_contract": {},
+          "output_contract": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "transitions": [
+            {
+              "outcome": "delivery_ready",
+              "target": "accept"
+            },
+            {
+              "outcome": "delivery_failed",
+              "target": "integration_review",
+              "allows_unresolved_failures": true
+            },
+            {
+              "outcome": "execution_failed",
+              "target": "failed"
+            }
+          ],
+          "metadata": {
+            "purpose": "确保交付可以被人类复现运行",
+            "derives_agent": true,
+            "writable_paths": [
+              "README.md",
+              "docs/delivery-report.md",
+              "startup.*",
+              "shutdown.*"
+            ]
+          }
+        },
+        {
+          "key": "accept",
+          "name": "最终需求验收",
+          "instruction": "逐条读取 docs/requirements-baseline.md 的验收标准，并核对DDD/接口设计、集成审查、真实测试与交付运行证据。写 FINAL_ACCEPTANCE.md，逐项列出证据。全部满足 complete delivered；产品问题 complete acceptance_failed 返回开发；执行失败 complete execution_failed。不得把存在文件等同于行为通过。",
+          "executor": {
+            "kind": "agent",
+            "capabilities": [
+              "project.files.list",
+              "project.files.read",
+              "project.files.search",
+              "project.files.write",
+              "project.command.run"
+            ]
+          },
+          "context": {
+            "include_project": true,
+            "include_task": true,
+            "upstream_outputs": [
+              "requirements",
+              "domain_design",
+              "backend_development",
+              "frontend_development",
+              "integration_review",
+              "system_test",
+              "delivery"
+            ],
+            "artifact_globs": []
+          },
+          "input_contract": {},
+          "output_contract": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "transitions": [
+            {
+              "outcome": "delivered",
+              "target": "done"
+            },
+            {
+              "outcome": "acceptance_failed",
+              "target": "integration_review",
+              "allows_unresolved_failures": true
+            },
+            {
+              "outcome": "execution_failed",
+              "target": "failed"
+            }
+          ],
+          "metadata": {
+            "purpose": "根据需求和真实证据完成最终验收",
+            "derives_agent": true,
+            "writable_paths": [
+              "FINAL_ACCEPTANCE.md"
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

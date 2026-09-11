@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from jsonschema import Draft202012Validator
@@ -84,6 +85,7 @@ def _canonicalize(value: Any, schema: Any, root: dict[str, Any]) -> Any:
             if decoded is not None:
                 value = decoded
         properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        value = _recover_misplaced_named_properties(value, properties)
         return {
             key: _canonicalize(item, properties.get(key, {}), root)
             for key, item in value.items()
@@ -111,6 +113,51 @@ def _decode_provider_json_text(value: str, expected_type: type[Any]) -> Any | No
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
     return decoded if isinstance(decoded, expected_type) else None
+
+
+_MISPLACED_PARAMETER = re.compile(
+    r',\s*"?parameter\s+name\s*=\s*"(?P<name>[^"<>]+)"\s*>\s*',
+    re.IGNORECASE,
+)
+
+
+def _recover_misplaced_named_properties(
+    value: dict[str, Any],
+    properties: dict[str, Any],
+) -> dict[str, Any]:
+    """Recover exact fields misplaced by an Anthropic-compatible transport.
+
+    Some compatible Providers occasionally append a following named parameter to
+    a JSON-text parameter, for example ``{\"a\":1},\"parameter
+    name=\"summary\">done``. Recovery is deliberately narrow: the source prefix
+    must decode to the source property's declared JSON container type, and every
+    recovered name must be declared by the surrounding object schema and absent
+    from the Provider object. No semantic value is invented.
+    """
+    for source_name, source_value in value.items():
+        if not isinstance(source_value, str):
+            continue
+        matches = list(_MISPLACED_PARAMETER.finditer(source_value))
+        if not matches:
+            continue
+        recovered_names = [match.group("name") for match in matches]
+        if any(name not in properties or name in value for name in recovered_names):
+            continue
+        source_schema = properties.get(source_name)
+        source_type = source_schema.get("type") if isinstance(source_schema, dict) else None
+        expected_type = dict if source_type == "object" else list if source_type == "array" else None
+        if expected_type is None:
+            continue
+        decoded = _decode_provider_json_text(source_value[: matches[0].start()], expected_type)
+        if decoded is None:
+            continue
+        recovered = dict(value)
+        recovered[source_name] = decoded
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(source_value)
+            recovered[match.group("name")] = source_value[match.end() : end]
+        return recovered
+    return value
 
 
 def _provider_reference(value: Any) -> dict[str, str] | None:

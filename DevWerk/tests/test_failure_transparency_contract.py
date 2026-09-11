@@ -9,7 +9,7 @@ from app.v1.agent import AgentCore, AgentRunSpec
 from app.v1.capabilities import CapabilityContext, build_core_registry
 from app.v1.contracts import ContractError
 from app.v1.domain import AgentExecutor, AgentModelResponse, CapabilityStep
-from app.v1.runtime import RuntimeExecutionError, WorkflowRuntime
+from app.v1.runtime import RuntimeExecutionError, WorkflowRuntime, _failure_message
 from tests.helpers import create_planned_task, publish_planned_workflow, sequence_workflow
 
 
@@ -29,6 +29,12 @@ def test_agent_execution_contract_has_no_platform_fuses():
     assert forbidden.isdisjoint(AgentExecutor.model_fields)
     with pytest.raises(ValidationError):
         AgentExecutor(capabilities=["system.noop"], max_iterations=16)
+
+
+def test_terminal_failure_uses_declared_reason_instead_of_generic_message():
+    assert _failure_message({"reason": "Task order exceeds the declared Project scope"}) == (
+        "Task order exceeds the declared Project scope"
+    )
 
 
 def test_provider_failure_is_attempted_once_and_raised(store, tmp_path):
@@ -79,7 +85,9 @@ def test_runtime_failure_is_persisted_and_re_raised(store, tmp_path):
         WorkflowRuntime(store, build_core_registry(), "worker").step(task["id"])
 
     persisted = store.get_task(task["id"])
-    assert persisted["status"] == "failed"
+    assert persisted["status"] == "recovering"
+    assert persisted["control_state"] == "paused"
+    assert persisted["failure_origin"] == "capability"
     assert "exited with code 23" in persisted["error"]
     attempt = store.attempts(project["id"], task["id"])[0]
     assert attempt["checkpoint"]["failed_result"]["output"]["exit_code"] == 23

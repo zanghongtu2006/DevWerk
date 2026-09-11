@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, V1RuntimePolicy
+from app.v1.process_runner import run_command
 
 
 logger = logging.getLogger("devwerk.files")
@@ -251,26 +252,12 @@ class ProjectFiles:
                 break
         return result
 
-    def run(self, argv: list[str], cwd: str = ".") -> dict[str, Any]:
+    def run(self, argv: list[str], cwd: str = ".", *, check=None, limits=None, guard=None) -> dict[str, Any]:
         working_dir = self.resolve(cwd)
         working_dir.mkdir(parents=True, exist_ok=True)
-        process = subprocess.run(
-            argv,
-            cwd=working_dir,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            shell=False,
-            env=os.environ.copy(),
-        )
-        return {
-            "command": argv,
-            "cwd": str(working_dir.relative_to(self.root)),
-            "exit_code": process.returncode,
-            "stdout": process.stdout,
-            "stderr": process.stderr,
-        }
+        output = run_command(argv, working_dir, limits or getattr(self, "policy", DEFAULT_V1_RUNTIME_POLICY).execution, check, guard)
+        output["cwd"] = str(working_dir.relative_to(self.root)) if isinstance(self, ProjectFiles) else str(working_dir)
+        return output
 
 
 class SystemFiles:
@@ -366,24 +353,10 @@ class SystemFiles:
                         return {"matches": matches, "truncated": True}
         return {"matches": matches, "truncated": False}
 
-    def run(self, argv: list[str], cwd: str = ".") -> dict[str, Any]:
+    def run(self, argv: list[str], cwd: str = ".", *, check=None, limits=None, guard=None) -> dict[str, Any]:
         working_dir = self.resolve(cwd)
         if not working_dir.is_dir():
             raise FileNotFoundError(f"system command cwd does not exist: {working_dir}")
-        process = subprocess.run(
-            argv,
-            cwd=working_dir,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            shell=False,
-            env=os.environ.copy(),
-        )
-        return {
-            "command": argv,
-            "cwd": str(working_dir),
-            "exit_code": process.returncode,
-            "stdout": process.stdout,
-            "stderr": process.stderr,
-        }
+        output = run_command(argv, working_dir, limits or getattr(self, "policy", DEFAULT_V1_RUNTIME_POLICY).execution, check, guard)
+        output["cwd"] = str(working_dir.relative_to(self.root)) if isinstance(self, ProjectFiles) else str(working_dir)
+        return output

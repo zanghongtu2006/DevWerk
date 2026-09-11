@@ -7,7 +7,8 @@ import fnmatch
 import logging
 import re
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from contextlib import contextmanager
 from typing import Any, Callable, Iterable, Literal
 
 from app.core.debug_trace import trace_json
@@ -15,6 +16,8 @@ from app.v1.contracts import canonicalize_contract_value, validate_contract, val
 from app.v1.domain import PollWaitPolicy, TaskCreate, TaskPlan, ToolResult, WorkflowDefinition, WorkflowPlan
 from app.v1.files import ProjectFiles, SystemFiles
 from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, V1RuntimePolicy
+from app.v1.execution_control import ExecutionControl, ExecutionOwnershipLost, ExecutionBudgetExceeded, ExecutionReplayUncertain
+from app.v1.execution_ledger import normalized_operation_arguments
 
 
 CapabilityHandler = Callable[[dict[str, Any], "CapabilityContext"], Any]
@@ -36,6 +39,11 @@ class CapabilityContext:
     execution_key: str | None = None
     writable_paths: tuple[str, ...] | None = None
     user_initiated: bool = False
+    execution_control: ExecutionControl | None = None
+    assignment: dict[str, Any] | None = None
+    agent_instance_id: str | None = None
+    requirement_id: str | None = None
+    requirement_revision: int | None = None
 
     @property
     def files(self) -> ProjectFiles:
@@ -44,6 +52,17 @@ class CapabilityContext:
     @property
     def system_files(self) -> SystemFiles:
         return SystemFiles()
+
+    @contextmanager
+    def effect_guard(self):
+        with self.store.tx(immediate=True):
+            if self.execution_control:
+                self.execution_control.check()
+            if self.assignment:
+                self.store.agents.assert_owner(self.assignment)
+            yield
+            if self.execution_control:
+                self.execution_control.check()
 
 
 @dataclass(frozen=True)
@@ -70,6 +89,11 @@ class CapabilityEntry:
                 "parameters": self.input_schema or {"type": "object", "additionalProperties": False},
             },
         }
+
+
+class _RollbackCapability(Exception):
+    def __init__(self, result):
+        self.result = result
 
 
 class CapabilityRegistry:
@@ -106,6 +130,34 @@ class CapabilityRegistry:
         return [entry.tool_schema() for entry in self.resolve(capability_ids, context)]
 
     def dispatch(self, capability_id: str, arguments: dict[str, Any], context: CapabilityContext) -> ToolResult:
+        if context.agent_run_id and not context.column_run_id:
+            with context.store.connect() as db:
+                binding = db.execute('SELECT j.requirement_id,j.requirement_revision,j.start_task,j.trigger_kind FROM v1_conversation_jobs j JOIN v1_agent_runs r ON r.conversation_job_id=j.id WHERE r.id=? AND j.project_id=?', (context.agent_run_id, context.project_id)).fetchone()
+            if binding:
+                context = replace(context, requirement_id=binding['requirement_id'], requirement_revision=binding['requirement_revision'],
+                                  start_task=bool(binding['start_task'] or binding['trigger_kind'] != 'user'),
+                                  user_initiated=binding['trigger_kind'] == 'user')
+        entry = self._entries.get(capability_id)
+        if entry and context.column_run_id and not entry.delegable_to_column:
+            return ToolResult(ok=False, capability=capability_id,
+                              error={"type": "LeafCapabilityDenied", "message": "A Column executes one Worker; this capability belongs to the project Conversation Agent"},
+                              checkpoint={"failure_disposition": "rejected_before_effect"})
+        # All core control handlers commit through Store transactions/savepoints.
+        # Keep caller fencing, business mutation and receipt in ONE transaction.
+        if entry and (entry.side_effect_kind == "control" or capability_id.startswith("project.memory.")):
+            try:
+                with context.effect_guard():
+                    result = self._dispatch(capability_id, arguments, context)
+                    if not result.ok:
+                        raise _RollbackCapability(result)
+                    return result
+            except _RollbackCapability as exc:
+                # A handler may write before discovering invalid input. Its
+                # failed ToolResult must roll back business state and events too.
+                return exc.result.model_copy(update={"checkpoint": {**(exc.result.checkpoint or {}), "failure_disposition": "rejected_before_effect"}})
+        return self._dispatch(capability_id, arguments, context)
+
+    def _dispatch(self, capability_id: str, arguments: dict[str, Any], context: CapabilityContext) -> ToolResult:
         receipt = None
         trace_json(
             trace_log,
@@ -120,12 +172,27 @@ class CapabilityRegistry:
             arguments=arguments,
         )
         try:
+            if context.execution_control:
+                context.execution_control.check()
             entry = self.resolve([capability_id], context)[0]
             self.validate_arguments(capability_id, arguments)
+            arguments = normalized_operation_arguments(capability_id, arguments)
+            if capability_id == "project.files.write":
+                _files_write_preflight(arguments, context)
+            if context.agent_run_id and not context.column_run_id and entry.side_effect_kind in {"write", "process"}:
+                with context.store.connect() as db:
+                    busy = db.execute("SELECT 1 FROM v1_tasks WHERE project_id=? AND (status IN ('running','waiting') OR failure_code='effect_outcome_unknown') LIMIT 1",
+                                      (context.project_id,)).fetchone()
+                if busy:
+                    raise ValueError("Project workspace is owned by an active Workflow; wait for it to stop before direct execution")
             digest = hashlib.sha256(json.dumps(arguments, sort_keys=True, default=str).encode("utf-8")).hexdigest()
             execution_key = context.execution_key or f"adhoc:{capability_id}:{digest}"
-            receipt = context.store.start_execution_receipt(context.project_id, execution_key, capability_id, arguments)
+            receipt = context.store.start_execution_receipt(context.project_id, execution_key, capability_id, arguments,
+                                                            retry_failed=not execution_key.startswith("op:") and ":effect:" not in execution_key)
             if receipt["status"] == "completed":
+                if capability_id in {"project.command.run", "system.command.run"} and (receipt.get("result") or {}).get("exit_code") != 0:
+                    return ToolResult(ok=False, capability=capability_id, output=receipt.get("result"),
+                                      error={"type": "LegacyCommandFailed", "message": "Historical command receipt has a nonzero exit code"})
                 result = ToolResult(ok=True, capability=capability_id, output=receipt["result"])
                 trace_json(trace_log, "capability.output", capability=capability_id, project_id=context.project_id, task_id=context.task_id, agent_run_id=context.agent_run_id, execution_key=execution_key, receipt_reused=True, result=result.model_dump(mode="json"))
                 return result
@@ -134,27 +201,41 @@ class CapabilityRegistry:
                 trace_json(trace_log, "capability.output", capability=capability_id, project_id=context.project_id, task_id=context.task_id, agent_run_id=context.agent_run_id, execution_key=execution_key, receipt_reused=True, result=result.model_dump(mode="json"))
                 return result
             if receipt["status"] == "started" and not receipt.get("claimed", False):
+                if entry.side_effect_kind in {"write", "process", "control"}:
+                    raise ExecutionReplayUncertain("Previous side effect has no committed outcome; reconcile it before retrying")
                 result = ToolResult(ok=False, capability=capability_id, error={"type": "ExecutionInProgress", "message": "an execution receipt already owns this side effect"})
                 trace_json(trace_log, "capability.output", capability=capability_id, project_id=context.project_id, task_id=context.task_id, agent_run_id=context.agent_run_id, execution_key=execution_key, result=result.model_dump(mode="json"))
                 return result
+            if receipt["status"] == "failed":
+                return ToolResult(ok=False, capability=capability_id, output=receipt.get("result"),
+                                  error={"type": "PriorExecutionFailed", "message": receipt.get("error") or "Prior execution failed"})
             output = entry.handler(arguments, context)
+            if context.execution_control:
+                context.execution_control.check()
             result = output if isinstance(output, ToolResult) else ToolResult(ok=True, capability=capability_id, output=output)
             if result.capability != capability_id:
                 raise ValueError("CapabilityResult capability must match the dispatched capability")
             if result.status == "completed":
                 validate_contract(result.output, entry.output_schema, label=f"{capability_id} output")
-                context.store.finish_execution_receipt(context.project_id, execution_key, True, result.output, None)
+                with context.effect_guard():
+                    context.store.finish_execution_receipt(context.project_id, execution_key, True, result.output, None)
             elif result.status == "awaiting":
                 # Runtime commits the receipt together with the AwaitHandle and Attempt checkpoint.
                 pass
             else:
-                context.store.finish_execution_receipt(
-                    context.project_id, execution_key, False, None,
-                    str((result.error or {}).get("message") or "capability failed"),
-                )
+                with context.effect_guard():
+                    context.store.finish_execution_receipt(
+                        context.project_id, execution_key, False, result.output,
+                        str((result.error or {}).get("message") or "capability failed"),
+                    )
             trace_json(trace_log, "capability.output", capability=capability_id, project_id=context.project_id, task_id=context.task_id, agent_run_id=context.agent_run_id, execution_key=execution_key, result=result.model_dump(mode="json"))
             return result
-        except (KeyError, ValueError, FileNotFoundError) as exc:
+        except (ExecutionOwnershipLost, ExecutionBudgetExceeded, ExecutionReplayUncertain):
+            # An in-flight effect may have occurred; do not mark it safe to retry.
+            raise
+        except (KeyError, ValueError, FileNotFoundError, PermissionError) as exc:
+            if receipt and receipt.get("claimed") and entry.side_effect_kind in {"write", "process"}:
+                raise ExecutionReplayUncertain(f"{capability_id} outcome is unknown after {type(exc).__name__}: {exc}") from exc
             if receipt and receipt.get("claimed"):
                 context.store.finish_execution_receipt(context.project_id, receipt["execution_key"], False, None, f"{type(exc).__name__}: {exc}")
             trace_json(trace_log, "capability.error", capability=capability_id, project_id=context.project_id, task_id=context.task_id, agent_run_id=context.agent_run_id, execution_key=context.execution_key, error_type=type(exc).__name__, error=str(exc))
@@ -162,11 +243,15 @@ class CapabilityRegistry:
                 return ToolResult(
                     ok=False,
                     capability=capability_id,
-                    error={"type": type(exc).__name__, "message": str(exc)},
-                    checkpoint={"failure_disposition": "rejected_before_effect"},
+                    error={"type": type(exc).__name__, "message": str(exc), "code": getattr(exc, 'error_code', None)},
+                    checkpoint={"failure_disposition": "execution_failed" if receipt and receipt.get("claimed") else "rejected_before_effect"},
                 )
             raise
         except Exception as exc:  # noqa: BLE001
+            if receipt and receipt.get("claimed") and entry.side_effect_kind in {"write", "process", "control"}:
+                # Leave started durable: an exception after dispatch cannot prove
+                # whether the external effect committed before the crash.
+                raise ExecutionReplayUncertain(f"{capability_id} outcome is unknown after {type(exc).__name__}: {exc}") from exc
             if receipt and receipt.get("claimed"):
                 context.store.finish_execution_receipt(context.project_id, receipt["execution_key"], False, None, f"{type(exc).__name__}: {exc}")
             trace_json(trace_log, "capability.error", capability=capability_id, project_id=context.project_id, task_id=context.task_id, agent_run_id=context.agent_run_id, execution_key=context.execution_key, error_type=type(exc).__name__, error=str(exc))
@@ -315,7 +400,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         "kind": {"type": "string", "minLength": 1, "maxLength": 200},
         "scope": {
             "type": "string",
-            "enum": ["project", "conversation", "workflow", "task", "workcell", "participant"],
+            "enum": ["project", "conversation", "workflow", "task"],
         },
         "scope_id": {"type": ["string", "null"], "maxLength": 500},
         "authority": {"type": "string", "minLength": 1, "maxLength": 200},
@@ -349,7 +434,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
             "required": ["query"],
             "properties": {
                 "query": {"type": "string", "maxLength": 4000},
-                "scope": {"type": "string", "enum": ["project", "conversation", "workflow", "task", "workcell", "participant"]},
+                "scope": {"type": "string", "enum": ["project", "conversation", "workflow", "task"]},
                 "scope_id": {"type": "string", "maxLength": 500},
                 "kinds": {"type": "array", "items": {"type": "string"}, "maxItems": 100},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200},
@@ -699,7 +784,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
                     "minItems": 1,
                     "maxItems": 32,
                     "uniqueItems": True,
-                    "description": "Exit codes accepted as success. Defaults to [0].",
+                    "description": "Deprecated compatibility field; Runtime always uses exit code 0 as success.",
                 },
             },
             "additionalProperties": False,
@@ -761,11 +846,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
             },
             "additionalProperties": False,
         },
-        lambda args, ctx: ctx.store.apply_loop(
-            ctx.project_id,
-            str(args["loop_key"]),
-            dict(args.get("bindings") or {}),
-        ),
+        _loop_apply,
         side_effect_kind="control",
         delegable_to_column=False,
     )
@@ -797,7 +878,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
             "Persist one immutable concrete Task Plan for an existing Workflow Revision. The plan owns every Task's "
             "title, input, readiness, dependencies, conflict domains, acceptance facts, and Agent-use policy. "
             "Dependencies reference Task refs in the same plan and must be acyclic. A Project-level stable Task "
-            "identity is derived from the Workflow Task Contract. For an incremental linear plan, include only the "
+            "identity is derived from the Workflow Task Contract. For an incremental ordered plan, include only the "
             "new contiguous work items; the first new item has no same-plan dependency because DevWerk links it to "
             "the existing Project predecessor. Never repeat an already materialized work item merely to make a new "
             "plan start at the configured first value. Saving the plan creates no Tasks. "
@@ -1046,6 +1127,50 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         side_effect_kind="control",
         delegable_to_column=False,
     )
+    add('agent.worker.list', 'Inspect persistent Workers and their current Assignment slots.',
+        {'type': 'object', 'properties': {}, 'additionalProperties': False},
+        lambda args, ctx: ctx.store.agents.list_workers(ctx.project_id), side_effect_kind='read', delegable_to_column=False)
+    add('agent.worker.inspect', 'Inspect a Worker, its Assignments and durable message consumption state.',
+        {'type': 'object', 'required': ['worker_id'], 'properties': {'worker_id': {'type': 'string'}}, 'additionalProperties': False},
+        lambda args, ctx: ctx.store.agents.inspect_worker(ctx.project_id, args['worker_id']), side_effect_kind='read', delegable_to_column=False)
+    add('agent.worker.send', 'Persist steering input for a Worker. Accepted means queued; inspect consumed_by_run_id for consumption. This does not complete work or start an idle Worker without a workflow Assignment.',
+        {'type': 'object', 'required': ['worker_id', 'content'], 'properties': {'worker_id': {'type': 'string'}, 'content': {'type': 'string', 'minLength': 1}, 'assignment_id': {'type': 'string'}, 'dedupe_key': {'type': 'string'}}, 'additionalProperties': False},
+        lambda args, ctx: ctx.store.agents.send(ctx.project_id, args['worker_id'], args['content'], assignment_id=args.get('assignment_id'), dedupe_key=args.get('dedupe_key')),
+        side_effect_kind='control', delegable_to_column=False)
+    add('agent.worker.lifecycle', 'Suspend, resume or retire an idle Worker. Retirement preserves its context and cannot be reversed.',
+        {'type': 'object', 'required': ['worker_id', 'state'], 'properties': {'worker_id': {'type': 'string'}, 'state': {'enum': ['available', 'suspended', 'retired']}}, 'additionalProperties': False},
+        lambda args, ctx: ctx.store.agents.set_lifecycle(ctx.project_id, args['worker_id'], args['state']), side_effect_kind='control', delegable_to_column=False)
+    add('agent.context.read', 'Read an earlier page of your persistent Worker context by source message ID. Main may specify a Worker.',
+        {'type': 'object', 'properties': {'worker_id': {'type': 'string'}, 'after_message_id': {'type': 'integer', 'minimum': 0}, 'limit': {'type': 'integer', 'minimum': 1, 'maximum': 50}}, 'additionalProperties': False},
+        _agent_context_read, side_effect_kind='read')
+    add('agent.context.compact', 'Save an explicit coverage summary for an idle Worker, preserving the full source transcript for later inspection.',
+        {'type': 'object', 'required': ['worker_id', 'through_message_id', 'summary'], 'properties': {'worker_id': {'type': 'string'}, 'through_message_id': {'type': 'integer', 'minimum': 1}, 'summary': {'type': 'object'}}, 'additionalProperties': False},
+        lambda args, ctx: ctx.store.agents.save_context_snapshot(ctx.project_id, args['worker_id'], args['through_message_id'], args['summary']), side_effect_kind='control', delegable_to_column=False)
+    add('agent.worker.replace', 'Create a successor for an idle retired Worker in the current Requirement, with an explicit handoff summary. Preserves the predecessor history; future assignments for its worker_key select the successor.',
+        {'type': 'object', 'required': ['worker_id', 'summary'], 'properties': {'worker_id': {'type': 'string'}, 'summary': {'type': 'string', 'minLength': 1}}, 'additionalProperties': False},
+        lambda args, ctx: ctx.store.agents.replace_worker(ctx, **args), side_effect_kind='control', delegable_to_column=False)
+    add('requirement.list', 'Inspect active and closed delivery Requirements before continuing planning.',
+        {'type': 'object', 'properties': {}, 'additionalProperties': False},
+        lambda args, ctx: ctx.store.agents.list_requirements(ctx.project_id), side_effect_kind='read', delegable_to_column=False)
+    add('requirement.create', 'Record a new delivery objective with an explicit stable scope_key. Existing scopes retain their identity; closed scopes are not revived.',
+        {'type': 'object', 'required': ['scope_key', 'objective'], 'properties': {'scope_key': {'type': 'string', 'minLength': 1}, 'objective': {'type': 'string', 'minLength': 1}}, 'additionalProperties': False},
+        _requirement_create, side_effect_kind='control', delegable_to_column=False)
+    add('project.scope.inspect', 'Inspect the current Requirement, Workflow revision and frozen Loop bindings before extending delivery.',
+        {'type': 'object', 'properties': {}, 'additionalProperties': False},
+        lambda args, ctx: ctx.store.scopes.inspect(ctx.project_id), side_effect_kind='read', delegable_to_column=False)
+    add('project.scope.revise', 'Atomically extend or revise the current project goal on a user request. Keeps completed Tasks and Worker contexts; publishes new Workflow/binding and Requirement revisions. Never close the Requirement first. This does not create Tasks; save a new TaskPlan against the returned Workflow then materialize it. Optionally select a new Loop digest from loop.inspect.',
+        {'type': 'object', 'required': ['requirement_id', 'expected_revision', 'expected_workflow_revision_id', 'objective', 'binding_patch', 'reason'],
+         'properties': {'requirement_id': {'type': 'string'}, 'expected_revision': {'type': 'integer', 'minimum': 1},
+                        'expected_workflow_revision_id': {'type': 'string'}, 'objective': {'type': 'string', 'minLength': 1},
+                        'binding_patch': {'type': 'object'}, 'reason': {'type': 'string', 'minLength': 1}, 'loop_digest': {'type': 'string'}},
+         'additionalProperties': False},
+        lambda args, ctx: ctx.store.scopes.revise(ctx, **args), side_effect_kind='control', delegable_to_column=False)
+    add('requirement.select', 'Select an existing active Requirement for this Conversation turn before planning its work.',
+        {'type': 'object', 'required': ['requirement_id'], 'properties': {'requirement_id': {'type': 'string'}}, 'additionalProperties': False},
+        lambda args, ctx: ctx.store.agents.select_requirement(ctx, args['requirement_id']), side_effect_kind='control', delegable_to_column=False)
+    add('requirement.close', 'Close a Requirement after all its Tasks and Assignments settle. Late Worker events cannot reopen it.',
+        {'type': 'object', 'required': ['requirement_id', 'status'], 'properties': {'requirement_id': {'type': 'string'}, 'status': {'enum': ['completed', 'cancelled']}}, 'additionalProperties': False},
+        _requirement_close, side_effect_kind='control', delegable_to_column=False)
     _bind_workflow_capability_catalog(workflow_defs, registry.column_ids())
     _bind_workflow_authoring_contract(workflow_schema, workflow_defs)
     return registry
@@ -1061,14 +1186,6 @@ def _bind_workflow_capability_catalog(schema_defs: dict[str, Any], capability_id
         "Values must be exact IDs from the live Capability Registry."
     )
     capability_list.setdefault("items", {})["enum"] = catalog
-
-    workcell_agent = schema_defs.get("WorkcellAgentParticipant", {})
-    workcell_capabilities = workcell_agent.get("properties", {}).get("capabilities", {})
-    workcell_capabilities["description"] = (
-        "Explicit allowlist for this named Workcell participant. Values must be exact IDs "
-        "from the live Capability Registry."
-    )
-    workcell_capabilities.setdefault("items", {})["enum"] = catalog
 
     capability_step = schema_defs.get("CapabilityStep", {})
     capability = capability_step.get("properties", {}).get("capability", {})
@@ -1113,6 +1230,14 @@ def _bind_workflow_authoring_contract(workflow_schema: dict[str, Any], schema_de
         )
 
 
+    if isinstance(properties.get('acceptance_checks'), dict):
+        properties['acceptance_checks']['description'] = (
+            'Fixed synchronous delivery checks, frozen at Assignment creation and run by Runtime on completion. '
+            'For executable delivery work, declare project.command.run with a real build/test or project.files.read '
+            'for a required artifact. These checks allow the Worker to correct exploratory commands without '
+            'having to repeat every failed probe. An empty list retains conservative legacy failure handling; '
+            'successful noops never waive an unresolved failure. Review should be a separate Column.'
+        )
     sequence = schema_defs.get("CapabilitySequenceExecutor", {})
     sequence["description"] = (
         "Deterministic steps. Supply completed_outcome or outcome_from and omit the other field; "
@@ -1142,8 +1267,9 @@ def _bind_workflow_plan_authoring_contract(schema_defs: dict[str, Any]) -> None:
     column_plan["description"] = (
         "One reusable lifecycle stage, not a Task, batch, numbered work unit, file group, or deliverable slice. "
         "The execution_mode is a deliberate project-management choice: agent runs one stage-scoped Agent; "
-        "capability_sequence performs declared deterministic operations without an Agent; workcell runs a "
-        "directed collaboration graph with named, session-stable participants."
+        "capability_sequence performs declared deterministic operations without an Agent. "
+        "A Column may execute at most one Agent; multi-Agent work must be represented as separate "
+        "Workflow Columns connected by explicit transitions."
     )
     self_check = schema_defs.get("WorkflowPlanSelfCheck", {})
     self_check["description"] = (
@@ -1186,22 +1312,14 @@ def _bind_task_plan_authoring_contract(schema_defs: dict[str, Any]) -> None:
 def validate_workflow_capabilities(workflow: WorkflowDefinition, registry: CapabilityRegistry) -> None:
     known = set(registry.column_ids())
     for column in workflow.columns:
+        for check in column.acceptance_checks:
+            registry.validate_arguments(check.capability, check.arguments)
         if column.executor is None:
             continue
         if column.executor.kind == "agent":
             requested = set(column.executor.capabilities)
         elif column.executor.kind == "capability_sequence":
             requested = {step.capability for step in column.executor.steps}
-        else:
-            requested = {
-                capability
-                for participant in column.executor.participants
-                for capability in (
-                    participant.capabilities
-                    if participant.kind == "agent"
-                    else [step.capability for step in participant.steps]
-                )
-            }
         if isinstance(column.wait_policy, PollWaitPolicy):
             requested.update(item for item in (column.wait_policy.poll_capability, column.wait_policy.cancel_capability, column.wait_policy.cleanup_capability) if item)
         unknown = sorted(requested - known)
@@ -1255,27 +1373,6 @@ def validate_workflow_capabilities(workflow: WorkflowDefinition, registry: Capab
                         f"column {column.key!r} has no transition for selected outcome values "
                         f"{missing} declared by its Capability output schema"
                     )
-        elif column.executor.kind == "workcell":
-            for participant in column.executor.participants:
-                if participant.kind != "capability_sequence":
-                    continue
-                for index, step in enumerate(participant.steps):
-                    registry.validate_workflow_references(step.capability, step.arguments)
-                    _validate_sequence_argument_references(
-                        f"{column.key}.{participant.key}",
-                        participant.steps,
-                        index,
-                        step.arguments,
-                        registry,
-                    )
-                    registry.validate_argument_template(step.capability, step.arguments)
-                if participant.signal_from:
-                    _validate_sequence_outcome_pointer(
-                        f"{column.key}.{participant.key}",
-                        participant.steps,
-                        participant.signal_from,
-                        registry,
-                    )
 
 
 def canonicalize_workflow_capability_arguments(
@@ -1305,16 +1402,6 @@ def canonicalize_workflow_capability_arguments(
             if isinstance(steps, list):
                 for step in steps:
                     _canonicalize_dynamic_capability_arguments(step, registry)
-        elif isinstance(executor, dict) and executor.get("kind") == "workcell":
-            participants = executor.get("participants")
-            if isinstance(participants, list):
-                for participant in participants:
-                    if not isinstance(participant, dict) or participant.get("kind") != "capability_sequence":
-                        continue
-                    steps = participant.get("steps")
-                    if isinstance(steps, list):
-                        for step in steps:
-                            _canonicalize_dynamic_capability_arguments(step, registry)
         wait_policy = column.get("wait_policy")
         if isinstance(wait_policy, dict):
             for prefix in ("poll", "cancel", "cleanup"):
@@ -1521,12 +1608,6 @@ def validate_task_capability_bindings(
         sequences: list[tuple[str, list[Any]]] = []
         if column.executor.kind == "capability_sequence":
             sequences.append((column.key, column.executor.steps))
-        elif column.executor.kind == "workcell":
-            sequences.extend(
-                (f"{column.key}.{participant.key}", participant.steps)
-                for participant in column.executor.participants
-                if participant.kind == "capability_sequence"
-            )
         for owner, steps in sequences:
             for index, step in enumerate(steps):
                 task_input_references.update(_task_input_references(step.arguments))
@@ -1709,7 +1790,8 @@ def _system_files_read(args: dict[str, Any], ctx: CapabilityContext) -> dict[str
 
 
 def _system_files_write(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
-    return {"file": ctx.system_files.write_text(str(args["path"]), str(args["content"]))}
+    with ctx.effect_guard():
+        return {"file": ctx.system_files.write_text(str(args["path"]), str(args["content"]))}
 
 
 def _system_files_search(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
@@ -1725,10 +1807,13 @@ def _system_command_run(args: dict[str, Any], ctx: CapabilityContext) -> ToolRes
     output = ctx.system_files.run(
         [str(item) for item in args["argv"]],
         str(args.get("cwd") or "."),
+        check=ctx.execution_control.check if ctx.execution_control else None,
+        limits=ctx.store.policy.execution,
+        guard=ctx.effect_guard,
     )
-    accepted = {int(item) for item in (args.get("success_exit_codes") or [0])}
+    accepted = {0}  # Exit truth belongs to the runtime, never to model arguments.
     exit_code = int(output["exit_code"])
-    if exit_code in accepted:
+    if exit_code in accepted and not output.get("timed_out") and not output.get("output_truncated"):
         return ToolResult(ok=True, capability="system.command.run", output=output)
     detail = str(output.get("stderr") or output.get("stdout") or "").strip()
     message = f"command exited with code {exit_code}"
@@ -1806,7 +1891,7 @@ def _verify_expectations_preflight(args: dict[str, Any]) -> None:
         )
 
 
-def _files_write(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
+def _files_write_preflight(args: dict[str, Any], ctx: CapabilityContext) -> None:
     requested_path = str(args["path"]).replace("\\", "/")
     if ctx.writable_paths is not None and not any(
         fnmatch.fnmatchcase(requested_path, pattern.replace("\\", "/"))
@@ -1816,6 +1901,17 @@ def _files_write(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]
             f"project.files.write path {requested_path!r} is outside this Column's declared writable paths: "
             f"{list(ctx.writable_paths)!r}"
         )
+    ctx.files.resolve(requested_path)
+
+
+def _files_write(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
+    with ctx.store.tx(immediate=True):
+        if ctx.execution_control:
+            ctx.execution_control.check()
+        return _files_write_owned(args, ctx)
+
+
+def _files_write_owned(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
     info = ctx.files.write_text(str(args["path"]), str(args["content"]))
     artifact = ctx.store.register_artifact(
         ctx.project_id,
@@ -1848,10 +1944,13 @@ def _command_run(args: dict[str, Any], ctx: CapabilityContext) -> ToolResult:
     output = ctx.files.run(
         [str(item) for item in args["argv"]],
         str(args.get("cwd") or "."),
+        check=ctx.execution_control.check if ctx.execution_control else None,
+        limits=ctx.store.policy.execution,
+        guard=ctx.effect_guard,
     )
-    accepted = {int(item) for item in (args.get("success_exit_codes") or [0])}
+    accepted = {0}  # Exit truth belongs to the runtime, never to model arguments.
     exit_code = int(output["exit_code"])
-    if exit_code in accepted:
+    if exit_code in accepted and not output.get("timed_out") and not output.get("output_truncated"):
         return ToolResult(ok=True, capability="project.command.run", output=output)
     detail = str(output.get("stderr") or output.get("stdout") or "").strip()
     message = f"command exited with code {exit_code}"
@@ -1876,25 +1975,77 @@ def _workflow_inspect(_args: dict[str, Any], ctx: CapabilityContext) -> dict[str
         return None
 
 
+def _require_user_planning_turn(ctx: CapabilityContext, capability: str) -> None:
+    if not ctx.start_task or ctx.column_run_id:
+        raise PermissionError(f'{capability} requires an active Conversation planning turn')
+    if ctx.agent_run_id is not None:
+        if not ctx.agent_instance_id or not ctx.requirement_id:
+            # Compatibility for explicit user calls from older service clients.
+            if ctx.user_initiated:
+                return
+            raise PermissionError('Conversation planning requires an explicit active Requirement')
+        main = ctx.store.agents.get_worker(ctx.project_id, ctx.agent_instance_id)
+        requirement = ctx.store.agents.get_requirement(ctx.project_id, ctx.requirement_id)
+        if main['role'] != 'main' or requirement['status'] != 'active':
+            raise PermissionError('Requirement is no longer active; use project.scope.revise for a user-requested extension')
+        if ctx.requirement_revision is not None and requirement['revision'] != ctx.requirement_revision:
+            raise ExecutionOwnershipLost('Conversation turn uses an obsolete Requirement revision; late events cannot plan new scope')
+        ctx.store.agents.charge_planning(ctx)
+
+
+def _requirement_create(args, ctx):
+    ctx.store.agents.assert_conversation(ctx)
+    if not ctx.user_initiated or not ctx.start_task:
+        raise PermissionError('A new delivery objective requires a user-initiated turn; continue the active Requirement for event-driven work')
+    requirement = ctx.store.agents.requirement(ctx.project_id, **args, strict=True)
+    return ctx.store.agents.select_requirement(ctx, requirement['id'])
+
+
+def _requirement_close(args, ctx):
+    _require_user_planning_turn(ctx, 'requirement.close')
+    if ctx.requirement_id and ctx.requirement_id != args['requirement_id']:
+        raise ValueError('Select the Requirement before closing it')
+    return ctx.store.agents.close_requirement(ctx.project_id, **args)
+
+
+def _loop_apply(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
+    _require_user_planning_turn(ctx, "loop.apply")
+    result = ctx.store.apply_loop(
+        ctx.project_id,
+        str(args["loop_key"]),
+        dict(args.get("bindings") or {}),
+    )
+    _bind_requirement(ctx, 'v1_workflow_plans', result['workflow_plan']['id'])
+    scope = ctx.store.scopes.for_workflow(result['workflow']['id'])
+    ctx.store.scopes.bind_workflow(result['workflow']['id'], scope['binding_id'], ctx.requirement_id, ctx.requirement_revision)
+    return result
+
+
 def _workflow_plan_save(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
-    if not ctx.start_task:
-        raise PermissionError("workflow.plan.save is disabled for this conversation turn")
-    return ctx.store.create_workflow_plan(ctx.project_id, WorkflowPlan.model_validate(args["plan"]))
+    _require_user_planning_turn(ctx, "workflow.plan.save")
+    result = ctx.store.create_workflow_plan(ctx.project_id, WorkflowPlan.model_validate(args["plan"]))
+    _bind_requirement(ctx, 'v1_workflow_plans', result['id'])
+    return result
 
 
 def _task_plan_save(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
-    if not ctx.start_task:
-        raise PermissionError("task.plan.save is disabled for this conversation turn")
-    return ctx.store.create_task_plan(ctx.project_id, TaskPlan.model_validate(args["plan"]))
+    _require_user_planning_turn(ctx, "task.plan.save")
+    _check_workflow_scope(ctx, args['plan']['workflow_revision_id'])
+    result = ctx.store.create_task_plan(ctx.project_id, TaskPlan.model_validate(args["plan"]))
+    _bind_requirement(ctx, 'v1_task_plans', result['id'])
+    return result
 
 
 def _workflow_publish(args: dict[str, Any], ctx: CapabilityContext, registry: CapabilityRegistry) -> dict[str, Any]:
-    if not ctx.start_task:
-        raise PermissionError("workflow.publish is disabled for this conversation turn")
+    _require_user_planning_turn(ctx, "workflow.publish")
+    _bind_requirement(ctx, 'v1_workflow_plans', str(args['workflow_plan_id']))
     workflow = WorkflowDefinition.model_validate(
         canonicalize_workflow_capability_arguments(args["workflow"], registry)
     )
-    return ctx.store.publish_workflow(ctx.project_id, workflow, str(args["workflow_plan_id"]))
+    result = ctx.store.publish_workflow(ctx.project_id, workflow, str(args["workflow_plan_id"]))
+    scope = ctx.store.scopes.for_workflow(result['id'])
+    ctx.store.scopes.bind_workflow(result['id'], scope['binding_id'], ctx.requirement_id, ctx.requirement_revision)
+    return result
 
 
 def _task_create(
@@ -1902,13 +2053,57 @@ def _task_create(
     ctx: CapabilityContext,
     registry: CapabilityRegistry,
 ) -> dict[str, Any]:
-    if not ctx.start_task:
-        raise PermissionError("task.create is disabled for this conversation turn")
-    return ctx.store.materialize_task_plan(
+    _require_user_planning_turn(ctx, "task.create")
+    _bind_requirement(ctx, 'v1_task_plans', str(args['task_plan_id']))
+    cause = ctx.store.agents.planning_cause(ctx)
+    plan = ctx.store.get_task_plan(ctx.project_id, str(args['task_plan_id']))['plan']
+    _check_workflow_scope(ctx, plan['workflow_revision_id'])
+    proposed = next((item for item in plan['tasks'] if item['proposed_task_ref'] == args['proposed_task_ref']), None)
+    if proposed is None:
+        raise ValueError('Task reference does not belong to the plan')
+    fingerprint = hashlib.sha256(json.dumps({'workflow': plan['workflow_revision_id'], 'task': proposed}, sort_keys=True).encode()).hexdigest()
+    existing = ctx.store.agents.caused_task(ctx.requirement_id, cause, args['proposed_task_ref'], fingerprint)
+    if existing:
+        return ctx.store.get_task(existing)
+    task = ctx.store.materialize_task_plan(
         ctx.project_id,
         task_plan_id=str(args["task_plan_id"]),
         proposed_task_ref=str(args["proposed_task_ref"]),
     )
+    _bind_requirement(ctx, 'v1_tasks', task['id'])
+    ctx.store.agents.record_caused_task(ctx.requirement_id, cause, args['proposed_task_ref'], fingerprint, task['id'])
+    return ctx.store.get_task(task['id'])
+
+
+def _bind_requirement(ctx, table, identity):
+    if not ctx.requirement_id:
+        return
+    assert table in {'v1_tasks', 'v1_task_plans', 'v1_workflow_plans'}
+    with ctx.store.tx(immediate=True) as db:
+        row = db.execute(f'SELECT * FROM {table} WHERE id=? AND project_id=?', (identity, ctx.project_id)).fetchone()
+        if not row or row['requirement_id'] not in (None, ctx.requirement_id):
+            raise ValueError('Work belongs to a different Requirement')
+        if table != 'v1_workflow_plans':
+            version = ctx.requirement_revision or ctx.store.agents.get_requirement(ctx.project_id, ctx.requirement_id)['revision']
+            if row['requirement_revision'] not in (None, version):
+                raise ValueError('Work belongs to a different Requirement revision; create a new TaskPlan')
+            db.execute(f'UPDATE {table} SET requirement_id=?,requirement_revision=? WHERE id=?', (ctx.requirement_id, version, identity))
+        else:
+            db.execute(f'UPDATE {table} SET requirement_id=? WHERE id=?', (ctx.requirement_id, identity))
+
+
+def _check_workflow_scope(ctx, workflow_revision_id):
+    scope = ctx.store.scopes.for_workflow(workflow_revision_id)
+    if scope and ctx.requirement_id and scope['requirement_id']:
+        if (scope['requirement_id'], scope['requirement_revision']) != (ctx.requirement_id, ctx.requirement_revision):
+            raise ValueError('Workflow belongs to a different Requirement revision; plan against the Workflow returned by project.scope.revise')
+
+
+def _agent_context_read(args, ctx):
+    worker_id = args.get('worker_id') or ctx.agent_instance_id
+    if not worker_id or (ctx.column_run_id and worker_id != ctx.agent_instance_id):
+        raise PermissionError('Leaf Workers may read only their own context')
+    return ctx.store.agents.context_page(ctx.project_id, worker_id, after=args.get('after_message_id', 0), limit=args.get('limit', 20))
 
 
 def _task_list(args: dict[str, Any], ctx: CapabilityContext) -> list[dict[str, Any]]:

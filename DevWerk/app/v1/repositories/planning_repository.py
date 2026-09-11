@@ -5,10 +5,10 @@ import json
 from typing import Any
 
 from app.v1.contracts import canonicalize_contract_value, validate_contract
-from app.v1.domain import LinearTaskDependencyContract, TaskPlan, WorkflowPlan
+from app.v1.domain import TaskPlan, WorkflowPlan
 from app.v1.repositories.base import StoreHost
+from app.v1.services.task_graph_admission import existing_task_orders, validate_task_graph_admission
 from app.v1.storage_support import new_id, utcnow
-from app.v1.task_identity import resolve_input_pointer
 
 
 class PlanningRepository:
@@ -97,15 +97,17 @@ class PlanningRepository:
             ).fetchone()
         if existing:
             return self.get_task_plan(project_id, str(existing[0]))
-        existing_order_values = _existing_linear_order_values(
-            self.store,
-            project_id,
-            method.task_contract.dependency_contract,
-        )
-        _validate_task_dependency_contract(
+        binding = self.store.get_project_loop_binding(project_id, plan.workflow_revision_id)
+        validate_task_graph_admission(
             plan,
             method.task_contract.dependency_contract,
-            existing_order_values=existing_order_values,
+            method.task_contract.admission_constraints,
+            loop_bindings=dict(binding.get("bindings") or {}) if binding else {},
+            existing_orders=existing_task_orders(
+                self.store,
+                project_id,
+                method.task_contract.dependency_contract,
+            ),
         )
         now = utcnow()
         with self.store.tx(immediate=True) as db:
@@ -124,6 +126,10 @@ class PlanningRepository:
                     now,
                 ),
             )
+            scope = self.store.scopes.for_workflow(plan.workflow_revision_id)
+            if scope and scope['requirement_id']:
+                db.execute('UPDATE v1_task_plans SET requirement_id=?,requirement_revision=? WHERE id=?',
+                           (scope['requirement_id'], scope['requirement_revision'], plan_id))
             self.store._event(
                 db,
                 project_id,
@@ -161,72 +167,3 @@ class PlanningRepository:
             row["plan"] = json.loads(row.pop("plan_json"))
             result.append(row)
         return result
-
-
-def _validate_task_dependency_contract(
-    plan: TaskPlan,
-    contract: LinearTaskDependencyContract | None,
-    *,
-    existing_order_values: set[int] | None = None,
-) -> None:
-    if contract is None:
-        return
-    ordered: list[tuple[int, str, set[str]]] = []
-    for task in plan.tasks:
-        try:
-            value: Any = resolve_input_pointer(task.input, contract.order_pointer)
-        except ValueError as exc:
-            raise ValueError(
-                f"task {task.proposed_task_ref!r} cannot resolve dependency order "
-                f"pointer {contract.order_pointer!r}"
-            ) from exc
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError(
-                f"task {task.proposed_task_ref!r} dependency order value must be an integer"
-            )
-        ordered.append((value, task.proposed_task_ref, set(task.dependencies)))
-    ordered.sort(key=lambda item: item[0])
-    values = [item[0] for item in ordered]
-    next_value = contract.first_value
-    for existing_value in sorted(existing_order_values or set()):
-        if existing_value == next_value:
-            next_value += 1
-        elif existing_value > next_value:
-            break
-    expected_values = list(range(next_value, next_value + len(ordered)))
-    if values != expected_values:
-        raise ValueError(
-            "linear Task dependency order must continue the Project Task graph from "
-            f"{next_value}: expected {expected_values}, got {values}"
-        )
-    for index, (_, task_ref, actual_dependencies) in enumerate(ordered):
-        expected_dependencies = set() if index == 0 else {ordered[index - 1][1]}
-        if actual_dependencies != expected_dependencies:
-            raise ValueError(
-                f"task {task_ref!r} must depend exactly on its linear predecessor: "
-                f"expected {sorted(expected_dependencies)}, got {sorted(actual_dependencies)}"
-            )
-
-
-def _existing_linear_order_values(
-    store: StoreHost,
-    project_id: str,
-    contract: LinearTaskDependencyContract | None,
-) -> set[int]:
-    if contract is None:
-        return set()
-    with store.connect() as db:
-        rows = db.execute(
-            "SELECT input_json FROM v1_tasks WHERE project_id=?",
-            (project_id,),
-        ).fetchall()
-    values: set[int] = set()
-    for row in rows:
-        try:
-            input_data = json.loads(row[0] or "{}")
-            value = resolve_input_pointer(input_data, contract.order_pointer)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
-        if isinstance(value, int) and not isinstance(value, bool):
-            values.add(value)
-    return values

@@ -1,0 +1,37 @@
+# 量化策略参数优化
+
+## Description: <br>
+通过 LLM 引导的参数搜索，对量化策略进行多轮回测优化，找到最优参数配置并生成对比报告。覆盖范围：参数调整 + 回测记录 + 智能搜索 + 最优解交付。不覆盖：代码重构、性能优化、交易执行。 <br>
+
+## Publisher: <br>
+DevWerk <br>
+
+## Category: <br>
+quantitative_optimization <br>
+
+## Tags: <br>
+- quantitative <br>
+- parameter-optimization <br>
+- backtest <br>
+- llm-guided-search <br>
+
+## Use Case: <br>
+用于有明确策略脚本和参数配置文件的量化策略优化项目。用户已确认优化目标（年化收益率为主）和最大迭代次数。 <br>
+
+## Selection Guide: <br>
+选择此 Loop 当你需要：对量化策略进行参数优化、通过回测历史数据引导参数调整、找到最优参数配置并生成对比报告。不要选择此 Loop 当：需要修改策略代码本身、目标不明确且需要大量探索性分析、已有确定的参数范围需要暴力枚举。 <br>
+
+## Loop Input: <br>
+strategy_script: 策略入口脚本路径 | config_file: 参数配置文件路径 | output_dir: 回测输出目录 | optimization_params: 优化参数配置（目标指标、最大迭代次数、耐心阈值等） <br>
+
+## Loop Output: <br>
+最优配置文件 best_config.yaml | 所有轮次历史记录 run_history.json | 对比分析报告 comparison_report.md | 汇总指标表 metrics_summary.csv <br>
+
+## Loop Version(s): <br>
+1.0.0 <br>
+
+## Loop Key: <br>
+quant.param_optimization <br>
+
+## Reference(s): <br>
+- [Executable bundle](loop.json) <br>

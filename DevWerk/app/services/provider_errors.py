@@ -48,6 +48,7 @@ MINIMAX_ERROR_CODES = {
 RECOVERABLE_LLM_ERROR_CODES = frozenset(
     {
         "LLM_TIMEOUT",
+        "LLM_CONNECTION_ERROR",
         "LLM_RATE_LIMITED",
         "LLM_OVERLOADED",
         "LLM_PROVIDER_ERROR",
@@ -272,6 +273,12 @@ def classify_provider_payload(
 def llm_error_code(exc: BaseException, default: str = "MODEL_ERROR") -> str:
     if isinstance(exc, LLMProviderError):
         return exc.error_code
+    if isinstance(exc, http_requests.Timeout):
+        return "LLM_TIMEOUT"
+    if isinstance(exc, (http_requests.ConnectionError, http_requests.exceptions.ChunkedEncodingError)):
+        return "LLM_CONNECTION_ERROR"
+    if getattr(exc, "error_code", None):
+        return str(exc.error_code)
     return default
 
 
@@ -288,7 +295,7 @@ def llm_error_log_payload(exc: BaseException) -> dict[str, Any]:
 
 
 def is_recoverable_llm_error(exc: BaseException) -> bool:
-    return isinstance(exc, LLMProviderError) and exc.error_code in RECOVERABLE_LLM_ERROR_CODES
+    return llm_error_code(exc) in RECOVERABLE_LLM_ERROR_CODES
 
 
 def is_recoverable_llm_error_code(error_code: str | None) -> bool:

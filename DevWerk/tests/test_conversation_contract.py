@@ -8,8 +8,6 @@ from pathlib import Path
 import pytest
 
 from app.v1.agent import AgentCore, AgentRunSpec
-from app.v1.agent import _requested_mutation_capabilities
-from app.v1.agent_protocol import ConversationTurnProtocol
 from app.v1.capabilities import (
     CapabilityContext,
     CapabilityEntry,
@@ -105,7 +103,7 @@ def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text
                 name="task.create",
                 arguments={"task_plan_id": planned["id"], "proposed_task_ref": "primary"},
             )])
-        return AgentModelResponse(text="Workflow and Task are now tracked.")
+        return AgentModelResponse(text=json.dumps({'mode': 'work_result', 'tool_call_ids': ['apply', 'task-plan', 'task']}))
 
     wakes: list[bool] = []
     registry = build_core_registry()
@@ -113,7 +111,7 @@ def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text
     accepted = run_turn(agent, project["id"], "Please manage this delivery.", True)
     job = store.get_conversation_job(accepted["job"]["id"])
     assert job["status"] == "succeeded"
-    assert job["result"]["reply"] == "Workflow and Task are now tracked."
+    assert "Deliver the managed product：待执行" in job["result"]["reply"]
     assert len(job["result"]["task_ids"]) == 1
     assert wakes == [True]
 
@@ -145,7 +143,7 @@ def test_conversation_with_loop_workflow_can_revise_but_cannot_reapply_loop(stor
                 name="workflow.inspect",
                 arguments={},
             )])
-        return AgentModelResponse(text="The Loop-created Workflow is ready for supervision.")
+        return AgentModelResponse(text=json.dumps({'mode': 'discussion', 'message': "The Loop-created Workflow is ready for supervision."}))
 
     registry = build_core_registry()
     agent = ConversationGateway(store, registry, agent_core=AgentCore(store, registry, model))
@@ -174,7 +172,7 @@ def test_start_task_false_keeps_stable_tools_but_rejects_mutation_execution(stor
             )])
         tool_result = json.loads(messages[-1]["content"])
         assert tool_result["error"]["type"] == "ConversationMutationDisabled"
-        return AgentModelResponse(text="Discussion complete.")
+        return AgentModelResponse(text=json.dumps({'mode': 'discussion', 'message': "Discussion complete."}))
 
     registry = build_core_registry()
     agent = ConversationGateway(store, registry, agent_core=AgentCore(store, registry, model))
@@ -210,7 +208,7 @@ def test_conversation_has_generic_system_file_authority_without_delegating_it_to
                 name="system.files.write",
                 arguments={"path": str(loop_card), "content": "name: reusable-loop\n"},
             )])
-        return AgentModelResponse(text="The requested system file was written.")
+        return AgentModelResponse(text=json.dumps({'mode': 'work_result', 'tool_call_ids': ['write-loop-card']}))
 
     registry = build_core_registry()
     assert not any(item.startswith("system.files.") for item in registry.column_ids())
@@ -237,7 +235,7 @@ def test_runtime_notifications_are_not_replayed_as_conversation_history(store, t
 
     def model(messages, _tools, **_kwargs):
         assert all("automatic runtime report" not in str(item.get("content") or "") for item in messages)
-        return AgentModelResponse(text="Discussion complete.")
+        return AgentModelResponse(text=json.dumps({'mode': 'discussion', 'message': "Discussion complete."}))
 
     registry = build_core_registry()
     agent = ConversationGateway(store, registry, agent_core=AgentCore(store, registry, model))
@@ -255,7 +253,7 @@ def test_action_enabled_conversation_can_finish_with_plain_text(store, tmp_path)
         turns += 1
         require_tool_values.append(bool(kwargs.get("require_tool")))
         return AgentModelResponse(
-            text="No existing Loop matches this request, so no Workflow was created."
+            text=json.dumps({'mode': 'blocked', 'message': "No existing Loop matches this request, so no Workflow was created."})
         )
 
     registry = build_core_registry()
@@ -280,7 +278,7 @@ def test_action_enabled_conversation_can_finish_with_plain_text(store, tmp_path)
     )
 
 
-def test_conversation_cannot_report_an_unexecuted_mutation_as_completed(store, tmp_path):
+def test_conversation_prose_never_mutates_state_or_forces_a_capability(store, tmp_path):
     project = store.create_project("mutation evidence", "", str(tmp_path / "project"))
     registry = build_core_registry()
     registry.register(CapabilityEntry(
@@ -297,20 +295,12 @@ def test_conversation_cannot_report_an_unexecuted_mutation_as_completed(store, t
         side_effect_kind="control",
         delegable_to_column=False,
     ))
-    turns = 0
     require_tool_values: list[bool] = []
+    exposed_tools: list[set[str]] = []
 
-    def model(messages, _tools, **kwargs):
-        nonlocal turns
-        turns += 1
+    def model(_messages, tools, **kwargs):
         require_tool_values.append(bool(kwargs.get("require_tool")))
-        if turns == 1:
-            return AgentModelResponse(text="I called test.control and completed the change.")
-        if turns == 2:
-            assert "unsupported_mutation_claims" in messages[-1]["content"]
-            return AgentModelResponse(tool_calls=[
-                AgentToolCall(id="control", name="test.control", arguments={})
-            ])
+        exposed_tools.append({item["function"]["name"] for item in tools})
         return AgentModelResponse(text="I called test.control and completed the change.")
 
     result = AgentCore(store, registry, model).run(AgentRunSpec(
@@ -323,362 +313,89 @@ def test_conversation_cannot_report_an_unexecuted_mutation_as_completed(store, t
     ))
 
     assert result.status == "succeeded"
-    assert turns == 3
-    assert require_tool_values == [False, True, False]
+    assert require_tool_values == [False]
+    assert exposed_tools == [{"test.control"}]
     invocations = store.tool_invocations(project["id"], result.agent_run_id)
-    assert len(invocations) == 1
-    assert invocations[0]["capability"] == "test.control"
-    assert invocations[0]["ok"] is True
+    assert invocations == []
 
 
-def test_conversation_repeated_unsupported_mutation_claim_fails_without_execution_progress(
+def test_current_request_never_creates_a_kernel_execution_obligation(
     store,
     tmp_path,
 ):
-    project = store.create_project("bounded correction", "", str(tmp_path / "project"))
-    registry = build_core_registry()
-    registry.register(CapabilityEntry(
-        id="test.control",
-        description="Perform one test control mutation.",
-        input_schema={"type": "object", "additionalProperties": False},
-        output_schema={"type": "object", "additionalProperties": True},
-        handler=lambda _args, _ctx: {"changed": True},
-        side_effect_kind="control",
-        delegable_to_column=False,
-    ))
-    turns = 0
+    project = store.create_project("discussion boundary", "", str(tmp_path / "project"))
+    provider_requests = 0
 
     def model(messages, tools, **kwargs):
-        nonlocal turns
-        turns += 1
-        if turns == 2:
-            assert "unsupported_mutation_claims" in messages[-1]["content"]
-            assert kwargs["require_tool"] is True
-            assert {
-                item["function"]["name"] for item in tools
-            } == {"test.control"}
-        if turns == 3:
-            assert kwargs["required_tool_name"] == "test.control"
-            assert {
-                item["function"]["name"] for item in tools
-            } == {"test.control"}
-        return AgentModelResponse(text="I called test.control and completed the change.")
-
-    with pytest.raises(RuntimeError, match="did not call the selected capability"):
-        AgentCore(store, registry, model).run(AgentRunSpec(
-            kind="conversation",
-            project=project,
-            instruction="",
-            instruction_revision=1,
-            context={},
-            capability_ids=["test.control"],
-        ))
-
-    assert turns == 3
-    run = store.agent_runs(project_id=project["id"])[0]
-    assert run["status"] == "failed"
-    assert "did not call the selected capability" in str(run["error"])
-    assert run["error_code"] == "conversation_protocol_stalled"
-
-
-def test_conversation_dispatch_correction_forces_plan_save_before_task_create():
-    protocol = ConversationTurnProtocol(required_capabilities=("task.create",))
-    tools = [
-        {
-            "type": "function",
-            "function": {"name": name, "description": name, "parameters": {}},
+        nonlocal provider_requests
+        provider_requests += 1
+        assert kwargs.get("require_tool") is False
+        assert kwargs.get("required_tool_name") is None
+        assert "execution_obligation" not in json.loads(messages[-1]["content"])
+        assert {item["function"]["name"] for item in tools} == {
+            "task.plan.save", "task.create"
         }
-        for name in (
-            "project.inspect",
-            "workflow.inspect",
-            "task.list",
-            "task.plan.list",
-            "task.plan.save",
-            "task.create",
-        )
-    ]
+        return AgentModelResponse(text="我们先讨论核心方向，不创建任何任务。")
 
-    protocol.select_tools(tools)
-
-    assert protocol.select_forced_tool(["task.create"]) == "task.plan.save"
-    assert protocol.forced_tool_name == "task.plan.save"
-    assert {
-        item["function"]["name"] for item in protocol.select_tools(tools)
-    } == {"task.plan.save"}
-
-
-def test_conversation_forces_claimed_capabilities_until_dispatch_receipts_exist(
-    store,
-    tmp_path,
-):
-    project = store.create_project("forced execution", "", str(tmp_path / "project"))
-    registry = build_core_registry()
-    executed: list[str] = []
-    for capability in ("test.plan.save", "test.task.create"):
-        registry.register(CapabilityEntry(
-            id=capability,
-            description=f"Execute {capability}.",
-            input_schema={"type": "object", "additionalProperties": False},
-            output_schema={"type": "object", "additionalProperties": True},
-            handler=lambda _args, _ctx, name=capability: executed.append(name) or {
-                "executed": name,
-            },
-            side_effect_kind="control",
-            delegable_to_column=False,
-        ))
-    turns = 0
-    provider_contracts: list[tuple[bool, set[str]]] = []
-
-    def model(messages, tools, **kwargs):
-        nonlocal turns
-        turns += 1
-        provider_contracts.append((
-            bool(kwargs["require_tool"]),
-            {item["function"]["name"] for item in tools},
-        ))
-        if turns == 1:
-            return AgentModelResponse(
-                text="test.plan.save and test.task.create completed."
-            )
-        if turns == 2:
-            assert "unsupported_mutation_claims" in messages[-1]["content"]
-            return AgentModelResponse(tool_calls=[AgentToolCall(
-                id="save-plan",
-                name="test.plan.save",
-                arguments={},
-            )])
-        if turns == 3:
-            assert json.loads(messages[-1]["content"])["ok"] is True
-            return AgentModelResponse(tool_calls=[AgentToolCall(
-                id="create-task",
-                name="test.task.create",
-                arguments={},
-            )])
-        return AgentModelResponse(
-            text="The plan was saved and the task was dispatched."
-        )
-
-    result = AgentCore(store, registry, model).run(AgentRunSpec(
+    result = AgentCore(store, build_core_registry(), model).run(AgentRunSpec(
         kind="conversation",
         project=project,
-        instruction="",
-        instruction_revision=1,
-        context={},
-        capability_ids=["test.plan.save", "test.task.create", "project.inspect"],
-    ))
-
-    assert result.status == "succeeded"
-    assert executed == ["test.plan.save", "test.task.create"]
-    assert provider_contracts == [
-        (False, {"test.plan.save", "test.task.create", "project.inspect"}),
-        (True, {"test.plan.save", "test.task.create"}),
-        (True, {"test.task.create"}),
-        (False, {"test.plan.save", "test.task.create", "project.inspect"}),
-    ]
-    assert [
-        item["capability"]
-        for item in store.tool_invocations(project["id"], result.agent_run_id)
-    ] == ["test.plan.save", "test.task.create"]
-
-
-def test_natural_language_dispatch_promise_requires_real_task_receipt(
-    store,
-    tmp_path,
-):
-    project = store.create_project("dispatch promise", "", str(tmp_path / "project"))
-    registry = CapabilityRegistry()
-    executed: list[str] = []
-    for capability, effect_kind in (
-        ("project.inspect", "read"),
-        ("task.plan.save", "process"),
-        ("task.create", "process"),
-    ):
-        registry.register(CapabilityEntry(
-            id=capability,
-            description=f"Execute {capability}.",
-            input_schema={"type": "object", "additionalProperties": False},
-            output_schema={"type": "object", "additionalProperties": True},
-            handler=lambda _args, _ctx, name=capability: executed.append(name) or {
-                "executed": name,
-            },
-            side_effect_kind=effect_kind,
-            delegable_to_column=False,
-        ))
-    turns = 0
-    contracts: list[tuple[bool, set[str]]] = []
-
-    def model(_messages, tools, **kwargs):
-        nonlocal turns
-        turns += 1
-        contracts.append((
-            bool(kwargs["require_tool"]),
-            {item["function"]["name"] for item in tools},
-        ))
-        if turns == 1:
-            return AgentModelResponse(
-                text="你说得对，我先看项目当前状态再派发。"
-            )
-        capability = {
-            2: "project.inspect",
-            3: "task.plan.save",
-            4: "task.create",
-        }.get(turns)
-        if capability:
-            return AgentModelResponse(tool_calls=[AgentToolCall(
-                id=f"call-{turns}",
-                name=capability,
-                arguments={},
-            )])
-        return AgentModelResponse(text="后续章节任务已经派发。")
-
-    result = AgentCore(store, registry, model).run(AgentRunSpec(
-        kind="conversation",
-        project=project,
-        instruction="",
-        instruction_revision=1,
-        context={},
-        capability_ids=["project.inspect", "task.plan.save", "task.create"],
-    ))
-
-    assert result.status == "succeeded"
-    assert executed == ["project.inspect", "task.plan.save", "task.create"]
-    assert contracts == [
-        (False, {"project.inspect", "task.plan.save", "task.create"}),
-        (True, {"project.inspect", "task.plan.save", "task.create"}),
-        (True, {"project.inspect", "task.plan.save", "task.create"}),
-        (True, {"project.inspect", "task.plan.save", "task.create"}),
-        (False, {"project.inspect", "task.plan.save", "task.create"}),
-    ]
-
-
-def test_explicit_dispatch_request_requires_task_receipt_from_first_model_step(
-    store,
-    tmp_path,
-):
-    project = store.create_project("dispatch request", "", str(tmp_path / "project"))
-    registry = CapabilityRegistry()
-    executed: list[str] = []
-    for capability, effect_kind in (
-        ("project.inspect", "read"),
-        ("task.plan.save", "process"),
-        ("task.create", "process"),
-    ):
-        registry.register(CapabilityEntry(
-            id=capability,
-            description=f"Execute {capability}.",
-            input_schema={"type": "object", "additionalProperties": False},
-            output_schema={"type": "object", "additionalProperties": True},
-            handler=lambda _args, _ctx, name=capability: executed.append(name) or {
-                "executed": name,
-            },
-            side_effect_kind=effect_kind,
-            delegable_to_column=False,
-        ))
-    turns = 0
-
-    def model(messages, tools, **kwargs):
-        nonlocal turns
-        turns += 1
-        if turns <= 3:
-            assert kwargs["require_tool"] is True
-            if turns == 1:
-                turn = json.loads(messages[-1]["content"])
-                assert turn["execution_obligation"] == {
-                    "required_successful_receipts": ["task.create"],
-                    "text_cannot_complete_turn": True,
-                    "instruction": (
-                        "This request explicitly requires a Project state change. "
-                        "Call the available inspection or prerequisite tools as needed, then continue "
-                        "until every required successful receipt exists. Do not answer with a plan, "
-                        "promise, explanation, or future action before those receipts exist."
-                    ),
-                }
-            assert {item["function"]["name"] for item in tools} == {
-                "project.inspect", "task.plan.save", "task.create",
-            }
-            capability = ("project.inspect", "task.plan.save", "task.create")[turns - 1]
-            return AgentModelResponse(tool_calls=[AgentToolCall(
-                id=f"call-{turns}",
-                name=capability,
-                arguments={},
-            )])
-        assert kwargs["require_tool"] is False
-        return AgentModelResponse(text="后续章节任务已经派发。")
-
-    result = AgentCore(store, registry, model).run(AgentRunSpec(
-        kind="conversation",
-        project=project,
-        instruction="",
+        instruction="discuss",
         instruction_revision=1,
         context={
             "current_request": {
                 "message_id": 1,
-                "content": "后续章节任务仍未派发，请现在实际派发。",
-            },
+                "content": "现在派发任务。",
+            }
         },
-        capability_ids=["project.inspect", "task.plan.save", "task.create"],
+        capability_ids=["task.plan.save", "task.create"],
+        start_task=True,
     ))
 
     assert result.status == "succeeded"
-    assert turns == 4
-    assert executed == ["project.inspect", "task.plan.save", "task.create"]
+    assert provider_requests == 1
 
 
-def test_initial_task_creation_exposes_loop_application_prerequisites():
-    protocol = ConversationTurnProtocol(required_capabilities=("task.create",))
-    tools = [
-        {
-            "type": "function",
-            "function": {"name": name, "parameters": {"type": "object"}},
-        }
-        for name in (
-            "loop.list",
-            "loop.inspect",
-            "loop.apply",
-            "project.inspect",
-            "workflow.inspect",
-            "task.plan.list",
-            "task.plan.save",
-            "task.create",
-        )
+def test_conversation_keeps_full_granted_tool_surface_after_a_receipt(store, tmp_path):
+    project = store.create_project("stable tools", "", str(tmp_path / "project"))
+    registry = CapabilityRegistry()
+    for capability, effect_kind in (("test.inspect", "read"), ("test.change", "control")):
+        registry.register(CapabilityEntry(
+            id=capability,
+            description=capability,
+            input_schema={"type": "object", "additionalProperties": False},
+            output_schema={"type": "object", "additionalProperties": True},
+            handler=lambda _args, _ctx, name=capability: {"capability": name},
+            side_effect_kind=effect_kind,
+            delegable_to_column=False,
+        ))
+    exposed: list[set[str]] = []
+
+    def model(messages, tools, **kwargs):
+        exposed.append({item["function"]["name"] for item in tools})
+        assert kwargs["require_tool"] is False
+        assert kwargs["required_tool_name"] is None
+        if len(exposed) == 1:
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id="inspect", name="test.inspect", arguments={}
+            )])
+        assert json.loads(messages[-1]["content"])["ok"] is True
+        return AgentModelResponse(text="Inspection complete.")
+
+    result = AgentCore(store, registry, model).run(AgentRunSpec(
+        kind="conversation",
+        project=project,
+        instruction="",
+        instruction_revision=1,
+        context={},
+        capability_ids=["test.inspect", "test.change"],
+    ))
+
+    assert result.status == "succeeded"
+    assert exposed == [
+        {"test.inspect", "test.change"},
+        {"test.inspect", "test.change"},
     ]
-
-    selected = {
-        item["function"]["name"]
-        for item in protocol.select_tools(tools)
-    }
-
-    assert selected == {
-        "loop.list",
-        "loop.inspect",
-        "loop.apply",
-        "project.inspect",
-        "workflow.inspect",
-        "task.plan.list",
-        "task.plan.save",
-        "task.create",
-    }
-
-
-def test_dispatch_intent_distinguishes_current_command_from_negative_status():
-    effect_kinds = {"task.create": "process"}
-
-    assert _requested_mutation_capabilities(
-        "后续章节任务仍未派发，请现在实际派发。",
-        effect_kinds,
-    ) == ["task.create"]
-    assert _requested_mutation_capabilities(
-        "任务尚未派发，我现在无法派发。",
-        effect_kinds,
-    ) == []
-    assert _requested_mutation_capabilities(
-        "这个冲突是否足够？仍先不要创建任务。",
-        effect_kinds,
-    ) == []
-    assert _requested_mutation_capabilities(
-        "先讨论人物关系，暂不创建任务。",
-        effect_kinds,
-    ) == []
 
 
 def test_conversation_rejects_an_identical_failed_tool_operation(store, tmp_path):
@@ -730,41 +447,53 @@ def test_conversation_rejects_an_identical_failed_tool_operation(store, tmp_path
     assert len(store.tool_invocations(project["id"], run["id"])) == 1
 
 
-def test_conversation_allows_staged_corrections_when_mutation_receipts_advance(
-    store,
-    tmp_path,
-):
-    project = store.create_project("progress correction", "", str(tmp_path / "project"))
-    registry = build_core_registry()
-    for capability in ("test.first", "test.second"):
-        registry.register(CapabilityEntry(
-            id=capability,
-            description=f"Perform {capability}.",
-            input_schema={"type": "object", "additionalProperties": False},
-            output_schema={"type": "object", "additionalProperties": True},
-            handler=lambda _args, _ctx, name=capability: {"changed": name},
-            side_effect_kind="control",
-            delegable_to_column=False,
-        ))
-    turns = 0
+def test_conversation_allows_reinspection_after_successful_repair(store, tmp_path):
+    project = store.create_project("repair then inspect", "", str(tmp_path / "project"))
+    registry = CapabilityRegistry()
+    repaired = False
+    inspections = 0
 
-    def model(messages, tools, **kwargs):
-        nonlocal turns
-        turns += 1
-        if turns == 1:
-            return AgentModelResponse(text="test.first and test.second completed.")
-        if turns == 2:
-            assert "unsupported_mutation_claims" in messages[-1]["content"]
-            return AgentModelResponse(tool_calls=[
-                AgentToolCall(id="first", name="test.first", arguments={})
-            ])
-        if turns == 3:
-            assert kwargs["require_tool"] is True
-            assert {item["function"]["name"] for item in tools} == {"test.second"}
-            return AgentModelResponse(tool_calls=[
-                AgentToolCall(id="second", name="test.second", arguments={})
-            ])
-        return AgentModelResponse(text="test.first and test.second completed.")
+    def inspect(_args, _ctx):
+        nonlocal inspections
+        inspections += 1
+        if not repaired:
+            raise ValueError("invalid asset")
+        return {"valid": True}
+
+    def repair(_args, _ctx):
+        nonlocal repaired
+        repaired = True
+        return {"written": True}
+
+    schema = {"type": "object", "additionalProperties": False}
+    registry.register(CapabilityEntry(
+        id="test.inspect", description="Inspect an asset.", input_schema=schema,
+        output_schema={"type": "object", "additionalProperties": True},
+        handler=inspect, side_effect_kind="read", delegable_to_column=False,
+    ))
+    registry.register(CapabilityEntry(
+        id="test.repair", description="Repair an asset.", input_schema=schema,
+        output_schema={"type": "object", "additionalProperties": True},
+        handler=repair, side_effect_kind="write", delegable_to_column=False,
+    ))
+    calls = 0
+
+    def model(_messages, _tools, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id="inspect-before", name="test.inspect", arguments={}
+            )])
+        if calls == 2:
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id="repair", name="test.repair", arguments={}
+            )])
+        if calls == 3:
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id="inspect-after", name="test.inspect", arguments={}
+            )])
+        return AgentModelResponse(text="Asset repaired and verified.")
 
     result = AgentCore(store, registry, model).run(AgentRunSpec(
         kind="conversation",
@@ -772,46 +501,45 @@ def test_conversation_allows_staged_corrections_when_mutation_receipts_advance(
         instruction="",
         instruction_revision=1,
         context={},
-        capability_ids=["test.first", "test.second"],
+        capability_ids=["test.inspect", "test.repair"],
+        start_task=True,
     ))
 
     assert result.status == "succeeded"
-    assert turns == 4
-    assert [
-        item["capability"]
-        for item in store.tool_invocations(project["id"], result.agent_run_id)
-    ] == ["test.first", "test.second"]
+    assert inspections == 2
+    assert [item["ok"] for item in store.tool_invocations(project["id"], result.agent_run_id)] == [
+        False,
+        True,
+        True,
+    ]
 
 
-def test_protocol_stall_is_published_as_a_human_readable_failed_reply(
-    store,
-    tmp_path,
-):
-    project = store.create_project("visible protocol failure", "", str(tmp_path / "project"))
-    registry = build_core_registry()
+def test_repeated_failed_operation_is_reported_without_business_claims(store, tmp_path):
+    project = store.create_project("visible duplicate failure", "", str(tmp_path / "project"))
+    registry = CapabilityRegistry()
     registry.register(CapabilityEntry(
-        id="test.dispatch",
-        description="Dispatch test work.",
+        id="test.mutate",
+        description="A failing mutation.",
         input_schema={"type": "object", "additionalProperties": False},
         output_schema={"type": "object", "additionalProperties": True},
-        handler=lambda _args, _ctx: {"dispatched": True},
+        handler=lambda _args, _ctx: (_ for _ in ()).throw(ValueError("invalid")),
         side_effect_kind="control",
         delegable_to_column=False,
     ))
 
     def model(_messages, _tools, **_kwargs):
-        return AgentModelResponse(text="test.dispatch completed.")
+        return AgentModelResponse(tool_calls=[AgentToolCall(
+            id="same", name="test.mutate", arguments={}
+        )])
 
     gateway = ConversationGateway(
-        store,
-        registry,
-        agent_core=AgentCore(store, registry, model),
+        store, registry, agent_core=AgentCore(store, registry, model)
     )
 
     async def execute() -> dict:
         await gateway.start()
         try:
-            accepted = await gateway.submit(project["id"], "Dispatch it now.", True)
+            accepted = await gateway.submit(project["id"], "执行操作", True)
             assert await gateway.wait_for_idle(timeout=10)
             return accepted
         finally:
@@ -820,69 +548,31 @@ def test_protocol_stall_is_published_as_a_human_readable_failed_reply(
     accepted = asyncio.run(execute())
     job = store.get_conversation_job(accepted["job"]["id"])
     assert job["status"] == "failed"
-    assert job["agent_run_id"] is not None
-    assert job["result"]["durable_progress"] is False
     assistant = [
         item for item in store.messages(project["id"])
         if item["role"] == "assistant"
     ]
     assert assistant[-1]["content"] == (
-        "本轮操作未执行：Conversation Agent 没有完成所需的项目工具调用，项目状态未改变。"
+        "本轮未完成：Conversation Agent 重复提交相同且失败的工具操作，"
+        "Runtime 已停止重复调用；项目状态未改变。"
     )
-    assert assistant[-1]["meta"]["error_code"] == "conversation_protocol_stalled"
 
 
-def test_protocol_failure_preserves_partial_execution_receipts(
-    store,
-    tmp_path,
-):
-    project = store.create_project("partial protocol progress", "", str(tmp_path / "project"))
-    registry = build_core_registry()
-    registry.register(CapabilityEntry(
-        id="test.plan.persist",
-        description="Persist a test plan.",
-        input_schema={"type": "object", "additionalProperties": False},
-        output_schema={"type": "object", "additionalProperties": True},
-        handler=lambda _args, _ctx: {"plan_id": "plan-1"},
-        side_effect_kind="process",
-        delegable_to_column=False,
-    ))
-    registry.register(CapabilityEntry(
-        id="test.work.dispatch",
-        description="Create a test task.",
-        input_schema={"type": "object", "additionalProperties": False},
-        output_schema={"type": "object", "additionalProperties": True},
-        handler=lambda _args, _ctx: {"task_id": "task-1"},
-        side_effect_kind="process",
-        delegable_to_column=False,
-    ))
-    turns = 0
+def test_user_turn_provider_failure_is_visible_in_conversation(store, tmp_path):
+    project = store.create_project("visible provider failure", "", str(tmp_path / "project"))
+    registry = CapabilityRegistry()
 
     def model(_messages, _tools, **_kwargs):
-        nonlocal turns
-        turns += 1
-        if turns == 1:
-            return AgentModelResponse(
-                text="test.plan.persist and test.work.dispatch completed."
-            )
-        if turns == 2:
-            return AgentModelResponse(tool_calls=[AgentToolCall(
-                id="save-plan",
-                name="test.plan.persist",
-                arguments={},
-            )])
-        return AgentModelResponse(text="test.work.dispatch completed.")
+        raise ConnectionError("provider connection unavailable")
 
     gateway = ConversationGateway(
-        store,
-        registry,
-        agent_core=AgentCore(store, registry, model),
+        store, registry, agent_core=AgentCore(store, registry, model)
     )
 
     async def execute() -> dict:
         await gateway.start()
         try:
-            accepted = await gateway.submit(project["id"], "Create the work now.", True)
+            accepted = await gateway.submit(project["id"], "执行操作", True)
             assert await gateway.wait_for_idle(timeout=10)
             return accepted
         finally:
@@ -891,20 +581,14 @@ def test_protocol_failure_preserves_partial_execution_receipts(
     accepted = asyncio.run(execute())
     job = store.get_conversation_job(accepted["job"]["id"])
     assert job["status"] == "failed"
-    assert job["agent_run_id"] is not None
-    assert job["result"]["durable_progress"] is True
-    assert [
-        item["capability"] for item in job["result"]["action_ledger"]
-    ] == ["test.plan.persist"]
     assistant = [
         item for item in store.messages(project["id"])
         if item["role"] == "assistant"
     ]
     assert assistant[-1]["content"] == (
-        "本轮操作未完成：Conversation Agent 没有完成全部所需的项目工具调用；"
-        "已经成功执行的操作及其回执已保留。"
+        "本轮未完成：ConnectionError: provider connection unavailable"
     )
-    assert assistant[-1]["meta"]["durable_progress"] is True
+    assert assistant[-1]["meta"]["error_code"] == "conversation_processing_failed"
 
 
 def test_conversation_system_prefix_is_stable_and_project_state_is_turn_input(
@@ -958,7 +642,7 @@ def test_same_project_jobs_remain_ordered_by_session_gateway(store, tmp_path):
         if current == "first":
             first_entered.set()
             assert release_first.wait(timeout=3)
-        return AgentModelResponse(text=f"Handled {current}.")
+        return AgentModelResponse(text=json.dumps({'mode': 'discussion', 'message': f"Handled {current}."}))
 
     registry = build_core_registry()
     agent = ConversationGateway(store, registry, agent_core=AgentCore(store, registry, model))
@@ -1121,7 +805,7 @@ def test_current_request_is_authoritative_and_not_duplicated(store, tmp_path):
 
     def model(messages, _tools, **_kwargs):
         captured.append(messages)
-        return AgentModelResponse(text="Acknowledged.")
+        return AgentModelResponse(text=json.dumps({'mode': 'discussion', 'message': "Acknowledged."}))
 
     registry = build_core_registry()
     agent = ConversationGateway(store, registry, agent_core=AgentCore(store, registry, model))
@@ -1143,7 +827,7 @@ def test_terminal_mailbox_turn_reports_model_text_to_user(store, tmp_path):
         calls += 1
         if calls == 1:
             return AgentModelResponse(tool_calls=[AgentToolCall(id="inspect", name="task.inspect", arguments={"task_id": task["id"]})])
-        return AgentModelResponse(text="任务失败，原因已核实：synthetic terminal failure")
+        return AgentModelResponse(text=json.dumps({'mode': 'work_result', 'task_ids': [task['id']]}))
 
     registry = build_core_registry()
     agent = ConversationGateway(store, registry, agent_core=AgentCore(store, registry, model))
@@ -1158,7 +842,7 @@ def test_terminal_mailbox_turn_reports_model_text_to_user(store, tmp_path):
 
     asyncio.run(execute())
     assistant = [item for item in store.messages(project["id"]) if item["role"] == "assistant"]
-    assert assistant[-1]["content"] == "任务失败，原因已核实：synthetic terminal failure"
+    assert "visible failure：失败" in assistant[-1]["content"]
     assert assistant[-1]["meta"]["subject_status"] == "failed"
 
 
@@ -1185,12 +869,12 @@ def test_project_session_replays_human_dialogue_without_raw_tool_evidence(store,
                 arguments={},
             )])
         if model_calls == 2:
-            return AgentModelResponse(text="I inspected workflow revision 7.")
+            return AgentModelResponse(text=json.dumps({'mode': 'work_result', 'tool_call_ids': ['inspect-session']}))
         encoded = json.dumps(messages, ensure_ascii=False)
         assert "Remember the inspected workflow." in encoded
         assert "workflow-revision-7" not in encoded
-        assert "I inspected workflow revision 7." in encoded
-        return AgentModelResponse(text="The same Project Session is continuing.")
+        assert "所引用的操作已完成。" in encoded
+        return AgentModelResponse(text=json.dumps({'mode': 'discussion', 'message': "The same Project Session is continuing."}))
 
     first_gateway = ConversationGateway(
         store,
@@ -1253,7 +937,7 @@ def test_failed_turn_does_not_destroy_project_session(store, tmp_path):
         model_calls += 1
         if model_calls == 1:
             raise RuntimeError("provider unavailable for this turn")
-        return AgentModelResponse(text="The next turn still runs in this Project Session.")
+        return AgentModelResponse(text=json.dumps({'mode': 'discussion', 'message': "The next turn still runs in this Project Session."}))
 
     gateway = ConversationGateway(
         store,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -101,19 +102,29 @@ class LoopCatalog:
 
     def __init__(self, root: str | Path | None = None):
         self.root = Path(root or Path(__file__).resolve().parents[2] / "loops").resolve()
+        self.errors: dict[str, str] = {}
 
     def _records(self) -> list[dict[str, Any]]:
         if not self.root.is_dir():
             return []
         records: list[dict[str, Any]] = []
+        self.errors = {}
         keys: set[str] = set()
         for directory in sorted(path for path in self.root.iterdir() if path.is_dir()):
             meta_path = directory / "loop.meta"
             if not meta_path.is_file():
                 continue
-            record = _parse_loop_meta(meta_path)
+            try:
+                record = _parse_loop_meta(meta_path)
+            except (OSError, ValueError) as exc:
+                self.errors[directory.name] = str(exc)
+                logging.getLogger(__name__).warning("invalid Loop %s: %s", directory.name, exc)
+                continue
             if record["loop_key"] in keys:
-                raise ValueError(f"duplicate Loop Key {record['loop_key']!r} under {self.root}")
+                self.errors[record["loop_key"]] = f"duplicate Loop Key {record['loop_key']!r} under {self.root}"
+                records = [item for item in records if item["loop_key"] != record["loop_key"]]
+                logging.getLogger(__name__).warning(self.errors[record["loop_key"]])
+                continue
             keys.add(record["loop_key"])
             record["directory"] = directory.name
             record["meta_path"] = meta_path
@@ -161,6 +172,8 @@ class LoopCatalog:
     def get(self, loop_key: str) -> dict[str, Any]:
         record = next((item for item in self._records() if item["loop_key"] == loop_key), None)
         if record is None:
+            if loop_key in self.errors:
+                raise ValueError(self.errors[loop_key])
             raise KeyError(f"Loop {loop_key!r} was not found")
         bundle_path = Path(record["bundle_path"])
         if not bundle_path.is_file():

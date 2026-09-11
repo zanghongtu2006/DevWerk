@@ -61,6 +61,7 @@ class LLMRuntimeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     trust_env_proxy: bool = False
+    connect_max_attempts: int = Field(default=3, ge=1)
 
 
 class LLMCatalog(BaseModel):
@@ -94,6 +95,7 @@ class ApiProfile:
     api_key: str | None
     effort_level: str | None = None
     trust_env_proxy: bool = False
+    connect_max_attempts: int = 3
     request_timeout_seconds: float = 600.0
 
 
@@ -117,6 +119,7 @@ class AgentModelConfig:
             "model": self.model,
             "effort_level": self.api.effort_level,
             "trust_env_proxy": self.api.trust_env_proxy,
+            "connect_max_attempts": self.api.connect_max_attempts,
             "request_timeout_seconds": self.api.request_timeout_seconds,
             "thinking_mode": self.thinking_mode,
             "temperature": self.temperature,
@@ -258,6 +261,7 @@ def _api_profile(
         api_key=api_key,
         effort_level=_none_if_empty(model.effort_level),
         trust_env_proxy=runtime.trust_env_proxy,
+        connect_max_attempts=runtime.connect_max_attempts,
         request_timeout_seconds=model.request_timeout_seconds,
     )
 

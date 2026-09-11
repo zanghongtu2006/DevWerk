@@ -61,6 +61,7 @@
     "default": "main"
   },
   "runtime": {
-    "trust_env_proxy": false
+    "trust_env_proxy": false,
+    "connect_max_attempts": 3
   }
 }

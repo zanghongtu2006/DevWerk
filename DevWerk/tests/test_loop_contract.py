@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 
 import pytest
+from pydantic import ValidationError
 
 from app.v1.capabilities import build_core_registry
 from app.v1.contracts import ContractError
@@ -32,9 +34,18 @@ def novel_task_input(chapter_number: int = 1) -> dict:
 
 def test_filesystem_loops_are_discoverable_and_novel_is_a_directed_graph(store):
     loops = store.list_loops()
-    assert {item["loop_key"] for item in loops} >= {"novel.production", "software.gitlab_devops"}
+    assert {item["loop_key"] for item in loops} >= {
+        "novel.production",
+        "software.gitlab_devops",
+        "software.ddd_delivery",
+    }
+    for item in loops:
+        definition = WorkflowDefinition.model_validate(store.get_loop(item["loop_key"])["bundle"]["workflow"])
+        assert all(column.executor.kind in {"agent", "capability_sequence"} for column in definition.columns)
     novel = store.get_loop("novel.production")
     assert novel["directory"] == "novel-production"
+
+
     assert "independent-review" in novel["tags"]
     assert set(novel["bundle"]) == {"defaults", "workflow_plan", "workflow"}
     assert "tasks" not in novel["bundle"]
@@ -43,8 +54,9 @@ def test_filesystem_loops_are_discoverable_and_novel_is_a_directed_graph(store):
     task_fields = set(novel["bundle"]["workflow_plan"]["task_contract"]["input_schema"]["properties"])
     dependency_contract = novel["bundle"]["workflow_plan"]["task_contract"]["dependency_contract"]
     assert dependency_contract == {
-        "kind": "linear_by_integer_input",
+        "kind": "previous_in_order",
         "order_pointer": "/chapter_number",
+        "continuity": "contiguous_integer",
         "first_value": 1,
     }
     assert project_fields.isdisjoint(task_fields)
@@ -72,18 +84,19 @@ def test_filesystem_loops_are_discoverable_and_novel_is_a_directed_graph(store):
         for column in workflow.columns
         for transition in column.transitions
     }
-    assert ("authoring", "recap_rejected", "recap") in transitions
+    assert ("review", "recap_rejected", "recap") in transitions
     assert ("authoring", "foundation_invalid", "foundation") in transitions
     authoring = workflow.column("authoring").executor
-    assert authoring.kind == "workcell"
-    workcell_transitions = {
-        (state.key, transition.signal, transition.target)
-        for state in authoring.states
-        for transition in state.transitions
-    }
-    assert ("review", "chapter_rejected", "write") in workcell_transitions
-    writer = next(item for item in authoring.participants if item.key == "writer")
-    assert writer.lifecycle == "task"
+    assert authoring.kind == "agent"
+    assert workflow.column("authoring").metadata["agent_session_key"] == "authoring"
+    assert workflow.column("authoring").metadata["writable_paths"] == [
+        {"$ref": "/input/task/input/body_path"}
+    ]
+    assert workflow.column("review").executor.kind == "agent"
+    assert workflow.column("review").metadata["writable_paths"] == [
+        {"$ref": "/input/task/input/review_path"}
+    ]
+    assert ("review", "chapter_rejected", "authoring") in transitions
     recap = workflow.column("recap")
     assert recap.context.include_current_goal is False
     assert recap.context.include_task_description is False
@@ -100,6 +113,82 @@ def test_filesystem_loops_are_discoverable_and_novel_is_a_directed_graph(store):
     assert "current_goal" in recap.instruction
 
 
+def test_workflow_column_rejects_nested_multi_agent_executor():
+    with pytest.raises(ValidationError):
+        WorkflowDefinition.model_validate({
+            "name": "invalid nested agent graph",
+            "entry": "build",
+            "terminals": {"success": "done", "failure": "failed"},
+            "columns": [{
+                "key": "build",
+                "name": "Build",
+                "executor": {
+                    "kind": "workcell",
+                    "entry": "write",
+                    "participants": [
+                        {"key": "first", "kind": "agent", "capabilities": ["system.noop"]},
+                        {"key": "second", "kind": "agent", "capabilities": ["system.noop"]},
+                    ],
+                    "states": [],
+                    "terminals": [],
+                },
+                "transitions": [{"outcome": "success", "target": "done"}],
+            }],
+        })
+
+
+def test_ddd_software_delivery_loop_has_generic_engineering_lifecycle(store):
+    loop = store.get_loop("software.ddd_delivery")
+    assert loop["directory"] == "ddd-software-delivery"
+    assert loop["version"] == "1.2.0"
+    assert loop["category"] == "software_delivery"
+    assert set(loop["tags"]) >= {
+        "domain-driven-design",
+        "pair-programming",
+        "automated-testing",
+        "devops",
+    }
+
+    workflow = loop["bundle"]["workflow"]
+    assert [column["key"] for column in workflow["columns"]] == [
+        "requirements",
+        "domain_design",
+        "backend_development",
+        "frontend_development",
+        "integration_review",
+        "system_test",
+        "delivery",
+        "accept",
+    ]
+    columns = {column["key"]: column for column in workflow["columns"]}
+    assert all(column["executor"]["kind"] == "agent" for column in workflow["columns"])
+    assert columns["backend_development"]["metadata"]["writable_paths"] == [
+        "backend/**",
+        "docs/backend-development.md",
+    ]
+    assert columns["frontend_development"]["metadata"]["writable_paths"] == [
+        "frontend/**",
+        "docs/frontend-development.md",
+    ]
+    assert columns["integration_review"]["metadata"]["writable_paths"] == ["docs/pair-review.md"]
+    assert columns["backend_development"]["metadata"]["agent_session_key"] == "backend_development"
+    assert columns["frontend_development"]["metadata"]["agent_session_key"] == "frontend_development"
+    transitions = {
+        (column["key"], transition["outcome"], transition["target"])
+        for column in workflow["columns"]
+        for transition in column["transitions"]
+    }
+    assert ("backend_development", "backend_ready", "frontend_development") in transitions
+    assert ("frontend_development", "frontend_ready", "integration_review") in transitions
+    assert ("integration_review", "backend_changes_requested", "backend_development") in transitions
+    assert ("integration_review", "frontend_changes_requested", "frontend_development") in transitions
+    assert columns["requirements"]["metadata"]["writable_paths"] == [
+        "docs/requirements-baseline.md"
+    ]
+    assert columns["system_test"]["metadata"]["writable_paths"] == ["docs/test-report.md"]
+    assert columns["accept"]["metadata"]["writable_paths"] == ["FINAL_ACCEPTANCE.md"]
+
+
 def test_preset_loop_definitions_are_not_stored_in_sqlite(store):
     with store.connect() as db:
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
@@ -109,6 +198,9 @@ def test_preset_loop_definitions_are_not_stored_in_sqlite(store):
     assert "v1_project_loop_bindings" in tables
     assert "v1_workflow_plans" in tables
     assert "v1_task_plans" in tables
+    assert "v1_workcells" not in tables
+    assert "v1_workcell_participants" not in tables
+    assert "v1_workcell_handoffs" not in tables
 
 
 def test_workflow_revision_requires_loop_provenance(store, tmp_path):
@@ -138,7 +230,7 @@ def test_loop_application_creates_reusable_workflow_without_tasks(store, tmp_pat
     active = store.get_workflow(project["id"])
     assert active["source_loop_key"] == "novel.production"
     assert active["source_loop_digest"] == application["loop"]["digest"]
-    assert active["loop_bindings"] == NOVEL_BINDINGS
+    assert active["loop_bindings"] == {**NOVEL_BINDINGS, 'ending_policy': 'conclude'}
 
 
 def test_novel_task_plan_requires_and_materializes_strict_chapter_dependencies(store, tmp_path):
@@ -161,7 +253,7 @@ def test_novel_task_plan_requires_and_materializes_strict_chapter_dependencies(s
         "readiness": {**second["readiness"], "decision": "queue"},
     })
     payload["tasks"].append(second)
-    with pytest.raises(ValueError, match="must depend exactly on its linear predecessor"):
+    with pytest.raises(ValueError, match="must depend exactly on its ordered predecessor"):
         store.create_task_plan(project["id"], TaskPlan.model_validate(payload))
 
     payload["tasks"][1]["dependencies"] = ["chapter_01"]
@@ -340,8 +432,73 @@ def test_linear_task_plan_rejects_duplicate_project_work_item(store, tmp_path):
 
     duplicate = first.model_copy(deep=True)
     duplicate.objective = "Try to duplicate the same logical work item"
-    with pytest.raises(ValueError, match="continue the Project Task graph from 2"):
+    with pytest.raises(ValueError, match="already exist in the Project"):
         store.create_task_plan(project["id"], duplicate)
+
+
+def test_incremental_task_plan_continues_after_legacy_string_order_value(store, tmp_path):
+    project = store.create_project("incremental identity", "", str(tmp_path / "incremental-identity"))
+    store.apply_loop(project["id"], "novel.production", NOVEL_BINDINGS)
+    active = store.get_workflow(project["id"])
+    workflow = WorkflowDefinition.model_validate(active["definition"])
+    first_plan = store.create_task_plan(
+        project["id"],
+        task_plan(
+            active["id"], workflow, task_ref="chapter_01", title="chapter 1",
+            input_data=novel_task_input(1),
+        ),
+    )
+    first = store.materialize_task_plan(
+        project["id"], task_plan_id=first_plan["id"], proposed_task_ref="chapter_01",
+    )
+    with store.tx(immediate=True) as db:
+        legacy_input = novel_task_input(1)
+        legacy_input["chapter_number"] = "1"
+        db.execute(
+            "UPDATE v1_tasks SET input_json=?,logical_task_key=?,status='done',current_column='done' WHERE id=?",
+            (
+                json.dumps(legacy_input),
+                '/chapter_number="1"',
+                first["id"],
+            ),
+        )
+
+    second_plan = store.create_task_plan(
+        project["id"],
+        task_plan(
+            active["id"], workflow, task_ref="chapter_02", title="chapter 2",
+            input_data=novel_task_input(2),
+        ),
+    )
+    second = store.materialize_task_plan(
+        project["id"], task_plan_id=second_plan["id"], proposed_task_ref="chapter_02",
+    )
+
+    assert second["input"]["chapter_number"] == 2
+    assert second["logical_task_key"] == "/chapter_number=2"
+    scheduling = store.task_scheduling(project["id"], second["id"])
+    assert scheduling["dependencies"][0]["resolved_task_id"] == first["id"]
+    assert scheduling["dependencies"][0]["satisfied"] is True
+
+
+def test_novel_task_admission_rejects_chapter_beyond_project_binding(store, tmp_path):
+    bindings = {**NOVEL_BINDINGS, "chapter_count": 4}
+    project = store.create_project("bounded novel", "", str(tmp_path / "bounded-novel"))
+    store.apply_loop(project["id"], "novel.production", bindings)
+    active = store.get_workflow(project["id"])
+    workflow = WorkflowDefinition.model_validate(active["definition"])
+
+    with pytest.raises(ValueError, match="exceeds the Project scope"):
+        store.create_task_plan(
+            project["id"],
+            task_plan(
+                active["id"],
+                workflow,
+                task_ref="chapter_05",
+                title="chapter 5",
+                input_data=novel_task_input(5),
+            ),
+        )
 
 
 def test_loop_rejects_duplicate_project_and_task_parameter_ownership(store, monkeypatch):
@@ -378,7 +535,7 @@ def test_runtime_separates_project_loop_bindings_from_task_input(store, tmp_path
     )
 
     assert context["project"]["loop"]["key"] == "novel.production"
-    assert context["project"]["loop"]["bindings"] == NOVEL_BINDINGS
+    assert context["project"]["loop"]["bindings"] == {**NOVEL_BINDINGS, 'ending_policy': 'conclude'}
     assert len(context["project"]["loop"]["assets"]) == 10
     assert all(asset["content"].strip() for asset in context["project"]["loop"]["assets"])
     assert context["task"]["input"] == novel_task_input(1)

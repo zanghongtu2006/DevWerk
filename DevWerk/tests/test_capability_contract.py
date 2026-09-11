@@ -95,7 +95,7 @@ def test_registry_rejects_bad_arguments_and_path_escape(store, tmp_path):
         registry.dispatch("project.files.read", {"path": "../outside"}, context)
 
 
-def test_command_capability_uses_declared_process_exit_semantics(store, tmp_path):
+def test_command_capability_keeps_runtime_process_exit_semantics(store, tmp_path):
     project = store.create_project("command-result", "", str(tmp_path / "project"))
     registry = build_core_registry()
     context = CapabilityContext(project_id=project["id"], project=project, store=store)
@@ -117,7 +117,7 @@ def test_command_capability_uses_declared_process_exit_semantics(store, tmp_path
     assert not failed.ok
     assert failed.error["type"] == "CommandFailed"
     assert failed.output["exit_code"] == 7
-    assert accepted.ok
+    assert not accepted.ok
     assert accepted.output["exit_code"] == 7
 
 
@@ -165,6 +165,36 @@ def test_loop_apply_capability_creates_initial_workflow(store, tmp_path):
     assert result.ok
     assert result.output["loop"]["loop_key"] == "software.gitlab_devops"
     assert store.get_workflow(project["id"])["source_loop_key"] == "software.gitlab_devops"
+
+
+def test_mailbox_agent_cannot_apply_loop_or_expand_task_graph(store, tmp_path):
+    project = store.create_project("mailbox authority", "", str(tmp_path / "mailbox-authority"))
+    registry = build_core_registry()
+    context = CapabilityContext(
+        project_id=project["id"],
+        project=project,
+        store=store,
+        agent_run_id="arun_mailbox",
+        start_task=False,
+        user_initiated=False,
+    )
+
+    result = registry.dispatch(
+        "loop.apply",
+        {
+            "loop_key": "novel.production",
+            "bindings": {
+                "project_title": "mailbox must not create this",
+                "premise": "none",
+                "chapter_count": 1,
+                "chapter_target_characters": 1000,
+                "chapter_max_characters": 2000,
+            },
+        },
+        context,
+    )
+    assert result.ok is False
+    assert "requires an active Conversation planning turn" in result.error["message"]
 
 
 def test_workflow_rejects_inline_control_character_sensitive_capability_strings():

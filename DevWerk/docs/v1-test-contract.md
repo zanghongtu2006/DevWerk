@@ -1,6 +1,6 @@
 # DevWerk Version 1 Test Contract
 
-**Status**: active pre-release review gate  
+**Status**: active pre-release review gate<br>
 **Derived from**: [`generic-conversation-agent-and-declarative-column-runtime.md`](generic-conversation-agent-and-declarative-column-runtime.md) and [`conversation-session-gateway-v1.md`](conversation-session-gateway-v1.md), with product intent retained in the Conversation Agent and Kanban design records
 
 ## Purpose
@@ -20,10 +20,11 @@ The complete `tests` directory protects the current Version 1 architecture. It i
 | `test_api_web_contract.py` | mounted API, Project isolation, system automation path, Web routes/modules, read-only Kanban governance |
 | `test_provider_contract.py` | native OpenAI/Anthropic tool-call normalization, routing, usage attribution, retryable/non-retryable errors |
 | `test_loop_contract.py` | filesystem metadata discovery, schema-bound materialization, initial-Workflow admission, novel directed graph, DevOps requirement gate |
-| `test_orchestration_policy_contract.py` | centralized scheduling policy, absence of Agent execution budgets, versioned policy evidence |
+| `test_orchestration_policy_contract.py` | centralized scheduling policy, versioned policy evidence, explicit external Await outcomes |
+| `test_p0_runtime_regressions.py` | runtime-owned completion evidence, execution fencing, bounded Agent/command/recovery loops, durable Await recovery, effect replay, immutable artifact versions, atomic Loop snapshots, successor dependency consistency |
 | `test_failure_transparency_contract.py` | original failure propagation, structured failure summaries, no silent fallback |
 | `test_logging_contract.py` | full V1 debug trace, fixed `devwerk.log` name, daily rotation, no queue wrapper |
-| `test_memory_workcell_contract.py` | File-first replaceable Memory providers, scoped retrieval and supersession, generic deterministic/Agent Workcells, typed feedback, persistent participant Sessions, and recovery continuity |
+| `test_memory_workcell_contract.py` | File-first replaceable Memory providers, scoped retrieval, supersession, and pre-Memory workspace initialization |
 
 ## Required Gate
 
@@ -32,6 +33,8 @@ The complete `tests` directory protects the current Version 1 architecture. It i
 ```
 
 The command must complete with zero failures. `skip`, `xfail`, and tests importing removed modules are not accepted as a clean result.
+
+The Runtime P0 design and incident replay are recorded in [`DEVWERK_P0_Runtime_Fix_2026-09-08.md`](DEVWERK_P0_Runtime_Fix_2026-09-08.md). Agent/command/recovery limits are Runtime liveness controls; workflow revisions do not carry a second independent execution-budget protocol.
 
 ## External Acceptance
 

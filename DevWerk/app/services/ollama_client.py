@@ -7,6 +7,8 @@ import logging
 from typing import Any
 
 import requests as http_requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from app.core.debug_trace import trace_json
 from app.services.provider_errors import provider_timeout_error
@@ -28,6 +30,20 @@ class OllamaClient:
         self.url = f"{self.base_url}/api/chat"
         self.session = http_requests.Session()
         self.session.trust_env = bool(config.get("trust_env_proxy", False))
+        connect_max_attempts = int(config.get("connect_max_attempts", 3))
+        if connect_max_attempts < 1:
+            raise ValueError("connect_max_attempts must be positive")
+        transport = HTTPAdapter(max_retries=Retry(
+            total=connect_max_attempts - 1,
+            connect=connect_max_attempts - 1,
+            read=0,
+            redirect=0,
+            status=0,
+            other=0,
+            backoff_factor=0.5,
+        ))
+        self.session.mount("http://", transport)
+        self.session.mount("https://", transport)
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, *, trace_id: str | None = None, require_tool: bool = False, required_tool_name: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {

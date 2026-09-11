@@ -20,6 +20,56 @@ class RecoveryManager:
     def __init__(self, store: StoreHost):
         self.store = store
 
+    def _recovery_exhausted(self, db, task_id, run_id=None):
+        previous = db.execute(
+            "SELECT COUNT(*),MIN(started_at) FROM v1_column_attempts "
+            "WHERE column_run_id=COALESCE(?,(SELECT id FROM v1_column_runs WHERE task_id=? ORDER BY sequence DESC LIMIT 1)) AND error_category IS NOT NULL", (run_id, task_id),
+        ).fetchone()
+        limits = self.store.policy.execution
+        return int(previous[0]) >= limits.max_recovery_attempts or bool(
+            previous[1] and (datetime.now(timezone.utc)-datetime.fromisoformat(previous[1])).total_seconds()
+            >= limits.recovery_max_elapsed_seconds
+        )
+
+    def _recovery_disposition(self, db, task_id, project_id, run_id, error, error_code, error_category, exhausted):
+        db.execute(
+            "UPDATE v1_tasks SET failure_origin=?,failure_code=?,failure_disposition=?,"
+            "control_state=CASE WHEN ? OR control_state='pause_requested' THEN 'paused' ELSE control_state END,"
+            "supervision_action=CASE WHEN ? THEN 'intervention_required' ELSE supervision_action END WHERE id=?",
+            (error_category.split('_', 1)[0], error_code,
+             'intervention_required' if exhausted else 'recover_column', exhausted, exhausted, task_id),
+        )
+        if exhausted:
+            self.store.agents.invalidate_task(db, task_id)
+            self.store._mailbox(db, project_id, "task.runtime_blocked", task_id, run_id,
+                                {"error": error, "failure_disposition": "intervention_required"})
+
+    def retry_await_operation(self, task, handle_id, error, *, error_code, error_category):
+        """Retry observing/resuming a durable wait without resubmitting its external job."""
+        now = utcnow()
+        with self.store.tx(immediate=True) as db:
+            self.store.assert_execution_owner(task, db=db)
+            handle = self.store.await_handle(handle_id)
+            checkpoint = dict(handle["checkpoint"])
+            retry = dict(checkpoint.get("runtime_retry") or {})
+            first = retry.get("first_at") or now
+            count = int(retry.get("count", 0)) + 1
+            limits = self.store.policy.execution
+            exhausted = count > limits.max_recovery_attempts or (
+                datetime.now(timezone.utc)-datetime.fromisoformat(first)
+            ).total_seconds() >= limits.recovery_max_elapsed_seconds
+            checkpoint["runtime_retry"] = {"first_at": first, "count": count, "error": error}
+            next_check = (datetime.now(timezone.utc) + timedelta(
+                seconds=self.store.policy.scheduling.recovery_retry_delay_seconds
+            )).isoformat(timespec="milliseconds")
+            db.execute("UPDATE v1_await_handles SET checkpoint_json=?,next_check_at=?,updated_at=? WHERE id=? AND status='pending'",
+                       (self.store._pack_json(checkpoint), next_check, now, handle_id))
+            db.execute("UPDATE v1_tasks SET error=?,updated_at=? WHERE id=?", (error, now, task["id"]))
+            self._recovery_disposition(db, task["id"], task["project_id"], handle["run_id"], error, error_code, error_category, exhausted)
+            self.store._event(db, task["project_id"], task["id"], handle["run_id"], "await.runtime_retry",
+                              {"await_handle_id": handle_id, "error": error, "retry_count": count, "exhausted": exhausted})
+            self.store._refresh_projection(db, task["project_id"])
+
     def recover_expired_task_leases(self, limit: int) -> list[str]:
         """Fence abandoned workers and return their Tasks to deterministic recovery."""
         now = utcnow()
@@ -34,6 +84,7 @@ class RecoveryManager:
             for row in rows:
                 task_id, project_id, column_key, state_version, lease_owner = row
                 error = f"WorkerLeaseExpired: execution owner {lease_owner or 'unknown'} stopped renewing its lease"
+                exhausted = self._recovery_exhausted(db, task_id)
                 changed = db.execute(
                     "UPDATE v1_tasks SET status='recovering',error=?,lease_owner=NULL,lease_until=NULL,"
                     "next_retry_at=?,supervision_action='recovering',state_version=state_version+1,updated_at=? "
@@ -63,11 +114,8 @@ class RecoveryManager:
                         "WHERE column_run_id=? AND status IN ('running','waiting')",
                         (error, now, run_id),
                     )
-                    db.execute(
-                        "UPDATE v1_execution_receipts SET status='failed',error=?,finished_at=? "
-                        "WHERE project_id=? AND execution_key LIKE ? AND status IN ('started','awaiting')",
-                        (error, now, project_id, f"{run_id}:%"),
-                    )
+                    # Keep started/awaiting receipts intact. A dead worker is not
+                    # evidence that its external side effect did not happen.
                     self.store._event(
                         db,
                         project_id,
@@ -89,6 +137,8 @@ class RecoveryManager:
                         "next_retry_at": now,
                     },
                 )
+                self._recovery_disposition(db, task_id, project_id, active_runs[-1][0] if active_runs else None,
+                                           error, "worker_lease_expired", "worker_interrupted", exhausted)
                 self.store._refresh_projection(db, project_id)
                 recovered.append(str(task_id))
         return recovered
@@ -113,10 +163,12 @@ class RecoveryManager:
         now = utcnow()
         context = {} if clear_context else task["context"]
         with self.store.tx(immediate=True) as db:
-            db.execute(
-                "UPDATE v1_tasks SET status='pending',control_state='active',current_column=?,attempt=0,context_json=?,error=NULL,lease_owner=NULL,lease_until=NULL,finished_at=NULL,state_version=state_version+1,updated_at=? WHERE id=?",
-                (target, json.dumps(context, ensure_ascii=False), now, task_id),
-            )
+            changed = db.execute(
+                "UPDATE v1_tasks SET status='pending',control_state='active',current_column=?,attempt=0,context_json=?,error=NULL,lease_owner=NULL,lease_until=NULL,finished_at=NULL,state_version=state_version+1,updated_at=? WHERE id=? AND status=? AND state_version=?",
+                (target, json.dumps(context, ensure_ascii=False), now, task_id, task['status'], task['state_version']),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("Task changed while retrying")
             data = {"target": target, "clear_context": clear_context}
             self.store._event(db, task["project_id"], task_id, None, "task.retry_requested", data)
             self.store._mailbox(db, task["project_id"], "task.retry_requested", task_id, None, data)
@@ -130,10 +182,11 @@ class RecoveryManager:
         recoverable: bool,
         error_code: str,
         error_category: str,
+        expected_task=None,
     ) -> dict[str, Any]:
         """Settle one Await failure and its owning Runtime state as one transition."""
         handle = self.store.await_handle(handle_id)
-        task = self.store.get_task(handle["task_id"])
+        task = expected_task or self.store.get_task(handle["task_id"])
         error = f"AwaitFailed[{error_code}]: {json.dumps(result, ensure_ascii=False, sort_keys=True)}"
         now = utcnow()
         next_retry_at = (
@@ -161,10 +214,13 @@ class RecoveryManager:
             ).fetchone()
             if not current:
                 raise KeyError(handle_id)
+            if expected_task is not None:
+                self.store.assert_execution_owner(expected_task, db=db)
             if current[0] != "pending":
                 return self.store.get_task(task["id"])
             if current[1] != "waiting":
                 raise RuntimeError("Await Handle no longer owns a waiting Task")
+            exhausted = recoverable and self._recovery_exhausted(db, task["id"], handle['run_id'])
             TASK_STATE_MACHINE.require(
                 TaskStatus.WAITING,
                 TaskStatus.RECOVERING if recoverable else TaskStatus.FAILED,
@@ -226,6 +282,8 @@ class RecoveryManager:
                 ).rowcount
                 if changed != 1:
                     raise RuntimeError("Task changed while resolving recoverable Await failure")
+                self._recovery_disposition(db, task["id"], task["project_id"], handle["run_id"],
+                                           error, error_code, error_category, exhausted)
                 self.store._event(
                     db,
                     task["project_id"],
@@ -243,6 +301,7 @@ class RecoveryManager:
                 )
             else:
                 assert failed_column is not None and terminal_artifact is not None
+                self.store.agents.invalidate_task(db, task['id'], 'failed')
                 changed = db.execute(
                     "UPDATE v1_tasks SET status='failed',control_state='active',current_column=?,error=?,"
                     "lease_owner=NULL,lease_until=NULL,finished_at=?,supervision_action=NULL,"
@@ -373,11 +432,13 @@ class RecoveryManager:
         target_state = "pause_requested" if task["status"] == "running" else "paused"
         with self.store.tx(immediate=True) as db:
             changed = db.execute(
-                "UPDATE v1_tasks SET control_state=?,state_version=state_version+1,updated_at=? WHERE id=? AND status NOT IN ('done','failed')",
-                (target_state, now, task_id),
+                "UPDATE v1_tasks SET control_state=?,state_version=state_version+CASE WHEN status='running' THEN 0 ELSE 1 END,updated_at=? WHERE id=? AND status=? AND state_version=?",
+                (target_state, now, task_id, task["status"], task["state_version"]),
             ).rowcount
             if changed != 1:
                 raise RuntimeError("Task changed while pausing")
+            if task['status'] != 'running':
+                self.store.agents.invalidate_task(db, task_id)
             self.store._event(db, task["project_id"], task_id, None, "task.pause_requested", {})
             self.store._mailbox(db, task["project_id"], "task.pause_requested", task_id, None, {})
             self.store._refresh_projection(db, task["project_id"])
@@ -394,12 +455,14 @@ class RecoveryManager:
             if task.get("supervision_action") == "startup_hold":
                 released_task_ids = self._release_task_plan_startup_holds(db, task, now, task_id)
             else:
-                db.execute(
+                changed = db.execute(
                     "UPDATE v1_tasks SET control_state='active',supervision_action=NULL,"
-                    "state_version=state_version+1,updated_at=? "
-                    "WHERE id=? AND status NOT IN ('done','failed')",
-                    (now, task_id),
-                )
+                    "state_version=state_version+CASE WHEN status='running' THEN 0 ELSE 1 END,updated_at=? "
+                    "WHERE id=? AND status=? AND state_version=? AND control_state=?",
+                    (now, task_id, task["status"], task["state_version"], task["control_state"]),
+                ).rowcount
+                if changed != 1:
+                    raise RuntimeError("Task changed while resuming")
                 released_task_ids = [task_id]
             data = {"released_startup_hold_task_ids": released_task_ids}
             self.store._event(db, task["project_id"], task_id, None, "task.resumed", data)
@@ -484,8 +547,9 @@ class RecoveryManager:
             + timedelta(seconds=self.store.policy.scheduling.recovery_retry_delay_seconds)
         ).isoformat(timespec="milliseconds")
         with self.store.tx(immediate=True) as db:
+            exhausted = self._recovery_exhausted(db, task["id"], run_id)
             db.execute(
-                "UPDATE v1_column_runs SET status='failed',error=?,error_category=?,finished_at=? WHERE id=?",
+                "UPDATE v1_column_runs SET status='interrupted',error=?,error_category=?,finished_at=? WHERE id=?",
                 (error, error_category, now, run_id),
             )
             db.execute(
@@ -502,6 +566,8 @@ class RecoveryManager:
             ).rowcount
             if changed != 1:
                 raise RuntimeError("stale Task state_version while entering recovery")
+            self._recovery_disposition(db, task["id"], task["project_id"], run_id,
+                                       error, error_code, error_category, exhausted)
             self.store._event(
                 db,
                 task["project_id"],
@@ -518,6 +584,30 @@ class RecoveryManager:
                     "next_retry_at": next_retry_at,
                 },
             )
+            self.store._refresh_projection(db, task["project_id"])
+
+    def block_runtime_failure(self, task, run_id, error, *, error_code, error_category, checkpoint=None):
+        """Stop automatic execution without asserting a business failure or retrying."""
+        now = utcnow()
+        origin = "agent_contract" if error_category.startswith("protocol") else error_category.split("_", 1)[0]
+        with self.store.tx(immediate=True) as db:
+            self.store.agents.settle_column(task, run_id, "blocked", {"error": error, "code": error_code})
+            changed = db.execute(
+                "UPDATE v1_tasks SET status=CASE WHEN status='waiting' THEN 'waiting' ELSE 'recovering' END,control_state='paused',supervision_action='blocked_runtime',"
+                "error=?,failure_origin=?,failure_code=?,failure_disposition='blocked_runtime',"
+                "lease_owner=NULL,lease_until=NULL,next_retry_at=NULL,state_version=state_version+1,updated_at=? "
+                "WHERE id=? AND status IN ('running','waiting') AND state_version=?",
+                (error, origin, error_code, now, task["id"], task["state_version"]),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("stale Task state_version while blocking Runtime failure")
+            db.execute("UPDATE v1_column_runs SET status='interrupted',error=?,error_category=?,finished_at=? WHERE id=? AND status!='waiting'",
+                       (error, error_category, now, run_id))
+            db.execute("UPDATE v1_column_attempts SET status='interrupted',error=?,error_code=?,error_category=?,checkpoint_json=?,finished_at=? WHERE column_run_id=? AND status='running'",
+                       (error, error_code, error_category, self.store._pack_json(checkpoint or {}), now, run_id))
+            data = {"error": error, "failure_origin": origin, "failure_code": error_code, "failure_disposition": "blocked_runtime"}
+            self.store._event(db, task["project_id"], task["id"], run_id, "task.runtime_blocked", data)
+            self.store._mailbox(db, task["project_id"], "task.runtime_blocked", task["id"], run_id, data)
             self.store._refresh_projection(db, task["project_id"])
 
     def _fail_task_now(self, task: dict[str, Any], reason: str, failure_code: str) -> dict[str, Any]:
@@ -541,7 +631,7 @@ class RecoveryManager:
             "recorded_at": now,
         }
         info = ProjectFiles(self.store.get_project(task["project_id"])["base_dir"], self.store.policy).write_text(
-            f".devwerk/terminal/{task['id']}.json",
+            f".devwerk/terminal/{task['id']}/{new_id('cancel')}.json",
             json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
         )
         with self.store.tx(immediate=True) as db:
@@ -550,6 +640,8 @@ class RecoveryManager:
                 raise KeyError(task["id"])
             if current[0] in {"done", "failed"}:
                 return self.store.get_task(task["id"])
+            if current[0] != task["status"] or current[0] == "running":
+                raise RuntimeError("Task changed while cancelling")
             TASK_STATE_MACHINE.require(current[0], TaskStatus.FAILED)
             db.execute(
                 "UPDATE v1_column_runs SET status='failed',error=?,finished_at=? WHERE task_id=? AND status IN ('pending','running','waiting')",
@@ -561,11 +653,12 @@ class RecoveryManager:
             )
             db.execute("UPDATE v1_await_handles SET status='cancelled',updated_at=? WHERE task_id=? AND status='pending'", (now, task["id"]))
             changed = db.execute(
-                "UPDATE v1_tasks SET status='failed',control_state='active',current_column=?,error=?,lease_owner=NULL,lease_until=NULL,state_version=state_version+1,updated_at=?,finished_at=? WHERE id=? AND status NOT IN ('done','failed')",
-                (failed_column, reason, now, now, task["id"]),
+                "UPDATE v1_tasks SET status='failed',control_state='active',current_column=?,error=?,lease_owner=NULL,lease_until=NULL,state_version=state_version+1,updated_at=?,finished_at=? WHERE id=? AND status=? AND state_version=?",
+                (failed_column, reason, now, now, task["id"], task["status"], task["state_version"]),
             ).rowcount
             if changed != 1:
                 raise RuntimeError("Task changed while applying terminal failure")
+            self.store.agents.invalidate_task(db, task['id'], 'cancelled')
             artifact_id = new_id("art")
             db.execute(
                 "INSERT INTO v1_artifacts(id,project_id,task_id,run_id,kind,path,sha256,size,meta_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(project_id,path) DO UPDATE SET id=excluded.id,task_id=excluded.task_id,run_id=excluded.run_id,kind=excluded.kind,sha256=excluded.sha256,size=excluded.size,meta_json=excluded.meta_json,created_at=excluded.created_at",

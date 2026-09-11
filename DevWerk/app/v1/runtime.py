@@ -4,6 +4,9 @@ import hashlib
 import json
 import logging
 import threading
+import time
+import sqlite3
+from app.v1.execution_control import ExecutionControl, ExecutionOwnershipLost, ExecutionBudgetExceeded, ExecutionReplayUncertain
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import PurePosixPath
@@ -11,17 +14,22 @@ from typing import Any
 
 from app.core.debug_trace import trace_json
 from app.services.provider_errors import (
+    LLMProviderError,
     is_recoverable_llm_error,
     is_recoverable_llm_error_code,
     llm_error_code,
 )
-from app.v1.agent import AgentCore, AgentRunSpec, _ledger_entry
+from app.v1.agent import AgentCore, AgentRunSpec
 from app.v1.capabilities import (
     CapabilityContext,
     CapabilityRegistry,
     resolve_references,
 )
 from app.v1.contracts import validate_contract
+from app.v1.completion_protocol import (
+    CompletionContract,
+    CompletionOutcomeRule,
+)
 from app.v1.domain import (
     AgentExecutor,
     CapabilitySequenceExecutor,
@@ -32,12 +40,12 @@ from app.v1.domain import (
     TaskPlan,
     TimerWaitPolicy,
     ToolResult,
-    WorkcellAgentParticipant,
-    WorkcellCapabilityParticipant,
-    WorkcellExecutor,
     WorkflowDefinition,
+    WorkflowPlan,
 )
 from app.v1.files import ProjectFiles
+from app.v1.execution_ledger import ledger_entry
+from app.v1.services.task_graph_admission import validate_task_scope
 from app.v1.store import V1Store
 
 
@@ -65,6 +73,7 @@ class WaitRequested(RuntimeError):
 class RuntimeExecutionError(RuntimeError):
     def __init__(self, message: str, category: str, *, error_code: str | None = None, checkpoint: dict[str, Any] | None = None, agent_run_id: str | None = None):
         self.category = category
+        self.error_category = category
         self.error_code = error_code
         self.checkpoint = checkpoint or {}
         self.agent_run_id = agent_run_id
@@ -92,10 +101,32 @@ class WorkflowRuntime:
         keeper.start()
         try:
             workflow = self.store.workflow_by_id(task["project_id"], task["workflow_revision_id"])
+            workflow_revision = self.store.get_workflow_revision(
+                task["project_id"], task["workflow_revision_id"]
+            )
+            workflow_plan = WorkflowPlan.model_validate(
+                self.store.get_workflow_plan(
+                    task["project_id"], str(workflow_revision["workflow_plan_id"])
+                )["plan"]
+            )
+            loop_binding = self.store.get_project_loop_binding(task["project_id"], task['workflow_revision_id'])
+            validate_task_scope(
+                str(task.get("proposed_task_ref") or task["id"]),
+                dict(task.get("input") or {}),
+                workflow_plan.task_contract.admission_constraints,
+                loop_bindings=(
+                    dict(loop_binding.get("bindings") or {}) if loop_binding else {}
+                ),
+            )
             column = workflow.column(task["current_column"])
             input_data = self._input_for(task, workflow, column)
             validate_contract(input_data, column.input_contract, label=f"Column {column.key} input")
             run = self.store.begin_run(task, input_data)
+            with self.store.connect() as db:
+                visits = db.execute("SELECT COUNT(*) FROM v1_column_runs WHERE task_id=? AND column_key=?",
+                                    (task_id, column.key)).fetchone()[0]
+            if visits > self.policy.execution.max_column_visits:
+                raise ExecutionBudgetExceeded("Column visit ceiling reached; revise or split the Task")
             trace_json(
                 trace_log,
                 "runtime.column_input",
@@ -150,6 +181,9 @@ class WorkflowRuntime:
             self._persist_wait(task, run, column, requested.request)
             return
         except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, ExecutionOwnershipLost):
+                log.warning("discarding stale execution task=%s: %s", task_id, exc)
+                return
             column_key = column.key if column else task["current_column"]
             trace_json(
                 trace_log,
@@ -175,15 +209,12 @@ class WorkflowRuntime:
             error_category = (
                 exc.category
                 if isinstance(exc, RuntimeExecutionError)
-                else "provider_transient" if is_recoverable_llm_error(exc) else "runtime_permanent"
+                else "provider_transient" if is_recoverable_llm_error(exc)
+                else "provider_permanent" if isinstance(exc, LLMProviderError)
+                else "infrastructure_transient" if isinstance(exc, sqlite3.OperationalError)
+                else getattr(exc, "error_category", "runtime_permanent")
             )
-            if is_recoverable_llm_error(exc) or is_recoverable_llm_error_code(error_code):
-                if run is not None:
-                    self.store.mark_workcell_recovering(
-                        task["project_id"],
-                        run["id"],
-                        error,
-                    )
+            if is_recoverable_llm_error(exc) or is_recoverable_llm_error_code(error_code) or error_category in {"tool_transient", "infrastructure_transient", "external_transient"}:
                 self.store.recover_task_from_exception(
                     task,
                     run["id"],
@@ -194,14 +225,12 @@ class WorkflowRuntime:
                     agent_run_id=exc.agent_run_id if isinstance(exc, RuntimeExecutionError) else None,
                 )
                 return
-            evidence = self.store.prepare_terminal_evidence(
-                task,
-                run["id"],
-                "failed",
-                {"summary": error, "exception_type": type(exc).__name__, "checkpoint": checkpoint},
-                error,
+            # Unhandled execution errors stop here. Only a declared Workflow
+            # outcome above (or explicit cancel) may assert business failure.
+            self.store.recovery_manager.block_runtime_failure(
+                task, run["id"], error, error_code=error_code,
+                error_category=error_category, checkpoint=checkpoint,
             )
-            self.store.fail_task_from_exception(task, run["id"], error, evidence, checkpoint=checkpoint)
             raise
         finally:
             keeper.stop()
@@ -247,7 +276,7 @@ class WorkflowRuntime:
                 "base_dir": project["base_dir"],
             }
         if selection.include_loop_bindings or selection.include_loop_assets:
-            loop_binding = self.store.get_project_loop_binding(task["project_id"])
+            loop_binding = self.store.get_project_loop_binding(task["project_id"], task['workflow_revision_id'])
             if loop_binding:
                 loop_context = {
                     "key": loop_binding["loop_key"],
@@ -257,7 +286,7 @@ class WorkflowRuntime:
                 if selection.include_loop_bindings:
                     loop_context["bindings"] = loop_binding["bindings"]
                 if selection.include_loop_assets:
-                    loop_assets = self.store.get_project_loop_assets(task["project_id"])
+                    loop_assets = self.store.get_project_loop_assets(task["project_id"], task['workflow_revision_id'])
                     preloaded_loop_assets = [
                         {
                             "path": item["path"],
@@ -314,7 +343,14 @@ class WorkflowRuntime:
                     if remaining_chars <= 0 or remaining_files <= 0:
                         return
                     try:
-                        measured = files.measure_text(path)
+                        snapshot = self.store.artifact_repository.snapshot_text(row)
+                        if snapshot is not None:
+                            measured = {"path": path, "sha256": hashlib.sha256(snapshot.encode('utf-8')).hexdigest(),
+                                        "size_bytes": len(snapshot.encode('utf-8')), "utf8_characters": len(snapshot),
+                                        "non_whitespace_characters": sum(not char.isspace() for char in snapshot),
+                                        "line_count": len(snapshot.splitlines())}
+                        else:
+                            measured = files.measure_text(path)
                         expected_sha256 = str(row.get("sha256") or "")
                         if expected_sha256 and measured["sha256"] != expected_sha256:
                             excluded_artifacts.append({
@@ -323,7 +359,7 @@ class WorkflowRuntime:
                                 "reason": "registered_hash_mismatch",
                             })
                             continue
-                        content = files.read_text(path)
+                        content = snapshot if snapshot is not None else files.read_text(path)
                     except (OSError, UnicodeDecodeError, ValueError) as exc:
                         excluded_artifacts.append({
                             "path": path,
@@ -467,8 +503,6 @@ class WorkflowRuntime:
             return self._execute_sequence(task, run, column.executor, input_data)
         if isinstance(column.executor, AgentExecutor):
             return self._execute_agent(task, workflow, run, column, input_data)
-        if isinstance(column.executor, WorkcellExecutor):
-            return self._execute_workcell(task, workflow, run, column, input_data)
         raise ValueError(f"column {column.key!r} has no supported declarative executor")
 
     def _execute_sequence(
@@ -487,6 +521,7 @@ class WorkflowRuntime:
             store=self.store,
             task_id=task["id"],
             column_run_id=run["id"],
+            execution_control=self._control(task),
         )
         scope: dict[str, Any] = dict((resume_checkpoint or {}).get("scope") or {"input": input_data, "steps": {}})
         results: list[dict[str, Any]] = list((resume_checkpoint or {}).get("results") or [])
@@ -539,7 +574,7 @@ class WorkflowRuntime:
             results.append({"step": index, "save_as": key, **value})
             if not result.ok:
                 error = result.error or {"type": "CapabilityFailed", "message": f"{step.capability} failed"}
-                category = "tool_transient" if "transient" in str(error.get("type") or "").lower() else "runtime_permanent"
+                category = "tool_transient" if "transient" in str(error.get("type") or "").lower() else "capability_permanent"
                 raise RuntimeExecutionError(
                     f"{step.capability}: {error.get('message') or error}",
                     category,
@@ -573,198 +608,6 @@ class WorkflowRuntime:
                 ) from exc
         outcome = str(outcome_value or "")
         return {"summary": f"capability sequence completed with outcome {outcome}", "steps": results}, outcome
-
-    def _execute_workcell(
-        self,
-        task: dict[str, Any],
-        workflow: WorkflowDefinition,
-        run: dict[str, Any],
-        column: ColumnDefinition,
-        input_data: dict[str, Any],
-    ) -> tuple[dict[str, Any], str]:
-        executor = column.executor
-        assert isinstance(executor, WorkcellExecutor)
-        project = self.store.get_project(task["project_id"])
-        workflow_row = self.store.get_workflow_revision(
-            task["project_id"], task["workflow_revision_id"]
-        )
-        workcell = self.store.get_or_create_workcell(
-            task["project_id"],
-            task["id"],
-            run["id"],
-            executor,
-            input_data,
-        )
-        participants = {
-            item["participant_key"]: item
-            for item in self.store.workcell_participants(task["project_id"], workcell["id"])
-        }
-        while workcell["status"] == "active":
-            state = executor.state(str(workcell["current_state"]))
-            participant = executor.participant(state.participant)
-            handoffs = self.store.workcell_handoffs(
-                task["project_id"],
-                workcell["id"],
-                receiver=participant.key,
-            )
-            participant_session_id = (
-                participants[participant.key].get("agent_session_id")
-                if isinstance(participant, WorkcellAgentParticipant)
-                and participant.lifecycle != "invocation"
-                else None
-            )
-            participant_input = input_data
-            if isinstance(participant, WorkcellAgentParticipant):
-                participant_input = self._input_for(
-                    task,
-                    workflow,
-                    column,
-                    context_selection=participant.context,
-                )
-                if participant_session_id and self.store.agent_session_messages(
-                    task["project_id"], participant_session_id
-                ):
-                    participant_input = self._resume_input(participant_input)
-            activation = {
-                **participant_input,
-                "workcell": {
-                    "id": workcell["id"],
-                    "current_state": state.key,
-                    "participant": participant.key,
-                },
-                "handoffs": handoffs,
-            }
-            validate_contract(
-                activation,
-                state.input_contract,
-                label=f"Workcell state {state.key} input",
-            )
-            self.store.activate_workcell_participant(
-                task["project_id"],
-                workcell["id"],
-                participant.key,
-                state.key,
-            )
-            if isinstance(participant, WorkcellAgentParticipant):
-                memory = self.store.memory.build_context(
-                    project,
-                    selectors=participant.context.memory,
-                    task_id=task["id"],
-                    workcell_id=workcell["id"],
-                    participant_key=participant.key,
-                    include_core=participant.context.include_project,
-                )
-                result = self.agent_core.run(
-                    AgentRunSpec(
-                        kind="column",
-                        project=project,
-                        instruction=self._agent_instruction(
-                            participant.instruction,
-                            state.instruction,
-                        ),
-                        instruction_revision=int(workflow_row["revision"]),
-                        context={
-                            "workflow": {
-                                "id": workflow_row["id"],
-                                "name": workflow.name,
-                                "description": workflow.description,
-                            },
-                            "column": {"key": column.key, "name": column.name},
-                            "workcell": activation["workcell"],
-                            "input": participant_input,
-                            "handoffs": handoffs,
-                            "memory": memory,
-                        },
-                        capability_ids=participant.capabilities,
-                        task_id=task["id"],
-                        column_run_id=run["id"],
-                        column_attempt_id=run["attempt_id"],
-                        completion_outcomes={item.signal for item in state.transitions},
-                        completion_targets={
-                            item.signal: item.target for item in state.transitions
-                        },
-                        output_contract=state.output_contract,
-                        agent_session_id=participant_session_id,
-                        completion_tool_name="workcell.complete",
-                        completion_requires_evidence=state.require_evidence,
-                        completion_auto_evidence=True,
-                    )
-                )
-                if result.status != "succeeded" or not result.completion:
-                    raise RuntimeExecutionError(
-                        result.error or "Workcell participant failed without a signal",
-                        result.error_category or "runtime_permanent",
-                        error_code=result.error_code,
-                        checkpoint={
-                            **result.checkpoint,
-                            "workcell_id": workcell["id"],
-                            "workcell_state": state.key,
-                            "participant": participant.key,
-                        },
-                        agent_run_id=result.agent_run_id,
-                    )
-                signal = str(result.completion["outcome"])
-                payload = {
-                    "output": dict(result.completion["output"]),
-                    "summary": str(result.completion.get("summary") or result.text),
-                    "evidence_ids": list(result.completion.get("evidence_ids") or []),
-                    "agent_run_id": result.agent_run_id,
-                }
-            elif isinstance(participant, WorkcellCapabilityParticipant):
-                sequence = CapabilitySequenceExecutor(
-                    steps=participant.steps,
-                    completed_outcome=participant.completed_signal,
-                    outcome_from=participant.signal_from,
-                )
-                output, signal = self._execute_sequence(
-                    task,
-                    run,
-                    sequence,
-                    activation,
-                )
-                payload = {"output": output, "summary": output.get("summary", "")}
-            else:
-                raise TypeError(f"unsupported Workcell participant: {type(participant).__name__}")
-            transition = next(
-                (item for item in state.transitions if item.signal == signal),
-                None,
-            )
-            if transition is None:
-                raise ValueError(
-                    f"Workcell state {state.key!r} produced undeclared signal {signal!r}"
-                )
-            terminal_outcome = executor.terminal_outcome(transition.target)
-            workcell = self.store.advance_workcell(
-                task["project_id"],
-                workcell["id"],
-                sender_key=participant.key,
-                signal=signal,
-                payload=payload,
-                receivers=transition.receivers,
-                target=transition.target,
-                terminal_outcome=terminal_outcome,
-            )
-            self.store.snapshot_workcell(task["project_id"], workcell["id"])
-            if terminal_outcome is not None:
-                for item in participants.values():
-                    session_id = item.get("agent_session_id")
-                    if session_id and item.get("lifecycle") == "column_visit":
-                        self.store.suspend_agent_session(
-                            task["project_id"], session_id, task["id"]
-                        )
-                final_output = payload.get("output")
-                if not isinstance(final_output, dict):
-                    final_output = {"value": final_output}
-                return final_output, terminal_outcome
-        terminal_outcome = executor.terminal_outcome(str(workcell["current_state"]))
-        if terminal_outcome is None:
-            raise RuntimeError("Workcell stopped outside a declared terminal")
-        output = workcell.get("output") or {}
-        final_output = output.get("output") if isinstance(output, dict) else output
-        return (
-            final_output if isinstance(final_output, dict) else {"value": final_output},
-            terminal_outcome,
-        )
 
     def _persist_wait(self, task: dict[str, Any], run: dict[str, Any], column: ColumnDefinition, request: dict[str, Any]) -> None:
         policy = column.wait_policy
@@ -826,14 +669,10 @@ class WorkflowRuntime:
         assert isinstance(column.executor, AgentExecutor)
         project = self.store.get_project(task["project_id"])
         workflow_row = self.store.get_workflow_revision(task["project_id"], task["workflow_revision_id"])
-        outcomes = {item.outcome for item in column.transitions}
-        session_key = str(column.metadata.get("agent_session_key") or "").strip()
-        session = (
-            self.store.get_or_create_agent_session(task["project_id"], task["id"], session_key)
-            if session_key else None
-        )
+        assignment = self.store.agents.assign(task, run, column)
+        session = {"id": assignment["session_id"]}
         agent_input = input_data
-        if session and self.store.agent_session_messages(task["project_id"], session["id"]):
+        if self.store.agents.session_history(task["project_id"], session["id"]):
             agent_input = self._resume_input(input_data)
         writable_path_values = resolve_references(
             column.metadata.get("writable_paths", []),
@@ -851,20 +690,21 @@ class WorkflowRuntime:
                     "workflow": {"id": workflow_row["id"], "name": workflow.name, "description": workflow.description},
                     "column": column.model_dump(mode="json"),
                     "input": agent_input,
-                    "action_ledger": prior_action_ledger or [],
+                    "action_ledger": self._column_action_ledger(task["project_id"], run["id"]) + (prior_action_ledger or []),
                 },
                 capability_ids=column.executor.capabilities,
                 task_id=task["id"],
                 column_run_id=run["id"],
                 column_attempt_id=run["attempt_id"],
-                completion_outcomes=outcomes,
-                completion_targets={
-                    transition.outcome: transition.target
-                    for transition in column.transitions
-                },
-                output_contract=column.output_contract,
+                execution_control=ExecutionControl(
+                    time.monotonic() + self.policy.execution.agent_wall_seconds,
+                    validate_owner=lambda: self.store.agents.assert_owner(assignment)),
+                completion_contract=_column_completion_contract(workflow, column),
                 wait_config=column.wait_policy.model_dump(mode="json") if column.wait_policy else {},
                 agent_session_id=session["id"] if session else None,
+                assignment=assignment,
+                agent_instance_id=assignment["agent_instance_id"],
+                requirement_id=assignment["requirement_id"],
                 writable_paths=(
                     tuple(str(path) for path in writable_path_values)
                     if writable_path_values is not None
@@ -882,16 +722,96 @@ class WorkflowRuntime:
                 checkpoint=result.checkpoint,
                 agent_run_id=result.agent_run_id,
             )
-        if session:
-            self.store.suspend_agent_session(task["project_id"], session["id"], task["id"])
         return dict(result.completion["output"]), str(result.completion["outcome"])
 
+    def _control(self, task):
+        return ExecutionControl(time.monotonic() + self.policy.execution.agent_wall_seconds,
+                                validate_owner=lambda: self.store.assert_execution_owner(task))
+
+    def _column_action_ledger(self, project_id, run_id):
+        """Restore execution facts across provider retry and Await continuation."""
+        with self.store.connect() as db:
+            runs = db.execute("SELECT id FROM v1_agent_runs WHERE project_id=? AND column_run_id=? ORDER BY created_at,rowid",
+                              (project_id, run_id)).fetchall()
+        ledger = []
+        seen_operations = set()
+        for row in runs:
+            after = 0
+            invocations = []
+            while True:
+                page = self.store.tool_invocations(project_id, row[0], limit=self.policy.service_limits.max_page_size,
+                                                   after_sequence=after, hydrate_payloads=True)
+                if not page:
+                    break
+                invocations.extend(page)
+                after = page[-1]["sequence"]
+            for item in invocations:
+                if item["capability"] in {"column.complete", "column.await"}:
+                    continue
+                result = ToolResult.model_validate(item["result"])
+                execution_key = (result.checkpoint or {}).get("execution_key")
+                if not execution_key and result.status == 'awaiting':
+                    with self.store.connect() as db:
+                        checkpoints = [json.loads(r[0]) for r in db.execute('SELECT checkpoint_json FROM v1_await_handles WHERE project_id=? AND run_id=?', (project_id, run_id))]
+                    matches = [cp for cp in checkpoints if cp.get('capability_result') == result.model_dump(mode='json')]
+                    if len(matches) == 1:
+                        execution_key = matches[0].get('execution_key')
+                if execution_key:
+                    if execution_key in seen_operations:
+                        continue
+                    seen_operations.add(execution_key)
+                    with self.store.connect() as db:
+                        receipt = db.execute("SELECT * FROM v1_execution_receipts WHERE project_id=? AND execution_key=?", (project_id, execution_key)).fetchone()
+                    if receipt and receipt["status"] in {"completed", "failed"}:
+                        result = ToolResult(ok=receipt["status"] == "completed", capability=item["capability"],
+                                            output=json.loads(receipt["result_json"]) if receipt["result_json"] else None,
+                                            error={"message": receipt["error"]} if receipt["error"] else None,
+                                            checkpoint=dict(result.checkpoint or {}))
+                if item["capability"] in {"project.command.run", "system.command.run"} and isinstance(result.output, dict) and result.output.get("exit_code") not in (None, 0):
+                    result = ToolResult(ok=False, capability=item["capability"], output=result.output,
+                                        error={"type": "CommandFailed", "message": "Recorded command exit code is nonzero"})
+                ledger.append(ledger_entry(row[0], item["tool_call_id"], item["capability"],
+                                           self.registry.side_effect_kind(item["capability"]), result,
+                                           arguments=item["arguments"]))
+        return ledger
+
     def reconcile_await(self, handle: dict[str, Any]) -> None:
-        task = self.store.get_task(handle["task_id"])
+        from app.v1.storage_support import new_id
+        owner = f"{self.worker_id}:{new_id('awaitowner')}"
+        task = self.store.claim_await(handle["id"], owner)
+        if task is None:
+            return
+        keeper = LeaseKeeper(self.store, task["id"], owner)
+        keeper.start()
+        try:
+            self._reconcile_claimed_await(self.store.await_handle(handle["id"]), task)
+        except ExecutionOwnershipLost:
+            log.warning("discarding stale Await execution handle=%s", handle["id"])
+        except Exception as exc:
+            code = getattr(exc, "error_code", None) or llm_error_code(exc, default=type(exc).__name__)
+            category = getattr(exc, "error_category", "runtime_permanent")
+            if is_recoverable_llm_error(exc) or category in {"provider_transient", "tool_transient", "infrastructure_transient"}:
+                self.store.recovery_manager.retry_await_operation(
+                    task, handle["id"], f"{type(exc).__name__}: {exc}",
+                    error_code=code, error_category="provider_transient" if is_recoverable_llm_error(exc) else category,
+                )
+                return
+            self.store.recovery_manager.block_runtime_failure(
+                task, handle["run_id"], f"{type(exc).__name__}: {exc}",
+                error_code=code, error_category=category,
+            )
+            raise
+        finally:
+            keeper.stop()
+            self.store.release_await_claim(task)
+
+    def _reconcile_claimed_await(self, handle, task):
         workflow = self.store.workflow_by_id(task["project_id"], task["workflow_revision_id"])
         column = workflow.column(handle["column_key"])
         now = datetime.now(timezone.utc)
-        if handle["waiting_kind"] == "timer":
+        if "resolved_external" in handle["checkpoint"]:
+            payload = handle["checkpoint"]["resolved_external"]
+        elif handle["waiting_kind"] == "timer":
             payload = {"status": "succeeded", "output": {"resumed_at": now.isoformat(timespec="milliseconds")}}
         elif handle["waiting_kind"] == "event":
             event = self.store.correlated_event(
@@ -900,7 +820,7 @@ class WorkflowRuntime:
             if event is None:
                 if not isinstance(column.wait_policy, EventWaitPolicy):
                     raise ValueError("await handle is not backed by an event wait policy")
-                self.store.settle_await_handle(handle["id"], "pending", {"status": "waiting_for_event"}, next_check_seconds=column.wait_policy.check_interval_seconds)
+                self.store.settle_await_handle(handle["id"], "pending", {"status": "waiting_for_event"}, next_check_seconds=column.wait_policy.check_interval_seconds, expected_task=task)
                 return
             event_data = event["data"]
             payload = {"status": "succeeded", "output": event_data.get("output") or {}, "event_id": event["id"]}
@@ -909,26 +829,27 @@ class WorkflowRuntime:
             try:
                 result = self.registry.dispatch(
                     handle["poll_capability"], handle["poll_arguments"],
-                    CapabilityContext(project_id=task["project_id"], project=project, store=self.store, task_id=task["id"], column_run_id=handle["run_id"], execution_key=f"{handle['id']}:poll:{handle['next_check_at']}"),
+                    CapabilityContext(project_id=task["project_id"], project=project, store=self.store, task_id=task["id"], column_run_id=handle["run_id"], execution_key=f"{handle['id']}:poll:{handle['next_check_at']}", execution_control=self._control(task)),
                 )
+            except (ExecutionOwnershipLost, ExecutionBudgetExceeded, ExecutionReplayUncertain):
+                raise
             except Exception as exc:  # noqa: BLE001
                 error_code = llm_error_code(exc, default=type(exc).__name__)
                 recoverable = is_recoverable_llm_error(exc) or is_recoverable_llm_error_code(error_code)
-                self.store.resolve_await_failure(
-                    handle["id"],
-                    {
-                        "status": "failed",
-                        "error": {"type": type(exc).__name__, "message": str(exc), "code": error_code},
-                    },
-                    recoverable=recoverable,
-                    error_code=error_code,
-                    error_category="provider_transient" if recoverable else "external_permanent",
+                if not recoverable:
+                    raise
+                self.store.recovery_manager.retry_await_operation(
+                    task, handle["id"], f"{type(exc).__name__}: {exc}",
+                    error_code=error_code, error_category="provider_transient",
                 )
                 return
             if result.status == "failed":
-                payload = {"status": "failed", "error": result.error or {"type": "PollFailed"}}
+                error = result.error or {"type": "PollFailed"}
+                code = str(error.get("code") or error.get("type") or "PollFailed")
+                transient = is_recoverable_llm_error_code(code) or "transient" in code.casefold()
+                raise RuntimeExecutionError(str(error), "tool_transient" if transient else "capability_permanent", error_code=code)
             elif result.status != "completed":
-                self.store.settle_await_handle(handle["id"], "pending", {"error": result.error or {"type": "PollNotCompleted"}}, next_check_seconds=self._poll_interval(column))
+                self.store.settle_await_handle(handle["id"], "pending", {"error": result.error or {"type": "PollNotCompleted"}}, next_check_seconds=self._poll_interval(column), expected_task=task)
                 return
             else:
                 payload = result.output if isinstance(result.output, dict) else {"value": result.output}
@@ -937,7 +858,7 @@ class WorkflowRuntime:
         state = str(payload.get("status") or "succeeded").lower()
         successful = set((handle.get("resume_condition") or {}).get("status_in") or ["succeeded", "done", "complete"])
         if state in {"pending", "running", "queued", "processing"} or state not in successful | {"failed", "error", "cancelled"}:
-            self.store.settle_await_handle(handle["id"], "pending", payload, next_check_seconds=self._poll_interval(column))
+            self.store.settle_await_handle(handle["id"], "pending", payload, next_check_seconds=self._poll_interval(column), expected_task=task)
             return
         if state in {"failed", "error", "cancelled"}:
             error_value = payload.get("error") if isinstance(payload.get("error"), dict) else {}
@@ -960,17 +881,26 @@ class WorkflowRuntime:
             self.store.resolve_await_failure(
                 handle["id"],
                 payload,
+                expected_task=task,
                 recoverable=recoverable,
                 error_code=error_code,
                 error_category=error_category if recoverable else "external_permanent",
             )
             return
         awaited_output = payload.get("output") if isinstance(payload.get("output"), dict) else payload
+        self.store.checkpoint_await(task, handle["id"], "resolved_external", payload)
         try:
-            output, outcome = self._resume_awaited_execution(task, workflow, column, handle, awaited_output)
+            resumed = handle["checkpoint"].get("resumed_completion")
+            if resumed:
+                output, outcome = resumed["output"], resumed["outcome"]
+            else:
+                output, outcome = self._resume_awaited_execution(task, workflow, column, handle, awaited_output)
+                self.store.checkpoint_await(task, handle["id"], "resumed_completion", {"output": output, "outcome": outcome})
         except WaitRequested as requested:
-            self._persist_wait(task, {"id": handle["run_id"], "attempt_id": handle["column_attempt_id"]}, column, requested.request)
-            self.store.settle_await_handle(handle["id"], "succeeded", payload)
+            with self.store.tx(immediate=True):
+                self.store.assert_execution_owner(task)
+                self._persist_wait(task, {"id": handle["run_id"], "attempt_id": handle["column_attempt_id"]}, column, requested.request)
+                self.store.settle_await_handle(handle["id"], "succeeded", payload)
             return
         validate_contract(output, column.output_contract, label=f"Column {column.key} awaited output")
         transition = next((item for item in column.transitions if item.outcome == outcome), None)
@@ -979,8 +909,10 @@ class WorkflowRuntime:
         context = dict(task["context"])
         context[column.key] = output
         self._await_auxiliary(task, handle, "cleanup")
-        self.store.settle_await_handle(handle["id"], "succeeded", payload)
-        self._finish_await_transition(task, handle["run_id"], workflow, transition.target, {**output, "context": context}, outcome)
+        with self.store.tx(immediate=True):
+            self.store.assert_execution_owner(task)
+            self.store.settle_await_handle(handle["id"], "succeeded", payload)
+            self._finish_await_transition(task, handle["run_id"], workflow, transition.target, {**output, "context": context}, outcome)
 
     def _resume_awaited_execution(
         self,
@@ -992,9 +924,11 @@ class WorkflowRuntime:
     ) -> tuple[dict[str, Any], str]:
         checkpoint = dict(handle.get("checkpoint") or {})
         if checkpoint.get("execution_key"):
-            self.store.complete_awaiting_receipt(
-                task["project_id"], str(checkpoint["execution_key"]), awaited_output
-            )
+            with self.store.tx(immediate=True) as db:
+                self.store.assert_execution_owner(task, db=db)
+                self.store.complete_awaiting_receipt(
+                    task["project_id"], str(checkpoint["execution_key"]), awaited_output
+                )
         source = str(checkpoint.get("source") or "agent")
         run = {"id": handle["run_id"], "attempt_id": handle["column_attempt_id"]}
         if source == "sequence":
@@ -1025,7 +959,7 @@ class WorkflowRuntime:
                 },
             )
             resume_ledger = [
-                _ledger_entry(
+                ledger_entry(
                     str(handle["run_id"]),
                     f"await-resume-{handle['id']}",
                     resume_capability,
@@ -1094,8 +1028,10 @@ class WorkflowRuntime:
         project = self.store.get_project(task["project_id"])
         result = self.registry.dispatch(
             capability, handle.get(f"{kind}_arguments") or {},
-            CapabilityContext(project_id=task["project_id"], project=project, store=self.store, task_id=task["id"], column_run_id=handle["run_id"], execution_key=f"{handle['id']}:{kind}"),
+            CapabilityContext(project_id=task["project_id"], project=project, store=self.store, task_id=task["id"], column_run_id=handle["run_id"], execution_key=f"{handle['id']}:{kind}", execution_control=self._control(task)),
         )
+        if not result.ok or result.status != "completed":
+            raise RuntimeExecutionError(f"Await {kind} did not complete: {result.error}", "capability_permanent")
         return result.model_dump(mode="json")
 
 
@@ -1108,6 +1044,7 @@ class LeaseKeeper:
         self.lease_seconds = lease_seconds or store.policy.scheduling.task_lease_seconds
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self.generation = store.get_task(task_id)["state_version"]
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._loop, name=f"lease-{self.task_id[-8:]}", daemon=True)
@@ -1120,7 +1057,12 @@ class LeaseKeeper:
 
     def _loop(self) -> None:
         while not self._stop.wait(self.interval):
-            if not self.store.renew_lease(self.task_id, self.owner, self.lease_seconds):
+            try:
+                if not self.store.renew_lease(self.task_id, self.owner, self.lease_seconds):
+                    return
+            except Exception:
+                self.store._revoked_owners.add((self.task_id, self.owner, self.generation))
+                log.exception("lease renewal failed task=%s; execution revoked", self.task_id)
                 return
 
 
@@ -1137,7 +1079,8 @@ class RuntimeSupervisor:
         self.store = store
         self.registry = registry
         self.interval = interval or store.policy.scheduling.supervisor_interval_seconds
-        self.executor = ThreadPoolExecutor(max_workers=max(1, workers or store.policy.scheduling.runtime_workers), thread_name_prefix="devwerk-v1")
+        self.workers = max(1, workers or store.policy.scheduling.runtime_workers)
+        self.executor = ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="devwerk-v1")
         self.worker_id = f"runtime-{id(self):x}"
         self.runtime = WorkflowRuntime(store, registry, self.worker_id, agent_core)
         self._stop = threading.Event()
@@ -1146,6 +1089,8 @@ class RuntimeSupervisor:
         self._active: set[str] = set()
         self._active_await: set[str] = set()
         self._lock = threading.Lock()
+        self.last_successful_tick: str | None = None
+        self.last_exception: str | None = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -1165,34 +1110,67 @@ class RuntimeSupervisor:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            for handle in self.store.due_await_handles():
-                with self._lock:
-                    if handle["id"] in self._active_await:
-                        continue
-                    self._active_await.add(handle["id"])
-                future = self.executor.submit(self.runtime.reconcile_await, handle)
-                future.add_done_callback(lambda item, value=handle["id"]: self._await_done(value, item))
-            for task_id in self.store.runnable_task_ids():
-                with self._lock:
-                    if task_id in self._active:
-                        continue
-                    self._active.add(task_id)
-                future = self.executor.submit(self.runtime.step, task_id)
-                future.add_done_callback(lambda item, value=task_id: self._done(value, item))
+            try:
+                self._tick()
+                self.last_successful_tick = datetime.now(timezone.utc).isoformat()
+                self.last_exception = None
+            except Exception as exc:
+                self.last_exception = f"{type(exc).__name__}: {exc}"
+                log.exception("supervisor tick failed; retrying next tick")
             self._wake.wait(self.interval)
             self._wake.clear()
+
+    def _tick(self) -> None:
+        for handle in self.store.due_await_handles():
+            with self._lock:
+                if len(self._active) + len(self._active_await) >= self.workers:
+                    break
+                if handle["id"] in self._active_await:
+                    continue
+                self._active_await.add(handle["id"])
+            try:
+                future = self.executor.submit(self.runtime.reconcile_await, handle)
+            except Exception:
+                with self._lock:
+                    self._active_await.discard(handle["id"])
+                raise
+            future.add_done_callback(lambda item, value=handle["id"]: self._await_done(value, item))
+        for task_id in self.store.runnable_task_ids():
+            with self._lock:
+                if len(self._active) + len(self._active_await) >= self.workers:
+                    break
+                if task_id in self._active:
+                    continue
+                self._active.add(task_id)
+            try:
+                future = self.executor.submit(self.runtime.step, task_id)
+            except Exception:
+                with self._lock:
+                    self._active.discard(task_id)
+                raise
+            future.add_done_callback(lambda item, value=task_id: self._done(value, item))
+
+    def health(self) -> dict[str, Any]:
+        return {"running": bool(self._thread and self._thread.is_alive()),
+                "last_successful_tick": self.last_successful_tick, "last_exception": self.last_exception}
 
     def _done(self, task_id: str, future: Any) -> None:
         with self._lock:
             self._active.discard(task_id)
         self.wake()
-        future.result()
+        try:
+            future.result()
+        except Exception:
+            log.exception("runtime worker stopped task=%s", task_id)
 
     def _await_done(self, handle_id: str, future: Any) -> None:
         with self._lock:
             self._active_await.discard(handle_id)
         self.wake()
-        future.result()
+        try:
+            future.result()
+        except Exception:
+            log.exception("Await worker stopped handle=%s", handle_id)
 
 
 def _failure_message(output: dict[str, Any]) -> str:
@@ -1200,4 +1178,34 @@ def _failure_message(output: dict[str, Any]) -> str:
         error = step.get("error") if isinstance(step, dict) else None
         if isinstance(error, dict) and error.get("message"):
             return f"{error.get('type')}: {error['message']}"
-    return str(output.get("summary") or "Column transitioned to failed")
+    for key in ("summary", "reason", "failure_reason", "error", "message"):
+        detail = output.get(key)
+        if isinstance(detail, str) and detail.strip():
+            return detail.strip()
+    return "Column transitioned to failed"
+
+
+def _column_completion_contract(
+    workflow: WorkflowDefinition,
+    column: ColumnDefinition,
+) -> CompletionContract:
+    rules: dict[str, CompletionOutcomeRule] = {}
+    for transition in column.transitions:
+        terminal_failure = workflow.terminal_kind(transition.target) == "failed"
+        rules[transition.outcome] = CompletionOutcomeRule(
+            target=transition.target,
+            evidence_requirement=(
+                transition.evidence_requirement
+                or "optional"
+            ),
+            allows_unresolved_failures=(
+                transition.allows_unresolved_failures or terminal_failure
+            ),
+        )
+    return CompletionContract(
+        tool_name="column.complete",
+        outcomes=rules,
+        output_schema=column.output_contract,
+        evidence_collection="runtime",
+        acceptance_checks=tuple(check.model_dump() for check in column.acceptance_checks),
+    )

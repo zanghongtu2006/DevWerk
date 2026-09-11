@@ -19,7 +19,7 @@ loops/
 
 `loop.json` is the executable declarative bundle. It contains `schema_version=devwerk.loop.bundle.v1`, a parameter schema, defaults, a reusable Workflow Plan, and a Workflow graph. It contains no concrete Task definitions or fixed Task portfolio. Inspecting or applying a Loop loads and validates this file. A digest over both files identifies the exact source used for materialization.
 
-From v0.1.0, a Loop may declare a generic `workcell` Column executor. Participant identities, lifecycle, inner states, typed feedback, domain instructions, and evidence contracts remain Loop data; Runtime only interprets the domain-neutral collaboration graph.
+From v0.1.0, every Column executes at most one logical Agent or one deterministic capability sequence. Participant identities and business roles remain Loop instructions; multi-Agent collaboration and typed feedback are expressed as ordinary Columns and explicit directed Workflow transitions.
 
 Loop discovery scans the filesystem on each request so edits become visible without copying definitions into SQLite or restarting the service. The directory is the sole source of bundled initial Workflow definitions.
 

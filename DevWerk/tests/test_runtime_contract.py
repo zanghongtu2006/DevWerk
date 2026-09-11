@@ -14,6 +14,7 @@ from app.services.provider_errors import (
 )
 from app.v1.agent import AgentCore, AgentRunSpec
 from app.v1.capabilities import build_core_registry
+from app.v1.completion_protocol import CompletionContract, CompletionOutcomeRule
 from app.v1.domain import (
     AgentModelResponse,
     AgentToolCall,
@@ -151,8 +152,10 @@ def test_runtime_separates_accepted_working_and_reference_artifact_provenance(st
         item["path"]
         for item in store.accepted_dependency_artifacts(project["id"], current["id"])
     } >= {"prior.md", "tampered.md"}
-    assert [item["path"] for item in context["accepted_artifacts"]] == ["prior.md"]
-    assert context["accepted_artifacts"][0]["provenance"] == "accepted_dependency"
+    accepted = {item["path"]: item for item in context["accepted_artifacts"]}
+    assert set(accepted) == {"prior.md", "tampered.md"}
+    assert all(item["provenance"] == "accepted_dependency" for item in accepted.values())
+    assert accepted["tampered.md"]["content"].encode("utf-8") == tampered_bytes
     assert [item["path"] for item in context["working_artifacts"]] == ["draft.md"]
     assert context["working_artifacts"][0]["provenance"] == "current_task"
     assert [item["path"] for item in context["reference_artifacts"]] == ["stale.md"]
@@ -163,7 +166,7 @@ def test_runtime_separates_accepted_working_and_reference_artifact_provenance(st
     assert {
         (item["path"], item["reason"])
         for item in context["context_manifest"]["excluded_artifacts"]
-    } == {("tampered.md", "registered_hash_mismatch")}
+    } == set()
 
 
 def test_each_completed_column_makes_the_next_column_runnable(store, tmp_path):
@@ -289,10 +292,11 @@ def test_provider_timeout_recovers_same_task_and_column(store, tmp_path):
     assert "task.recovery_started" in event_types
     assert "task.recovered" in event_types
     assert event_types[-1] == "task.done"
-    assert [run["column_key"] for run in store.runs(project["id"], task["id"])] == ["work", "work"]
+    assert [run["column_key"] for run in store.runs(project["id"], task["id"])] == ["work"]
+    assert len(store.attempts(project["id"], task["id"])) == 2
 
 
-def test_token_limit_remains_terminal(store, tmp_path):
+def test_token_limit_blocks_runtime_without_business_terminal(store, tmp_path):
     project = store.create_project("terminal token limit", "", str(tmp_path / "project"))
     publish_planned_workflow(store, project["id"], agent_workflow())
     task = create_planned_task(store, project["id"], "must stop")
@@ -311,8 +315,10 @@ def test_token_limit_remains_terminal(store, tmp_path):
         WorkflowRuntime(store, registry, "worker", AgentCore(store, registry, model)).step(task["id"])
 
     failed = store.get_task(task["id"])
-    assert failed["status"] == "failed"
-    assert failed["terminal_artifact_id"]
+    assert failed["status"] == "recovering"
+    assert failed["control_state"] == "paused"
+    assert failed["failure_origin"] == "provider"
+    assert failed["terminal_artifact_id"] is None
     assert "task.recovering" not in [event["type"] for event in store.events(task_id=task["id"])]
 
 
@@ -517,7 +523,7 @@ def test_task_owned_exact_text_survives_reference_write_and_verification(store, 
     assert verification["output"]["actual"]["ends_with_newline"]
 
 
-def test_ephemeral_column_agent_uses_same_tool_loop_and_declared_contract(store, tmp_path):
+def test_persistent_column_worker_uses_same_tool_loop_and_declared_contract(store, tmp_path):
     project = store.create_project("agent", "", str(tmp_path / "project"))
     publish_planned_workflow(store, project["id"], agent_workflow(instruction="Handle an arbitrary deliverable."))
     task = create_planned_task(store, project["id"], "unknown domain", "do it", {"shape": "unseen"})
@@ -558,7 +564,8 @@ def test_ephemeral_column_agent_uses_same_tool_loop_and_declared_contract(store,
     runs = store.agent_runs(project_id=project["id"], task_id=task["id"])
     assert len(runs) == 1
     assert runs[0]["kind"] == "column"
-    assert runs[0]["capabilities"] == ["project.files.write", "project.files.read", "column.complete"]
+    assert runs[0]["capabilities"] == ["project.files.write", "project.files.read", "agent.context.read", "column.complete"]
+    assert runs[0]['assignment_id'] and runs[0]['agent_instance_id']
     assert [item["capability"] for item in store.tool_invocations(project["id"], runs[0]["id"])] == ["project.files.write", "column.complete"]
 
 
@@ -590,7 +597,8 @@ def test_capability_sequence_cannot_reach_done_after_failed_command(store, tmp_p
         WorkflowRuntime(store, build_core_registry(), "worker").step(task["id"])
 
     failed = store.get_task(task["id"])
-    assert failed["status"] == "failed"
+    assert failed["status"] == "recovering"
+    assert failed["control_state"] == "paused"
     assert "exited with code 9" in (failed["error"] or "")
     attempt = store.attempts(project["id"], task["id"])[0]
     assert attempt["checkpoint"]["failed_result"]["output"]["exit_code"] == 9
@@ -638,13 +646,12 @@ def test_agent_column_cannot_claim_success_from_failed_capability_evidence(store
         )])
 
     registry = build_core_registry()
-    with pytest.raises(RuntimeError, match="command exited with code 7"):
-        WorkflowRuntime(
-            store,
-            registry,
-            "worker",
-            AgentCore(store, registry, model),
-        ).step(task["id"])
+    WorkflowRuntime(
+        store,
+        registry,
+        "worker",
+        AgentCore(store, registry, model),
+    ).step(task["id"])
     assert store.get_task(task["id"])["status"] == "failed"
 
 
@@ -748,13 +755,12 @@ def test_different_successful_operation_does_not_recover_failed_column_action(st
         )])
 
     registry = build_core_registry()
-    with pytest.raises(RuntimeError, match="command exited with code 7"):
-        WorkflowRuntime(
-            store,
-            registry,
-            "worker",
-            AgentCore(store, registry, model),
-        ).step(task["id"])
+    WorkflowRuntime(
+        store,
+        registry,
+        "worker",
+        AgentCore(store, registry, model),
+    ).step(task["id"])
     assert store.get_task(task["id"])["status"] == "failed"
 
 
@@ -881,8 +887,10 @@ def test_agent_repairs_multiple_column_complete_calls_without_accepting_either(s
         instruction_revision=1,
         context={},
         capability_ids=["system.noop"],
-        completion_outcomes={"success"},
-        completion_targets={"success": "done"},
+        completion_contract=CompletionContract(
+            tool_name="column.complete",
+            outcomes={"success": CompletionOutcomeRule(target="done")},
+        ),
     ))
 
     assert result.status == "succeeded"
@@ -937,8 +945,16 @@ def test_agent_repairs_column_complete_combined_with_await(store, tmp_path):
         instruction_revision=1,
         context={},
         capability_ids=["system.noop"],
-        completion_outcomes={"failure"},
-        completion_targets={"failure": "failed"},
+        completion_contract=CompletionContract(
+            tool_name="column.complete",
+            outcomes={
+                "failure": CompletionOutcomeRule(
+                    target="failed",
+                    evidence_requirement="optional",
+                    allows_unresolved_failures=True,
+                )
+            },
+        ),
         wait_config={"poll_capability": "system.noop"},
     ))
 
@@ -968,7 +984,8 @@ def test_agent_can_repair_invalid_column_complete_arguments(store, tmp_path):
                 ),
             ])
         failed_completion = json.loads(messages[-1]["content"])
-        assert failed_completion["error"]["message"] == "column.complete output must be an object"
+        assert "output" in failed_completion["error"]["message"]
+        assert "not of type 'object'" in failed_completion["error"]["message"]
         evidence_id = json.loads(messages[-2]["content"])["evidence"]["evidence_id"]
         return AgentModelResponse(tool_calls=[AgentToolCall(
             id="repaired-complete",
@@ -989,64 +1006,14 @@ def test_agent_can_repair_invalid_column_complete_arguments(store, tmp_path):
         instruction_revision=1,
         context={},
         capability_ids=["system.noop"],
-        completion_outcomes={"success"},
-        completion_targets={"success": "done"},
+        completion_contract=CompletionContract(
+            tool_name="column.complete",
+            outcomes={"success": CompletionOutcomeRule(target="done")},
+        ),
     ))
 
     assert result.status == "succeeded"
     assert result.iterations == 2
-
-
-def test_workcell_completion_collects_action_evidence_without_model_retries(
-    store,
-    tmp_path,
-):
-    project = store.create_project(
-        "repair custom completion",
-        "",
-        str(tmp_path / "project"),
-    )
-    turn = 0
-
-    def model(messages, _tools, **_kwargs):
-        nonlocal turn
-        turn += 1
-        if turn == 1:
-            return AgentModelResponse(tool_calls=[AgentToolCall(
-                id="write",
-                name="project.files.write",
-                arguments={"path": "candidate.txt", "content": "ready"},
-            )])
-        return AgentModelResponse(tool_calls=[AgentToolCall(
-            id="participant-complete",
-            name="workcell.complete",
-            arguments={
-                "outcome": "ready",
-                "output": {},
-                "summary": "grounded",
-            },
-        )])
-
-    registry = build_core_registry()
-    result = AgentCore(store, registry, model).run(AgentRunSpec(
-        kind="column",
-        project=project,
-        instruction="",
-        instruction_revision=1,
-        context={},
-        capability_ids=["project.files.write"],
-        completion_outcomes={"ready"},
-        completion_targets={"ready": "next"},
-        completion_tool_name="workcell.complete",
-        completion_requires_evidence=True,
-        completion_auto_evidence=True,
-    ))
-
-    assert result.status == "succeeded"
-    assert result.iterations == 2
-    assert result.completion is not None
-    assert len(result.completion["evidence_ids"]) == 1
-    assert (tmp_path / "project" / "candidate.txt").read_text(encoding="utf-8") == "ready"
 
 
 def test_logical_agent_session_replays_only_latest_structured_checkpoint(store, tmp_path):
@@ -1057,7 +1024,7 @@ def test_logical_agent_session_replays_only_latest_structured_checkpoint(store, 
     session = store.get_or_create_agent_session(
         project["id"],
         task["id"],
-        "participant",
+        "column-agent",
     )
     activation = 0
 
@@ -1082,7 +1049,7 @@ def test_logical_agent_session_replays_only_latest_structured_checkpoint(store, 
             assert f"checkpoint-{activation - 2}" not in checkpoints[0]["content"]
         return AgentModelResponse(tool_calls=[AgentToolCall(
             id=f"signal-{activation}",
-            name="workcell.complete",
+            name="column.complete",
             arguments={
                 "outcome": "ready",
                 "output": {"revision": activation},
@@ -1102,10 +1069,16 @@ def test_logical_agent_session_replays_only_latest_structured_checkpoint(store, 
             capability_ids=[],
             task_id=task["id"],
             agent_session_id=session["id"],
-            completion_outcomes={"ready"},
-            completion_targets={"ready": "next"},
-            completion_tool_name="workcell.complete",
-            completion_auto_evidence=True,
+            completion_contract=CompletionContract(
+                tool_name="column.complete",
+                outcomes={
+                    "ready": CompletionOutcomeRule(
+                        target="next",
+                        evidence_requirement="optional",
+                    )
+                },
+                evidence_collection="runtime",
+            ),
         ))
         assert result.status == "succeeded"
 
@@ -1139,7 +1112,7 @@ def test_expired_task_lease_interrupts_old_attempt_and_becomes_runnable(store, t
         receipt_status = db.execute(
             "SELECT status FROM v1_execution_receipts WHERE id=?", (receipt["id"],)
         ).fetchone()[0]
-    assert receipt_status == "failed"
+    assert receipt_status == "started"
 
     reclaimed = store.claim_task(task["id"], "replacement-worker")
     assert reclaimed is not None
@@ -1147,19 +1120,22 @@ def test_expired_task_lease_interrupts_old_attempt_and_becomes_runnable(store, t
     assert resumed["id"] == run["id"]
     assert resumed["attempt_no"] == 2
 
-    stale_evidence = store.prepare_terminal_evidence(
-        claimed,
-        run["id"],
-        "failed",
-        {"summary": "late result from abandoned worker"},
-        "late result",
-    )
+    from app.v1.execution_control import ExecutionOwnershipLost
+    with pytest.raises(ExecutionOwnershipLost):
+        store.prepare_terminal_evidence(
+            claimed,
+            run["id"],
+            "failed",
+            {"summary": "late result from abandoned worker"},
+            "late result",
+        )
+    assert not (tmp_path / "project" / ".devwerk" / "terminal").exists()
     with pytest.raises(RuntimeError, match="stale Task state_version"):
         store.fail_task_from_exception(
             claimed,
             run["id"],
             "late result",
-            stale_evidence,
+            {},
         )
     fenced = store.get_task(task["id"])
     assert fenced["status"] == "running"

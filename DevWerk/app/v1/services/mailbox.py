@@ -77,14 +77,14 @@ class MailboxService:
         if mailbox_ids is None:
             rows = db.execute(
                 "SELECT id,delivery_count FROM v1_project_mailbox "
-                "WHERE project_id=? AND state='pending' ORDER BY id LIMIT ?",
+                "WHERE project_id=? AND state='pending' AND recipient_agent_id IS NULL ORDER BY id LIMIT ?",
                 (project_id, limit),
             ).fetchall()
         elif mailbox_ids:
             placeholders = ",".join("?" for _ in mailbox_ids)
             rows = db.execute(
                 f"SELECT id,delivery_count FROM v1_project_mailbox "
-                f"WHERE project_id=? AND state='pending' AND id IN ({placeholders}) ORDER BY id",
+                f"WHERE project_id=? AND state='pending' AND recipient_agent_id IS NULL AND id IN ({placeholders}) ORDER BY id",
                 [project_id, *mailbox_ids],
             ).fetchall()
         else:
@@ -269,12 +269,14 @@ class MailboxService:
         now = utcnow()
         with self.store.tx(immediate=True) as db:
             row = db.execute(
-                "SELECT state FROM v1_project_mailbox WHERE id=? AND project_id=?",
+                "SELECT state,recipient_agent_id,assignment_id FROM v1_project_mailbox WHERE id=? AND project_id=?",
                 (message_id, project_id),
             ).fetchone()
             if not row:
                 raise KeyError(message_id)
             MAILBOX_STATE_MACHINE.require(row[0], MailboxStatus.PENDING)
+            if row['recipient_agent_id']:
+                self.store.agents.validate_message_target(db, project_id, row['recipient_agent_id'], row['assignment_id'])
             db.execute(
                 "UPDATE v1_project_mailbox SET state='pending',redelivered_at=?,last_error=NULL,"
                 "last_delivery_job_id=NULL,delivered_at=NULL,received_at=NULL,failed_at=NULL,"

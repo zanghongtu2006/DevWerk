@@ -80,11 +80,14 @@ def not_found(exc: KeyError) -> HTTPException:
 def health(request: Request) -> dict[str, Any]:
     with store(request).connect() as db:
         db.execute("SELECT 1").fetchone()
+    runtime_health = supervisor(request).health()
+    gateway_health = request.app.state.v1_conversation.status()
     return {
-        "status": "ok",
+        "status": "ok" if runtime_health["running"] and gateway_health["status"] == "running" else "degraded",
         "runtime": "devwerk-v1",
-        "supervisor": "running",
-        "conversation_gateway": request.app.state.v1_conversation.status(),
+        "supervisor": "running" if runtime_health["running"] else "stopped",
+        "supervisor_health": runtime_health,
+        "conversation_gateway": gateway_health,
     }
 
 
@@ -385,10 +388,6 @@ def get_task(project_id: str, task_id: str, request: Request) -> dict[str, Any]:
         task["attempts"] = store(request).attempts(project_id, task_id)
         task["artifacts"] = store(request).artifacts(project_id, task_id)
         task["agent_runs"] = store(request).agent_runs(project_id=project_id, task_id=task_id, limit=DETAIL_PAGE)
-        task["workcells"] = store(request).workcells(project_id, task_id=task_id)
-        for workcell in task["workcells"]:
-            workcell["participants"] = store(request).workcell_participants(project_id, workcell["id"])
-            workcell["handoffs"] = store(request).workcell_handoffs(project_id, workcell["id"])
         return task
     except KeyError as exc:
         raise not_found(exc) from exc
@@ -463,30 +462,6 @@ def get_agent_run(project_id: str, agent_run_id: str, request: Request, after_se
         run["messages"] = store(request).agent_messages(project_id, agent_run_id, limit, after_sequence)
         run["tool_invocations"] = store(request).tool_invocations(project_id, agent_run_id, limit, after_sequence)
         return run
-    except KeyError as exc:
-        raise not_found(exc) from exc
-
-
-@router.get("/projects/{project_id}/workcells")
-def project_workcells(
-    project_id: str,
-    request: Request,
-    task_id: str | None = None,
-) -> list[dict[str, Any]]:
-    try:
-        store(request).get_project(project_id)
-        return store(request).workcells(project_id, task_id=task_id)
-    except KeyError as exc:
-        raise not_found(exc) from exc
-
-
-@router.get("/projects/{project_id}/workcells/{workcell_id}")
-def get_workcell(project_id: str, workcell_id: str, request: Request) -> dict[str, Any]:
-    try:
-        value = store(request).get_workcell(project_id, workcell_id)
-        value["participants"] = store(request).workcell_participants(project_id, workcell_id)
-        value["handoffs"] = store(request).workcell_handoffs(project_id, workcell_id)
-        return value
     except KeyError as exc:
         raise not_found(exc) from exc
 

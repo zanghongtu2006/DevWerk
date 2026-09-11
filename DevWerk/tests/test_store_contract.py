@@ -177,6 +177,7 @@ def test_failed_mailbox_requires_explicit_redelivery_and_keeps_attempt_history(s
         store._mailbox(db, project["id"], "task.failed", None, None, {"reason": "provider unavailable"})
     mailbox_id = store.mailbox(project["id"])[0]["id"]
     first_job_id = store.enqueue_governance_jobs()[0]
+    assert store.get_conversation_job(first_job_id)["start_task"] is False
     assert store.claim_conversation_job(first_job_id, "first-owner") is not None
     store.fail_conversation_job(first_job_id, "LLM_USAGE_LIMIT")
 

@@ -1,0 +1,405 @@
+{
+  "schema_version": "devwerk.loop.bundle.v1",
+  "parameter_schema": {
+    "type": "object",
+    "required": ["strategy_script", "config_file", "output_dir"],
+    "properties": {
+      "strategy_script": {
+        "type": "string",
+        "description": "策略入口脚本路径"
+      },
+      "config_file": {
+        "type": "string",
+        "description": "参数配置文件路径"
+      },
+      "output_dir": {
+        "type": "string",
+        "description": "回测输出目录"
+      },
+      "run_history_path": {
+        "type": "string",
+        "description": "历史记录文件路径"
+      },
+      "optimization_params": {
+        "type": "object",
+        "description": "优化参数配置",
+        "properties": {
+          "target_metric": {
+            "type": "string",
+            "description": "优化目标指标"
+          },
+          "max_iterations": {
+            "type": "integer",
+            "description": "最大迭代次数"
+          },
+          "patience": {
+            "type": "integer",
+            "description": "连续无改善轮次阈值"
+          },
+          "target_threshold": {
+            "type": ["number", "null"],
+            "description": "目标阈值（null表示无固定阈值）"
+          },
+          "max_drawdown_threshold": {
+            "type": "number",
+            "description": "最大回撤容忍阈值"
+          },
+          "adjustable_factors": {
+            "type": "array",
+            "description": "可调整的因子列表",
+            "items": {"type": "string"}
+          }
+        }
+      }
+    },
+    "additionalProperties": false
+  },
+  "bundle": {
+    "defaults": {
+      "strategy_script": "量化多因子回测系统/main.py",
+      "config_file": "量化多因子回测系统/config.yaml",
+      "output_dir": "量化多因子回测系统/report",
+      "run_history_path": "optimization/run_history.json",
+      "optimization_params": {
+        "target_metric": "annual_return",
+        "max_iterations": 15,
+        "patience": 3,
+        "target_threshold": null,
+        "max_drawdown_threshold": 0.3,
+        "adjustable_factors": ["momentum", "volatility", "turnover", "size", "value", "quality"]
+      }
+    },
+    "workflow_plan": {
+      "schema_version": "devwerk.workflow-plan.v1",
+      "intent_summary": "通过 LLM 引导的参数搜索，对量化策略进行多轮回测优化，找到最优参数配置并生成对比报告。",
+      "completion_definition": "完成所有迭代后，交付最优配置文件、所有轮次历史记录、以及对比分析报告。",
+      "flow_unit": "一次量化策略参数优化迭代，包含参数分析、调整、回测、评估四个步骤，形成一个完整的优化循环。",
+      "lifecycle_summary": "从基线回测开始，每次迭代分析历史结果，决定参数调整方向，运行回测，评估是否满足终止条件，直到找到最优解或达到最大迭代次数。",
+      "entry_meaning": "输入策略脚本、配置文件路径和优化参数，开始参数优化流程。",
+      "terminal_meaning": "达到终止条件（目标阈值、最大迭代次数或收敛）后，交付最优配置和对比报告。",
+      "task_contract": {
+        "identity_pointer": "/iteration",
+        "input_schema": {
+          "type": "object",
+          "required": ["iteration"],
+          "properties": {
+            "iteration": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "required_context": [],
+        "expected_outputs": ["更新的 run_history.json", "最优配置文件 best_config.yaml", "对比报告 comparison_report.md"],
+        "acceptance_contract": ["每次迭代后 run_history.json 被更新", "最终交付物包含所有三个文件", "最优配置的 metrics 优于或等于历史最佳"]
+      },
+      "columns": [
+        {
+          "key": "analyze",
+          "responsibility": "解析配置文件，提取可调参数及约束，运行基线回测，记录初始指标。当 iteration=0 时执行。",
+          "execution_mode": "agent",
+          "entry_evidence": ["配置文件存在", "策略脚本存在"],
+          "exit_evidence": ["参数清单已提取", "基线回测已完成", "metrics.csv 已生成"],
+          "context_boundary": "只负责参数解析和基线回测，不涉及参数调整决策。",
+          "review_or_rework_role": "检查参数提取是否完整，基线回测是否成功。"
+        },
+        {
+          "key": "tune",
+          "responsibility": "分析历史回测结果，LLM 决定本轮参数调整方向，生成新的配置文件。只在 iteration > 0 时执行。",
+          "execution_mode": "agent",
+          "entry_evidence": ["run_history.json 存在", "包含上一轮结果"],
+          "exit_evidence": ["新的 config.yaml 已生成", "参数调整有明确依据"],
+          "context_boundary": "只负责参数调整决策，不执行回测。调整需要基于历史数据的分析。",
+          "review_or_rework_role": "检查参数调整是否合理，是否避免重复已尝试的组合。"
+        },
+        {
+          "key": "backtest",
+          "responsibility": "运行回测脚本，解析 metrics.csv，记录本轮结果。",
+          "execution_mode": "agent",
+          "entry_evidence": ["config.yaml 存在"],
+          "exit_evidence": ["metrics.csv 已生成", "结果已记录到 run_history"],
+          "context_boundary": "执行回测命令，解析输出，不做参数调整决策。",
+          "review_or_rework_role": "检查回测是否成功，指标是否在合理范围内。"
+        },
+        {
+          "key": "evaluate",
+          "responsibility": "评估本轮回测结果，检查终止条件，决定是否继续迭代。",
+          "execution_mode": "agent",
+          "entry_evidence": ["本轮 metrics 已记录"],
+          "exit_evidence": ["终止决策已做出", "继续或进入 deliver"],
+          "context_boundary": "基于当前和历史结果做终止决策，不执行回测。",
+          "review_or_rework_role": "检查终止条件判断是否正确。"
+        },
+        {
+          "key": "deliver",
+          "responsibility": "汇总所有轮次结果，生成最优配置和对比报告。",
+          "execution_mode": "agent",
+          "entry_evidence": ["所有迭代已完成"],
+          "exit_evidence": ["best_config.yaml 已生成", "comparison_report.md 已生成", "metrics_summary.csv 已生成"],
+          "context_boundary": "只负责生成交付物，不执行新的回测。",
+          "review_or_rework_role": "检查报告内容是否完整准确。"
+        }
+      ],
+      "lifecycle_walkthrough": [
+        {
+          "column_key": "analyze",
+          "receives": ["strategy_script", "config_file", "output_dir", "iteration=0"],
+          "action": "解析 config.yaml，识别可调参数（因子参数和权重），运行基线回测（iteration=0时），解析 metrics.csv，记录初始指标到 run_history.json。",
+          "produces": ["参数清单", "基线回测指标"],
+          "completion_evidence": ["参数清单包含所有可调参数及约束", "metrics.csv 存在且可解析"],
+          "outcome": "continue_to_tune"
+        },
+        {
+          "column_key": "tune",
+          "receives": ["run_history", "当前参数配置"],
+          "action": "分析历史回测结果（iteration>0时），识别表现最好和最差的参数组合，LLM 决定本轮参数调整方向（优先调整因子权重和窗口参数），生成新的 config.yaml。",
+          "produces": ["新的 config.yaml"],
+          "completion_evidence": ["config.yaml 已更新", "参数调整有历史数据支撑"],
+          "outcome": "continue_to_backtest"
+        },
+        {
+          "column_key": "backtest",
+          "receives": ["config.yaml"],
+          "action": "运行 python main.py --config config.yaml，等待回测完成，解析 output_dir/metrics.csv，提取关键指标（annual_return, sharpe, max_drawdown 等），将结果追加到 run_history。",
+          "produces": ["本轮 metrics", "更新的 run_history"],
+          "completion_evidence": ["回测命令执行成功", "metrics.csv 存在且格式正确"],
+          "outcome": "continue_to_evaluate"
+        },
+        {
+          "column_key": "evaluate",
+          "receives": ["run_history", "optimization_params"],
+          "action": "检查终止条件：(1) 达到目标阈值 (2) 达到最大迭代次数 (3) 连续 N 轮无显著改善。如果满足任一条件，进入 deliver；否则返回 tune 继续迭代。",
+          "produces": ["终止决策"],
+          "completion_evidence": ["终止条件已检查", "决策有明确依据"],
+          "outcome": "deliver_or_continue"
+        },
+        {
+          "column_key": "deliver",
+          "receives": ["run_history"],
+          "action": "遍历 run_history，找到最优参数组合（基于 target_metric），复制对应 config 为 best_config.yaml，生成 comparison_report.md 和 metrics_summary.csv。",
+          "produces": ["best_config.yaml", "comparison_report.md", "metrics_summary.csv"],
+          "completion_evidence": ["所有交付物已生成", "最优解已确认"],
+          "outcome": "success"
+        }
+      ],
+      "wip_group": "quant-optimization",
+      "wip_limit": 1,
+      "wip_decision": "每次只运行一个迭代任务，前一个迭代完成后才能开始下一个。",
+      "concurrency_groups": [],
+      "serialization_reasons": ["回测结果需要按顺序积累供后续分析", "避免并发回测占用过多资源"],
+      "progress_evidence": ["run_history.json 记录每次迭代结果", "最优指标持续更新"],
+      "review_points": ["基线回测是否成功", "参数调整是否有依据", "终止条件判断是否正确", "交付物是否完整"],
+      "intervention_conditions": ["回测连续失败 3 次", "发现异常参数值", "用户手动要求停止"],
+      "self_check": {
+        "every_task_can_start_at_entry": true,
+        "every_column_applies_to_every_task": true,
+        "columns_are_process_stages_not_work_slices": true,
+        "tasks_are_independently_reviewable": true,
+        "context_handoffs_are_explicit": true,
+        "concurrency_conflicts_are_declared": true,
+        "terminal_and_rework_paths_are_explicit": true
+      }
+    },
+    "workflow": {
+      "schema_version": "devwerk.workflow.v1",
+      "name": "量化策略参数优化工作流",
+      "description": "通过 LLM 引导的参数搜索，对量化策略进行多轮回测优化，找到最优参数配置并生成对比报告。",
+      "entry": "analyze",
+      "terminals": {
+        "success": "done",
+        "failure": "failed"
+      },
+      "columns": [
+        {
+          "key": "analyze",
+          "name": "参数分析与基线回测",
+          "instruction": "读取策略脚本和配置文件，解析可调参数（因子参数如 window、因子权重 weight），运行基线回测，解析 output_dir/metrics.csv，记录初始指标到 run_history.json。生成参数清单，包含每个可调参数的名称、当前值、约束范围。当 iteration=0 时执行此步骤。完成后 complete continue_to_tune；执行失败 complete execution_failed。",
+          "executor": {
+            "kind": "agent",
+            "capabilities": [
+              "project.files.list",
+              "project.files.read",
+              "project.files.search",
+              "project.files.write",
+              "project.command.run",
+              "system.noop"
+            ]
+          },
+          "context": {
+            "include_project": true,
+            "include_task": true,
+            "include_loop_bindings": true,
+            "include_current_goal": true,
+            "upstream_outputs": [],
+            "artifact_globs": []
+          },
+          "input_contract": {},
+          "output_contract": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "transitions": [
+            {"outcome": "continue_to_tune", "target": "tune"},
+            {"outcome": "execution_failed", "target": "failed"}
+          ],
+          "metadata": {
+            "purpose": "建立基线和参数清单",
+            "derives_agent": true,
+            "writable_paths": ["optimization/run_history.json", "optimization/parameters.json"]
+          }
+        },
+        {
+          "key": "tune",
+          "name": "LLM 参数调整决策",
+          "instruction": "分析 run_history.json 中的历史回测结果，识别表现最好和最差的参数组合。LLM 决定本轮参数调整方向：优先调整因子权重（weight）和窗口参数（window）。生成新的 config.yaml，避免重复已尝试的组合。只在 iteration > 0 时执行。完成后 complete continue_to_backtest；无有效调整方向 complete no_improvement；执行失败 complete execution_failed。",
+          "executor": {
+            "kind": "agent",
+            "capabilities": [
+              "project.files.list",
+              "project.files.read",
+              "project.files.search",
+              "project.files.write",
+              "project.memory.read",
+              "project.memory.search"
+            ]
+          },
+          "context": {
+            "include_project": true,
+            "include_task": true,
+            "include_loop_bindings": true,
+            "include_current_goal": true,
+            "upstream_outputs": ["analyze", "backtest", "evaluate"],
+            "artifact_globs": []
+          },
+          "input_contract": {},
+          "output_contract": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "transitions": [
+            {"outcome": "continue_to_backtest", "target": "backtest"},
+            {"outcome": "no_improvement", "target": "evaluate"},
+            {"outcome": "execution_failed", "target": "failed"}
+          ],
+          "metadata": {
+            "purpose": "基于历史数据做出参数调整决策",
+            "derives_agent": true,
+            "writable_paths": ["量化多因子回测系统/config.yaml"]
+          }
+        },
+        {
+          "key": "backtest",
+          "name": "执行回测",
+          "instruction": "运行 python main.py --config config.yaml，等待回测完成。解析 output_dir/metrics.csv，提取 annual_return, sharpe, max_drawdown, calmar, win_rate, turnover_avg 等指标。将本轮结果追加到 run_history.json，包含 iteration、参数快照、metrics 和 timestamp。完成后 complete continue_to_evaluate；回测失败 complete backtest_failed；执行失败 complete execution_failed。",
+          "executor": {
+            "kind": "agent",
+            "capabilities": [
+              "project.files.list",
+              "project.files.read",
+              "project.files.search",
+              "project.files.write",
+              "project.command.run",
+              "system.noop"
+            ]
+          },
+          "context": {
+            "include_project": true,
+            "include_task": true,
+            "include_loop_bindings": true,
+            "include_current_goal": true,
+            "upstream_outputs": ["analyze", "tune", "evaluate"],
+            "artifact_globs": []
+          },
+          "input_contract": {},
+          "output_contract": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "transitions": [
+            {"outcome": "continue_to_evaluate", "target": "evaluate"},
+            {"outcome": "backtest_failed", "target": "evaluate"},
+            {"outcome": "execution_failed", "target": "failed"}
+          ],
+          "metadata": {
+            "purpose": "执行回测并记录结果",
+            "derives_agent": true,
+            "writable_paths": ["optimization/run_history.json"]
+          }
+        },
+        {
+          "key": "evaluate",
+          "name": "终止条件评估",
+          "instruction": "读取 run_history.json 和 optimization_params。LLM 检查终止条件：(1) 达到目标阈值 target_threshold (2) 达到最大迭代次数 max_iterations (3) 连续 patience 轮无显著改善。如果满足任一条件，完成 deliver_or_continue 进入 deliver；否则继续迭代回到 tune。输出终止决策的理由。完成后 complete deliver_or_continue 或 continue_to_tune；执行失败 complete execution_failed。",
+          "executor": {
+            "kind": "agent",
+            "capabilities": [
+              "project.files.list",
+              "project.files.read",
+              "project.files.search",
+              "project.files.write",
+              "system.noop"
+            ]
+          },
+          "context": {
+            "include_project": true,
+            "include_task": true,
+            "include_loop_bindings": true,
+            "include_current_goal": true,
+            "upstream_outputs": ["analyze", "tune", "backtest"],
+            "artifact_globs": []
+          },
+          "input_contract": {},
+          "output_contract": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "transitions": [
+            {"outcome": "deliver_or_continue", "target": "deliver"},
+            {"outcome": "continue_to_tune", "target": "tune"},
+            {"outcome": "execution_failed", "target": "failed"}
+          ],
+          "metadata": {
+            "purpose": "评估是否满足终止条件",
+            "derives_agent": true,
+            "writable_paths": ["optimization/termination_decision.md"]
+          }
+        },
+        {
+          "key": "deliver",
+          "name": "交付最优解与报告",
+          "instruction": "遍历 run_history.json，基于 target_metric 找到最优参数组合。复制对应 config 为 optimization/best_config.yaml。生成 comparison_report.md，包含所有轮次对比分析和最优解说明。生成 metrics_summary.csv，汇总所有轮次指标。完成后 complete success；执行失败 complete execution_failed。",
+          "executor": {
+            "kind": "agent",
+            "capabilities": [
+              "project.files.list",
+              "project.files.read",
+              "project.files.search",
+              "project.files.write",
+              "system.noop"
+            ]
+          },
+          "context": {
+            "include_project": true,
+            "include_task": true,
+            "include_loop_bindings": true,
+            "include_current_goal": true,
+            "upstream_outputs": ["analyze", "tune", "backtest", "evaluate"],
+            "artifact_globs": []
+          },
+          "input_contract": {},
+          "output_contract": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "transitions": [
+            {"outcome": "success", "target": "done"},
+            {"outcome": "execution_failed", "target": "failed"}
+          ],
+          "metadata": {
+            "purpose": "生成交付物",
+            "derives_agent": true,
+            "writable_paths": ["optimization/best_config.yaml", "optimization/comparison_report.md", "optimization/metrics_summary.csv"]
+          }
+        }
+      ]
+    }
+  }
+}

@@ -178,6 +178,24 @@ def test_anthropic_adapter_translates_tool_calls_and_results_without_prompt_prot
     assert messages[2]["content"][0]["type"] == "tool_result"
 
 
+def test_anthropic_transport_retries_connection_establishment_only():
+    client = AnthropicClient({
+        "api_name": "test",
+        "base_url": "https://provider.invalid",
+        "api_key": "token",
+        "model": "m",
+        "temperature": 0.2,
+        "max_tokens": 65535,
+        "connect_max_attempts": 4,
+    })
+
+    retry = client.session.get_adapter(client.url).max_retries
+    assert retry.connect == 3
+    assert retry.total == 3
+    assert retry.read == 0
+    assert retry.status == 0
+
+
 def test_anthropic_adapter_canonicalizes_schema_shaped_array_and_boolean_wrappers():
     client = AnthropicClient({"api_name": "test", "base_url": "https://provider.invalid", "api_key": "token", "model": "m", "temperature": 0.2, "max_tokens": 65535})
     client.session.post = lambda _url, **_kwargs: Response(
@@ -503,7 +521,6 @@ def test_real_workflow_publish_provider_schema_keeps_executor_fields_visible(sto
     assert set(executor["properties"]["kind"]["enum"]) == {
         "agent",
         "capability_sequence",
-        "workcell",
     }
     assert {"capabilities", "steps", "completed_outcome", "outcome_from"} <= set(
         executor["properties"]

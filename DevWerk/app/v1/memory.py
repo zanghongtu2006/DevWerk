@@ -22,8 +22,6 @@ MemoryScope = Literal[
     "conversation",
     "workflow",
     "task",
-    "workcell",
-    "participant",
 ]
 
 _SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -188,7 +186,7 @@ class FileMemoryStore(MemoryStore):
     def initialize_project(self, project: dict[str, Any]) -> dict[str, Any]:
         root = self.root(project)
         root.mkdir(parents=True, exist_ok=True)
-        for relative in ("knowledge", "tasks", "workcells", "records"):
+        for relative in ("knowledge", "tasks", "records"):
             (root / relative).mkdir(parents=True, exist_ok=True)
         created: list[str] = []
         for name, title, purpose in _CORE_FILES:
@@ -417,8 +415,6 @@ class MemoryManager:
         *,
         selectors: Iterable[MemorySelector] = (),
         task_id: str | None = None,
-        workcell_id: str | None = None,
-        participant_key: str | None = None,
         include_core: bool = True,
     ) -> dict[str, Any]:
         self.store.initialize_project(project)
@@ -434,7 +430,7 @@ class MemoryManager:
                 seen.add(item["reference"])
         omitted: list[dict[str, Any]] = []
         for selector in selectors:
-            scope_id = _scope_id(selector.scope, task_id, workcell_id, participant_key)
+            scope_id = _scope_id(selector.scope, task_id)
             matches = self.index.search(
                 self.store,
                 project,
@@ -486,17 +482,9 @@ class MemoryManager:
 def _scope_id(
     scope: str,
     task_id: str | None,
-    workcell_id: str | None,
-    participant_key: str | None,
 ) -> str | None:
     if scope == "task":
         return task_id
-    if scope == "workcell":
-        return workcell_id
-    if scope == "participant":
-        if not workcell_id or not participant_key:
-            return None
-        return f"{workcell_id}.{participant_key}"
     return None
 
 

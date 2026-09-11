@@ -175,42 +175,6 @@ class SchemaRepository:
                     FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
                     FOREIGN KEY(task_id) REFERENCES v1_tasks(id) ON DELETE CASCADE
                 );
-                CREATE TABLE IF NOT EXISTS v1_workcells (
-                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task_id TEXT NOT NULL,
-                    column_run_id TEXT NOT NULL UNIQUE, status TEXT NOT NULL,
-                    current_state TEXT NOT NULL, definition_json TEXT NOT NULL,
-                    input_json TEXT NOT NULL DEFAULT '{}', output_json TEXT NOT NULL DEFAULT '{}',
-                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, finished_at TEXT,
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
-                    FOREIGN KEY(task_id) REFERENCES v1_tasks(id) ON DELETE CASCADE,
-                    FOREIGN KEY(column_run_id) REFERENCES v1_column_runs(id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_v1_workcells_task
-                    ON v1_workcells(task_id, created_at);
-                CREATE TABLE IF NOT EXISTS v1_workcell_participants (
-                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, workcell_id TEXT NOT NULL,
-                    participant_key TEXT NOT NULL, kind TEXT NOT NULL, lifecycle TEXT NOT NULL,
-                    agent_session_id TEXT, status TEXT NOT NULL, config_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                    UNIQUE(workcell_id, participant_key),
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
-                    FOREIGN KEY(workcell_id) REFERENCES v1_workcells(id) ON DELETE CASCADE,
-                    FOREIGN KEY(agent_session_id) REFERENCES v1_agent_sessions(id)
-                );
-                CREATE TABLE IF NOT EXISTS v1_workcell_handoffs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL,
-                    task_id TEXT NOT NULL, workcell_id TEXT NOT NULL, sequence INTEGER NOT NULL,
-                    sender_key TEXT NOT NULL, receivers_json TEXT NOT NULL DEFAULT '[]',
-                    signal TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}',
-                    artifact_refs_json TEXT NOT NULL DEFAULT '[]',
-                    memory_refs_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL,
-                    UNIQUE(workcell_id, sequence),
-                    FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
-                    FOREIGN KEY(task_id) REFERENCES v1_tasks(id) ON DELETE CASCADE,
-                    FOREIGN KEY(workcell_id) REFERENCES v1_workcells(id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_v1_workcell_handoffs
-                    ON v1_workcell_handoffs(workcell_id, sequence);
                 CREATE INDEX IF NOT EXISTS idx_v1_agent_runs_project
                     ON v1_agent_runs(project_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_v1_agent_runs_task
@@ -254,6 +218,22 @@ class SchemaRepository:
                     FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE
                 );
                 CREATE INDEX IF NOT EXISTS idx_v1_artifacts_task ON v1_artifacts(task_id, created_at);
+                CREATE TABLE IF NOT EXISTS v1_artifact_versions (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task_id TEXT,
+                    run_id TEXT, kind TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT,
+                    size INTEGER NOT NULL DEFAULT 0, meta_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_v1_artifact_versions_task ON v1_artifact_versions(project_id,task_id,path);
+                CREATE TABLE IF NOT EXISTS v1_artifact_contents (
+                    sha256 TEXT PRIMARY KEY, content BLOB NOT NULL
+                );
+                INSERT OR IGNORE INTO v1_artifact_versions SELECT * FROM v1_artifacts;
+                CREATE TRIGGER IF NOT EXISTS v1_artifact_version_insert AFTER INSERT ON v1_artifacts BEGIN
+                    INSERT OR IGNORE INTO v1_artifact_versions VALUES(NEW.id,NEW.project_id,NEW.task_id,NEW.run_id,NEW.kind,NEW.path,NEW.sha256,NEW.size,NEW.meta_json,NEW.created_at);
+                END;
+                CREATE TRIGGER IF NOT EXISTS v1_artifact_version_update AFTER UPDATE ON v1_artifacts BEGIN
+                    INSERT OR IGNORE INTO v1_artifact_versions VALUES(NEW.id,NEW.project_id,NEW.task_id,NEW.run_id,NEW.kind,NEW.path,NEW.sha256,NEW.size,NEW.meta_json,NEW.created_at);
+                END;
                 CREATE TABLE IF NOT EXISTS v1_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, task_id TEXT,
                     run_id TEXT, type TEXT NOT NULL, data_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL
@@ -380,6 +360,10 @@ class SchemaRepository:
             self._ensure_column(db, "v1_conversation_jobs", "resolved_by_job_id", "TEXT")
             self._ensure_column(db, "v1_tasks", "readiness_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(db, "v1_tasks", "state_version", "INTEGER NOT NULL DEFAULT 1")
+            self._ensure_column(db, "v1_tasks", "failure_origin", "TEXT")
+            self._ensure_column(db, "v1_project_loop_bindings", "package_json", "TEXT")
+            self._ensure_column(db, "v1_tasks", "failure_code", "TEXT")
+            self._ensure_column(db, "v1_tasks", "failure_disposition", "TEXT")
             self._ensure_column(db, "v1_tasks", "terminal_artifact_id", "TEXT")
             self._ensure_column(db, "v1_tasks", "terminal_event_id", "INTEGER")
             self._ensure_column(db, "v1_tasks", "notified_at", "TEXT")

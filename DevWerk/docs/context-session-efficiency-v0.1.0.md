@@ -6,7 +6,7 @@ Date: **2026-08-27**
 
 ## 1. Purpose
 
-This design reduces provider calls and active-context size without changing domain workflows. It applies equally to novel production, software delivery, research, operations, and future Loops. Runtime remains aware only of Projects, Tasks, Columns, capabilities, Artifacts, Memory, Sessions, Workcells, and evidence.
+This design reduces provider calls and active-context size without changing domain workflows. It applies equally to novel production, software delivery, research, operations, and future Loops. Runtime remains aware only of Projects, Tasks, Columns, capabilities, Artifacts, Memory, Sessions, transitions, and evidence.
 
 Full conversation, Agent, tool, event, and Artifact evidence remains durable and queryable. Optimization changes the active context projection, not the audit record.
 
@@ -18,8 +18,8 @@ An Agent receives the smallest provenance-aware projection needed for its curren
 2. current Project bindings and Task input;
 3. declared upstream outputs;
 4. Loop-selected accepted, working, and reference Artifacts plus Memory records;
-5. the current Workcell node and subscribed Handoffs;
-6. a compact logical Session checkpoint when the participant is reactivated.
+5. the current Column and declared upstream outputs;
+6. a compact logical Session checkpoint when the Column Agent is reactivated.
 
 Preloaded text carries path, content hash, character count, source Task/Run where available, and content. Runtime does not treat every file found on disk as a fact. It projects three distinct channels:
 
@@ -31,7 +31,7 @@ Registered content is injected only when its current filesystem hash still match
 
 The consumption rule is part of the Runtime protocol, not an optional hint. A preloaded Loop asset is read from `project.loop.assets`; it is not a Project filesystem path. A preloaded Project Artifact is read from its named provenance channel. File capabilities are reserved for paths absent from the projection, paths known to have changed, or explicit independent verification.
 
-Workcell context is projected again before every participant activation so that newly written Artifacts and their hashes are visible to the next participant. Runtime does not reuse the stale Column-entry projection for the entire Workcell.
+Context is projected on every Column activation so newly written Artifacts and their hashes are visible after a Workflow transition. Runtime never hides several Agent activations inside one Column-entry projection.
 
 Loops choose `accepted_artifact_globs`, `working_artifact_globs`, optional unverified `artifact_globs`, Memory selectors, and whether Project metadata, Loop bindings/assets, current Task description/context, or the planned current goal is visible. Runtime does not choose files based on a domain, Column name, or prompt text.
 
@@ -63,24 +63,24 @@ The provider-visible Session has a stable prefix: Conversation identity, instruc
 
 The structure follows the common boundary verified in the reference agents: Codex separates a durable Session from a Turn and continues a Turn whenever tool output requires follow-up; Hermes keeps a byte-stable conversation prefix, persists complete tool-call/result history, and treats gateway input as new Turns; Claude Code's public repository does not expose its production loop source, but its published behavior confirms resumable sessions, streamed tool activity, and recovery that removes malformed tool output from retry context. DevWerk adopts these boundaries without importing their product-specific safety, UI, or autonomous-agent policies.
 
-## 5. Participant Session Checkpoint
+## 5. Column Agent Session Checkpoint
 
-When a Column or Workcell participant completes through a tool call, Runtime persists a compact checkpoint containing its declared outcome, summary, and structured output even if the provider returned no natural-language text. A Workcell participant reports semantic completion through `workcell.complete`; it does not emit a routing signal or assemble evidence identifiers. Runtime collects successful action evidence from the current Agent Run, maps the declared outcome to the Workcell transition, persists the directed Handoff, and advances the Workcell state machine internally.
+When a Column Agent completes through `column.complete`, Runtime persists a compact checkpoint containing its declared outcome, summary, and structured output even if the provider returned no natural-language text. Runtime collects successful action evidence, validates the declared outcome, and advances the outer Workflow state machine.
 
 On reactivation, active context includes:
 
 - the latest Agent Run checkpoint;
 - the latest successful checkpoint when the most recent run failed;
-- current Task, Artifact manifests, Memory, Workcell, and directed Handoff state;
+- current Task, Artifact manifests, Memory, Column, and declared upstream-output state;
 - current content-addressed manifests for Loop-selected inputs.
 
-The first activation receives the participant's Loop-declared full context projection. A persistent Session reactivation receives a compact resume projection: Project and Loop identity, bindings, Task identity and inputs, current manifests, Memory selection, and directed Handoffs. It does not receive Loop asset bodies or Artifact bodies a second time. The participant fetches only a specific missing or changed Project path when the checkpoint, manifest, and directed Handoff are insufficient.
+The first activation receives the Column's Loop-declared full context projection. A persistent Session reactivation receives a compact resume projection: Project and Loop identity, bindings, Task identity and inputs, current manifests, Memory selection, and declared upstream outputs. It does not receive unchanged Loop asset or Artifact bodies a second time. The Agent fetches only specific missing or changed Project paths when the checkpoint and manifests are insufficient.
 
 All older Agent Runs remain in SQLite for audit but are not replayed into active context. This keeps repeated review/repair cycles bounded while preserving the same logical Session identity.
 
 ## 6. Memory Role
 
-File Memory remains the semantic source of durable Project knowledge. Workcell snapshots remain compact, content-addressed recovery state. Session checkpoints are execution continuity, not a replacement for semantic Memory.
+File Memory remains the semantic source of durable Project knowledge. Session checkpoints provide execution continuity and are not a replacement for semantic Memory.
 
 The Runtime records which Memory records and preloaded Artifacts entered each activation. Empty core Memory files are not injected. A Loop may declare Memory selectors; the architecture does not invent domain memories or make a separate LLM call for memory capture.
 
@@ -89,14 +89,14 @@ The Runtime records which Memory records and preloaded Artifacts entered each ac
 1. Text write receipts make redundant measure calls unnecessary.
 2. Preloaded Artifact manifests are hash-addressed, provenance-labelled, and visible to every executor kind.
 3. Conversation replay preserves human dialogue and excludes raw tool traces.
-4. Participant reactivation receives a non-empty compact checkpoint for tool-based completion.
-5. Active participant history is bounded by semantic role rather than an arbitrary turn count.
+4. Persistent Column Agent reactivation receives a non-empty compact checkpoint for tool-based completion.
+5. Active Agent history is bounded by declared session identity rather than an arbitrary turn count.
 6. Complete execution evidence remains queryable in SQLite.
 7. No Runtime branch refers to novels, code, GitLab, Writer, Reviewer, or another domain role.
-8. Existing Loop graphs and terminal semantics remain unchanged.
-9. Every Workcell participant sees an activation-time Artifact projection rather than a stale Column-entry snapshot.
-10. A persistent participant reactivation does not re-inject unchanged static content.
-11. Workcell routing signals and action-evidence assembly are Runtime responsibilities, not model-generated protocol data.
+8. Multi-Agent collaboration is represented by observable Workflow Columns, never a nested execution graph.
+9. Every Column Agent sees an activation-time Artifact projection.
+10. A persistent Column Agent reactivation does not re-inject unchanged static content.
+11. Workflow routing and action-evidence assembly are Runtime responsibilities, not model-generated protocol data.
 12. Conversation identity, instruction, platform policy, and capability schemas form a stable Session prefix; current Project state is supplied as the authoritative Turn input.
 13. An unsupported Conversation mutation claim may continue only after a new successful state-changing tool receipt. Repeated prose or read-only calls at the same execution progress fail explicitly without an arbitrary retry count.
 14. The first unsupported mutation claim changes the next Provider request to a required-tool continuation and exposes only the claimed capabilities. Ordinary discussion remains tool-optional. A Provider that ignores the required tool choice, or repeats the same failed operation without materially different arguments, terminates with an explicit protocol failure and a human-readable Conversation reply.

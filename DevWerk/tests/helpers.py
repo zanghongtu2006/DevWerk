@@ -13,8 +13,6 @@ from app.v1.domain import (
     TaskPlanItem,
     TaskPlanReadiness,
     Transition,
-    WorkcellAgentParticipant,
-    WorkcellExecutor,
     WorkflowDefinition,
     WorkflowPlan,
 )
@@ -189,13 +187,6 @@ def task_plan(
             agent_execution=agent_execution or (
                 "required" if any(
                     isinstance(column.executor, AgentExecutor)
-                    or (
-                        isinstance(column.executor, WorkcellExecutor)
-                        and any(
-                            isinstance(participant, WorkcellAgentParticipant)
-                            for participant in column.executor.participants
-                        )
-                    )
                     for column in workflow.columns
                 ) else "forbidden"
             ),
