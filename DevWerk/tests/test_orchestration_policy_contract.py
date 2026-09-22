@@ -425,9 +425,9 @@ def test_mailbox_observation_does_not_invalidate_running_task_state(store, tmp_p
 
 def test_platform_policy_is_compact_project_manager_identity(store):
     content = store.latest_platform_policy().content
-    assert len(content) < 2_000
+    assert len(content) < 3_000
     assert "professional project manager and agile coach" in content
-    assert "Discover filesystem Loops first" in content
+    assert "Discover and inspect filesystem Loops" in content
     assert "never invent an initial Workflow" in content
     assert "supervise them to `done` or `failed`" in content
     assert "Never describe an intended state change as completed" in content

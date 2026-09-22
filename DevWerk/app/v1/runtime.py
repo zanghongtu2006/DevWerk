@@ -607,6 +607,19 @@ class WorkflowRuntime:
                     },
                 ) from exc
         outcome = str(outcome_value or "")
+        workflow = self.store.workflow_by_id(task['project_id'],task['workflow_revision_id'])
+        column = workflow.column(task['current_column'])
+        transition = next((edge for edge in column.transitions if edge.outcome == outcome),None)
+        if transition and not transition.allows_unresolved_failures:
+            for check in column.acceptance_checks:
+                execution_key = f"{run['id']}:acceptance:{check.key}:{time.monotonic_ns()}"
+                ctx = CapabilityContext(**{**capability_context.__dict__, 'execution_key':execution_key})
+                result = self.registry.dispatch(check.capability, check.arguments, ctx)
+                spec = AgentRunSpec(kind='column', project=project, instruction='',instruction_revision=0,
+                    context={},capability_ids=[],task_id=task['id'],column_run_id=run['id'],column_attempt_id=run['attempt_id'])
+                self.store.feedback.record_check(spec,check.key,execution_key,result,task_owner=task)
+                if not result.ok or result.status != 'completed':
+                    raise RuntimeExecutionError(f'Required acceptance check failed: {check.key}', 'runtime_permanent')
         return {"summary": f"capability sequence completed with outcome {outcome}", "steps": results}, outcome
 
     def _persist_wait(self, task: dict[str, Any], run: dict[str, Any], column: ColumnDefinition, request: dict[str, Any]) -> None:
@@ -672,7 +685,7 @@ class WorkflowRuntime:
         assignment = self.store.agents.assign(task, run, column)
         session = {"id": assignment["session_id"]}
         agent_input = input_data
-        if self.store.agents.session_history(task["project_id"], session["id"]):
+        if self.store.agents.session_history(task["project_id"], session["id"], assignment_id=assignment['id']):
             agent_input = self._resume_input(input_data)
         writable_path_values = resolve_references(
             column.metadata.get("writable_paths", []),
@@ -690,6 +703,13 @@ class WorkflowRuntime:
                     "workflow": {"id": workflow_row["id"], "name": workflow.name, "description": workflow.description},
                     "column": column.model_dump(mode="json"),
                     "input": agent_input,
+                    "task_feedback": self.store.feedback.list(task['project_id'], task['id']),
+                    **({'feedback_contract':{
+                        'responsible_columns':[c.key for c in workflow.columns],
+                        'checks':[{'column':c.key,'check_key':check.key,'purpose':check.purpose[:500]}
+                                  for c in workflow.columns for check in c.acceptance_checks],
+                        'instruction':'Before reporting a defect/rework outcome, persist task.feedback.record with a responsible Column and frozen check references. Read existing feedback to avoid duplicates. Runtime handles the declared handoff; do not send instructions through Mailbox or run other Workers.'}}
+                       if 'task.feedback.record' in column.executor.capabilities else {}),
                     "action_ledger": self._column_action_ledger(task["project_id"], run["id"]) + (prior_action_ledger or []),
                 },
                 capability_ids=column.executor.capabilities,

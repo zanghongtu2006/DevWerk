@@ -29,6 +29,12 @@ class AgentRepository:
     def init_schema(self):
         with self.store.tx(immediate=True) as db:
             statements = [
+                """CREATE TABLE IF NOT EXISTS v1_worker_inputs (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES v1_projects(id) ON DELETE CASCADE,
+                    recipient_agent_id TEXT NOT NULL, assignment_id TEXT, payload_json TEXT NOT NULL,
+                    dedupe_key TEXT, state TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL,
+                    consumed_by_run_id TEXT, acknowledged_at TEXT, failed_at TEXT, last_error TEXT,
+                    UNIQUE(project_id,dedupe_key))""",
                 'CREATE TABLE IF NOT EXISTS v1_agent_worker_slots (requirement_id TEXT NOT NULL,worker_key TEXT NOT NULL,instance_id TEXT NOT NULL,PRIMARY KEY(requirement_id,worker_key))',
                 "CREATE TABLE IF NOT EXISTS v1_requirement_planning_ops (operation_id TEXT PRIMARY KEY,requirement_id TEXT NOT NULL,created_at TEXT NOT NULL)",
                 "CREATE TABLE IF NOT EXISTS v1_requirement_task_causes (requirement_id TEXT NOT NULL,cause_key TEXT NOT NULL,task_ref TEXT NOT NULL,plan_fingerprint TEXT NOT NULL,task_id TEXT NOT NULL,PRIMARY KEY(requirement_id,cause_key,task_ref))",
@@ -116,26 +122,25 @@ class AgentRepository:
         """Bind the Conversation turn to the revision of its durable cause."""
         if job.get('requirement_id'):
             return self.store.scopes.requirement_version(job['project_id'], job['requirement_id'], job.get('requirement_revision'))
+        if job.get('trigger_kind', 'user') == 'user':
+            # A transport flag is not a request to create a business Requirement.
+            # The current Conversation Agent binds it when resolving an execution request.
+            return None
         requirement = None
-        if job.get('trigger_kind', 'user') == 'user' and job.get('start_task'):
-            with self.store.connect() as db:
-                recent = db.execute("SELECT r.* FROM v1_requirements r JOIN v1_conversation_jobs j ON j.requirement_id=r.id WHERE j.project_id=? AND j.id!=? AND j.trigger_kind='user' ORDER BY j.created_at DESC,j.rowid DESC LIMIT 1", (job['project_id'], job['id'])).fetchone()
-            requirement = dict(recent) if recent else self.requirement(job['project_id'], objective=job.get('message') or 'Project delivery')
-        else:
-            ids = set()
-            with self.store.connect() as db:
-                for message in mailbox:
-                    if message.get('task_id'):
-                        row = db.execute('SELECT requirement_id,requirement_revision FROM v1_tasks WHERE id=? AND project_id=?', (message['task_id'], job['project_id'])).fetchone()
-                        if row and row[0]:
-                            ids.add((row[0], row[1]))
-                if len(ids) == 1:
-                    req_id, revision = ids.pop()
-                    requirement = self.store.scopes.requirement_version(job['project_id'], req_id, revision)
-                elif not ids:
-                    rows = db.execute("SELECT * FROM v1_requirements WHERE project_id=? AND status='active'", (job['project_id'],)).fetchall()
-                    if len(rows) == 1:
-                        requirement = dict(rows[0])
+        ids = set()
+        with self.store.connect() as db:
+            for message in mailbox:
+                if message.get('task_id'):
+                    row = db.execute('SELECT requirement_id,requirement_revision FROM v1_tasks WHERE id=? AND project_id=?', (message['task_id'], job['project_id'])).fetchone()
+                    if row and row[0]:
+                        ids.add((row[0], row[1]))
+            if len(ids) == 1:
+                req_id, revision = ids.pop()
+                requirement = self.store.scopes.requirement_version(job['project_id'], req_id, revision)
+            elif not ids:
+                rows = db.execute("SELECT * FROM v1_requirements WHERE project_id=? AND status='active'", (job['project_id'],)).fetchall()
+                if len(rows) == 1:
+                    requirement = dict(rows[0])
         if requirement:
             with self.store.tx(immediate=True) as db:
                 db.execute('UPDATE v1_conversation_jobs SET requirement_id=?,requirement_revision=? WHERE id=? AND requirement_id IS NULL', (requirement['id'], requirement['revision'], job['id']))
@@ -322,7 +327,10 @@ class AgentRepository:
         worker = self.get_worker(project_id, worker_id)
         with self.store.connect() as db:
             assignments = [self.store._decode(dict(row), 'input_json', 'contract_json', 'result_json', 'budget_json') for row in db.execute('SELECT * FROM v1_agent_assignments WHERE agent_instance_id=? ORDER BY created_at', (worker_id,))]
-        return {'worker': worker, 'assignments': assignments, 'messages': self.messages(project_id, worker_id)}
+            legacy = [dict(row) for row in db.execute(
+                'SELECT id,state,payload_json,assignment_id,consumed_by_run_id FROM v1_project_mailbox WHERE project_id=? AND recipient_agent_id=? ORDER BY id', (project_id, worker_id))]
+        return {'worker': worker, 'assignments': assignments, 'messages': self.messages(project_id, worker_id),
+                'legacy_mailbox_inputs_read_only':legacy}
 
     def context_page(self, project_id, worker_id, *, after=0, limit=20):
         worker = self.get_worker(project_id, worker_id)
@@ -431,9 +439,7 @@ class AgentRepository:
                 raise ValueError('Message Assignment has ended')
 
     def _fail_pending_messages(self, db, project_id, worker_id, reason, *, assignment_id=None):
-        from app.v1.states import MAILBOX_STATE_MACHINE, MailboxStatus
-        MAILBOX_STATE_MACHINE.require(MailboxStatus.PENDING, MailboxStatus.FAILED)
-        db.execute("UPDATE v1_project_mailbox SET state='failed',failed_at=?,last_error=? "
+        db.execute("UPDATE v1_worker_inputs SET state='failed',failed_at=?,last_error=? "
                    "WHERE project_id=? AND recipient_agent_id=? AND state='pending' "
                    "AND (? IS NULL OR assignment_id=?)",
                    (utcnow(), reason+' before message consumption', project_id, worker_id, assignment_id, assignment_id))
@@ -443,35 +449,36 @@ class AgentRepository:
             raise ValueError("Message must not be empty")
         with self.store.tx(immediate=True) as db:
             if dedupe_key:
-                existing = db.execute("SELECT * FROM v1_project_mailbox WHERE project_id=? AND dedupe_key=?", (project_id, dedupe_key)).fetchone()
+                existing = db.execute("SELECT * FROM v1_worker_inputs WHERE project_id=? AND dedupe_key=?", (project_id, dedupe_key)).fetchone()
                 if existing:
                     payload = json.loads(existing['payload_json'])
                     if existing['recipient_agent_id'] != worker_id or existing['assignment_id'] != assignment_id or payload.get('content') != str(content):
                         raise ValueError('Message dedupe_key cannot refer to different input')
                     return dict(existing)
             self.validate_message_target(db, project_id, worker_id, assignment_id)
-            self.store._mailbox(db, project_id, "agent.message", None, None, {"content": str(content), "worker_id": worker_id})
-            identity = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-            db.execute("UPDATE v1_project_mailbox SET recipient_agent_id=?,assignment_id=?,message_kind='steer',dedupe_key=? WHERE id=?", (worker_id, assignment_id, dedupe_key, identity))
-            return dict(db.execute("SELECT * FROM v1_project_mailbox WHERE id=?", (identity,)).fetchone())
+            identity = new_id('winput')
+            db.execute("""INSERT INTO v1_worker_inputs
+                (id,project_id,recipient_agent_id,assignment_id,payload_json,dedupe_key,created_at)
+                VALUES(?,?,?,?,?,?,?)""", (identity, project_id, worker_id, assignment_id,
+                json.dumps({'content':str(content),'worker_id':worker_id}, ensure_ascii=False), dedupe_key, utcnow()))
+            return dict(db.execute("SELECT * FROM v1_worker_inputs WHERE id=?", (identity,)).fetchone())
 
     def messages(self, project_id, worker_id):
         self.get_worker(project_id, worker_id)
         with self.store.connect() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM v1_project_mailbox WHERE project_id=? AND recipient_agent_id=? ORDER BY id", (project_id, worker_id))]
+            return [dict(row) for row in db.execute("SELECT * FROM v1_worker_inputs WHERE project_id=? AND recipient_agent_id=? ORDER BY created_at,rowid", (project_id, worker_id))]
 
     def consume_messages(self, assignment, agent_run_id):
         with self.store.tx(immediate=True) as db:
             self.assert_owner(assignment, db=db)
-            rows = db.execute("SELECT * FROM v1_project_mailbox WHERE project_id=? AND recipient_agent_id=? AND state='pending' AND (assignment_id IS NULL OR assignment_id=?) ORDER BY id", (assignment["project_id"], assignment["agent_instance_id"], assignment["id"])).fetchall()
+            rows = db.execute("SELECT * FROM v1_worker_inputs WHERE project_id=? AND recipient_agent_id=? AND state='pending' AND (assignment_id IS NULL OR assignment_id=?) ORDER BY created_at,rowid", (assignment["project_id"], assignment["agent_instance_id"], assignment["id"])).fetchall()
             if not rows:
                 return []
             payload = [{"message_id": row["id"], "input": json.loads(row["payload_json"])} for row in rows]
             self.store.add_agent_message(agent_run_id, "user", json.dumps({"worker_messages": payload}), [], emit_progress=False)
             for row in rows:
                 now = utcnow()
-                db.execute("UPDATE v1_project_mailbox SET state='acknowledged',consumed_by_run_id=?,acknowledged_at=?,received_at=?,delivered_at=?,delivery_count=delivery_count+1 WHERE id=? AND state='pending'", (agent_run_id, now, now, now, row["id"]))
-                db.execute("INSERT INTO v1_mailbox_deliveries(project_id,mailbox_id,attempt_no,conversation_job_id,consumer_kind,state,delivered_at,received_at,finished_at) VALUES(?,?,?,?,?,'acknowledged',?,?,?)", (assignment['project_id'], row['id'], row['delivery_count']+1, agent_run_id, 'worker_assignment', now, now, now))
+                db.execute("UPDATE v1_worker_inputs SET state='acknowledged',consumed_by_run_id=?,acknowledged_at=? WHERE id=? AND state='pending'", (agent_run_id, now, row["id"]))
             return payload
 
     def set_lifecycle(self, project_id, worker_id, state):
@@ -578,15 +585,16 @@ class AgentRepository:
         with self.store.tx(immediate=True) as db:
             db.execute('UPDATE v1_agent_operations SET delivered=1 WHERE id=? AND result_json IS NOT NULL', (identity,))
 
-    def session_history(self, project_id, session_id, *, before_run_id=None):
+    def session_history(self, project_id, session_id, *, before_run_id=None, assignment_id=None):
         with self.store.connect() as db:
             session = db.execute("SELECT id,legacy_session_id FROM v1_agent_context_sessions WHERE id=? AND project_id=?", (session_id, project_id)).fetchone()
             if not session:
                 return []
             rows = db.execute("""SELECT m.* FROM v1_agent_messages m JOIN v1_agent_runs r ON r.id=m.agent_run_id
                                WHERE r.project_id=? AND r.agent_session_id IN (?,?) AND r.id IS NOT ?
-                               AND m.role!='system' ORDER BY m.id""", (project_id, session_id, session['legacy_session_id'], before_run_id)).fetchall()
-            snapshot = db.execute("SELECT * FROM v1_agent_context_snapshots WHERE session_id=? ORDER BY revision DESC LIMIT 1", (session_id,)).fetchone()
+                               AND (? IS NULL OR r.assignment_id=?)
+                               AND m.role!='system' ORDER BY m.id""", (project_id, session_id, session['legacy_session_id'], before_run_id, assignment_id, assignment_id)).fetchall()
+            snapshot = None if assignment_id else db.execute("SELECT * FROM v1_agent_context_snapshots WHERE session_id=? ORDER BY revision DESC LIMIT 1", (session_id,)).fetchone()
         history = []
         if snapshot:
             history.append({"role": "user", "content": json.dumps({"context_checkpoint": json.loads(snapshot["summary_json"]), "covers_through_message_id": snapshot["through_message_id"]})})
@@ -612,6 +620,13 @@ class AgentRepository:
                           'retrieve': 'Use agent.context.read to inspect older source messages; no source history has been deleted.'}}
             history = checkpoint_prefix + [{'role': 'user', 'content': json.dumps(checkpoint)}] + list(reversed(retained))
         return history
+
+    def prior_assignments(self, project_id, session_id, assignment_id):
+        with self.store.connect() as db:
+            return [dict(row) for row in db.execute(
+                """SELECT id,task_id,column_run_id,status FROM v1_agent_assignments
+                   WHERE project_id=? AND session_id=? AND id!=?
+                   ORDER BY created_at DESC,rowid DESC LIMIT 8""", (project_id, session_id, assignment_id))]
 
     def save_context_snapshot(self, project_id, worker_id, through_message_id, summary):
         if len(json.dumps(summary)) > self.store.policy.context.worker_context_max_characters // 2:

@@ -40,7 +40,13 @@ The Runtime P0 design and incident replay are recorded in [`DEVWERK_P0_Runtime_F
 
 Real LLM and generated-project acceptance is intentionally outside the deterministic unit/integration gate because it spends quota and depends on external runtimes. Its evidence must be stored under `D:\workspace\codex-devwerk-project-files`, while the deterministic contracts for provider parsing, file boundaries, Runtime state, and API behavior remain in this repository.
 
+Every Workflow test and audit must also satisfy the [Column Agent lifecycle and interaction gate](column-agent-lifecycle-interaction-test-gate-2026-09-16.md). In a complex-task test, verify actual Agent/Session continuity, feedback delivery across Columns, targeted rework, repeated verification, and successful implementation build/test evidence before reporting success. A missing or broken interaction/rework/implementation gate is P0; a test that did not exercise the required cycles is incomplete, not passing.
+
 ## Change Rule
+
+09-21 contract revision: [repair/evidence/token design](DEVWERK_Repair_Evidence_Token_Fix_2026-09-21.md) defines Mailbox as passive notifications. `test_conversation_contract.py` and `test_p0_runtime_regressions.py` must assert zero automatic model calls and no event-authorized task control. Notification acknowledgement cannot resolve a failed Job. `test_persistent_agents.py` and `test_p0_assignment_regressions.py` verify explicit Worker input in its own store, separate from Mailbox. `test_agent_recovery_and_fencing.py` verifies archived Worker context remains retrievable while native replay is scoped to the current Assignment.
+
+`test_repair_notification_contract.py` covers two real-file/real-subprocess cross-Column repair cycles, Runtime-only terminal evidence, explicit corrected-plan successors and atomic dependency materialization. `test_task_entry_admission.py` covers instantiated software behavioral checks and accepted baseline receipts. `test_completion_protocol.py` rejects unrelated resolution evidence while accepting an actual identical retry already resolved by Runtime. `scripts/eval_worker_repair.py` exercises two real-provider feedback/repair cycles in an isolated evidence directory; it does not claim complete web/software product acceptance.
 
 Before changing a contract:
 

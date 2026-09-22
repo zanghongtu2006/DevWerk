@@ -9,6 +9,7 @@ from app.v1.domain import TaskPlan, WorkflowPlan
 from app.v1.repositories.base import StoreHost
 from app.v1.services.task_graph_admission import existing_task_orders, validate_task_graph_admission
 from app.v1.storage_support import new_id, utcnow
+from app.v1.services.task_plan_compiler import compile_task_plan
 
 
 class PlanningRepository:
@@ -70,24 +71,17 @@ class PlanningRepository:
 
     def create_task_plan(self, project_id: str, plan: TaskPlan) -> dict[str, Any]:
         self.store.get_project(project_id)
+        if plan.repair_of_task_id:
+            predecessor = self.store.get_project_task(project_id,plan.repair_of_task_id)
+            if predecessor['status'] not in {'done','failed'} or not any(
+                    item.proposed_task_ref == predecessor['proposed_task_ref'] for item in plan.tasks):
+                raise ValueError('repair_of_task_id must name a terminal Task whose proposed_task_ref is preserved')
         revision = self.store.get_workflow_revision(project_id, plan.workflow_revision_id)
         workflow = self.store.workflow_by_id(project_id, plan.workflow_revision_id)
         method = WorkflowPlan.model_validate(
             self.get_workflow_plan(project_id, str(revision["workflow_plan_id"]))["plan"]
         )
-        plan = plan.model_copy(deep=True)
-        for item in plan.tasks:
-            item.input = canonicalize_contract_value(
-                item.input,
-                method.task_contract.input_schema,
-            )
-            item.validate_agent_execution_workflow(workflow)
-            item.validate_exact_input_workflow(workflow)
-            validate_contract(
-                item.input,
-                method.task_contract.input_schema,
-                label=f"Task Plan {item.proposed_task_ref} input",
-            )
+        plan = compile_task_plan(plan, workflow, method, self.store.registry)
         payload = plan.model_dump_json()
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         with self.store.connect() as db:
@@ -98,6 +92,8 @@ class PlanningRepository:
         if existing:
             return self.get_task_plan(project_id, str(existing[0]))
         binding = self.store.get_project_loop_binding(project_id, plan.workflow_revision_id)
+        from app.v1.services.task_entry_admission import validate_entry_evidence
+        validate_entry_evidence(self.store, project_id, plan, method)
         validate_task_graph_admission(
             plan,
             method.task_contract.dependency_contract,
@@ -111,6 +107,12 @@ class PlanningRepository:
         )
         now = utcnow()
         with self.store.tx(immediate=True) as db:
+            from app.v1.task_identity import logical_task_key
+            for item in plan.tasks:
+                identity = logical_task_key(method.task_contract, item.input)
+                prior = db.execute('SELECT id,status,proposed_task_ref FROM v1_tasks WHERE project_id=? AND logical_task_key=? ORDER BY created_at DESC LIMIT 1', (project_id,identity)).fetchone() if identity else None
+                if prior and not (plan.repair_of_task_id == prior['id'] and prior['status'] in {'done','failed'} and item.proposed_task_ref == prior['proposed_task_ref']):
+                    raise ValueError(f'DuplicateTaskIdentity: Project already contains {identity}; an explicit repair_of_task_id must name its terminal predecessor')
             plan_id = new_id("tplan")
             db.execute(
                 "INSERT INTO v1_task_plans(id,project_id,workflow_revision_id,schema_version,objective,plan_json,plan_hash,created_at) "

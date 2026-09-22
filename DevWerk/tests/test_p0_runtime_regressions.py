@@ -258,18 +258,29 @@ def test_conversation_lease_and_workflow_claim_do_not_overlap(store, tmp_path):
     assert not (tmp_path / "project" / "conflict.txt").exists()
 
 
-def test_mailbox_can_reopen_but_discussion_cannot(store, tmp_path):
+def test_neither_mailbox_nor_discussion_can_reopen_task(store, tmp_path):
     project, task = setup_task(store, tmp_path)
     store.route_task_to_failed(task["id"], "retry needed")
     def run_turn(supervision):
+        queued = store.create_conversation_job(project['id'], 'Supervise this failed Task' if supervision else 'Only discuss', False)
+        job = store.claim_conversation_job(queued['id'], 'test-supervision')
+        req = store.agents.requirement(project['id'])
+        store.agents.attach_task(task['id'], req['id'])
+        if supervision:
+            with store.tx(immediate=True) as db:
+                db.execute("UPDATE v1_conversation_jobs SET trigger_kind='mailbox',requirement_id=?,requirement_revision=? WHERE id=?",
+                           (req['id'],req['revision'],job['id']))
         turns = iter([AgentModelResponse(tool_calls=[AgentToolCall(id="reopen", name="task.reopen", arguments={"task_id": task["id"]})]), AgentModelResponse(text="handled")])
         core = AgentCore(store, store.registry, lambda *a, **kw: next(turns))
-        return core.run(AgentRunSpec(kind="conversation", project=project, instruction="", instruction_revision=1,
+        result = core.run(AgentRunSpec(kind="conversation", project=project, instruction="", instruction_revision=1,
+                                    conversation_job_id=job['id'], agent_instance_id=store.agents.main(project['id'])['id'],
                                     context={}, capability_ids=["task.reopen"], start_task=False, supervision_turn=supervision))
+        store.finish_conversation_job(job['id'], None, result.agent_run_id, {})
+        return result
     run_turn(False)
     assert store.get_task(task["id"])["status"] == "failed"
     run_turn(True)
-    assert store.get_task(task["id"])["status"] == "pending"
+    assert store.get_task(task["id"])["status"] == "failed"
 
 
 def test_supervisor_survives_one_failed_tick(store, monkeypatch):

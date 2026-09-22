@@ -25,13 +25,13 @@ Use for a client-server software delivery scope whose user-visible requirement a
 Select when the work must produce runnable software and verifiable engineering evidence. Continue user conversation instead when product behavior, acceptance criteria, or delivery target remains materially ambiguous. <br>
 
 ## Loop Input: <br>
-Project name and delivery target are Project bindings. Each Task identifies one confirmed requirement file and its delivery scope. <br>
+Project name and delivery target are Project bindings. Each Task is one independently accepted delivery scope traversing every Column, not a Column-sized stage. Before TaskPlan save, write the accepted requirement baseline and supply Task.entry_evidence: confirmed_scope = current execution grant ID; requirements_file = successful project.files.write execution_key. Keep exact_input_strings empty for these agent Tasks. <br>
 
 ## Loop Output: <br>
 Traceable requirements, domain and interface design, reviewed source code, automated test evidence, operable delivery assets, and final acceptance. <br>
 
 ## Loop Version(s): <br>
-1.2.0 <br>
+1.3.0 <br>
 
 ## Loop Key: <br>
 software.ddd_delivery <br>

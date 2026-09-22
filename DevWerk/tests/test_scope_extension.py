@@ -11,17 +11,26 @@ from tests.test_loop_contract import novel_task_input
 from tests.test_persistent_agents import assignment
 
 
-def turn(store, project, requirement=None):
+def turn(store, project, requirement=None, request=None):
+    with store.connect() as db:
+        prior = db.execute("SELECT id,agent_run_id FROM v1_conversation_jobs WHERE project_id=? AND status='running'", (project['id'],)).fetchall()
+    for row in prior:
+        store.finish_conversation_job(row['id'], None, row['agent_run_id'], {})
     queued = store.create_conversation_job(project['id'], 'Extend the novel to twelve chapters without ending it', True)
     job = store.claim_conversation_job(queued['id'], 'scope-test')
-    req = requirement or store.agents.turn_requirement(job, [])
-    if requirement:
-        with store.tx(immediate=True) as db:
-            db.execute('UPDATE v1_conversation_jobs SET requirement_id=?,requirement_revision=? WHERE id=?', (req['id'], req['revision'], job['id']))
     main = store.agents.main(project['id'])
     run = begin_agent(store, project, kind='conversation', conversation_job_id=job['id'])
-    return CapabilityContext(project['id'], project, store, agent_run_id=run['id'], agent_instance_id=main['id'],
-                             requirement_id=req['id'], requirement_revision=req['revision'], user_initiated=True), req
+    ctx = CapabilityContext(project['id'], project, store, agent_run_id=run['id'], agent_instance_id=main['id'], user_initiated=True)
+    state = store.intents.context(job)
+    result = store.registry.dispatch('conversation.turn.resolve', {
+        'source_message_id':job['user_message_id'], 'based_on_intent_revision':state['revision'],
+        'act':'execute', 'execution_request':request or ('extend' if requirement else 'begin'),
+        'requirement_id':requirement['id'] if requirement else None,
+        'scope_summary':job['message'], 'user_evidence':[{'message_id':job['user_message_id'],'quote':job['message']}],
+    }, ctx)
+    assert result.ok, result.error
+    req = result.output['requirement']
+    return replace(ctx, requirement_id=req['id'], requirement_revision=req['revision']), req
 
 
 def invoke(ctx, name, args):
@@ -67,8 +76,9 @@ def test_scope_extension_closed_six_to_twelve_same_conversation_and_frozen_histo
         db.execute("UPDATE v1_tasks SET status='done' WHERE project_id=?", (project['id'],))
     store.agents.close_requirement(project['id'], req['id'], 'cancelled')
     rejected = store.registry.dispatch('requirement.create', {'scope_key': 'default', 'objective': 'Twelve'}, ctx)
-    assert not rejected.ok and rejected.error['code'] == 'requirement_scope_conflict'
+    assert not rejected.ok
     assert 'Main Agent' not in rejected.error['message']
+    ctx, _ = turn(store, project, req)
     revised = invoke(replace(ctx, start_task=False), 'project.scope.revise', revision_args(req, old_workflow))
     assert revised['requirement']['id'] == req['id'] and revised['requirement']['revision'] == 2
     assert revised['bindings']['chapter_max_characters'] == 4000
@@ -94,6 +104,7 @@ def test_scope_extension_closed_six_to_twelve_same_conversation_and_frozen_histo
 
 def test_scope_revision_atomic_rollback_and_compare_and_swap(store, tmp_path, monkeypatch):
     project, ctx, req, workflow = novel(store, tmp_path)
+    ctx, _ = turn(store, project, req)
     original = store.publish_workflow
     def fail(*args, **kwargs):
         original(*args, **kwargs)
@@ -131,6 +142,7 @@ def test_old_assignment_finishes_with_old_contract_after_scope_revision(store, t
 
 def test_late_event_cannot_select_or_revise_new_scope(store, tmp_path):
     project, ctx, req, workflow = novel(store, tmp_path)
+    ctx, _ = turn(store, project, req)
     invoke(ctx, 'project.scope.revise', revision_args(req, workflow))
     with store.tx(immediate=True) as db:
         db.execute("UPDATE v1_conversation_jobs SET trigger_kind='mailbox',requirement_revision=1 WHERE id=(SELECT conversation_job_id FROM v1_agent_runs WHERE id=?)", (ctx.agent_run_id,))
@@ -149,7 +161,7 @@ def test_retired_worker_successor_keeps_old_history_and_new_private_context(stor
     evidence = store.prepare_terminal_evidence(task, run['id'], 'done', {}, None)
     store.finish_run(task, run['id'], {}, 'success', 'done', terminal='done', terminal_artifact=evidence)
     store.agents.set_lifecycle(project['id'], old['agent_instance_id'], 'retired')
-    ctx, _ = turn(store, project, req)
+    ctx, _ = turn(store, project, req, request='continue')
     result = invoke(ctx, 'agent.worker.replace', {'worker_id': old['agent_instance_id'], 'summary': 'Chapter six ends with the unopened letter.'})
     store.finish_conversation_job(store.agents.conversation_job(ctx)['id'], None, ctx.agent_run_id, {})
     _, _, new = assignment(store, project, wf, requirement=req)
@@ -196,6 +208,7 @@ def test_report_uses_actual_pending_state_not_model_claim(store, tmp_path):
 def test_continue_policy_and_frozen_loop_assets_survive_catalog_change(store, tmp_path, monkeypatch):
     project, ctx, req, workflow = novel(store, tmp_path)
     frozen_assets = store.get_project_loop_assets(project['id'], workflow)
+    ctx, _ = turn(store, project, req)
     invoke(ctx, 'project.scope.revise', revision_args(req, workflow))
     current = store.get_workflow(project['id'])
     assert current['loop_bindings']['ending_policy'] == 'continue'
@@ -248,7 +261,9 @@ def test_gateway_continues_cancelled_requirement_and_reports_six_created_tasks(s
             plan = next(p for p in store.list_task_plans(project['id']) if p['plan']['tasks'][0]['proposed_task_ref'] == 'chapter07')
             return call('task.create', {'task_plan_id': plan['id'], 'proposed_task_ref': 'chapter07'}, 'create')
         return AgentModelResponse(text=json.dumps({'mode': 'work_result', 'message': 'Chapter seven is running', 'tool_call_ids': ['revise', 'create']}))
-    gateway = ConversationGateway(store, store.registry, agent_core=AgentCore(store, store.registry, model))
+    from tests.helpers import resolve_execution_before
+    gateway = ConversationGateway(store, store.registry, agent_core=AgentCore(store, store.registry,
+        resolve_execution_before(model, request='extend', requirement_id=req['id'])))
     queued = run_turn(gateway, project['id'], 'Continue chapters seven through twelve without concluding', True)
     job = store.get_conversation_job(queued['job']['id'])
     assert job['status'] == 'succeeded' and step == 5

@@ -81,6 +81,10 @@ class AgentToolBatchExecutor:
             if self.spec.kind == "column"
             else None
         )
+        if self.spec.kind == 'conversation' and len(tool_calls) > 1 and any(
+            call.name in {'conversation.turn.resolve','conversation.reply'} for call in tool_calls
+        ):
+            protocol_error = 'Submit conversation.turn.resolve or conversation.reply alone; read other receipts before choosing the next action. This batch had no effects.'
         if protocol_error is not None:
             self.completion_guard.observe_rejection(
                 {
@@ -94,6 +98,12 @@ class AgentToolBatchExecutor:
                 completion_tool_name=completion_tool_name,
             )
 
+        if self.spec.kind == 'conversation' and not protocol_error:
+            for call in tool_calls:
+                if repeats_failed_operation(call.name, call.arguments, self.logical_ledger):
+                    raise ConversationProtocolStalled(
+                        f'Conversation Agent repeated an identical failed tool operation without changing its arguments: {call.name}')
+
         for index, call in enumerate(tool_calls):
             operation_id = operation_ids[index] if operation_ids else None
             operation = self.store.agents.operation(operation_id) if operation_id else None
@@ -103,16 +113,23 @@ class AgentToolBatchExecutor:
                 result = ToolResult.model_validate_json(operation['result_json'])
                 completion = json.loads(operation['completion_json']) if operation['completion_json'] else None
                 wait_request = json.loads(operation['wait_json']) if operation['wait_json'] else None
-                if completion is not None:
+                if completion is not None and self.spec.kind == 'column':
                     # A prior admission may precede an interrupted Task commit.
                     # Validate the frozen checks against the current workspace.
                     result, completion = self._complete(call.arguments)
+                elif completion is not None and call.name == 'conversation.reply':
+                    from app.v1.conversation_report import render_report
+                    rendered, evidence = render_report(
+                        self.store, self.spec.project['id'], operation['source_run_id'],
+                        json.dumps(call.arguments, ensure_ascii=False), execution_control=self.spec.execution_control)
+                    completion = {'rendered': rendered, 'conversation_report': evidence}
+                    result = result.model_copy(update={'output': completion})
             elif protocol_error is not None:
                 result = ToolResult(
                     ok=False,
                     capability=call.name,
                     error={
-                        "type": "ColumnCompletionProtocolError",
+                        "type": "ColumnCompletionProtocolError" if self.spec.kind == 'column' else 'ConversationTurnProtocolError',
                         "message": protocol_error,
                     },
                     checkpoint={"failure_disposition": "rejected_before_effect"},
@@ -135,21 +152,16 @@ class AgentToolBatchExecutor:
                 )
             elif (
                 self.spec.kind == "conversation"
-                and not self._conversation_mutation_enabled()
-                and self.effect_kinds.get(call.name) in {"write", "process", "control"}
-                and not (self.spec.supervision_turn and call.name in {
-                    "task.retry", "task.reopen", "task.pause", "task.resume", "task.rerun"
-                })
+                and (boundary_error := self.store.intents.denial(
+                    self.capability_context, call.name, call.arguments,
+                    self.effect_kinds.get(call.name, 'control')))
             ):
                 result = ToolResult(
                     ok=False,
                     capability=call.name,
                     error={
-                        "type": "ConversationMutationDisabled",
-                        "message": (
-                            "This Conversation Turn is discussion-only; state-changing capabilities "
-                            "remain visible for a stable Session tool surface but cannot execute."
-                        ),
+                        "type": boundary_error.split(':')[0],
+                        "message": boundary_error,
                     },
                     checkpoint={"failure_disposition": "rejected_before_effect"},
                 )
@@ -209,6 +221,8 @@ class AgentToolBatchExecutor:
                         },
                     )
 
+            if self.spec.kind == 'conversation' and call.name == 'conversation.reply' and result.ok:
+                completion = result.output
             if operation_id:
                 if wait_request:
                     wait_request['checkpoint'] = {**(wait_request.get('checkpoint') or {}), 'operation_id': operation_id}
@@ -325,20 +339,6 @@ class AgentToolBatchExecutor:
                 None,
             )
 
-    def _conversation_mutation_enabled(self):
-        # The initial spec is a context snapshot, not current turn authority.
-        # A closed Requirement can be revised by a user and selected again in
-        # this very turn; do not reject it before Capability dispatch refreshes.
-        with self.store.connect() as db:
-            row = db.execute('''SELECT j.start_task,j.trigger_kind,j.requirement_revision,r.revision,r.status
-                FROM v1_agent_runs a JOIN v1_conversation_jobs j ON j.id=a.conversation_job_id
-                LEFT JOIN v1_requirements r ON r.id=j.requirement_id WHERE a.id=?''', (self.run_id,)).fetchone()
-        if row is None:
-            return self.spec.start_task
-        if row['trigger_kind'] == 'user':
-            return bool(row['start_task'])
-        return row['status'] == 'active' and row['revision'] == row['requirement_revision']
-
     def _run_acceptance_checks(self):
         for check in self.completion_contract.acceptance_checks:
             if self.spec.assignment:
@@ -351,6 +351,7 @@ class AgentToolBatchExecutor:
             self.store.record_tool_invocation(agent_run_id=self.run_id, tool_call_id=call_id,
                                              capability=check['capability'], arguments=check['arguments'],
                                              result=result.model_dump(mode='json'), ok=result.ok)
+            self.store.feedback.record_check(self.spec, check['key'], f'{self.run_id}:{call_id}', result, agent_run_id=self.run_id)
             item = ledger_entry(self.run_id, call_id, check['capability'], self.registry.side_effect_kind(check['capability']), result, arguments=check['arguments'])
             item['acceptance_check'] = check['key']
             self.logical_ledger.append(item)

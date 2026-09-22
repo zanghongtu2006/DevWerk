@@ -71,12 +71,15 @@ class CompletionAdmissionService:
         }
         resolved_failure_ids: set[str] = set()
         for resolution in submission.failure_resolutions:
-            failed = unresolved_by_evidence.get(resolution.failed_evidence_id)
+            # A valid explicit pair remains valid after an identical retry has
+            # already discharged that failure automatically. Never require the
+            # model to infer whether the Runtime removed it from `unresolved`.
+            failed = by_evidence.get(resolution.failed_evidence_id)
             repaired = by_evidence.get(resolution.resolved_by_evidence_id)
-            if failed is None:
+            if failed is None or failed.get('ok') or failed.get('status') == 'awaiting':
                 return self._reject(
                     "unknown_failed_evidence",
-                    f"failure resolution references an unresolved failure that does not exist: "
+                    f"failure resolution references a failed receipt that does not exist: "
                     f"{resolution.failed_evidence_id!r}",
                 )
             if repaired is None or not repaired.get("ok") or repaired.get("status") != "completed":

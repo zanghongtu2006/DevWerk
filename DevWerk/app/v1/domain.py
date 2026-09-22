@@ -154,6 +154,17 @@ class AcceptanceCheck(BaseModel):
     key: str = Field(pattern=KEY_PATTERN)
     capability: Literal["project.command.run", "project.files.read"]
     arguments: dict[str, Any]
+    evidence_kind: Literal['artifact', 'behavior'] = 'artifact'
+    purpose: str = Field(default='', max_length=4000)
+
+    @model_validator(mode='after')
+    def behavior_requires_execution(self):
+        if self.evidence_kind == 'behavior':
+            if self.capability != 'project.command.run' or not self.purpose.strip():
+                raise ValueError('Behavior acceptance requires an executable command and a concrete purpose')
+            if '--list' in self.arguments.get('argv', []):
+                raise ValueError('Listing tests is not behavioral execution evidence')
+        return self
 
 
 class ColumnDefinition(BaseModel):
@@ -244,6 +255,13 @@ class TerminalSentinels(BaseModel):
     failure: Literal["failed"] = "failed"
 
 
+class AcceptanceObligation(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    column: str = Field(pattern=KEY_PATTERN)
+    check_key: str = Field(pattern=KEY_PATTERN)
+    invalidated_by: list[str] = Field(default_factory=list, max_length=200)
+
+
 class WorkflowDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid")
     schema_version: Literal["devwerk.workflow.v1"] = "devwerk.workflow.v1"
@@ -252,6 +270,7 @@ class WorkflowDefinition(BaseModel):
     entry: str = Field(pattern=KEY_PATTERN)
     terminals: TerminalSentinels = Field(default_factory=TerminalSentinels)
     columns: list[ColumnDefinition] = Field(min_length=1, max_length=200)
+    acceptance_obligations: list[AcceptanceObligation] = Field(default_factory=list, max_length=200)
 
     @model_validator(mode="after")
     def validate_graph(self) -> "WorkflowDefinition":
@@ -259,6 +278,14 @@ class WorkflowDefinition(BaseModel):
         if len(keys) != len(set(keys)):
             raise ValueError("workflow column keys must be unique")
         known = set(keys)
+        references = [(o.column,o.check_key) for o in self.acceptance_obligations]
+        if len(references) != len(set(references)):
+            raise ValueError('Acceptance obligations must be unique')
+        for obligation in self.acceptance_obligations:
+            if set(obligation.invalidated_by) - known:
+                raise ValueError('Acceptance invalidation must reference Workflow columns')
+            if obligation.column not in known or not any(c.key == obligation.check_key for c in self.column(obligation.column).acceptance_checks):
+                raise ValueError('Acceptance obligation must reference a frozen Column check')
         if self.entry not in known:
             raise ValueError("workflow entry must reference a column")
 
@@ -338,9 +365,18 @@ class ProjectCreate(BaseModel):
     agent_instruction: str = Field(default="", max_length=60_000)
 
 
+class ConversationAction(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    kind: Literal['start_proposal']
+    proposal_id: str = Field(min_length=1)
+    proposal_hash: str = Field(min_length=1)
+
+
 class ConversationRequest(BaseModel):
     message: str = Field(min_length=1, max_length=30_000)
     start_task: bool = True
+    mode: Literal['auto', 'discuss'] = 'auto'
+    user_action: ConversationAction | None = None
 
 
 class ExternalEventSignal(BaseModel):
@@ -516,6 +552,8 @@ def _decode_exact_escaped_value(value: str) -> str:
 class TaskPlanItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
     proposed_task_ref: str = Field(pattern=KEY_PATTERN)
+    entry_evidence: dict[str, str] = Field(default_factory=dict,
+        description='Declared entry requirement key to a real scope grant or file-write execution_key.')
     title: str = Field(min_length=1, max_length=200)
     brief: str = Field(default="", max_length=30_000)
     input: dict[str, Any] = Field(default_factory=dict)
@@ -523,8 +561,9 @@ class TaskPlanItem(BaseModel):
     workflow_fit: str = Field(min_length=1, max_length=4_000)
     agent_execution: Literal["forbidden", "required", "allowed"] = Field(
         description=(
-            "Executable Task policy for ephemeral Agent use. forbidden means zero Task-associated "
-            "Agent Runs; required means done requires at least one; allowed permits either."
+            "Workflow Column Worker policy. Use required or allowed when any Column has an agent executor. "
+            "forbidden is only for entirely deterministic capability_sequence workflows. "
+            "Each agent Column runs one leaf Worker; this field does not request a multi-agent loop."
         ),
     )
     dependencies: list[str] = Field(default_factory=list, max_length=200)
@@ -693,9 +732,29 @@ class OrderedTaskDependencyContract(BaseModel):
     first_value: int | str | None = None
 
 
+class TaskEntryRequirement(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    key: str = Field(min_length=1)
+    kind: Literal['accepted_scope_snapshot', 'input_file_snapshot']
+    input_pointer: str | None = None
+    scope_evidence_key: str | None = None
+
+    @model_validator(mode='after')
+    def file_reference(self):
+        if self.kind == 'input_file_snapshot' and (not self.input_pointer or not self.input_pointer.startswith('/') or not self.scope_evidence_key):
+            raise ValueError('input_file_snapshot requires input_pointer and scope_evidence_key')
+        return self
+
+
 class TaskContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
     input_schema: dict[str, Any] = Field(default_factory=dict)
+    entry_requirements: list[TaskEntryRequirement] = Field(default_factory=list)
+    required_behavior_columns: list[str] = Field(default_factory=list, max_length=200,
+        description='Before Task admission, each named Column needs a behavioral command check referenced by workflow.acceptance_obligations.')
+    acceptance_invalidated_by: list[str] = Field(default_factory=list, max_length=200)
+    feedback_columns: list[str] = Field(default_factory=list, max_length=200,
+        description='Columns that must expose task.feedback.record for persistent defect handoff.')
     identity_pointer: str | None = Field(
         default=None,
         pattern=r"^/.*",
@@ -710,6 +769,18 @@ class TaskContract(BaseModel):
     required_context: list[str] = Field(default_factory=list, max_length=200)
     expected_outputs: list[str] = Field(min_length=1, max_length=200)
     acceptance_contract: list[str] = Field(min_length=1, max_length=200)
+
+    @model_validator(mode='after')
+    def entry_evidence_references(self):
+        rules = {rule.key: rule for rule in self.entry_requirements}
+        if len(rules) != len(self.entry_requirements):
+            raise ValueError('Entry requirement keys must be unique')
+        for rule in self.entry_requirements:
+            if rule.kind == 'input_file_snapshot':
+                target = rules.get(rule.scope_evidence_key)
+                if not target or target.kind != 'accepted_scope_snapshot':
+                    raise ValueError('File entry evidence must reference an accepted_scope_snapshot rule')
+        return self
 
 
 class WorkflowPlan(BaseModel):
@@ -780,6 +851,8 @@ class TaskPlan(BaseModel):
     schema_version: Literal["devwerk.task-plan.v1"] = "devwerk.task-plan.v1"
     objective: str = Field(min_length=1, max_length=10_000)
     workflow_revision_id: str = Field(min_length=1)
+    repair_of_task_id: str | None = Field(default=None,
+        description='Explicit terminal predecessor when planning a corrected successor. Preserve its proposed_task_ref and create using task.successor.')
     tasks: list[TaskPlanItem] = Field(min_length=1, max_length=200)
 
     @model_validator(mode="after")

@@ -242,7 +242,7 @@ def test_durable_queue_recovers_failed_claim_without_restart(store, tmp_path, mo
     asyncio.run(run())
 
 
-def test_main_uses_worker_completion_to_create_scoped_repair_task(store, tmp_path):
+def test_notification_does_not_create_repair_and_explicit_repair_reuses_worker(store, tmp_path):
     wf = agent_workflow()
     wf.column('work').executor.worker_key = 'developer'
     project, first, runtime = setup(store, tmp_path, wf, [response('column.complete', COMPLETE)])
@@ -270,22 +270,21 @@ def test_main_uses_worker_completion_to_create_scoped_repair_task(store, tmp_pat
     assert job['trigger_kind'] == 'mailbox'
     from app.v1.execution_control import ExecutionControl
     import time
-    with pytest.raises(requests.ConnectionError, match='reply interrupted'):
-        gateway._process(job, ExecutionControl(time.monotonic()+30, validate_owner=lambda: store.assert_conversation_owner(job)))
-    assert store.get_conversation_job(job_id)['status'] == 'failed'
-    repair = next(t for t in store.list_tasks(project['id']) if t['proposed_task_ref'] == 'repair')
-    assert repair['requirement_id'] == requirement_id
+    gateway._process(job, ExecutionControl(time.monotonic()+30, validate_owner=lambda: store.assert_conversation_owner(job)))
+    assert store.get_conversation_job(job_id)['status'] == 'succeeded'
+    assert n == 0 and len(store.list_tasks(project['id'])) == 1
     # Redeliver the same source events with a different plan envelope. The
     # actual proposed work is unchanged, so a second Task must not be created.
     for message_id in job['mailbox_ids']:
-        redelivered = store.mailbox_service.redeliver(project['id'], message_id, 'retry interrupted Main turn')
-        assert redelivered['event_id'] is not None
+        with pytest.raises(ValueError, match='acknowledged'):
+            store.mailbox_service.redeliver(project['id'], message_id, 'duplicate notification')
     plan = plan.model_copy(update={'objective': 'The same feedback was redelivered'})
     n = 0
-    again_id = store.enqueue_governance_jobs()[0]
-    again = store.claim_conversation_job(again_id, 'test-main-again')
-    gateway._process(again, ExecutionControl(time.monotonic()+30, validate_owner=lambda: store.assert_conversation_owner(again)))
-    assert store.get_conversation_job(again_id)['status'] == 'succeeded'
+    assert store.enqueue_governance_jobs() == []
+    assert n == 0 and len(store.list_tasks(project['id'])) == 1
+    saved = store.create_task_plan(project['id'], plan)
+    repair = store.create_task(project['id'], task_plan_id=saved['id'], proposed_task_ref='repair')
+    assert repair['requirement_id'] == requirement_id
     assert len(store.list_tasks(project['id'])) == 2
     worker = next(w for w in store.agents.list_workers(project['id']) if w['role'] == 'leaf')
     message = store.agents.send(project['id'], worker['id'], 'Preserve the earlier interface')
@@ -302,7 +301,9 @@ def test_main_uses_worker_completion_to_create_scoped_repair_task(store, tmp_pat
     assert first['id'] in seen[0]  # Previous work survives in this Worker's own context.
     consumed = next(m for m in detail['messages'] if m['id'] == message['id'])
     assert consumed['consumed_by_run_id'] and consumed['state'] == 'acknowledged'
-    assert store.mailbox_service.deliveries(project['id'], message['id'])[0]['consumer_kind'] == 'worker_assignment'
+    assert store.mailbox_service.deliveries(project['id'], message['id']) == []
+    with store.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM v1_project_mailbox WHERE event_type='agent.message'").fetchone()[0] == 0
 
 
 def test_worker_message_is_not_delivered_to_main(store, tmp_path):

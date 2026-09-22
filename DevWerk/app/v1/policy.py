@@ -28,6 +28,7 @@ class SchedulingPolicy(_PolicyModel):
 
 
 class ContextPolicy(_PolicyModel):
+    conversation_history_max_characters: int = Field(default=40_000, ge=1024)
     worker_context_max_characters: int = Field(default=80_000, ge=1024)
     task_summary_limit: int = Field(default=100, ge=1)
     mailbox_limit: int = Field(default=100, ge=1)

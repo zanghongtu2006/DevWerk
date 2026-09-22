@@ -190,6 +190,8 @@ async def converse(project_id: str, payload: ConversationRequest, request: Reque
             project_id,
             payload.message,
             payload.start_task,
+            mode=payload.mode,
+            user_action=payload.user_action.model_dump(mode='json') if payload.user_action else None,
         )
         trace_json(_trace_log, "web.conversation_output", project_id=project_id, output=result)
         return result

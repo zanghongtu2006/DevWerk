@@ -71,10 +71,13 @@ class AgentExecutionRunner:
             model_complete=self.model_complete,
             spec=spec,
             run_id=run["id"],
+            registry=self.registry,
         )
         try:
             iteration = 0
             report_rejections = 0
+            empty_responses = 0
+            force_reply_tool = False
             scope_id = spec.column_run_id or spec.conversation_job_id or run["id"]
             adopt_legacy_intents(self.store, self.registry, spec, run['id'])
             pending = self.store.agents.pending_operations(spec.project["id"], scope_id)
@@ -115,7 +118,8 @@ class AgentExecutionRunner:
                 else:
                     response = self._bounded_request(control, provider.request,
                         messages, prepared.tools, iteration=iteration,
-                        require_tool=False, required_tool_name=None,
+                        require_tool=force_reply_tool,
+                        required_tool_name='conversation.reply' if force_reply_tool else None,
                     )
                 if response.text.strip():
                     latest_text = response.text.strip()
@@ -152,6 +156,9 @@ class AgentExecutionRunner:
                     )
                     direct_effect_calls += batch.direct_effect_calls
                     if batch.completion is not None:
+                        if spec.kind == 'conversation':
+                            result = self._finish_text(run['id'], batch.completion['rendered'], iteration, calls_used)
+                            return replace(result, completion={'conversation_report':batch.completion['conversation_report']})
                         return self._finish_completion(
                             run["id"], batch.completion, iteration, calls_used,
                             direct_effect_calls,
@@ -169,18 +176,40 @@ class AgentExecutionRunner:
                     )
                 text = response.text.strip()
                 if not text:
-                    raise RuntimeError(
-                        "Conversation Agent returned neither tools nor final text"
-                    )
+                    empty_responses += 1
+                    if not spec.require_conversation_report or empty_responses >= 3:
+                        raise RuntimeError("Conversation Agent returned neither tools nor final text")
+                    job = self.store.intents.job_for_run(run['id'], spec.project['id'])
+                    force_reply_tool = ('conversation.reply' in prepared.allowed and
+                        (not job or self.store.intents.contract(job)['phase'] != 'unresolved'))
+                    correction = ('Your response was empty. The current turn is not finished. ' +
+                        ('Call conversation.reply alone using actual evidence IDs or a discussion message.'
+                         if force_reply_tool else 'Resolve the current user turn with conversation.turn.resolve; preserve its discussion constraints.'))
+                    messages.append({'role':'user','content':correction})
+                    self.store.add_agent_message(run['id'],'user',correction,[],emit_progress=False)
+                    continue
                 if spec.require_conversation_report:
                     from app.v1.conversation_report import render_report, REPORT_INSTRUCTION
                     try:
-                        text, evidence = render_report(self.store, spec.project['id'], run['id'], text)
+                        text, evidence = render_report(self.store, spec.project['id'], run['id'], text, execution_control=control)
                     except (ValueError, KeyError) as exc:
                         report_rejections += 1
                         if report_rejections >= 3:
                             raise ValueError('Conversation reply has no valid fact report after three attempts') from exc
-                        correction = 'Reply validation failed: '+str(exc)+'. '+REPORT_INSTRUCTION
+                        job = self.store.intents.job_for_run(run['id'], spec.project['id'])
+                        boundary_hint = ''
+                        if job:
+                            state = self.store.intents.context(job)
+                            phase = self.store.intents.contract(job)['phase']
+                            boundary_hint = (f' Current durable phase={phase}; source_message_id={job["user_message_id"]}; '
+                                             f'based_on_intent_revision={state["revision"]}. Rejected calls changed nothing. '
+                                             'Do not output phase/execution_hold/decisions/open_questions inside turn_resolution. '
+                                             'Use decision_updates/open_question_updates; user_decided is the valid decision status, not user_specified. ')
+                        force_reply_tool = ('conversation.reply' in prepared.allowed and
+                            (not job or self.store.intents.contract(job)['phase'] != 'unresolved'))
+                        correction = ('Reply validation failed: '+str(exc)+'. '+boundary_hint+
+                            ('Call conversation.reply ALONE now with mode and actual task_ids/tool_call_ids. Do not reformat plain JSON or include turn_resolution/draft_update.'
+                             if force_reply_tool else REPORT_INSTRUCTION))
                         messages.append({'role': 'user', 'content': correction})
                         self.store.add_agent_message(run['id'], 'user', correction, [], emit_progress=False)
                         continue

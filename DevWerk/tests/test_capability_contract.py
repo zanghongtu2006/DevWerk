@@ -194,7 +194,7 @@ def test_mailbox_agent_cannot_apply_loop_or_expand_task_graph(store, tmp_path):
         context,
     )
     assert result.ok is False
-    assert "requires an active Conversation planning turn" in result.error["message"]
+    assert result.error['type'] == 'ConversationMutationDisabled'
 
 
 def test_workflow_rejects_inline_control_character_sensitive_capability_strings():

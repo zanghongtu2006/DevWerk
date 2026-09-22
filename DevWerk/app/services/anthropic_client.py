@@ -178,7 +178,8 @@ class AnthropicClient:
                             "input": arguments,
                         }
                     )
-                converted.append({"role": "assistant", "content": blocks})
+                if blocks:
+                    converted.append({"role": "assistant", "content": blocks})
                 continue
             if role == "tool":
                 block = {

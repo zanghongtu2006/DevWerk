@@ -140,7 +140,7 @@ def test_workflow_column_rejects_nested_multi_agent_executor():
 def test_ddd_software_delivery_loop_has_generic_engineering_lifecycle(store):
     loop = store.get_loop("software.ddd_delivery")
     assert loop["directory"] == "ddd-software-delivery"
-    assert loop["version"] == "1.2.0"
+    assert loop["version"] == "1.3.0"
     assert loop["category"] == "software_delivery"
     assert set(loop["tags"]) >= {
         "domain-driven-design",
@@ -162,6 +162,7 @@ def test_ddd_software_delivery_loop_has_generic_engineering_lifecycle(store):
     ]
     columns = {column["key"]: column for column in workflow["columns"]}
     assert all(column["executor"]["kind"] == "agent" for column in workflow["columns"])
+    assert all({'task.feedback.record','task.feedback.list'}.issubset(column['executor']['capabilities']) for column in workflow['columns'])
     assert columns["backend_development"]["metadata"]["writable_paths"] == [
         "backend/**",
         "docs/backend-development.md",
@@ -183,7 +184,7 @@ def test_ddd_software_delivery_loop_has_generic_engineering_lifecycle(store):
     assert ("integration_review", "backend_changes_requested", "backend_development") in transitions
     assert ("integration_review", "frontend_changes_requested", "frontend_development") in transitions
     assert columns["requirements"]["metadata"]["writable_paths"] == [
-        "docs/requirements-baseline.md"
+        "docs/requirements-traceability.md"
     ]
     assert columns["system_test"]["metadata"]["writable_paths"] == ["docs/test-report.md"]
     assert columns["accept"]["metadata"]["writable_paths"] == ["FINAL_ACCEPTANCE.md"]

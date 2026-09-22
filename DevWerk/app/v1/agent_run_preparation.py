@@ -57,6 +57,8 @@ class AgentRunPreparer:
         platform_policy = self.platform_policy or self.store.latest_platform_policy()
         pre_run_context = self._capability_context(spec)
         allowed = list(dict.fromkeys(spec.capability_ids))
+        if spec.kind == 'conversation' and spec.require_conversation_report and self.registry.contains('conversation.reply') and 'conversation.reply' not in allowed:
+            allowed.append('conversation.reply')
         if spec.assignment and self.registry.contains('agent.context.read') and 'agent.context.read' not in allowed:
             allowed.append('agent.context.read')
         capabilities = self.registry.resolve(allowed, pre_run_context)
@@ -183,11 +185,30 @@ class AgentRunPreparer:
                     ),
                 )
             )
-            messages.extend(history)
+            budget = self.store.policy.context.conversation_history_max_characters
+            selected, used = [], 0
+            for item in reversed(history):
+                size = len(stable_json(item))
+                if used + size > budget:
+                    break
+                selected.append(item)
+                used += size
+            if len(selected) < len(history):
+                messages.append({'role':'user','content':stable_json({
+                    'history_projection':{'omitted_messages':len(history)-len(selected),
+                        'source_characters':sum(len(stable_json(item)) for item in history),
+                        'retained_characters':used},
+                    'instruction':'Older dialogue is archived, not revoked. Current WorkIntent decisions and constraints remain authoritative. Use conversation.history.read for earlier source messages before resolving uncertain scope.'})})
+            messages.extend(reversed(selected))
             return
         if spec.assignment:
+            prior = self.store.agents.prior_assignments(spec.project['id'], spec.agent_session_id, spec.assignment['id'])
+            if prior:
+                messages.append({'role':'user', 'content':stable_json({
+                    'prior_assignments_reference':prior,
+                    'instruction':'These are archived work references, not completion of the current Assignment. Use agent.context.read for source details. Complete the current Assignment against its current input and contract.'})})
             history = replayable_session_messages(self.store.agents.session_history(
-                spec.project["id"], spec.agent_session_id, before_run_id=run_id))
+                spec.project["id"], spec.agent_session_id, before_run_id=run_id, assignment_id=spec.assignment['id']))
             messages.extend(history)
             return
         history = self.store.agent_session_messages(
@@ -251,9 +272,10 @@ class AgentRunPreparer:
                 **turn_context,
             },
             "instruction": (
-                "This immutable request created the current Conversation Job. It is authoritative "
-                "over historical conversation instructions. The accompanying Project state is "
-                "the current Turn projection; use tools for any new inspection or state change."
+                "This immutable request created the current Conversation Job. Interpret it together with "
+                "the user's unrevoked constraints in the accompanying Project state. A continuation does "
+                "not revoke those constraints; only an explicit user change does. Assistant promises "
+                "never broaden the user's authorization. Use tools for inspection or state changes."
             ),
         }
         if messages and messages[-1].get("role") == "user":
@@ -261,6 +283,32 @@ class AgentRunPreparer:
             turn_payload["unanswered_prior_user_message"] = str(
                 prior.get("content") or ""
             )
+        if spec.kind == 'conversation' and spec.conversation_job_id:
+            intent = spec.context.get('work_intent') or {}
+            hold_source = None
+            if intent.get('execution_hold') and intent.get('hold_source_id'):
+                with self.store.connect() as db:
+                    row = db.execute("SELECT id,content FROM v1_conversations WHERE project_id=? AND id=? AND role='user'",
+                        (spec.project['id'], intent['hold_source_id'])).fetchone()
+                    hold_source = {'message_id':row['id'], 'content':row['content']} if row else None
+            turn_payload['current_turn_boundary'] = {
+                'source_message_id': current_request.get('message_id'),
+                'based_on_intent_revision': intent.get('revision', 0),
+                'execution_hold': intent.get('execution_hold', False),
+                'unrevoked_hold_source': hold_source,
+                'instruction': (
+                    'First identify what the CURRENT user wants as the outcome of THIS reply. '
+                    'Advice, recommendations, design, comparison, answering choices, and remaining questions are discussion. '
+                    'They do not authorize implementing the discussed project, even when a prior assistant promised to start after answers. '
+                    'A proposal can describe concrete code without asking you to write that code. '
+                    'Choose discuss and answer the question unless the user now directs you to carry out the work. '
+                    'When explicitly directed to implement/deliver, execute without asking again. '
+                    'Keep the same draft for follow-up choices; new_scope does not remove a discussion hold. '
+                    'An ambiguous continuation inherits discussion while the hold above is active. '
+                    'A prior assistant offer to start after confirmation cannot change this rule. '
+                    'Use the IDs above; failed tool calls never increment this revision.'
+                ),
+            }
         item = {"role": "user", "content": stable_json(turn_payload)}
         messages.append(item)
         self.store.add_agent_message(run_id, "user", item["content"], [])

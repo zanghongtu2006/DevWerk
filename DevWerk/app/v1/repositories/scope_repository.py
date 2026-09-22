@@ -149,6 +149,7 @@ class ScopeRepository:
             self.remember(revised, job_id=self.store.agents.conversation_job(ctx)['id'], reason=reason)
             self.bind_workflow(published['id'], binding_id, requirement_id, revised['revision'])
             self.store.agents.select_requirement(ctx, requirement_id)
+            self.store.intents.bind_revised_scope(ctx, revised)
             result = {'requirement': revised, 'workflow_revision_id': published['id'], 'binding_id': binding_id,
                       'bindings': parameters, 'previous_workflow_revision_id': active['id'], 'task_ids': []}
             self.store._event(db, ctx.project_id, None, None, 'project.scope.revised', result)

@@ -10,7 +10,7 @@ from app.v1.storage_support import new_id, utcnow
 
 
 class MailboxService:
-    """Durable Project communication and delivery lifecycle.
+    """Durable Project notifications and delivery lifecycle.
 
     This service does not schedule Tasks or invoke an Agent. Callers bind a pending
     message to one consumer, then record receipt and one explicit terminal result.
@@ -276,7 +276,7 @@ class MailboxService:
                 raise KeyError(message_id)
             MAILBOX_STATE_MACHINE.require(row[0], MailboxStatus.PENDING)
             if row['recipient_agent_id']:
-                self.store.agents.validate_message_target(db, project_id, row['recipient_agent_id'], row['assignment_id'])
+                raise ValueError('Legacy Worker input is read-only in Mailbox; submit explicit Worker input instead')
             db.execute(
                 "UPDATE v1_project_mailbox SET state='pending',redelivered_at=?,last_error=NULL,"
                 "last_delivery_job_id=NULL,delivered_at=NULL,received_at=NULL,failed_at=NULL,"

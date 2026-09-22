@@ -48,6 +48,7 @@ from app.v1.repositories.project_repository import ProjectRepository
 from app.v1.repositories.planning_repository import PlanningRepository
 from app.v1.repositories.schema_repository import SchemaRepository
 from app.v1.repositories.agent_repository import AgentRepository
+from app.v1.repositories.task_feedback_repository import TaskFeedbackRepository
 from app.v1.repositories.scope_repository import ScopeRepository
 from app.v1.services.scheduler import SchedulerService
 from app.v1.services.recovery_manager import RecoveryManager
@@ -248,7 +249,10 @@ class V1Store:
         self.mailbox_service = MailboxService(self)
         self.schema_repository = SchemaRepository(self)
         self.agents = AgentRepository(self)
+        self.feedback = TaskFeedbackRepository(self)
         self.scopes = ScopeRepository(self)
+        from app.v1.repositories.conversation_intent_repository import ConversationIntentRepository
+        self.intents = ConversationIntentRepository(self)
         self.path = Path(db_path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._schema_lock = threading.Lock()
@@ -297,7 +301,9 @@ class V1Store:
     def init_schema(self) -> None:
         self.schema_repository.init_schema()
         self.agents.init_schema()
+        self.feedback.init_schema()
         self.scopes.init_schema()
+        self.intents.init_schema()
 
     def _validate_persisted_runtime_statuses(self, db: sqlite3.Connection) -> None:
         self.schema_repository._validate_persisted_runtime_statuses(db)
@@ -696,12 +702,24 @@ class V1Store:
             "project_id": project_id,
             "agent_state": agent["state"],
             "job": job,
+            "work_intent": self.intents.context({'project_id': project_id, 'user_message_id': 9223372036854775807}),
         }
 
-    def create_conversation_job(self, project_id: str, message: str, start_task: bool) -> dict[str, Any]:
+    def create_conversation_job(self, project_id: str, message: str, start_task: bool,
+                                requested_mode: str = 'auto', user_action: dict | None = None) -> dict[str, Any]:
         self.get_project(project_id)
         job_id, now = new_id("cjob"), utcnow()
         with self.tx(immediate=True) as db:
+            if requested_mode not in {'auto', 'discuss'}:
+                raise ValueError('Unknown conversation mode')
+            if user_action:
+                from app.v1.domain import ConversationAction
+                action = ConversationAction.model_validate(user_action)
+                proposal = self.intents.context({'project_id': project_id, 'user_message_id': 9223372036854775807}).get('proposal')
+                if requested_mode == 'discuss' or not start_task:
+                    raise ValueError('Starting a proposal conflicts with discussion-only mode')
+                if not proposal or (action.proposal_id, action.proposal_hash) != (proposal['id'], proposal['hash']):
+                    raise ValueError('Proposal changed; review the current proposal before starting')
             session = db.execute(
                 "SELECT logical_id FROM v1_conversation_agents WHERE project_id=?",
                 (project_id,),
@@ -721,9 +739,10 @@ class V1Store:
             message_id = int(cursor.lastrowid)
             db.execute(
                 "INSERT INTO v1_conversation_jobs "
-                "(id,project_id,conversation_session_id,user_message_id,message,start_task,status,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,'queued',?,?)",
-                (job_id, project_id, session[0], message_id, message, int(start_task), now, now),
+                "(id,project_id,conversation_session_id,user_message_id,message,start_task,status,created_at,updated_at,requested_mode,user_action_json) "
+                "VALUES(?,?,?,?,?,?,'queued',?,?,?,?)",
+                (job_id, project_id, session[0], message_id, message, int(start_task), now, now, requested_mode,
+                 json.dumps(user_action) if user_action else None),
             )
             db.execute(
                 "UPDATE v1_conversation_agents SET state='planning',updated_at=? WHERE project_id=?",
@@ -856,7 +875,9 @@ class V1Store:
                 "SELECT 1 FROM v1_conversation_jobs earlier "
                 "JOIN v1_conversation_jobs current ON current.id=? "
                 "WHERE earlier.project_id=current.project_id AND earlier.status='queued' "
-                "AND (earlier.created_at<current.created_at OR (earlier.created_at=current.created_at AND earlier.user_message_id<current.user_message_id))"
+                "AND ((earlier.trigger_kind='user' AND current.trigger_kind!='user') OR "
+                "((earlier.trigger_kind='user')=(current.trigger_kind='user') AND "
+                "(earlier.created_at<current.created_at OR (earlier.created_at=current.created_at AND earlier.user_message_id<current.user_message_id))))"
                 ") "
                 "AND NOT EXISTS (SELECT 1 FROM v1_conversation_agents a JOIN v1_conversation_jobs j ON j.project_id=a.project_id WHERE j.id=? AND a.lease_until IS NOT NULL AND a.lease_until>?)",
                 (claim_owner, now, job_id, job_id, job_id, now),
@@ -913,7 +934,7 @@ class V1Store:
                 None,
                 None,
                 "conversation.planning_started",
-                {"job_id": job_id, "session_owner": claim_owner, "agent_id": agent[0] if agent else None, "llm_used": True},
+                {"job_id": job_id, "session_owner": claim_owner, "agent_id": agent[0] if agent else None, "llm_used": row['trigger_kind'] == 'user'},
             )
         return self.get_conversation_job(job_id)
 
@@ -959,36 +980,8 @@ class V1Store:
             resolved_failure_job_ids: list[str] = []
             if mailbox_ids:
                 placeholders = ",".join("?" for _ in mailbox_ids)
-                failed_job_ids: list[str] = []
-                failure_facts = db.execute(
-                    f"SELECT event_type,payload_json FROM v1_project_mailbox "
-                    f"WHERE project_id=? AND id IN ({placeholders})",
-                    [project_id, *mailbox_ids],
-                ).fetchall()
-                for event_type, payload_json in failure_facts:
-                    if event_type != "conversation.planning_failed":
-                        continue
-                    payload = json.loads(payload_json or "{}")
-                    failed_job_id = str(payload.get("job_id") or "")
-                    if failed_job_id and failed_job_id != job_id:
-                        failed_job_ids.append(failed_job_id)
-                if failed_job_ids:
-                    failure_placeholders = ",".join("?" for _ in failed_job_ids)
-                    resolved_failure_job_ids = [
-                        str(item[0])
-                        for item in db.execute(
-                            f"SELECT id FROM v1_conversation_jobs "
-                            f"WHERE project_id=? AND status='failed' AND resolved_by_job_id IS NULL "
-                            f"AND id IN ({failure_placeholders})",
-                            [project_id, *failed_job_ids],
-                        ).fetchall()
-                    ]
-                    db.execute(
-                        f"UPDATE v1_conversation_jobs SET resolved_by_job_id=? "
-                        f"WHERE project_id=? AND status='failed' AND resolved_by_job_id IS NULL "
-                        f"AND id IN ({failure_placeholders})",
-                        [job_id, project_id, *failed_job_ids],
-                    )
+                # Notification acknowledgement proves delivery only. It cannot
+                # resolve the originating failure, even in a successful turn.
                 decision_id = new_id("gdec")
                 decision = "governance_turn_completed" if task_id else "observed_no_intervention"
                 db.execute(
@@ -1019,7 +1012,10 @@ class V1Store:
                     (now, row[2], job_id),
                 )
             db.execute("UPDATE v1_conversation_agents SET lease_owner=NULL,lease_until=NULL WHERE project_id=?", (project_id,))
-            self._event(db, project_id, task_id, None, "conversation.planning_succeeded", {"job_id": job_id})
+            trigger = db.execute('SELECT trigger_kind FROM v1_conversation_jobs WHERE id=?', (job_id,)).fetchone()[0]
+            self._event(db, project_id, task_id, None,
+                        'conversation.planning_succeeded' if trigger == 'user' else 'mailbox.notification_completed',
+                        {"job_id": job_id})
             if resolved_failure_job_ids:
                 self._event(
                     db,
@@ -1339,6 +1335,7 @@ class V1Store:
         *,
         task_plan_id: str,
         proposed_task_ref: str,
+        rerun_of_task_id: str | None = None,
     ) -> dict[str, Any]:
         """Start one immutable Task Plan by materializing its complete Task graph."""
         plan_row = self.get_task_plan(project_id, task_plan_id)
@@ -1351,6 +1348,8 @@ class V1Store:
         workflow_plan = WorkflowPlan.model_validate(
             self.get_workflow_plan(project_id, str(workflow["workflow_plan_id"]))["plan"]
         )
+        from app.v1.services.task_plan_compiler import compile_task_plan
+        plan = compile_task_plan(plan, definition, workflow_plan, self.registry)
         prepared = [
             self._prepare_task_materialization(
                 project_id,
@@ -1360,6 +1359,7 @@ class V1Store:
                 workflow,
                 definition,
                 workflow_plan,
+                rerun_of_task_id=(rerun_of_task_id if proposed.proposed_task_ref == proposed_task_ref else None),
             )
             for proposed in plan.tasks
         ]
@@ -1382,7 +1382,13 @@ class V1Store:
                 )
             if present_refs == set(task_refs):
                 requested_task_id = existing[proposed_task_ref]
+                if rerun_of_task_id:
+                    existing_predecessor = db.execute('SELECT rerun_of_task_id FROM v1_tasks WHERE id=?', (requested_task_id,)).fetchone()[0]
+                    if existing_predecessor != rerun_of_task_id:
+                        raise ValueError('The selected plan was already materialized without this predecessor')
             else:
+                from app.v1.services.task_entry_admission import validate_entry_evidence
+                validate_entry_evidence(self, project_id, plan, workflow_plan)
                 for item in prepared:
                     task_id = self._insert_prepared_task(db, item)
                     created_task_ids.append(task_id)
@@ -1404,7 +1410,10 @@ class V1Store:
                 self._refresh_projection(db, project_id)
         if requested_task_id is None:
             raise RuntimeError("requested Task Plan item was not materialized")
-        return self.get_project_task(project_id, requested_task_id)
+        return {**self.get_project_task(project_id, requested_task_id), 'materialization': {
+            'created_task_ids': created_task_ids,
+            'reused_task_ids': list(existing.values()) if not created_task_ids else [],
+        }}
 
     def _prepare_task_materialization(
         self,
@@ -1418,25 +1427,9 @@ class V1Store:
         *,
         rerun_of_task_id: str | None = None,
     ) -> dict[str, Any]:
-        input_data = canonicalize_contract_value(
-            validate_task_capability_bindings(
-                definition,
-                self.registry,
-                dict(proposed.input),
-                exact_strings=task_binding_exact_strings(
-                    self,
-                    project_id,
-                    task_plan_id,
-                    proposed.proposed_task_ref,
-                ),
-            ),
-            workflow_plan.task_contract.input_schema,
-        )
-        validate_contract(
-            input_data,
-            workflow_plan.task_contract.input_schema,
-            label=f"Task {proposed.proposed_task_ref} input",
-        )
+        from app.v1.services.task_plan_compiler import prepare_task_input
+        input_data, readiness, task_logical_key = prepare_task_input(
+            proposed, definition, workflow_plan, self.registry)
         binding = self.get_project_loop_binding(project_id, workflow['id'])
         validate_task_scope(
             str(proposed.proposed_task_ref),
@@ -1444,18 +1437,6 @@ class V1Store:
             workflow_plan.task_contract.admission_constraints,
             loop_bindings=dict(binding.get("bindings") or {}) if binding else {},
         )
-        proposed.validate_agent_execution_workflow(definition)
-        readiness = ReadinessDecision.model_validate({
-            **proposed.readiness.model_dump(mode="json"),
-            "objective": proposed.objective,
-            "dependencies": list(proposed.dependencies),
-            "conflict_domains": [
-                item.model_dump(mode="json")
-                for item in proposed.conflict_domains
-            ],
-        }).model_dump(mode="json")
-        _validate_deterministic_deliverable_coverage(definition, readiness)
-        task_logical_key = logical_task_key(workflow_plan.task_contract, input_data)
         external_dependency: dict[str, str] | None = None
         dependency_contract = workflow_plan.task_contract.dependency_contract
         if dependency_contract is not None and not proposed.dependencies:
@@ -1475,6 +1456,17 @@ class V1Store:
                 raise ValueError("a Task successor requires an immutable terminal predecessor")
             if predecessor.get("proposed_task_ref") != proposed.proposed_task_ref:
                 raise ValueError("a Task successor must preserve proposed task identity")
+            if plan.repair_of_task_id and plan.repair_of_task_id != rerun_of_task_id and predecessor['task_plan_id'] != task_plan_id:
+                raise ValueError('Corrected TaskPlan names a different predecessor')
+            previous_definition = self.workflow_by_id(project_id, predecessor['workflow_revision_id'])
+            obligations = {(o.column,o.check_key):set(o.invalidated_by) for o in definition.acceptance_obligations}
+            for old in previous_definition.acceptance_obligations:
+                if (old.column,old.check_key) not in obligations or not set(old.invalidated_by).issubset(obligations[(old.column,old.check_key)]):
+                    raise ValueError('A repair successor must preserve accepted verification obligations and their invalidation scope')
+        elif plan.repair_of_task_id:
+            repair_target = self.get_project_task(project_id,plan.repair_of_task_id)
+            if proposed.proposed_task_ref == repair_target['proposed_task_ref']:
+                raise ValueError('A repair TaskPlan must be materialized with task.successor and its explicit predecessor')
         return {
             "project_id": project_id,
             "task_plan_id": task_plan_id,
@@ -1590,6 +1582,8 @@ class V1Store:
             ),
         )
         owner = db.execute('SELECT requirement_id,requirement_revision FROM v1_task_plans WHERE id=?', (task_plan_id,)).fetchone()
+        if rerun_of_task_id:
+            self.feedback.inherit(db, rerun_of_task_id, task_id, definition)
         if owner and owner['requirement_id']:
             db.execute('UPDATE v1_tasks SET requirement_id=?,requirement_revision=? WHERE id=?', (owner['requirement_id'], owner['requirement_revision'], task_id))
         run_id = new_id("run")
@@ -1935,6 +1929,8 @@ class V1Store:
             attempt_row = db.execute("SELECT status FROM v1_column_attempts WHERE id=?", (attempt[0],)).fetchone()
             if not run_row or not attempt_row:
                 raise RuntimeError("Column Run state disappeared while finishing")
+            next_column, terminal = self.feedback.settle(db, task, run_id, outcome, next_column, terminal)
+            task_status = terminal or ('failed' if error else 'pending')
             COLUMN_RUN_STATE_MACHINE.require(run_row[0], run_status)
             ATTEMPT_STATE_MACHINE.require(attempt_row[0], run_status)
             TASK_STATE_MACHINE.require(task["status"], task_status)

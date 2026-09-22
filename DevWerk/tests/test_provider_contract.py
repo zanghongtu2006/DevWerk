@@ -39,6 +39,21 @@ class Response:
             raise RuntimeError(self.status_code)
 
 
+def test_anthropic_skips_empty_assistant_records_without_losing_tool_history():
+    _, messages = AnthropicClient._to_provider_messages([
+        {'role':'user','content':'Discuss'},
+        {'role':'assistant','content':'','tool_calls':[]},
+        {'role':'user','content':'Please reply'},
+        {'role':'assistant','content':'','tool_calls':[{'id':'read','function':{
+            'name':'project.files.read','arguments':'{"path":"baseline.md"}'}}]},
+        {'role':'tool','tool_call_id':'read','content':'baseline'},
+    ])
+    assert all(m['content'] for m in messages)
+    assert len(messages) == 3
+    assert messages[1]['content'][0]['type'] == 'tool_use'
+    assert messages[2]['content'][0]['tool_use_id'] == 'read'
+
+
 def test_contract_error_explains_nested_discriminator_branch_failure():
     schema = {
         "oneOf": [

@@ -131,7 +131,7 @@ def test_additive_session_migration_preserves_legacy_transcript_and_owner_scope(
         seen.append(json.dumps(messages))
         return response('column.complete', COMPLETE)
     WorkflowRuntime(restarted, store.registry, 'new', AgentCore(restarted, store.registry, model)).step(task['id'])
-    assert 'Retain this design decision' in seen[0]
+    assert 'Retain this design decision' not in seen[0]  # archived, not active Assignment dialogue
     with restarted.connect() as db:
         assert [tuple(r) for r in db.execute('SELECT * FROM v1_agent_sessions')] == before
     worker = next(w for w in restarted.agents.list_workers(project['id']) if w['role'] == 'leaf')

@@ -74,7 +74,7 @@ class CapabilityEntry:
     handler: CapabilityHandler
     toolset: str = "core"
     availability_check: AvailabilityCheck | None = None
-    side_effect_kind: Literal["none", "read", "write", "process", "control"] = "none"
+    side_effect_kind: Literal["none", "read", "write", "process", "control", "session_control"] = "none"
     parallel_safe: bool = False
     delegable_to_column: bool = True
     argument_preflight: ArgumentPreflight | None = None
@@ -130,23 +130,32 @@ class CapabilityRegistry:
         return [entry.tool_schema() for entry in self.resolve(capability_ids, context)]
 
     def dispatch(self, capability_id: str, arguments: dict[str, Any], context: CapabilityContext) -> ToolResult:
-        if context.agent_run_id and not context.column_run_id:
-            with context.store.connect() as db:
-                binding = db.execute('SELECT j.requirement_id,j.requirement_revision,j.start_task,j.trigger_kind FROM v1_conversation_jobs j JOIN v1_agent_runs r ON r.conversation_job_id=j.id WHERE r.id=? AND j.project_id=?', (context.agent_run_id, context.project_id)).fetchone()
+        if not context.column_run_id:
+            binding = context.store.intents.job_for_run(context.agent_run_id, context.project_id)
             if binding:
+                contract = context.store.intents.contract(binding)
                 context = replace(context, requirement_id=binding['requirement_id'], requirement_revision=binding['requirement_revision'],
-                                  start_task=bool(binding['start_task'] or binding['trigger_kind'] != 'user'),
+                                  start_task=contract['phase'] in {'execution', 'targeted_control'} or binding['trigger_kind'] != 'user',
                                   user_initiated=binding['trigger_kind'] == 'user')
         entry = self._entries.get(capability_id)
+        denied = context.store.intents.denial(context, capability_id, arguments, entry.side_effect_kind if entry else 'control')
+        if denied:
+            return ToolResult(ok=False, capability=capability_id,
+                              error={'type': denied.split(':')[0], 'message': denied},
+                              checkpoint={'failure_disposition': 'rejected_before_effect'})
         if entry and context.column_run_id and not entry.delegable_to_column:
             return ToolResult(ok=False, capability=capability_id,
                               error={"type": "LeafCapabilityDenied", "message": "A Column executes one Worker; this capability belongs to the project Conversation Agent"},
                               checkpoint={"failure_disposition": "rejected_before_effect"})
         # All core control handlers commit through Store transactions/savepoints.
         # Keep caller fencing, business mutation and receipt in ONE transaction.
-        if entry and (entry.side_effect_kind == "control" or capability_id.startswith("project.memory.")):
+        if entry and (entry.side_effect_kind in {"control", "session_control"} or capability_id.startswith("project.memory.")):
             try:
                 with context.effect_guard():
+                    denied = context.store.intents.denial(context, capability_id, arguments, entry.side_effect_kind)
+                    if denied:
+                        raise _RollbackCapability(ToolResult(ok=False, capability=capability_id,
+                            error={'type': denied.split(':')[0], 'message': denied}))
                     result = self._dispatch(capability_id, arguments, context)
                     if not result.ok:
                         raise _RollbackCapability(result)
@@ -179,6 +188,8 @@ class CapabilityRegistry:
             arguments = normalized_operation_arguments(capability_id, arguments)
             if capability_id == "project.files.write":
                 _files_write_preflight(arguments, context)
+            if capability_id == 'project.command.run':
+                context.files.resolve(str(arguments.get('cwd') or '.'))
             if context.agent_run_id and not context.column_run_id and entry.side_effect_kind in {"write", "process"}:
                 with context.store.connect() as db:
                     busy = db.execute("SELECT 1 FROM v1_tasks WHERE project_id=? AND (status IN ('running','waiting') OR failure_code='effect_outcome_unknown') LIMIT 1",
@@ -375,7 +386,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         handler: CapabilityHandler,
         *,
         output_schema: dict[str, Any] | None = None,
-        side_effect_kind: Literal["none", "read", "write", "process", "control"] = "none",
+        side_effect_kind: Literal["none", "read", "write", "process", "control", "session_control"] = "none",
         delegable_to_column: bool = True,
         argument_preflight: ArgumentPreflight | None = None,
         workflow_reference_fields: tuple[str, ...] = (),
@@ -394,6 +405,30 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
             )
         )
 
+    from app.v1.conversation_intent import TurnResolution, DiscussionDraftUpdate
+    from app.v1.conversation_report import ConversationReply, render_report
+    def reply(args, ctx):
+        ctx.store.agents.assert_conversation(ctx)
+        rendered, evidence = render_report(ctx.store, ctx.project_id, ctx.agent_run_id,
+            json.dumps(args, ensure_ascii=False), execution_control=ctx.execution_control)
+        return {'rendered':rendered, 'conversation_report':evidence}
+    add('conversation.reply', 'Finish this Conversation turn with a fact-checked reply. Call ALONE after other tools. For work_result cite actual task_ids/tool_call_ids, not plan or grant IDs. Runtime renders the facts.',
+        ConversationReply.model_json_schema(), reply, side_effect_kind='session_control', delegable_to_column=False)
+    add('conversation.draft.update', 'Save further discussion decisions/questions/proposal after resolving discussion. Does not grant execution. Use the current revision from turn.inspect.',
+        DiscussionDraftUpdate.model_json_schema(), lambda args, ctx: ctx.store.intents.update_draft(ctx, args),
+        side_effect_kind='session_control', delegable_to_column=False)
+    add('conversation.turn.inspect', 'Read the current user message ID, durable boundary and work_intent revision. Rejected operations never increment revision.',
+        {'type':'object','additionalProperties':False},
+        lambda args, ctx: _inspect_conversation_turn(ctx), side_effect_kind='read', delegable_to_column=False)
+    add('conversation.turn.resolve',
+        'Record this user turn interpretation and durable discussion/execution boundary. Submit ALONE, then read the receipt. '
+        'Answering choices is not starting work; preserve discussion holds. Cite the current user request for execution. '
+        'This is the same project Conversation Agent, not a higher Main Agent.',
+        _turn_resolution_schema(), _resolve_current_turn,
+        side_effect_kind='session_control', delegable_to_column=False)
+    add('conversation.history.read', 'Read archived user dialogue and replies by message ID. Notifications are excluded; never interpret archived messages as a new authorization.',
+        {'type':'object','properties':{'before_message_id':{'type':'integer','minimum':1},'limit':{'type':'integer','minimum':1,'maximum':30}},'additionalProperties':False},
+        _conversation_history, side_effect_kind='read', delegable_to_column=False)
     add("system.noop", "Complete a deterministic no-operation step.", {"type": "object", "additionalProperties": False}, lambda _a, _c: {"completed": True})
     memory_record_properties = {
         "id": {"type": "string", "minLength": 1, "maxLength": 500},
@@ -945,7 +980,10 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
             "Stable Project-level Task identity prevents a later immutable Plan from silently duplicating existing "
             "work; use task.rerun or task.reopen when the intent is to execute an existing work item again. "
             "Dependency/WIP-queued Tasks then advance automatically without further task.create calls. Use "
-            "scheduling.decide hold only for deliberate manual waiting."
+            "scheduling.decide hold only for deliberate manual waiting. "
+            "Runtime asynchronously creates Column Assignments and Workers. A pending Task needs no manual "
+            "Worker start. After creating the intended Tasks, use conversation.reply with their IDs; do not "
+            "implement their deliverables in this turn or wait for Workers to appear."
         ),
         {**task_schema, "$defs": task_defs},
         lambda args, ctx: _task_create(args, ctx, registry),
@@ -1031,7 +1069,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     )
     add(
         "task.rerun",
-        "Create a successor Task for an immutable done/failed Task. Task Plan dependencies are satisfied "
+        "Repeat an immutable done/failed Task using its ORIGINAL frozen TaskPlan and Workflow revision. To use a corrected plan/revision use task.successor instead. Task Plan dependencies are satisfied "
         "only by successful predecessor Tasks; otherwise the successor remains dependency-queued until one succeeds.",
         {
             "type": "object",
@@ -1043,6 +1081,23 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         side_effect_kind="control",
         delegable_to_column=False,
     )
+    add('task.successor',
+        'Create a terminal Task successor using an explicitly selected corrected TaskPlan and the same proposed_task_ref. The predecessor remains immutable.',
+        {'type':'object', 'required':['task_id','task_plan_id'],
+         'properties':{'task_id':{'type':'string'},'task_plan_id':{'type':'string'}}, 'additionalProperties':False},
+        _task_successor, side_effect_kind='control', delegable_to_column=False)
+    add('task.feedback.record',
+        'Persist a Task defect for a responsible Column with frozen verification checks. Runtime routes only at a safe Column boundary along declared Workflow edges. This does not send Mailbox instructions or start another Agent.',
+        {'type':'object', 'required':['task_id','dedupe_key','responsible_column','description','checks'],
+         'properties':{'task_id':{'type':'string'},'dedupe_key':{'type':'string','minLength':1,'maxLength':200},
+             'responsible_column':{'type':'string'},'description':{'type':'string','minLength':1,'maxLength':12000},
+             'checks':{'type':'array','minItems':1,'maxItems':30,'items':{'type':'object',
+                 'required':['column','check_key'],'properties':{'column':{'type':'string'},'check_key':{'type':'string'}},'additionalProperties':False}}},
+         'additionalProperties':False},
+        lambda args, ctx: ctx.store.feedback.record(ctx,args), side_effect_kind='control')
+    add('task.feedback.list', 'Read durable Task feedback and Runtime verification references.',
+        {'type':'object','required':['task_id'],'properties':{'task_id':{'type':'string'}},'additionalProperties':False},
+        lambda args, ctx: ctx.store.feedback.list(ctx.project_id,args['task_id']), side_effect_kind='read')
     add(
         "task.pause",
         "Pause a non-terminal Task until it is explicitly resumed.",
@@ -1711,7 +1766,7 @@ def _set_json_pointer(document: dict[str, Any], pointer: str, value: str) -> Non
     for token in tokens[:-1]:
         if isinstance(current, dict):
             if token not in current:
-                current[token] = {}
+                raise ValueError(f"ExactInputTargetMissing: {pointer!r} must select an existing string relative to Task.input")
             current = current[token]
         elif isinstance(current, list):
             index = int(token)
@@ -1722,12 +1777,18 @@ def _set_json_pointer(document: dict[str, Any], pointer: str, value: str) -> Non
             raise ValueError(f"exact Task input string pointer crosses a scalar: {pointer!r}")
     final = tokens[-1]
     if isinstance(current, dict):
+        if final not in current:
+            raise ValueError(f"ExactInputTargetMissing: {pointer!r} must select an existing string relative to Task.input")
+        if not isinstance(current[final], str):
+            raise ValueError(f"ExactInputTargetType: {pointer!r} selects {type(current[final]).__name__}, not a string")
         current[final] = value
         return
     if isinstance(current, list):
         index = int(final)
         if index < 0 or index >= len(current):
             raise ValueError(f"exact Task input string pointer index is unavailable: {pointer!r}")
+        if not isinstance(current[index], str):
+            raise ValueError(f"ExactInputTargetType: {pointer!r} must select a string")
         current[index] = value
         return
     raise ValueError(f"exact Task input string pointer crosses a scalar: {pointer!r}")
@@ -1923,7 +1984,8 @@ def _files_write_owned(args: dict[str, Any], ctx: CapabilityContext) -> dict[str
         info["size"],
         {"agent_run_id": ctx.agent_run_id},
     )
-    return {"file": info, "artifact": artifact}
+    return {"file": info, "artifact": artifact,
+            **({'execution_key': ctx.execution_key} if ctx.execution_key else {})}
 
 
 def _files_search(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
@@ -2008,6 +2070,14 @@ def _requirement_close(args, ctx):
     return ctx.store.agents.close_requirement(ctx.project_id, **args)
 
 
+def _inspect_conversation_turn(ctx):
+    job = ctx.store.intents.job_for_run(ctx.agent_run_id, ctx.project_id)
+    if not job:
+        raise ValueError('A current Conversation Job is required')
+    return {'source_message_id':job['user_message_id'], 'turn_contract':ctx.store.intents.contract(job),
+            'work_intent':ctx.store.intents.context(job), 'requested_mode':job['requested_mode']}
+
+
 def _loop_apply(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
     _require_user_planning_turn(ctx, "loop.apply")
     result = ctx.store.apply_loop(
@@ -2064,7 +2134,8 @@ def _task_create(
     fingerprint = hashlib.sha256(json.dumps({'workflow': plan['workflow_revision_id'], 'task': proposed}, sort_keys=True).encode()).hexdigest()
     existing = ctx.store.agents.caused_task(ctx.requirement_id, cause, args['proposed_task_ref'], fingerprint)
     if existing:
-        return ctx.store.get_task(existing)
+        return {**ctx.store.get_task(existing), 'materialization': {
+            'created_task_ids': [], 'reused_task_ids': [existing]}, 'dispatch': _TASK_DISPATCH_RECEIPT}
     task = ctx.store.materialize_task_plan(
         ctx.project_id,
         task_plan_id=str(args["task_plan_id"]),
@@ -2072,7 +2143,15 @@ def _task_create(
     )
     _bind_requirement(ctx, 'v1_tasks', task['id'])
     ctx.store.agents.record_caused_task(ctx.requirement_id, cause, args['proposed_task_ref'], fingerprint, task['id'])
-    return ctx.store.get_task(task['id'])
+    return {**ctx.store.get_task(task['id']), 'materialization': task['materialization'], 'dispatch': _TASK_DISPATCH_RECEIPT}
+
+
+_TASK_DISPATCH_RECEIPT = {
+    'owner': 'runtime',
+    'mode': 'asynchronous',
+    'next_action': 'Report the actual Task IDs with conversation.reply. Runtime schedules Column Workers automatically; '
+                   'pending does not mean started. Do not start a Worker manually or implement the Task deliverables yourself.',
+}
 
 
 def _bind_requirement(ctx, table, identity):
@@ -2160,6 +2239,53 @@ def _task_retry(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
 def _task_rerun(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
     task = ctx.store.get_project_task(ctx.project_id, str(args["task_id"]))
     return ctx.store.rerun_task(task["id"])
+
+
+def _task_successor(args, ctx):
+    _require_user_planning_turn(ctx, 'task.successor')
+    task = ctx.store.get_project_task(ctx.project_id, args['task_id'])
+    if task['task_plan_id'] == args['task_plan_id']:
+        raise ValueError('task.successor requires a corrected TaskPlan; use task.rerun to repeat the original plan')
+    _bind_requirement(ctx, 'v1_task_plans', args['task_plan_id'])
+    plan = ctx.store.get_task_plan(ctx.project_id, args['task_plan_id'])['plan']
+    _check_workflow_scope(ctx, plan['workflow_revision_id'])
+    if not any(item['proposed_task_ref'] == task['proposed_task_ref'] for item in plan['tasks']):
+        raise ValueError('Corrected TaskPlan must preserve the predecessor proposed_task_ref')
+    return ctx.store.materialize_task_plan(ctx.project_id, task_plan_id=args['task_plan_id'],
+        proposed_task_ref=task['proposed_task_ref'], rerun_of_task_id=task['id'])
+
+
+def _turn_resolution_schema():
+    from app.v1.conversation_intent import TurnResolution
+    schema = TurnResolution.model_json_schema()
+    schema['required'] = [key for key in schema['required'] if key not in {'source_message_id', 'based_on_intent_revision'}]
+    for key in ('source_message_id', 'based_on_intent_revision', 'user_evidence'):
+        schema['properties'][key]['description'] = 'Optional: host binds the current user turn when omitted. Explicit values remain strictly validated.'
+    return schema
+
+
+def _conversation_history(args, ctx):
+    job = ctx.store.intents.job_for_run(ctx.agent_run_id, ctx.project_id)
+    before = min(int(args.get('before_message_id') or 2**63-1), job['user_message_id'] if job else 2**63-1)
+    with ctx.store.connect() as db:
+        rows = db.execute("""SELECT id,role,content FROM v1_conversations
+            WHERE project_id=? AND id<? AND role IN ('user','assistant')
+            AND COALESCE(json_extract(meta_json,'$.kind'),'')!='notification'
+            ORDER BY id DESC LIMIT ?""", (ctx.project_id,before,int(args.get('limit') or 10))).fetchall()
+    return {'messages':[dict(row) for row in reversed(rows)], 'next_before_message_id':rows[-1]['id'] if rows else None}
+
+
+def _resolve_current_turn(args, ctx):
+    job = ctx.store.agents.assert_conversation(ctx)
+    arguments = dict(args)
+    arguments.setdefault('source_message_id', job['user_message_id'])
+    # Preserve the original revision for an idempotent replay after resolution.
+    with ctx.store.connect() as db:
+        prior = db.execute('SELECT resolution_json FROM v1_turn_resolutions WHERE job_id=?', (job['id'],)).fetchone()
+    revision = json.loads(prior[0])['based_on_intent_revision'] if prior else ctx.store.intents.context(job)['revision']
+    arguments.setdefault('based_on_intent_revision', revision)
+    arguments.setdefault('user_evidence', [{'message_id':job['user_message_id']}])
+    return ctx.store.intents.resolve(ctx, arguments)
 
 
 def _task_pause(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:

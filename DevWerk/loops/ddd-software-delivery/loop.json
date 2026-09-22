@@ -29,7 +29,14 @@
       "entry_meaning": "需求文件存在，用户已确认其功能边界与验收标准。",
       "terminal_meaning": "done 表示软件和运行证据均验收通过；failed 表示明确且不可在本轮恢复的执行失败，可 reopen 原 Task。",
       "task_contract": {
+        "required_behavior_columns": ["backend_development", "frontend_development", "system_test", "delivery", "accept"],
+        "acceptance_invalidated_by": ["backend_development", "frontend_development"],
+        "feedback_columns": ["integration_review", "system_test", "delivery", "accept"],
         "identity_pointer": "/requirements_path",
+        "entry_requirements": [
+          {"key": "confirmed_scope", "kind": "accepted_scope_snapshot"},
+          {"key": "requirements_file", "kind": "input_file_snapshot", "input_pointer": "/requirements_path", "scope_evidence_key": "confirmed_scope"}
+        ],
         "input_schema": {
           "type": "object",
           "required": [
@@ -196,7 +203,7 @@
           ],
           "action": "建立需求追踪和验收基线。",
           "produces": [
-            "docs/requirements-baseline.md"
+            "docs/requirements-traceability.md"
           ],
           "completion_evidence": [
             "每项需求具有验收方式"
@@ -353,10 +360,12 @@
         {
           "key": "requirements",
           "name": "需求基线与验收追踪",
-          "instruction": "读取 project.loop.bindings 与 Task input 指定的 requirements_path。只整理已经确认的产品行为、非目标、接口边界、运行方式和可执行验收标准，写 docs/requirements-baseline.md。不得扩展需求。内容明确时 complete requirements_ready；存在影响实现的歧义 complete requirement_gap；执行失败 complete execution_failed。",
+          "instruction": "读取 project.loop.bindings 与 Task input 指定的 requirements_path，该文件是已接受的需求快照，不得改写。只整理已经确认的产品行为、非目标、接口边界、运行方式和可执行验收标准，写 docs/requirements-traceability.md；说明本 Task 的需求来源路径。不得扩展需求。内容明确时 complete requirements_ready；存在影响实现的歧义 complete requirement_gap；执行失败 complete execution_failed。",
           "executor": {
             "kind": "agent",
             "capabilities": [
+              "task.feedback.record",
+              "task.feedback.list",
               "project.files.list",
               "project.files.read",
               "project.files.write"
@@ -391,7 +400,7 @@
             "purpose": "固定需求事实并建立验收追踪",
             "derives_agent": true,
             "writable_paths": [
-              "docs/requirements-baseline.md"
+              "docs/requirements-traceability.md"
             ]
           }
         },
@@ -402,6 +411,8 @@
           "executor": {
             "kind": "agent",
             "capabilities": [
+              "task.feedback.record",
+              "task.feedback.list",
               "project.files.list",
               "project.files.read",
               "project.files.search",
@@ -454,6 +465,8 @@
           "executor": {
             "kind": "agent",
             "capabilities": [
+              "task.feedback.record",
+              "task.feedback.list",
               "project.files.list",
               "project.files.read",
               "project.files.search",
@@ -512,6 +525,8 @@
           "executor": {
             "kind": "agent",
             "capabilities": [
+              "task.feedback.record",
+              "task.feedback.list",
               "project.files.list",
               "project.files.read",
               "project.files.search",
@@ -574,6 +589,8 @@
           "executor": {
             "kind": "agent",
             "capabilities": [
+              "task.feedback.record",
+              "task.feedback.list",
               "project.files.list",
               "project.files.read",
               "project.files.search",
@@ -637,6 +654,8 @@
           "executor": {
             "kind": "agent",
             "capabilities": [
+              "task.feedback.record",
+              "task.feedback.list",
               "project.files.list",
               "project.files.read",
               "project.files.search",
@@ -691,6 +710,8 @@
           "executor": {
             "kind": "agent",
             "capabilities": [
+              "task.feedback.record",
+              "task.feedback.list",
               "project.files.list",
               "project.files.read",
               "project.files.search",
@@ -740,10 +761,12 @@
         {
           "key": "accept",
           "name": "最终需求验收",
-          "instruction": "逐条读取 docs/requirements-baseline.md 的验收标准，并核对DDD/接口设计、集成审查、真实测试与交付运行证据。写 FINAL_ACCEPTANCE.md，逐项列出证据。全部满足 complete delivered；产品问题 complete acceptance_failed 返回开发；执行失败 complete execution_failed。不得把存在文件等同于行为通过。",
+          "instruction": "逐条读取当前 Task input.requirements_path 指定的已接受需求快照及 docs/requirements-traceability.md 的验收标准，并核对DDD/接口设计、集成审查、真实测试与交付运行证据。写 FINAL_ACCEPTANCE.md，逐项列出证据。全部满足 complete delivered；产品问题 complete acceptance_failed 返回开发；执行失败 complete execution_failed。不得把存在文件等同于行为通过。",
           "executor": {
             "kind": "agent",
             "capabilities": [
+              "task.feedback.record",
+              "task.feedback.list",
               "project.files.list",
               "project.files.read",
               "project.files.search",

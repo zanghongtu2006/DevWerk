@@ -69,7 +69,7 @@ def test_late_assignment_input_settles_without_fabricating_consumption(store, tm
     assert messages[future['id']]['state'] == 'pending'
     with pytest.raises(ValueError, match='Assignment has ended'):
         store.agents.send(project['id'], worker_id, 'too late', assignment_id=active['id'])
-    with pytest.raises(ValueError, match='Assignment has ended'):
+    with pytest.raises(KeyError):
         store.mailbox_service.redeliver(project['id'], scoped['id'], 'retry')
 
 
@@ -90,5 +90,5 @@ def test_retirement_settles_unconsumed_worker_input(store, tmp_path, close_requi
     result = store.agents.messages(project['id'], worker_id)[0]
     assert result['state'] == 'failed' and result['consumed_by_run_id'] is None
     assert store.agents.get_worker(project['id'], worker_id)['lifecycle'] == ('available' if close_requirement else 'retired')
-    with pytest.raises(ValueError, match='closed' if close_requirement else 'retired'):
+    with pytest.raises(KeyError):
         store.mailbox_service.redeliver(project['id'], message['id'], 'retry')

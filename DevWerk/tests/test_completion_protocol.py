@@ -25,6 +25,7 @@ def _entry(
     effect_kind: str,
     *,
     ok: bool,
+    arguments: dict | None = None,
 ) -> dict:
     return ledger_entry(
         "run-1",
@@ -37,7 +38,7 @@ def _entry(
             output={"call": call_id} if ok else None,
             error=None if ok else {"type": "RuntimeError", "message": "failed"},
         ),
-        arguments={"call": call_id},
+        arguments=arguments if arguments is not None else {"call": call_id},
     )
 
 
@@ -117,6 +118,17 @@ def test_unrelated_success_cannot_resolve_an_executed_failure() -> None:
     assert decision.accepted is False
     assert decision.rejection is not None
     assert decision.rejection.code == "unrelated_resolution_evidence"
+
+
+def test_explicit_resolution_can_reference_failure_already_cleared_by_identical_retry():
+    arguments = {'argv':['test-runner','verify']}
+    failed = _entry('failed', 'project.command.run', 'process', ok=False, arguments=arguments)
+    passed = _entry('passed', 'project.command.run', 'process', ok=True, arguments=arguments)
+    contract = CompletionContract(tool_name='column.complete', outcomes={'ready':CompletionOutcomeRule(target='done')})
+    submission = CompletionSubmission(outcome='ready',output={},summary='verified',
+        evidence_ids=(failed['evidence_id'],passed['evidence_id']),
+        failure_resolutions=(FailureResolution(failed['evidence_id'],passed['evidence_id'],'same check passed'),))
+    assert CompletionAdmissionService().evaluate(submission,contract,[failed,passed]).accepted
 
 
 def test_repeated_rejected_completion_stalls_without_execution_progress() -> None:

@@ -107,7 +107,8 @@ def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text
 
     wakes: list[bool] = []
     registry = build_core_registry()
-    agent = ConversationGateway(store, registry, on_task_created=lambda: wakes.append(True), agent_core=AgentCore(store, registry, model))
+    from tests.helpers import resolve_execution_before
+    agent = ConversationGateway(store, registry, on_task_created=lambda: wakes.append(True), agent_core=AgentCore(store, registry, resolve_execution_before(model)))
     accepted = run_turn(agent, project["id"], "Please manage this delivery.", True)
     job = store.get_conversation_job(accepted["job"]["id"])
     assert job["status"] == "succeeded"
@@ -133,10 +134,8 @@ def test_conversation_with_loop_workflow_can_revise_but_cannot_reapply_loop(stor
         nonlocal calls
         calls += 1
         exposed.append({item["function"]["name"] for item in tools})
-        assert "workflow.publish" in exposed[-1]
-        assert "workflow.plan.save" in exposed[-1]
-        assert "task.plan.save" in exposed[-1]
-        assert "task.create" in exposed[-1]
+        assert "conversation.turn.resolve" in exposed[-1]
+        assert {"workflow.publish", "workflow.plan.save", "task.plan.save", "task.create"}.isdisjoint(exposed[-1])
         if calls == 1:
             return AgentModelResponse(tool_calls=[AgentToolCall(
                 id="workflow",
@@ -149,13 +148,10 @@ def test_conversation_with_loop_workflow_can_revise_but_cannot_reapply_loop(stor
     agent = ConversationGateway(store, registry, agent_core=AgentCore(store, registry, model))
     accepted = run_turn(agent, project["id"], "Inspect the existing Workflow.", True)
     assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
-    # Main-Agent Sessions keep one stable tool surface. The existing
-    # Workflow invariant is enforced when loop.apply executes, not by hiding
-    # the capability from the model on later Turns.
-    assert "loop.apply" in exposed[0]
+    assert "loop.apply" not in exposed[0]
 
 
-def test_start_task_false_keeps_stable_tools_but_rejects_mutation_execution(store, tmp_path):
+def test_start_task_false_hides_mutations_and_rejects_injected_calls(store, tmp_path):
     project = store.create_project("discussion", "", str(tmp_path / "project"))
     exposed: list[set[str]] = []
     calls = 0
@@ -179,9 +175,9 @@ def test_start_task_false_keeps_stable_tools_but_rejects_mutation_execution(stor
     accepted = run_turn(agent, project["id"], "Only discuss this.", False)
     assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
     assert calls == 2
-    assert "system.files.read" in exposed[0]
-    assert "system.files.write" in exposed[0]
-    assert "system.command.run" in exposed[0]
+    assert "conversation.turn.resolve" in exposed[0]
+    assert "system.files.write" not in exposed[0]
+    assert "system.command.run" not in exposed[0]
     assert exposed[0] == exposed[1]
     assert not (tmp_path / "blocked.txt").exists()
 
@@ -213,10 +209,11 @@ def test_conversation_has_generic_system_file_authority_without_delegating_it_to
     registry = build_core_registry()
     assert not any(item.startswith("system.files.") for item in registry.column_ids())
     assert "system.command.run" not in registry.column_ids()
+    from tests.helpers import resolve_execution_before
     agent = ConversationGateway(
         store,
         registry,
-        agent_core=AgentCore(store, registry, model),
+        agent_core=AgentCore(store, registry, resolve_execution_before(model)),
     )
 
     accepted = run_turn(agent, project["id"], "Create this reusable Loop asset.", True)
@@ -224,7 +221,7 @@ def test_conversation_has_generic_system_file_authority_without_delegating_it_to
     job = store.get_conversation_job(accepted["job"]["id"])
     assert job["status"] == "succeeded"
     assert loop_card.read_text(encoding="utf-8") == "name: reusable-loop\n"
-    assert job["result"]["action_ledger"][0]["capability"] == "system.files.write"
+    assert [x['capability'] for x in job['result']['action_ledger'] if x['effect_kind'] == 'write'] == ['system.files.write']
     with pytest.raises(KeyError):
         store.get_workflow(project["id"])
 
@@ -243,7 +240,7 @@ def test_runtime_notifications_are_not_replayed_as_conversation_history(store, t
     assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
 
 
-def test_action_enabled_conversation_can_finish_with_plain_text(store, tmp_path):
+def test_unresolved_conversation_accepts_legacy_blocked_report_without_business_effects(store, tmp_path):
     project = store.create_project("no matching loop", "", str(tmp_path / "project"))
     turns = 0
     require_tool_values: list[bool] = []
@@ -264,13 +261,14 @@ def test_action_enabled_conversation_can_finish_with_plain_text(store, tmp_path)
     )
     accepted = run_turn(agent, project["id"], "Try to create a new Loop.", True)
     job = store.get_conversation_job(accepted["job"]["id"])
-    assert job["status"] == "succeeded"
+    assert job["status"] == "failed"
+    assert job['result']['business_outcome'] == 'blocked'
     assert job["result"]["reply"] == (
         "No existing Loop matches this request, so no Workflow was created."
     )
     assert job["result"]["action_ledger"] == []
     assert turns == 1
-    assert require_tool_values == [False]
+    assert require_tool_values == [True]
     assert store.conversation_agent(project["id"])["state"] != "attention"
     assert any(
         item["role"] == "assistant" and item["content"] == job["result"]["reply"]
@@ -552,10 +550,9 @@ def test_repeated_failed_operation_is_reported_without_business_claims(store, tm
         item for item in store.messages(project["id"])
         if item["role"] == "assistant"
     ]
-    assert assistant[-1]["content"] == (
-        "本轮未完成：Conversation Agent 重复提交相同且失败的工具操作，"
-        "Runtime 已停止重复调用；项目状态未改变。"
-    )
+    assert '本轮新建 0 个任务，其中 0 个已启动' in assistant[-1]['content']
+    assert 'TurnUnresolved' in assistant[-1]['content']
+    assert '重复失败调用已停止' in assistant[-1]['content']
 
 
 def test_user_turn_provider_failure_is_visible_in_conversation(store, tmp_path):
@@ -586,6 +583,7 @@ def test_user_turn_provider_failure_is_visible_in_conversation(store, tmp_path):
         if item["role"] == "assistant"
     ]
     assert assistant[-1]["content"] == (
+        "本轮新建 0 个任务，其中 0 个已启动。"
         "本轮未完成：ConnectionError: provider connection unavailable"
     )
     assert assistant[-1]["meta"]["error_code"] == "conversation_processing_failed"
@@ -815,7 +813,7 @@ def test_current_request_is_authoritative_and_not_duplicated(store, tmp_path):
     assert encoded.count("current instruction") == 1
 
 
-def test_terminal_mailbox_turn_reports_model_text_to_user(store, tmp_path):
+def test_terminal_mailbox_reports_durable_state_without_model(store, tmp_path):
     project = store.create_project("terminal", "", str(tmp_path / "project"))
     publish_planned_workflow(store, project["id"], sequence_workflow())
     task = create_planned_task(store, project["id"], "visible failure")
@@ -844,6 +842,9 @@ def test_terminal_mailbox_turn_reports_model_text_to_user(store, tmp_path):
     assistant = [item for item in store.messages(project["id"]) if item["role"] == "assistant"]
     assert "visible failure：失败" in assistant[-1]["content"]
     assert assistant[-1]["meta"]["subject_status"] == "failed"
+    assert calls == 0
+    assert assistant[-1]['meta']['llm_used'] is False
+    assert store.get_task(task['id'])['status'] == 'failed'
 
 
 def test_project_session_replays_human_dialogue_without_raw_tool_evidence(store, tmp_path):
@@ -999,15 +1000,17 @@ def test_mailbox_usage_limit_failure_never_forms_an_automatic_llm_retry_loop(sto
 
     asyncio.run(execute())
 
-    assert model_calls == 1
+    assert model_calls == 0
     with store.connect() as db:
         failed_job_count = db.execute(
             "SELECT COUNT(*) FROM v1_conversation_jobs "
             "WHERE project_id=? AND trigger_kind='mailbox' AND status='failed'",
             (project["id"],),
         ).fetchone()[0]
-    assert failed_job_count == 1
-    failed_mailbox = store.mailbox(project["id"], state="failed")
-    assert [item["id"] for item in failed_mailbox] == [mailbox_id]
-    assert failed_mailbox[0]["last_error"].endswith("provider_2056")
-    assert store.mailbox_deliveries(project["id"], mailbox_id)[0]["state"] == "failed"
+    assert failed_job_count == 0
+    observed = store.mailbox(project["id"], state="acknowledged")
+    assert [item["id"] for item in observed] == [mailbox_id]
+    deliveries = store.mailbox_deliveries(project["id"], mailbox_id)
+    assert len(deliveries) == 1 and deliveries[0]['state'] == 'acknowledged'
+    assert 'column provider plan exhausted' in store.messages(project['id'])[-1]['content'] or any(
+        'column provider plan exhausted' in m['content'] for m in store.messages(project['id']))

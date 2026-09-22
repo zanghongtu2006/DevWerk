@@ -158,7 +158,8 @@ def completion_tool_schema(contract: CompletionContract) -> dict[str, Any]:
             "name": contract.tool_name,
             "description": (
                 "Submit one declared assignment outcome with structured output and auditable evidence. "
-                "An alternative repair for an executed failure must be declared in failure_resolutions."
+                "Runtime collects evidence automatically. Frozen acceptance checks or successful identical retries "
+                "discharge failures; failure_resolutions is optional and cannot equate unrelated commands."
             ),
             "parameters": completion_arguments_schema(contract),
         },

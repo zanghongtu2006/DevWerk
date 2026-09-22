@@ -39,5 +39,6 @@ Code and secondary documentation must remain consistent with all four. For Loop,
 ## Verification
 
 - [`v1-test-contract.md`](v1-test-contract.md): maps the current test suite to the V1 contracts.
+- [`column-agent-lifecycle-interaction-test-gate-2026-09-16.md`](column-agent-lifecycle-interaction-test-gate-2026-09-16.md): mandatory real-Workflow audit of Column Agent lifecycle, feedback, directed rework, and build/test evidence before a complex-task success report.
 
 Real-provider smoke-test products and audit evidence remain outside source control under `D:\workspace\codex-devwerk-project-files` and `D:\workspace\codex-notes`.

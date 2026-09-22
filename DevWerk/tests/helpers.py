@@ -1,5 +1,38 @@
 from __future__ import annotations
 
+import json
+
+
+def resolve_execution_before(model, *, request='begin', requirement_id=None):
+    """Script the new user-boundary handshake before an existing business-tool fixture."""
+    from app.v1.domain import AgentModelResponse, AgentToolCall
+    resolved = set()
+    def wrapped(messages, tools, **kwargs):
+        for message in reversed(messages):
+            if message.get('role') != 'user':
+                continue
+            try:
+                payload = json.loads(message['content'])
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(payload, dict) or 'authoritative_current_request' not in payload:
+                continue
+            current = payload['authoritative_current_request']
+            state = payload['authoritative_project_state']
+            identity = current['message_id']
+            if identity not in resolved and state.get('turn_contract', {}).get('phase') == 'unresolved':
+                resolved.add(identity)
+                intent = state['work_intent']
+                return AgentModelResponse(tool_calls=[AgentToolCall(id='resolve-user-turn', name='conversation.turn.resolve', arguments={
+                    'source_message_id': identity, 'based_on_intent_revision': intent['revision'],
+                    'act':'execute', 'execution_request':request, 'requirement_id':requirement_id,
+                    'constraint_change':'release_hold' if intent['execution_hold'] else 'retain',
+                    'scope_summary':current['content'], 'user_evidence':[{'message_id':identity,'quote':current['content']}],
+                })])
+            break
+        return model(messages, tools, **kwargs)
+    return wrapped
+
 from app.v1.domain import (
     AgentExecutor,
     CapabilitySequenceExecutor,

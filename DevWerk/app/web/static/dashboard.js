@@ -282,7 +282,7 @@ async function sendConversation(event) {
   document.getElementById("message-input")?.focus();
   setBusy(true, "Conversation Agent 正在理解并安排工作…");
   try {
-    await api.post(`/projects/${state.projectId}/conversation`, { message, start_task: true }, { timeout: 660_000 });
+    await api.post(`/projects/${state.projectId}/conversation`, { message, mode: "auto", user_action: null }, { timeout: 660_000 });
     await Promise.all([refreshConversationMessages(), refreshConversationStatus()]);
     state.pendingMessage = "";
     showToast("Conversation Agent 已接收并更新项目。", "success");

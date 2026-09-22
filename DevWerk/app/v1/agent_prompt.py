@@ -48,6 +48,7 @@ def build_conversation_system_envelope(
 ) -> dict[str, Any]:
     """Return the byte-stable prefix for one logical Project Session."""
     from app.v1.conversation_report import REPORT_INSTRUCTION
+    from app.v1.conversation_intent import TURN_INSTRUCTION
     return {
         "protocol_version": "devwerk.conversation-session.v1",
         "agent": {
@@ -64,6 +65,7 @@ def build_conversation_system_envelope(
             "content": platform_policy.content,
         },
         "turn_protocol": {
+            **({'intent_boundary': TURN_INSTRUCTION} if spec.conversation_job_id else {}),
             **({'reply_report': REPORT_INSTRUCTION} if spec.require_conversation_report else {}),
             "state": "authoritative Project state is supplied in the current user Turn",
             "execution": "state changes exist only after successful tool receipts",
