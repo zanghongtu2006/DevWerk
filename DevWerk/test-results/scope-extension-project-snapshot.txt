@@ -1,0 +1,15 @@
+{
+  "source_open_mode": "read-only",
+  "project_id": "prj_22d5638974ee405885b0552e4a24e91f",
+  "old_requirement_status": "cancelled",
+  "old_scope_revision": 1,
+  "new_scope_revision": 2,
+  "old_loop_version": "1.4.0",
+  "new_loop_version": "1.5.0",
+  "historical_tasks_unchanged": 6,
+  "additional_tasks": 6,
+  "chapter_max_characters": 4000,
+  "ending_policy": "continue",
+  "workers_executed": 0,
+  "source_mutated": false
+}
