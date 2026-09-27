@@ -15,7 +15,7 @@ def replayable_session_messages(history: list[dict[str, Any]]) -> list[dict[str,
             if role in {"user", "assistant"}:
                 projected = {
                     key: item[key]
-                    for key in ("role", "content", "tool_calls", "tool_call_id")
+                    for key in ("role", "content", "tool_calls", "tool_call_id", "_source_message_id", "_checkpoint")
                     if key in item and item[key] not in (None, [])
                 }
                 if (
@@ -23,6 +23,7 @@ def replayable_session_messages(history: list[dict[str, Any]]) -> list[dict[str,
                     and replay
                     and replay[-1].get("role") == role
                     and not replay[-1].get("tool_calls")
+                    and not item.get('_checkpoint') and not replay[-1].get('_checkpoint')
                 ):
                     replay[-1]["content"] = (
                         str(replay[-1].get("content") or "").rstrip()
@@ -47,11 +48,13 @@ def replayable_session_messages(history: list[dict[str, Any]]) -> list[dict[str,
                 "role": "assistant",
                 "content": str(item.get("content") or ""),
                 "tool_calls": calls,
+                "_source_message_id": item.get('_source_message_id', item.get('id', 0)),
             })
             replay.extend({
                 "role": "tool",
                 "content": str(tool.get("content") or ""),
                 "tool_call_id": str(tool.get("tool_call_id") or ""),
+                "_source_message_id": tool.get('_source_message_id', tool.get('id', 0)),
             } for tool in tool_messages)
         elif str(item.get("content") or "").strip():
             replay.append({

@@ -52,10 +52,15 @@ class WindowsJob:
         launcher = (
             "import subprocess,sys; "
             "ready=sys.stdin.buffer.read(1); "
-            "sys.exit(subprocess.call(sys.argv[1:],stdin=subprocess.DEVNULL,"
+            "args=sys.argv[2:]; "
+            "command=(subprocess.list2cmdline(args[:-1])+' '+args[-1]) if sys.argv[1]=='batch' else args; "
+            "sys.exit(subprocess.call(command,stdin=subprocess.DEVNULL,"
             "creationflags=subprocess.CREATE_NO_WINDOW) if ready==b'1' else 1)"
         )
-        process = subprocess.Popen([sys.executable, "-c", launcher, *argv],
+        # list2cmdline escapes embedded quotes for a CRT executable, not cmd /c.
+        # Only the explicitly quoted shim payload bypasses that final conversion.
+        mode = 'batch' if len(argv) == 6 and argv[1:5] == ['/d','/s','/v:off','/c'] else 'argv'
+        process = subprocess.Popen([sys.executable, "-c", launcher, mode, *argv],
                                    stdin=subprocess.PIPE, **options)
         try:
             if not self.api.AssignProcessToJobObject(self.handle, int(process._handle)):

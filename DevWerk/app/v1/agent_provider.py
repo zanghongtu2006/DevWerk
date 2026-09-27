@@ -7,6 +7,8 @@ from typing import Any
 from app.core.debug_trace import trace_json
 from app.v1.agent_models import AgentRunSpec, ModelComplete
 from app.v1.domain import AgentModelResponse
+from app.v1.context_manager import ContextManager, ContextExhausted, digest
+from app.services.provider_errors import LLMProviderError
 
 
 trace_log = logging.getLogger("devwerk.agent.trace")
@@ -29,6 +31,7 @@ class ProviderTurnRequester:
         self.spec = spec
         self.run_id = run_id
         self.registry = registry or store.registry
+        self.context = None
 
     def request(
         self,
@@ -56,6 +59,10 @@ class ProviderTurnRequester:
                         permitted.add(contract['control_capability'])
                     tools = [tool for tool in tools if tool['function']['name'] in permitted or
                         self.registry.side_effect_kind(tool['function']['name']) in {'none','read'}]
+        if self.context is None:
+            self.context = ContextManager(self.store, self.spec, self.run_id, self.model_complete)
+        working_messages = messages
+        messages = self.context.prepare(working_messages, tools)
         if self.spec.kind == "conversation":
             self.store.record_conversation_progress(
                 self.run_id,
@@ -72,15 +79,28 @@ class ProviderTurnRequester:
             require_tool=require_tool,
             required_tool_name=required_tool_name,
         )
-        response = self.model_complete(
-            messages,
-            tools,
-            project_id=self.spec.project["id"],
-            task_id=self.spec.task_id,
-            agent="conversation" if self.spec.kind == "conversation" else "column",
-            require_tool=require_tool,
-            required_tool_name=required_tool_name,
-        )
+        kwargs = dict(project_id=self.spec.project['id'], task_id=self.spec.task_id,
+                      agent=self.spec.kind, require_tool=require_tool, required_tool_name=required_tool_name)
+        try:
+            response = self.model_complete(messages, tools, **kwargs)
+        except LLMProviderError as exc:
+            if exc.error_code != 'LLM_CONTEXT_WINDOW_EXCEEDED':
+                raise
+            previous = digest(messages)
+            previous_size = self.context.estimate(messages, tools)
+            reduced = self.context.prepare(working_messages, tools, force=True)
+            if digest(reduced) == previous or self.context.estimate(reduced, tools) >= previous_size:
+                raise ContextExhausted('Provider overflow: no smaller valid request is available') from exc
+            if self.spec.execution_control:
+                self.spec.execution_control.check()
+            if self.spec.assignment:
+                self.store.agents.charge(self.spec.assignment, models=1)
+            try:
+                response = self.model_complete(reduced, tools, **kwargs)
+            except LLMProviderError as retry_error:
+                if retry_error.error_code == 'LLM_CONTEXT_WINDOW_EXCEEDED':
+                    raise ContextExhausted('Provider overflow after one reduced-context retry') from retry_error
+                raise
         trace_json(
             trace_log,
             "agent.model_output",
@@ -93,6 +113,8 @@ class ProviderTurnRequester:
         )
         if not isinstance(response, AgentModelResponse):
             response = AgentModelResponse.model_validate(response)
+        self.context.observe(response)
+        trace_json(trace_log, 'agent.context_budget', **self._trace_context(iteration), **self.context.last_metrics)
         return response
 
     def _interpretation_messages(self, messages, job):

@@ -22,7 +22,8 @@ def software_plan(store, tmp_path):
     for key in ('backend_development','frontend_development','system_test','delivery','accept'):
         definition.column(key).acceptance_checks = [AcceptanceCheck(key='verify_fixture',capability='project.command.run',
             arguments={'argv':[sys.executable,'-c',"from pathlib import Path; assert Path('docs/baseline.md').exists()"]},
-            evidence_kind='behavior',purpose='Test fixture for entry-admission contract, not software acceptance')]
+            evidence_kind='behavior',purpose='Test fixture for entry-admission contract, not software acceptance',
+            scenario_ids=['entry-fixture'],report_path='fixture-report.json')]
         definition.acceptance_obligations.append(AcceptanceObligation(column=key,check_key='verify_fixture',
             invalidated_by=[key] if key.endswith('_development') else ['backend_development','frontend_development']))
     workflow = store.publish_workflow(project['id'],definition,workflow['workflow_plan_id'])
@@ -31,7 +32,7 @@ def software_plan(store, tmp_path):
         replace(ctx, execution_key=execution_key))
     assert receipt.ok, receipt.error
     plan = task_plan(workflow['id'], WorkflowDefinition.model_validate(workflow['definition']),
-        input_data={'requirements_path':'docs/baseline.md','requirements_confirmed':True})
+        input_data={'requirements_path':'docs/baseline.md','requirements_confirmed':True,'acceptance_scenarios':['entry-fixture']})
     plan.tasks[0].entry_evidence = {'confirmed_scope':resolution.output['turn_contract']['execution_grant_id'],
                                   'requirements_file':execution_key}
     return project, plan, ctx
@@ -46,6 +47,24 @@ def test_software_receipts_save_and_materialize_one_task(store, tmp_path):
     assert created.output['materialization']['created_task_ids'] == [created.output['id']]
     replay = store.materialize_task_plan(project['id'], task_plan_id=saved['id'], proposed_task_ref='primary')
     assert replay['materialization'] == {'created_task_ids':[], 'reused_task_ids':[created.output['id']]}
+
+
+def test_unsaved_plan_is_not_misdiagnosed_as_requirement_conflict(store, tmp_path):
+    project, plan, ctx = software_plan(store, tmp_path)
+    before = store.get_project(project['id'])
+    validation = store.registry.dispatch('task.plan.validate',{'plan':plan.model_dump(mode='json')},ctx)
+    assert validation.ok and validation.output['valid'], validation.error
+    result = store.registry.dispatch('task.create',{'task_plan_id':'tpln_invented','proposed_task_ref':'primary'},ctx)
+    assert not result.ok
+    assert 'TaskPlanNotFound' in str(result.error) and 'task.plan.save' in str(result.error)
+    assert 'different Requirement' not in str(result.error)
+    assert not store.list_tasks(project['id']) and not store.list_task_plans(project['id'])
+    assert store.get_project(project['id']) == before
+    saved = store.registry.dispatch('task.plan.save',{'plan':plan.model_dump(mode='json')},ctx)
+    assert saved.ok, saved.error
+    created = store.registry.dispatch('task.create',{'task_plan_id':saved.output['id'],'proposed_task_ref':'primary'},ctx)
+    assert created.ok, created.error
+    assert len(store.list_tasks(project['id'])) == 1
 
 
 @pytest.mark.parametrize('invalid', ['missing','wrong_grant','foreign_receipt','changed_file'])

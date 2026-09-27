@@ -155,4 +155,10 @@ def test_worker_context_window_preserves_explicit_snapshot_and_source_records(st
     payload = json.dumps(history)
     assert 'Preserve the API contract' in payload and 'older_messages_omitted' in payload
     assert len(payload) < 3000
-    assert len(store.agents.context_page(project['id'], worker['id'], limit=50)) >= 20
+    pages, after = [], 0
+    while page := store.agents.context_page(project['id'], worker['id'], after=after, limit=50):
+        assert len(json.dumps(page,ensure_ascii=False).encode('utf8')) < 14000
+        pages.extend(page)
+        after = page[-1]['id']
+    assert len(pages) >= 20
+    assert sum('context-' in p['content'] for p in pages) == 20

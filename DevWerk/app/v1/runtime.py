@@ -614,7 +614,8 @@ class WorkflowRuntime:
             for check in column.acceptance_checks:
                 execution_key = f"{run['id']}:acceptance:{check.key}:{time.monotonic_ns()}"
                 ctx = CapabilityContext(**{**capability_context.__dict__, 'execution_key':execution_key})
-                result = self.registry.dispatch(check.capability, check.arguments, ctx)
+                from app.v1.services.acceptance_execution import run_acceptance_check
+                result = run_acceptance_check(self.registry, ctx, check.model_dump(mode='json'))
                 spec = AgentRunSpec(kind='column', project=project, instruction='',instruction_revision=0,
                     context={},capability_ids=[],task_id=task['id'],column_run_id=run['id'],column_attempt_id=run['attempt_id'])
                 self.store.feedback.record_check(spec,check.key,execution_key,result,task_owner=task)

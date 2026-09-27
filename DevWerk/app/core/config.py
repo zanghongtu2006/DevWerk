@@ -46,6 +46,7 @@ class LLMModelConfig(BaseModel):
     temperature: float
     top_p: float | None = Field(default=None, ge=0, le=1)
     max_tokens: int = Field(gt=0)
+    context_window: int | None = Field(default=None, ge=4096)
     effort_level: str | None = None
 
 
@@ -108,6 +109,7 @@ class AgentModelConfig:
     temperature: float
     top_p: float | None
     max_tokens: int
+    context_window: int | None = None
 
     def as_client_config(self) -> dict[str, Any]:
         return {
@@ -125,6 +127,7 @@ class AgentModelConfig:
             "temperature": self.temperature,
             "top_p": self.top_p,
             "max_tokens": self.max_tokens,
+            "context_window": self.context_window,
         }
 
 
@@ -229,6 +232,7 @@ class Settings(BaseSettings):
             temperature=model.temperature,
             top_p=model.top_p,
             max_tokens=model.max_tokens,
+            context_window=model.context_window,
         )
 
     def get_llm_config(self, agent: str | None = None) -> dict[str, Any]:

@@ -28,6 +28,13 @@ class SchedulingPolicy(_PolicyModel):
 
 
 class ContextPolicy(_PolicyModel):
+    fallback_window_tokens: int = Field(default=128_000, ge=4096)
+    fallback_output_tokens: int = Field(default=16_384, ge=256)
+    tool_result_tokens: int = Field(default=4_000, ge=256)
+    summary_tokens: int = Field(default=4_000, ge=256)
+    soft_fraction: float = Field(default=0.8, gt=0, lt=1)
+    target_fraction: float = Field(default=0.55, gt=0, lt=0.8)
+    safety_fraction: float = Field(default=0.05, gt=0, lt=0.3)
     conversation_history_max_characters: int = Field(default=40_000, ge=1024)
     worker_context_max_characters: int = Field(default=80_000, ge=1024)
     task_summary_limit: int = Field(default=100, ge=1)

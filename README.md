@@ -1,208 +1,186 @@
 # DevWerk
 
-DevWerk is a pre-1.0 multi-agent workflow system. Each Project has one long-lived logical Conversation Agent that communicates with the user, shapes requirements, publishes the Project workflow, dispatches formal Tasks, supervises execution, and handles recovery. Tasks run through a Column-based Kanban state machine until they explicitly reach `done` or `failed`.
+**DevWerk is a conversation-led multi-agent framework for completing long-running tasks through explicit workflows and independently managed agent contexts.**
 
-The current public release is `v0.1.0`. The repository carries one active architecture only; historical implementations and compatibility contracts are intentionally not retained in the working tree.
+Each Project has one persistent Conversation Agent that works with the user to define requirements, organize tasks, and coordinate delivery. Workflow Columns assign bounded steps to lifecycle-managed sub-agents. Each agent Column has one agent; collaboration, review, and rework are visible in the Workflow.
 
-## Authoritative Design
+The aim is more precise context and memory management: decide which agent needs which information, for which step, and for how long. DevWerk applies this approach to general tasks, including software development and long-form writing.
 
-The following documents define the product and runtime contract:
+**Status: pre-1.0, under active development.** This README describes the current development tree. Published packages may contain an earlier implementation; see their [release notes](https://github.com/zanghongtu2006/DevWerk/releases) for the corresponding version.
 
-- [`DevWerk/docs/generic-conversation-agent-and-declarative-column-runtime.md`](DevWerk/docs/generic-conversation-agent-and-declarative-column-runtime.md)
-- [`DevWerk/docs/conversation-agent-design-v1.md`](DevWerk/docs/conversation-agent-design-v1.md)
-- [`DevWerk/docs/kanban-workflow-design-v1.md`](DevWerk/docs/kanban-workflow-design-v1.md)
-- [`DevWerk/docs/conversation-agent-orchestration-soul-p0-design.md`](DevWerk/docs/conversation-agent-orchestration-soul-p0-design.md)
+## Why DevWerk
 
-These four locked documents remain equal architecture facts for the general Agent and Kanban Runtime. The approved planning-ownership refinement in `loop-task-plan-decoupling-v1.md` is authoritative for Loop, Workflow Plan, Workflow Revision, Task Plan, and Task boundaries. When code, tests, or secondary documentation conflict with the applicable authority, treat that as a defect. Do not restore an older API or behavior through compatibility patches.
+A long-running task can involve different responsibilities, changing requirements, repeated verification, and large amounts of tool output. Carrying all of that through one growing conversation makes it difficult to distinguish relevant knowledge, failed attempts, accepted results, and the next step.
 
-Implemented V1 runtime extensions are specified by:
+DevWerk organizes this work around explicit boundaries:
 
-- [`DevWerk/docs/loop-runtime-v1.md`](DevWerk/docs/loop-runtime-v1.md)
-- [`DevWerk/docs/loop-task-plan-decoupling-v1.md`](DevWerk/docs/loop-task-plan-decoupling-v1.md)
-- [`DevWerk/docs/kanban-recovering-runtime-v1.md`](DevWerk/docs/kanban-recovering-runtime-v1.md)
-- [`DevWerk/docs/agent-tool-rejection-recovery-v1.md`](DevWerk/docs/agent-tool-rejection-recovery-v1.md)
-- [`DevWerk/docs/conversation-session-gateway-v1.md`](DevWerk/docs/conversation-session-gateway-v1.md)
-- [`DevWerk/docs/memory-and-workcell-runtime-v0.1.0.md`](DevWerk/docs/memory-and-workcell-runtime-v0.1.0.md)
-- [`DevWerk/docs/v1-test-contract.md`](DevWerk/docs/v1-test-contract.md)
+- **Workflow and Task decomposition:** divide a larger objective into independently accepted work, with observable execution stages.
+- **Independent agent context:** a Worker uses its own Session and the inputs selected for its current Assignment.
+- **Controlled continuity:** preserve useful working context across related assignments and rework without sharing every agent's transcript.
+- **Scoped memory and evidence:** keep durable knowledge, original execution records, and model-visible context distinct.
+- **Explicit handoffs and validation:** move artifacts, feedback, and completion evidence through declared Workflow contracts.
 
-## Version 1 Boundaries
+A single agent still uses a model–tool loop inside its Column. DevWerk's additional structure is at the collaboration and lifecycle level: it controls how work is divided, which context crosses a boundary, and when results are accepted.
 
-- V1 pre-release uses full, unredacted local debug tracing for Agent, Provider, Capability, and Runtime inputs and outputs. Functional completion and diagnosis take priority; authentication, approval, privacy controls, redaction, and production log minimization are deferred until after V1.
-- One logical Conversation Agent identity per Project.
-- One durable Conversation Session per Project; each Turn is a short-lived background Run, and Turn failure does not terminate the Session.
-- Every governance Run preloads the versioned `DevWerk/DEVWERK.md` platform policy.
-- Conversation is the user-facing governance mutation surface.
-- Kanban, Task, Run, Event, and Artifact views are read-only to the user.
-- A Project isolates structured facts by `project_id` and files by canonical `base_dir`.
-- One active Workflow per Project, with immutable revisions.
-- A reusable Workflow Plan is required before Workflow publication; it contains method and Task Contract facts, never a concrete Task inventory.
-- A user objective becomes an immutable Task Plan that selects a Workflow Revision and owns concrete Task inputs, dependencies, conflicts, readiness, and Agent policy.
-- A Task is materialized only from `task_plan_id + proposed_task_ref` and remains pinned to that Task Plan's Workflow Revision.
-- Column Definitions declare repeatable process stages, context boundaries, execution, contracts, outcomes, transitions, and retry limits.
-- Conversation Agent, single-Agent Columns, and Workcell Agent participants share one general-purpose AgentCore and Capability Registry.
-- Reusable business process knowledge lives in version-controlled `loops/<name>/loop.meta` and `loop.json` files; SQLite stores only applied Project instances and source provenance, while Python runtime code contains no domain-routing branch.
-- A Project's initial Workflow can only be materialized by `loop.apply`; subsequent immutable revisions may be published through `workflow.publish`.
-- Columns select a generic `agent`, `capability_sequence`, or directed `workcell` executor. Workcells support arbitrary named Agent or deterministic participants, stable participant Sessions, receiver-scoped handoffs, and inner rework without falsely failing the Task.
-- Every Column visit creates a Column Run; retry creates an immutable Attempt under that Run.
-- Runtime execution may be deterministic, use one logical Agent, or coordinate persistent Workcell participants.
-- Only `done` and `failed` are Task terminal states; both are reserved Workflow sentinels, not executable Columns.
-- V1RuntimePolicy centralizes scheduling, leases, recovery delay, context windows, page sizes, and SQLite limits. V1 does not impose model-iteration, tool-call, or wall-clock budgets on Agent execution.
-- Recoverable provider infrastructure failures move the same Task to non-terminal `recovering`; Kanban reclaims the same Column after `next_retry_at` without rebuilding the Task.
-- Tool calls rejected before producing a side effect remain visible evidence but do not prevent the Agent from choosing a valid alternative and completing the Column.
-- Task dispatch rechecks declared dependencies and conflict domains atomically before execution.
-- SQLite is the transactional Runtime source of truth and uses WAL plus short transactions. Human-readable semantic Memory is Project-local Markdown under `.devwerk/memory`; optional search indexes are rebuildable providers rather than the authority.
-- Large deliverables remain files; SQLite stores Artifact metadata, hashes, sizes, and relationships.
-- Conversation history remains durable execution evidence. File-first semantic Memory and a replaceable index boundary are included in the v0.1.0 design; vector indexing remains an optional provider. IDEA Plugin development, user approval boundaries, and multiple active Workflows remain outside the current implementation scope.
+The goal is finer control than a single long agent loop or one shared harness. This is a design hypothesis, not a claim of demonstrated superiority. Reliability, context relevance, token consumption, and coordination overhead still need comparative evaluation.
 
-## Repository Layout
+## Architecture
 
-```text
-DevWerk/
-  app/
-    main.py       FastAPI application assembly
-    v1/           current domain, File Memory, Workcell runtime, Conversation Agent, API
-    services/     LLM provider adapters, error classification, usage accounting
-    core/         service configuration and logging
-    web/          modular native-ES-module Web workbench
-  docs/           authoritative V1 design and test contract
-  tests/          V1-only automated contract tests
-  config/         LLM routing
-  loops/          discoverable Loop cards and declarative Workflow bundles
-  scripts/        current V1 operational helpers
-  Dockerfile      Linux container definition
-  install.*       portable release installers
-  startup.*       project-venv-only service launchers
-  shutdown.*      project-scoped service shutdown helpers
-
-idea-plugin/      suspended; not part of the standalone V1 release gate
+```mermaid
+flowchart TD
+    U["User / Web"] <--> CA["Project Conversation Agent — sole main agent"]
+    CA --> P["Requirement, Workflow and Task planning"]
+    P --> RT["Workflow Runtime"]
+    RT --> C["Current Column Run / Attempt"]
+    C --> A["Assignment → one leaf Worker"]
+    C --> D["Deterministic capability sequence"]
+    A <--> S["Worker's private Session / context"]
+    A --> E["Artifacts, feedback and acceptance evidence"]
+    D --> E
+    E --> RT
+    RT --> N["Next Column, directed rework or terminal outcome"]
+    CA --> I["Explicit Worker input"]
+    I --> A
+    RT --> MB["Mailbox — passive notifications"]
+    MB --> V["Project conversation / status views"]
+    CA <--> M["Project semantic memory"]
 ```
 
-## Download and Docker
+### One main agent per Project
 
-Download the current standalone ZIP package from [GitHub Releases](https://github.com/zanghongtu2006/DevWerk/releases/latest), or download the `v0.1.0` asset directly:
+The Conversation Agent is the Project's main agent. It discusses requirements, selects a Loop, plans formal work, observes results, and coordinates changes within the user's request.
 
-```text
-https://github.com/zanghongtu2006/DevWerk/releases/download/v0.1.0/devwerk-release.zip
+Runtime is the scheduling and persistence mechanism. It manages dependencies, assignments, leases, state transitions, and verification; it is not another agent above the Conversation Agent.
+
+### One agent per agent Column
+
+A Column represents one execution responsibility and context boundary. It runs either:
+
+- `agent`: one leaf Worker using the shared AgentCore and allowed capabilities; or
+- `capability_sequence`: deterministic tool execution without a model.
+
+An agent may inspect files, run commands, and revise its work over multiple model–tool iterations within that Column. Multi-agent collaboration belongs across Columns and in the Project Conversation Agent's coordination. Columns do not contain nested agent teams or internal Workcell graphs.
+
+For example, implementation, independent review, and repair can be separate stages of one Task. A review outcome follows a declared rework edge; it does not require inventing a new collaboration loop inside the review Column.
+
+### Tasks, Workers, and Sessions have different lifecycles
+
+A **Task** is one independently accepted delivery unit that traverses its Workflow Columns. A **Worker** is a logical agent identity. An **Assignment** binds a Column visit to that Worker and its Session.
+
+Workers are Task/Column-scoped by default. An explicit `worker_key` enables reuse within a Requirement. Finishing an Assignment releases execution ownership while retaining the logical Worker and its context for permitted later work. Persistence does not require a permanently running thread or process.
+
+### Mailbox is a notification mechanism
+
+Mailbox carries events, delivery feedback, and source references for observation. Its processing does not call a model, plan work, choose a Worker, or relay a conversation between agents.
+
+Explicit Worker inputs use a separate durable input channel. Normal handoffs and repair feedback use Workflow artifact/context contracts and Task feedback. Receiving a notification does not prove that a defect was fixed or a task passed acceptance.
+
+## Context, Memory, and Evidence
+
+| Layer | Purpose |
+| --- | --- |
+| Active context | The bounded information presented to an agent for its current step |
+| Worker Session | The agent's private work history and continuation state |
+| Semantic memory | Project-local knowledge with scope, provenance, revision, and lifecycle |
+| Execution evidence | Original messages, tool results, runs, artifacts, and verification records |
+
+Semantic memory lives under `{project.base_dir}/.devwerk/memory/`. Its supported scopes are `project`, `conversation`, `workflow`, and `task`. Worker Session context is separate from these file-memory scopes.
+
+The current development tree includes per-request context budgeting, bounded tool-result views, Assignment checkpoints, and a limited smaller-context retry for explicit provider overflow. Original evidence remains available for inspection. Summaries and model statements cannot substitute for successful verification.
+
+Context projection and summarization are lossy. They aim to preserve useful continuity without making every historical token part of every request; they do not guarantee that every relevant fact will always be selected.
+
+## Reusable Workflows
+
+Process definitions live in versioned `loops/<name>/` bundles. The repository includes Loops for novel production, software delivery, GitLab delivery, and parameter optimization. Their presence is not a guarantee that every end-to-end scenario has passed validation.
+
+A Loop supplies a reusable method. A Workflow Revision freezes the executable Columns and transitions. A Task Plan selects that revision and supplies concrete tasks, inputs, dependencies, and acceptance obligations. Publishing a new revision does not rewrite existing Tasks.
+
+## Quick Start
+
+From a source checkout, enter the service directory:
+
+```sh
+cd DevWerk
 ```
 
-The ZIP contains checked-in Linux and Windows launchers. After extraction, start it with:
+For a fresh installation, create the virtual environment and copy the LLM template.
 
-```bash
+Linux/macOS:
+
+```sh
 sh ./install.sh
-sh ./startup.sh
-```
-
-or on Windows:
-
-```powershell
-.\install.bat
-.\startup.bat
-```
-
-The installer creates `venv` and installs `requirements.txt`; both startup scripts then use only that project environment. These files are maintained under `DevWerk/`; release packaging copies them unchanged and does not generate launch scripts.
-
-Stop the corresponding local service with `sh ./shutdown.sh` or `.\shutdown.bat`. The shutdown helper only targets the Uvicorn process running from this DevWerk directory's `venv`.
-
-### Configure the LLM
-
-`config/llm.json` is intentionally absent from Git, the standalone ZIP, and the Docker image. The release includes only the safe template `config/llm.example.json`. Before starting an LLM-backed local installation, create the runtime configuration from that template:
-
-```bash
 cp config/llm.example.json config/llm.json
 ```
 
+Windows PowerShell:
+
 ```powershell
+.\install.bat
 Copy-Item .\config\llm.example.json .\config\llm.json
 ```
 
-Edit `config/llm.json` to select the provider, model, and `conversation`/`column`/`default` routes. Provider secrets are not stored in this JSON. Each provider's `api_key_env` names the environment variable that must contain its key, for example:
+Edit the provider, model, and `conversation` / `column` / `default` routes. Set the environment variable named by the selected provider's `api_key_env`. Configure the model's `context_window` when it is not one of the direct-provider defaults recognized by the runtime. See the [service configuration guide](DevWerk/README.md#llm-configuration).
 
-```bash
+Linux/macOS:
+
+```sh
 export DEVWERK_MINIMAX_API_KEY="your-key"
 sh ./startup.sh
 ```
 
+Windows PowerShell:
+
 ```powershell
-$env:DEVWERK_MINIMAX_API_KEY="your-key"
+$env:DEVWERK_MINIMAX_API_KEY = "your-key"
 .\startup.bat
 ```
 
-You may instead supply the complete validated JSON through `DEVWERK_LLM_CONFIG_JSON`. Never commit `config/llm.json`, `.env`, or provider credentials.
+Use your configured provider's variable if it differs from the example. Open [the workbench](http://127.0.0.1:8000/workbench). Stop the local service with `shutdown.sh` or `shutdown.bat`.
 
-Docker Hub is the recommended container source:
+Standalone downloads are listed under [GitHub Releases](https://github.com/zanghongtu2006/DevWerk/releases). For a container built from the current source, see [Docker](DevWerk/README.md#docker).
 
-```bash
-docker pull zanghongtu2006/devwerk:v0.1.0
+## Repository Layout
+
+```text
+README.md              Project introduction
+DevWerk/
+  README.md            Runtime, configuration and verification guide
+  app/
+    main.py            FastAPI application
+    v1/                Agents, context, memory, planning and Workflow Runtime
+    services/          Model provider adapters and usage/error handling
+    core/              Configuration and logging
+    web/               Browser workbench
+  loops/               Reusable workflow bundles
+  config/              LLM routing and startup settings
+  docs/                Designs, revisions, audits and verification records
+  tests/               Automated runtime and contract tests
+  scripts/             Operational and isolated evaluation helpers
+  Dockerfile
+  install.*
+  startup.*
+  shutdown.*
+
+idea-plugin/           Suspended; outside the standalone V1 release scope
 ```
 
-The same image is also published to GitHub Container Registry:
+## Current Boundaries and Verification
 
-```bash
-docker pull ghcr.io/zanghongtu2006/devwerk:v0.1.0
-```
+V1 prioritizes completing the user conversation → planning → execution → verification → delivery loop. It is a development system with detailed local debug traces; production security hardening remains future work.
 
-Create persistent volumes and start DevWerk:
+The current runtime has one active Workflow per Project, immutable revisions, persistent logical agent identities, scoped context, and explicit execution budgets. Collaboration does not imply unrestricted parallel writes; dependency, resource, and ownership rules still apply.
 
-```bash
-docker volume create devwerk-data
-docker volume create devwerk-projects
-docker run -d --name devwerk --restart unless-stopped -p 8000:8000 -v devwerk-data:/opt/devwerk/data -v devwerk-projects:/workspace zanghongtu2006/devwerk:v0.1.0
-```
+Automated tests cover planning, single-agent Columns, persistent Workers, memory, passive notifications, recovery, context management, and evidence-based acceptance. Complete real-provider software delivery and subsequent user repair remain under validation. Passing local tests does not establish a general delivery guarantee or a measured token-saving ratio.
 
-Open `http://127.0.0.1:8000/workbench`. Project base directories created inside the container should use `/workspace/...` so generated files remain in the `devwerk-projects` volume.
-
-For LLM-backed Conversation and Column Agents, copy `DevWerk/config/llm.example.json` from the repository to a host `llm.json`, edit its model routes, put the referenced provider key in an environment file, and mount only the JSON file. Mounting the whole host `config` directory would hide configuration shipped in the image.
-
-Example `.env`:
-
-```dotenv
-DEVWERK_MINIMAX_API_KEY=your-key
-```
-
-```bash
-docker run -d --name devwerk --restart unless-stopped -p 8000:8000 --env-file /absolute/path/to/.env -v devwerk-data:/opt/devwerk/data -v devwerk-projects:/workspace --mount type=bind,source=/absolute/path/to/llm.json,target=/opt/devwerk/config/llm.json,readonly zanghongtu2006/devwerk:v0.1.0
-```
-
-Follow runtime logs with:
-
-```bash
-docker logs -f devwerk
-```
-
-## Start
-
-The service must use the existing project virtual environment:
+From `DevWerk/`:
 
 ```powershell
-cd D:\workspace\DevWerk\DevWerk
-.\startup.bat
-```
-
-Open:
-
-- `http://127.0.0.1:8000/workbench`
-- `http://127.0.0.1:8000/dashboard`
-- `http://127.0.0.1:8000/kanban`
-- `http://127.0.0.1:8000/tasks`
-- `http://127.0.0.1:8000/events`
-- `http://127.0.0.1:8000/docs`
-
-## Test
-
-The entire test directory is the Version 1 release contract. There is no secondary historical suite.
-
-```powershell
-cd D:\workspace\DevWerk\DevWerk
 .\venv\Scripts\python.exe -m pytest tests -q
-.\venv\Scripts\python.exe -m compileall app tests
 ```
 
-The tests cover declarative outer and Workcell graph validation, filesystem Loop discovery, immutable planning and Task materialization, Capability Registry dispatch, Project isolation, File Memory provider substitution/versioning/search, persistent Conversation and Workcell participant Sessions, receiver-scoped feedback, provider recovery, deterministic participants, explicit terminal paths, SQLite indexes, Artifact boundaries, provider contracts, logging, APIs, and the read-only Web governance boundary.
+See the [runtime guide](DevWerk/README.md), [current implementation and validation record](DevWerk/docs/bugs/2026-09-22-context-overflow-implementation.md), and [README architecture review](DevWerk/docs/bugs/2026-09-27-readme-proposal-review.md).
 
-Conversation messages are stored with stable message IDs and timestamps and are rendered as normal user/Agent turns. Runtime status and tool audit evidence remain outside the human conversation bubbles and update over the Project SSE stream.
+## License
 
-Real-provider and three-project black-box acceptance evidence is kept outside the repository in `D:\workspace\codex-devwerk-project-files` so generated products do not pollute source control.
-
-## Review Rule
-
-A change is not reviewable when it reintroduces an API, module, test, configuration surface, or document that belongs to a superseded design. Git history is the archive; the active tree is the current product contract.
+See [LICENSE](LICENSE).

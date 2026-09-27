@@ -9,7 +9,7 @@ from app.v1.domain import TaskPlan, WorkflowPlan
 from app.v1.repositories.base import StoreHost
 from app.v1.services.task_graph_admission import existing_task_orders, validate_task_graph_admission
 from app.v1.storage_support import new_id, utcnow
-from app.v1.services.task_plan_compiler import compile_task_plan
+from app.v1.services.task_plan_compiler import compile_task_plan, diagnose_acceptance_launches, PlanAdmissionError
 
 
 class PlanningRepository:
@@ -82,6 +82,9 @@ class PlanningRepository:
             self.get_workflow_plan(project_id, str(revision["workflow_plan_id"]))["plan"]
         )
         plan = compile_task_plan(plan, workflow, method, self.store.registry)
+        launch_errors = diagnose_acceptance_launches(self.store, project_id, workflow)['diagnostics']
+        if launch_errors:
+            raise PlanAdmissionError(launch_errors)
         payload = plan.model_dump_json()
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         with self.store.connect() as db:

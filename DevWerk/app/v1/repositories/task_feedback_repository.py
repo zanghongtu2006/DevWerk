@@ -1,5 +1,6 @@
 """Task feedback and verification evidence; Mailbox is not a routing participant."""
 import json
+import hashlib
 from collections import deque
 
 from app.v1.storage_support import new_id, utcnow
@@ -26,6 +27,7 @@ class TaskFeedbackRepository:
                 column_attempt_id TEXT NOT NULL, agent_run_id TEXT, check_key TEXT NOT NULL,
                 execution_key TEXT NOT NULL, ok INTEGER NOT NULL, result_json TEXT NOT NULL,
                 created_at TEXT NOT NULL, UNIQUE(task_id,execution_key))''')
+            self.store.schema_repository._ensure_column(db,'v1_task_feedback','observed_check_rowid','INTEGER NOT NULL DEFAULT 0')
 
     def list(self, project_id, task_id):
         self.store.get_project_task(project_id, task_id)
@@ -66,7 +68,7 @@ class TaskFeedbackRepository:
             workflow = self.store.workflow_by_id(ctx.project_id, task['workflow_revision_id'])
             responsible = args['responsible_column']
             workflow.column(responsible)
-            if task['current_column'] != responsible or task['status'] != 'pending':
+            if task['current_column'] != responsible:
                 self.route(workflow, task['current_column'], responsible)
             checks = args['checks']
             if not checks or len({(c['column'],c['check_key']) for c in checks}) != len(checks):
@@ -93,6 +95,7 @@ class TaskFeedbackRepository:
                 (identity,ctx.project_id,task_id,args['dedupe_key'],responsible,args['description'],encoded,
                  ctx.column_run_id,job['id'] if job else None,sequence,utcnow()))
             self.store._event(db,ctx.project_id,task_id,ctx.column_run_id,'task.feedback_recorded',{'feedback_id':identity})
+            db.execute('UPDATE v1_task_feedback SET observed_check_rowid=(SELECT COALESCE(MAX(rowid),0) FROM v1_acceptance_results) WHERE id=?',(identity,))
         return next(item for item in self.list(ctx.project_id, task_id) if item['id'] == identity)
 
     def inherit(self, db, predecessor_id, task_id, workflow):
@@ -123,20 +126,33 @@ class TaskFeedbackRepository:
                  spec.column_attempt_id,agent_run_id,key,execution_key,int(result.ok),
                  result.model_dump_json(),utcnow()))
 
-    def verified(self, db, task, column, key, *, after_sequence=0, current_run=None):
+    def verified(self, db, task, column, key, *, after_sequence=0, current_run=None, after_check_rowid=0):
         # The latest visit invalidates all receipts from previous visits, even if
         # the old run succeeded. A pending/failed latest visit is not evidence.
         latest = db.execute('SELECT id,sequence,status FROM v1_column_runs WHERE task_id=? AND column_key=? ORDER BY sequence DESC LIMIT 1',
                             (task['id'],column)).fetchone()
         if not latest or latest['sequence'] < after_sequence or (latest['status'] != 'succeeded' and latest['id'] != current_run):
             return None
-        row = db.execute('''SELECT * FROM v1_acceptance_results WHERE task_id=? AND workflow_revision_id=?
+        row = db.execute('''SELECT rowid AS check_rowid,* FROM v1_acceptance_results WHERE task_id=? AND workflow_revision_id=?
             AND column_run_id=? AND check_key=? ORDER BY rowid DESC LIMIT 1''',
             (task['id'],task['workflow_revision_id'],latest['id'],key)).fetchone()
-        if not row or not row['ok']:
+        if not row or not row['ok'] or row['check_rowid'] <= after_check_rowid:
             return None
         attempt = db.execute('SELECT id FROM v1_column_attempts WHERE column_run_id=? ORDER BY attempt_no DESC LIMIT 1', (latest['id'],)).fetchone()
-        return row['id'] if attempt and attempt['id'] == row['column_attempt_id'] else None
+        if not attempt or attempt['id'] != row['column_attempt_id']:
+            return None
+        from app.v1.files import ProjectFiles
+        evidence = (json.loads(row['result_json']).get('output') or {}).get('scenario_evidence') or {}
+        if evidence:
+            files = ProjectFiles(self.store.get_project(task['project_id'])['base_dir'], self.store.policy)
+            for scenario in evidence['scenarios']:
+                source = scenario['test_source']
+                try:
+                    if hashlib.sha256(files.resolve(source['path']).read_bytes()).hexdigest() != source['sha256']:
+                        return None
+                except (OSError, ValueError):
+                    return None
+        return row['id']
 
     def settle(self, db, task, run_id, outcome, next_column, terminal):
         workflow = self.store.workflow_by_id(task['project_id'], task['workflow_revision_id'])
@@ -149,12 +165,15 @@ class TaskFeedbackRepository:
         transition = next(t for t in workflow.column(task['current_column']).transitions if t.outcome == outcome)
         for item in feedback:
             repair_run = item['repair_run_id']
-            if item['responsible_column'] == task['current_column'] and run['sequence'] > item['reported_sequence'] and not transition.allows_unresolved_failures:
+            if item['responsible_column'] == task['current_column'] and (
+                run['sequence'] > item['reported_sequence'] or item['source_run_id'] == run_id
+            ) and not transition.allows_unresolved_failures:
                 repair_run = run_id
                 db.execute("UPDATE v1_task_feedback SET state='verifying',repair_run_id=? WHERE id=?", (run_id,item['id']))
             if repair_run:
                 repair_sequence = db.execute('SELECT sequence FROM v1_column_runs WHERE id=?', (repair_run,)).fetchone()[0]
-                verified = [self.verified(db,task,c['column'],c['check_key'],after_sequence=repair_sequence,current_run=run_id)
+                verified = [self.verified(db,task,c['column'],c['check_key'],after_sequence=repair_sequence,current_run=run_id,
+                                         after_check_rowid=item['observed_check_rowid'])
                             for c in json.loads(item['checks_json'])]
                 if all(verified):
                     db.execute("UPDATE v1_task_feedback SET state='resolved',verification_json=?,resolved_at=? WHERE id=?", (json.dumps(verified),utcnow(),item['id']))
@@ -167,7 +186,8 @@ class TaskFeedbackRepository:
             if item['state'] == 'verifying':
                 repair_sequence = db.execute('SELECT sequence FROM v1_column_runs WHERE id=?', (item['repair_run_id'],)).fetchone()[0]
                 target = next(c['column'] for c in json.loads(item['checks_json']) if not self.verified(
-                    db,task,c['column'],c['check_key'],after_sequence=repair_sequence,current_run=run_id))
+                    db,task,c['column'],c['check_key'],after_sequence=repair_sequence,current_run=run_id,
+                    after_check_rowid=item['observed_check_rowid']))
             routed = self.route(workflow, task['current_column'], target)
             self.store._event(db,task['project_id'],task['id'],run_id,'task.feedback_routed',{'feedback_id':item['id'],'next':routed})
             return routed, None

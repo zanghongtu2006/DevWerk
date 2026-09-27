@@ -40,19 +40,24 @@ class TurnResolution(BaseModel):
     execution_request: Literal['none', 'begin', 'continue', 'extend'] | None = Field(
         default='none', description='No execution: omit, null, or "none". Execution: begin, continue, or extend.')
     constraint_change: Literal['retain', 'set_hold', 'release_hold'] = 'retain'
-    focus: Literal['current', 'new_scope'] = 'current'
+    focus: Literal['current', 'new_scope'] = Field(default='current',
+        description='Keep current when accepting/continuing the discussed proposal. new_scope discards the current draft and its proposal; it cannot accept an existing proposal ID.')
     requirement_id: str | None = None
     user_evidence: list[UserEvidence] = Field(default_factory=list, max_length=30)
     scope_summary: str = Field(default='', max_length=30000)
     decision_updates: list[IntentDecision] = Field(default_factory=list, max_length=100)
     open_question_updates: list[IntentQuestionUpdate] = Field(default_factory=list, max_length=100)
-    proposal: str | None = Field(default=None, max_length=30000)
-    accepted_proposal_id: str | None = None
+    proposal: str | None = Field(default=None, max_length=30000,
+        description='Draft proposal text during discussion only. Omit on execute; use accepted_proposal_id or scope_summary instead.')
+    accepted_proposal_id: str | None = Field(default=None,
+        description='Exact current work_intent.proposal.id when accepting that proposal; requires focus=current. Never invent an ID.')
     control_capability: Literal['task.pause', 'task.resume', 'task.cancel'] | None = None
     control_task_id: str | None = None
 
     @model_validator(mode='after')
     def coherent(self):
+        if self.accepted_proposal_id and self.focus == 'new_scope':
+            raise ValueError('ProposalConflict: accepting the existing proposal requires focus=current; new_scope discards it. Keep accepted_proposal_id and use focus=current if the user is proceeding with the discussed plan.')
         if self.execution_request is None:
             self.execution_request = 'none'
         if (self.act == 'execute') != (self.execution_request != 'none'):
@@ -86,6 +91,9 @@ user says 'go on': discuss. Same context, user says 'now implement the proposed 
 When the current message only asks to proceed without specifying a change of mode, retain the hold.
 When user explicitly asks to implement, proceed without redundant confirmation. Bind the accepted proposal if
 there is one. A clear direct request can start without a prior proposal; record scope_summary and delegated choices.
+Accepting the discussed plan uses focus=current, accepted_proposal_id from work_intent.proposal.id,
+act=execute, execution_request=begin and constraint_change=release_hold. Omit proposal on execute.
+focus=new_scope means the user introduced a different objective, not that implementation is beginning.
 Record decisions separately from open questions; user-approved implementation discretion need not block delivery.
 Pure discussion/status may finish tool-free with a ConversationReport containing turn_resolution. That path cannot
 grant execution. Persist proposals in conversation data while discussing; do not publish a Workflow/TaskPlan or
@@ -101,7 +109,12 @@ For software.ddd_delivery: confirmed_scope is the resolve receipt's execution_gr
 execution_key in the successful project.files.write receipt for the accepted requirements_path baseline.
 The software Loop is a template: before saving a TaskPlan, publish concrete behavioral acceptance_checks
 for backend_development, frontend_development, system_test, delivery and accept, with evidence_kind=behavior
-and a purpose tied to accepted behavior. Reference their column/check_key in workflow.acceptance_obligations.
+and a purpose tied to accepted behavior. Use workflow.acceptance.configure with the current revision/hash to
+avoid resending unchanged instructions. Checks require scenario_ids and report_path, produced freshly by the
+frozen command using devwerk.acceptance-report.v1 (passed scenarios, actual/expected assertions and test-source hash).
+Freeze accepted requirement scenario IDs in Task input.acceptance_scenarios; final acceptance must cover all of them.
+Choose an actual assertion/report runner that the assigned column can implement; bare build or dir commands
+do not produce this evidence. Reference column/check_key in workflow.acceptance_obligations.
 Implementation checks are invalidated_by their own implementation Column. QA/delivery/accept checks are
 invalidated_by both backend_development and frontend_development. Run actual tests/browser/runtime probes,
 never test listing or report reads.

@@ -423,7 +423,7 @@ class ConversationGateway:
                 workflow_publications = [
                     item["result"]["output"]
                     for item in all_invocations
-                    if item["capability"] == "workflow.publish"
+                    if item["capability"] in {"workflow.publish", "workflow.acceptance.configure"}
                     and item["ok"]
                     and isinstance(item.get("result", {}).get("output"), dict)
                 ]
@@ -642,6 +642,7 @@ def _has_durable_governance_progress(
         "task.plan.save",
         "workflow.plan.save",
         "workflow.publish",
+        "workflow.acceptance.configure",
         "loop.apply",
     }
     return any(

@@ -31,8 +31,8 @@ class AnthropicClient:
         self.request_timeout_seconds = float(config.get("request_timeout_seconds", 600.0))
         if self.request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
-        if self.max_tokens < 65_535:
-            raise ValueError("Anthropic max_tokens must be explicitly configured to at least 65535")
+        if self.max_tokens <= 0:
+            raise ValueError("Anthropic max_tokens must be positive")
         self.url = f"{self.base_url}/messages" if self.base_url.endswith("/v1") else f"{self.base_url}/v1/messages"
         self.session = http_requests.Session()
         self.session.trust_env = bool(config.get("trust_env_proxy", False))

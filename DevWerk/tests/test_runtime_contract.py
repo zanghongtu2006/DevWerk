@@ -564,7 +564,7 @@ def test_persistent_column_worker_uses_same_tool_loop_and_declared_contract(stor
     runs = store.agent_runs(project_id=project["id"], task_id=task["id"])
     assert len(runs) == 1
     assert runs[0]["kind"] == "column"
-    assert runs[0]["capabilities"] == ["project.files.write", "project.files.read", "agent.context.read", "column.complete"]
+    assert runs[0]["capabilities"] == ["project.files.write", "project.files.read", "agent.result.read", "agent.context.read", "column.complete"]
     assert runs[0]['assignment_id'] and runs[0]['agent_instance_id']
     assert [item["capability"] for item in store.tool_invocations(project["id"], runs[0]["id"])] == ["project.files.write", "column.complete"]
 

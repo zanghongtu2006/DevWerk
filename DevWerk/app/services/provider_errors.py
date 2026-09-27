@@ -85,6 +85,13 @@ class ProviderErrorDetails:
 
 class LLMProviderError(RuntimeError):
     def __init__(self, details: ProviderErrorDetails):
+        # 2013 alone covers many unrelated invalid parameters. Match the explicit
+        # provider context error before the generic bad-request classification.
+        if details.status_code in (None, 200, 400, 413) and (
+            details.provider_error_type in {'context_length_exceeded', 'context_window_exceeded'}
+            or re.search(r'context (?:window|length) (?:exceeds|exceeded)|maximum context length|prompt is too long', details.message, re.I)
+        ):
+            details.error_code = 'LLM_CONTEXT_WINDOW_EXCEEDED'
         self.details = details
         super().__init__(details.message)
 

@@ -11,6 +11,7 @@ from typing import Callable
 from contextlib import nullcontext
 
 from app.v1.policy import ExecutionLimits
+from app.v1.command_resolution import resolve_command
 
 
 def _kill_tree(process: subprocess.Popen) -> None:
@@ -31,6 +32,7 @@ def run_command(argv: list[str], cwd: Path, limits: ExecutionLimits,
                 check: Callable[[], None] | None = None, guard=None) -> dict:
     if check:
         check()
+    launch_argv = resolve_command(argv, cwd)
     options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {"start_new_session": True}
     job = None
     if os.name == "nt":
@@ -41,7 +43,7 @@ def run_command(argv: list[str], cwd: Path, limits: ExecutionLimits,
             spawn = job.spawn if job else subprocess.Popen
             if not job:
                 options["stdin"] = subprocess.DEVNULL
-            process = spawn(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            process = spawn(launch_argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             env=os.environ.copy(), shell=False, **options)
     except BaseException:
         if job:
@@ -92,7 +94,7 @@ def run_command(argv: list[str], cwd: Path, limits: ExecutionLimits,
         stop_tree()
         for reader in readers:
             reader.join(timeout=1)
-    return {"command": argv, "cwd": str(cwd), "exit_code": process.returncode,
+    return {"command": argv, "resolved_command": launch_argv, "cwd": str(cwd), "exit_code": process.returncode,
             "stdout": buffers[0].decode("utf-8", errors="replace"),
             "stderr": buffers[1].decode("utf-8", errors="replace"),
             "timed_out": timed_out, "output_truncated": overflow.is_set()}

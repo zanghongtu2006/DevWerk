@@ -29,6 +29,11 @@ class AgentRepository:
     def init_schema(self):
         with self.store.tx(immediate=True) as db:
             statements = [
+                """CREATE TABLE IF NOT EXISTS v1_context_checkpoints (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, scope_id TEXT NOT NULL,
+                    agent_run_id TEXT NOT NULL, revision INTEGER NOT NULL, through_message_id INTEGER NOT NULL,
+                    summary_json TEXT NOT NULL, source_hash TEXT NOT NULL, metrics_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL, UNIQUE(scope_id,revision))""",
                 """CREATE TABLE IF NOT EXISTS v1_worker_inputs (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES v1_projects(id) ON DELETE CASCADE,
                     recipient_agent_id TEXT NOT NULL, assignment_id TEXT, payload_json TEXT NOT NULL,
@@ -337,7 +342,19 @@ class AgentRepository:
         with self.store.connect() as db:
             session = db.execute('SELECT legacy_session_id FROM v1_agent_context_sessions WHERE id=?', (worker['active_session_id'],)).fetchone()
             rows = db.execute("SELECT m.* FROM v1_agent_messages m JOIN v1_agent_runs r ON r.id=m.agent_run_id WHERE r.project_id=? AND r.agent_session_id IN (?,?) AND m.id>? AND m.role!='system' ORDER BY m.id LIMIT ?", (project_id, worker['active_session_id'], session[0] if session else None, after, min(max(limit, 1), 50))).fetchall()
-        return [self.store._decode(dict(row), 'tool_calls_json') for row in rows]
+        from app.v1.context_manager import project_result, packed, bounded_value
+        page, used = [], 0
+        for row in rows:
+            item = self.store._decode(dict(row), 'tool_calls_json')
+            item['content'] = project_result(item['content'], 3000)
+            item['tool_calls'] = bounded_value(item.get('tool_calls',[]), 400)
+            item['source_message_id'] = item['id']
+            size = len(packed(item).encode('utf8'))
+            if page and used+size > 12000:
+                break
+            page.append(item)
+            used += size
+        return page
 
     def assign(self, task, run, column, *, worker_key=None):
         now = utcnow()
@@ -594,14 +611,20 @@ class AgentRepository:
                                WHERE r.project_id=? AND r.agent_session_id IN (?,?) AND r.id IS NOT ?
                                AND (? IS NULL OR r.assignment_id=?)
                                AND m.role!='system' ORDER BY m.id""", (project_id, session_id, session['legacy_session_id'], before_run_id, assignment_id, assignment_id)).fetchall()
-            snapshot = None if assignment_id else db.execute("SELECT * FROM v1_agent_context_snapshots WHERE session_id=? ORDER BY revision DESC LIMIT 1", (session_id,)).fetchone()
+            snapshot = (db.execute('SELECT * FROM v1_context_checkpoints WHERE project_id=? AND scope_id=? ORDER BY revision DESC LIMIT 1', (project_id,assignment_id)).fetchone()
+                        if assignment_id else db.execute("SELECT * FROM v1_agent_context_snapshots WHERE session_id=? ORDER BY revision DESC LIMIT 1", (session_id,)).fetchone())
         history = []
         if snapshot:
-            history.append({"role": "user", "content": json.dumps({"context_checkpoint": json.loads(snapshot["summary_json"]), "covers_through_message_id": snapshot["through_message_id"]})})
+            history.append({"role": "user", "_checkpoint": True, "content": json.dumps({"context_checkpoint": json.loads(snapshot["summary_json"]), "covers_through_message_id": snapshot["through_message_id"]})})
             rows = [row for row in rows if row["id"] > snapshot["through_message_id"]]
         for row in rows:
             item = self.store._decode(dict(row), "tool_calls_json")
+            item['_source_message_id'] = item['id']
             history.append(item)
+        if assignment_id:
+            # The per-request manager budgets complete batches, including the
+            # current run. Do not cut individual messages before replay pairing.
+            return history
         checkpoint_prefix = history[:1] if snapshot else []
         budget = self.store.policy.context.worker_context_max_characters - len(json.dumps(checkpoint_prefix)) - 1024
         used, retained = 0, []

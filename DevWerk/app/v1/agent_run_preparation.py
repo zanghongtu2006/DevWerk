@@ -57,6 +57,8 @@ class AgentRunPreparer:
         platform_policy = self.platform_policy or self.store.latest_platform_policy()
         pre_run_context = self._capability_context(spec)
         allowed = list(dict.fromkeys(spec.capability_ids))
+        if self.registry.contains('agent.result.read') and 'agent.result.read' not in allowed:
+            allowed.append('agent.result.read')
         if spec.kind == 'conversation' and spec.require_conversation_report and self.registry.contains('conversation.reply') and 'conversation.reply' not in allowed:
             allowed.append('conversation.reply')
         if spec.assignment and self.registry.contains('agent.context.read') and 'agent.context.read' not in allowed:

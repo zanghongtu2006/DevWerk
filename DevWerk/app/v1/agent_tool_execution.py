@@ -268,7 +268,7 @@ class AgentToolBatchExecutor:
                 ),
             }
             messages.append(tool_message)
-            self.store.add_agent_message(
+            saved_message = self.store.add_agent_message(
                 self.run_id,
                 "tool",
                 tool_message["content"],
@@ -276,6 +276,7 @@ class AgentToolBatchExecutor:
                 call.id,
                 progress_details={"iteration": iteration, "capability": call.name},
             )
+            tool_message['_source_message_id'] = saved_message['id']
             if operation_id:
                 self.store.agents.deliver_operation(operation_id)
             if wait_request is not None:
@@ -340,12 +341,13 @@ class AgentToolBatchExecutor:
             )
 
     def _run_acceptance_checks(self):
+        from app.v1.services.acceptance_execution import run_acceptance_check
         for check in self.completion_contract.acceptance_checks:
             if self.spec.assignment:
                 self.store.agents.charge(self.spec.assignment, tools=1)
             call_id = f"acceptance-{len(self.logical_ledger)}-{check['key']}"
-            result = self.registry.dispatch(check['capability'], check['arguments'],
-                                            replace(self.capability_context, execution_key=f'{self.run_id}:{call_id}'))
+            result = run_acceptance_check(self.registry,
+                replace(self.capability_context, execution_key=f'{self.run_id}:{call_id}'), check)
             if result.status == 'awaiting':
                 raise ValueError('Acceptance checks must complete synchronously')
             self.store.record_tool_invocation(agent_run_id=self.run_id, tool_call_id=call_id,

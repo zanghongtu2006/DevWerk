@@ -189,7 +189,8 @@ class CapabilityRegistry:
             if capability_id == "project.files.write":
                 _files_write_preflight(arguments, context)
             if capability_id == 'project.command.run':
-                context.files.resolve(str(arguments.get('cwd') or '.'))
+                from app.v1.command_resolution import resolve_command
+                resolve_command(arguments['argv'], context.files.resolve(str(arguments.get('cwd') or '.')))
             if context.agent_run_id and not context.column_run_id and entry.side_effect_kind in {"write", "process"}:
                 with context.store.connect() as db:
                     busy = db.execute("SELECT 1 FROM v1_tasks WHERE project_id=? AND (status IN ('running','waiting') OR failure_code='effect_outcome_unknown') LIMIT 1",
@@ -1081,6 +1082,17 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         side_effect_kind="control",
         delegable_to_column=False,
     )
+    add('task.plan.validate', 'Read-only admission diagnostics for a concrete Task Plan. Returns all independent contract errors, paths and legal columns. Does not persist plans or execute future commands.',
+        {'type':'object','required':['plan'],'properties':{'plan':{'type':'object'}},'additionalProperties':False},
+        lambda args, ctx: _task_plan_validate(args, ctx, registry), side_effect_kind='read', delegable_to_column=False)
+    add('workflow.acceptance.configure', 'Instantiate acceptance on the exact active Workflow revision without resending its instructions or graph. base_digest is definition_hash from workflow.inspect or loop.apply. Replaces checks only on listed columns and replaces obligations; validates before publication. Every required behavior column needs at least one behavior check with scenario_ids AND report_path. Build/file-only checks are artifacts. Obligation invalidated_by must include the Task Contract invalidators (the implementation column itself for backend/frontend, all implementation columns for later gates). Report schema: devwerk.acceptance-report.v1, scenarios [{id,status:passed,assertions:[{expected,actual}],test_source:{path,sha256}}]. Frozen Tasks retain their old revision.',
+        {'type':'object','required':['base_revision_id','base_digest','columns','acceptance_obligations'],
+         'properties':{'base_revision_id':{'type':'string'},'base_digest':{'type':'string'},
+           'columns':{'type':'array','minItems':1,'items':{'type':'object','required':['key','acceptance_checks'],
+              'properties':{'key':{'type':'string'},'acceptance_checks':{'type':'array','items':{'$ref':'#/$defs/AcceptanceCheck'}}},'additionalProperties':False}},
+           'acceptance_obligations':workflow_schema['properties']['acceptance_obligations']},
+         'additionalProperties':False,'$defs':{k:workflow_defs[k] for k in ('AcceptanceCheck','AcceptanceObligation')}},
+        lambda args, ctx: _workflow_acceptance_configure(args, ctx, registry), side_effect_kind='control', delegable_to_column=False)
     add('task.successor',
         'Create a terminal Task successor using an explicitly selected corrected TaskPlan and the same proposed_task_ref. The predecessor remains immutable.',
         {'type':'object', 'required':['task_id','task_plan_id'],
@@ -1195,7 +1207,13 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     add('agent.worker.lifecycle', 'Suspend, resume or retire an idle Worker. Retirement preserves its context and cannot be reversed.',
         {'type': 'object', 'required': ['worker_id', 'state'], 'properties': {'worker_id': {'type': 'string'}, 'state': {'enum': ['available', 'suspended', 'retired']}}, 'additionalProperties': False},
         lambda args, ctx: ctx.store.agents.set_lifecycle(ctx.project_id, args['worker_id'], args['state']), side_effect_kind='control', delegable_to_column=False)
-    add('agent.context.read', 'Read an earlier page of your persistent Worker context by source message ID. Main may specify a Worker.',
+    add('agent.result.read', 'Read a bounded slice of an archived tool result by source run and tool-call ID. Use next_offset to continue; summaries are not execution evidence.',
+        {'type':'object','required':['agent_run_id','tool_call_id'], 'properties':{
+            'agent_run_id':{'type':'string'},'tool_call_id':{'type':'string'},
+            'field':{'type':'string','enum':['result','stdout','stderr']},
+            'offset':{'type':'integer','minimum':0},'limit':{'type':'integer','minimum':1,'maximum':8000}},'additionalProperties':False},
+        _agent_result_read, side_effect_kind='read')
+    add('agent.context.read', 'Read bounded excerpts of earlier Worker context by source message ID. Continue after the last returned ID; use agent.result.read for full tool evidence. Main may specify a Worker.',
         {'type': 'object', 'properties': {'worker_id': {'type': 'string'}, 'after_message_id': {'type': 'integer', 'minimum': 0}, 'limit': {'type': 'integer', 'minimum': 1, 'maximum': 50}}, 'additionalProperties': False},
         _agent_context_read, side_effect_kind='read')
     add('agent.context.compact', 'Save an explicit coverage summary for an idle Worker, preserving the full source transcript for later inspection.',
@@ -2106,6 +2124,66 @@ def _task_plan_save(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, A
     return result
 
 
+def _task_plan_validate(args, ctx, registry):
+    from pydantic import ValidationError
+    from app.v1.services.task_plan_compiler import diagnose_task_plan, diagnose_acceptance_launches
+    try:
+        plan = TaskPlan.model_validate(args['plan'])
+    except ValidationError as exc:
+        return {'valid':False,'diagnostics':[{'path':'/'+ '/'.join(str(p).replace('~','~0').replace('/','~1') for p in e['loc']),
+            'message':e['msg'],'expected':e['type']} for e in exc.errors()]}
+    revision = ctx.store.get_workflow_revision(ctx.project_id, plan.workflow_revision_id)
+    method = WorkflowPlan.model_validate(ctx.store.get_workflow_plan(ctx.project_id, revision['workflow_plan_id'])['plan'])
+    result = diagnose_task_plan(plan, WorkflowDefinition.model_validate(revision['definition']), method, registry)
+    launches = diagnose_acceptance_launches(ctx.store,ctx.project_id,WorkflowDefinition.model_validate(revision['definition']))
+    result['diagnostics'].extend(launches['diagnostics'])
+    result['deferred_command_checks'] = launches['deferred_command_checks']
+    from app.v1.services.task_entry_admission import validate_entry_evidence
+    from app.v1.services.task_graph_admission import validate_task_graph_admission, existing_task_orders
+    binding = ctx.store.get_project_loop_binding(ctx.project_id, plan.workflow_revision_id)
+    for check in (
+        lambda: validate_entry_evidence(ctx.store, ctx.project_id, plan, method),
+        lambda: validate_task_graph_admission(plan,method.task_contract.dependency_contract,method.task_contract.admission_constraints,
+            loop_bindings=dict(binding.get('bindings') or {}) if binding else {},
+            existing_orders=existing_task_orders(ctx.store,ctx.project_id,method.task_contract.dependency_contract)),
+    ):
+        try:
+            check()
+        except ValueError as exc:
+            result['diagnostics'].append({'path':'/tasks','message':str(exc)})
+    result['valid'] = not result['diagnostics']
+    return result
+
+
+def _workflow_acceptance_configure(args, ctx, registry):
+    from app.v1.services.task_plan_compiler import acceptance_diagnostics, PlanAdmissionError
+    _require_user_planning_turn(ctx, 'workflow.acceptance.configure')
+    # Keep the base check and publication in one transaction, so stale partial edits
+    # cannot overwrite a concurrent publication. Existing task revisions are immutable.
+    with ctx.store.tx(immediate=True):
+        base = ctx.store.get_workflow(ctx.project_id)
+        if (base['id'], base['definition_hash']) != (args['base_revision_id'], args['base_digest']):
+            raise ValueError('WorkflowRevisionChanged: inspect the current revision before configuring acceptance')
+        _check_workflow_scope(ctx, base['id'])
+        value = copy.deepcopy(base['definition'])
+        columns = {c['key']:c for c in value['columns']}
+        seen = set()
+        for item in args['columns']:
+            if item['key'] not in columns or item['key'] in seen:
+                raise ValueError('Unknown or duplicate column; legal columns: '+', '.join(columns))
+            seen.add(item['key'])
+            columns[item['key']]['acceptance_checks'] = item['acceptance_checks']
+        value['acceptance_obligations'] = args['acceptance_obligations']
+        definition = WorkflowDefinition.model_validate(canonicalize_workflow_capability_arguments(value, registry))
+        method = WorkflowPlan.model_validate(ctx.store.get_workflow_plan(ctx.project_id, base['workflow_plan_id'])['plan'])
+        errors = acceptance_diagnostics(definition, method)
+        if errors:
+            raise PlanAdmissionError(errors)
+        result = _workflow_publish({'workflow_plan_id':base['workflow_plan_id'],'workflow':definition.model_dump(mode='json')},ctx,registry)
+        return {key:result[key] for key in ('id','definition_hash','workflow_plan_id')} | {
+            'changed_columns':sorted(seen),'details_capability':'workflow.inspect'}
+
+
 def _workflow_publish(args: dict[str, Any], ctx: CapabilityContext, registry: CapabilityRegistry) -> dict[str, Any]:
     _require_user_planning_turn(ctx, "workflow.publish")
     _bind_requirement(ctx, 'v1_workflow_plans', str(args['workflow_plan_id']))
@@ -2160,7 +2238,12 @@ def _bind_requirement(ctx, table, identity):
     assert table in {'v1_tasks', 'v1_task_plans', 'v1_workflow_plans'}
     with ctx.store.tx(immediate=True) as db:
         row = db.execute(f'SELECT * FROM {table} WHERE id=? AND project_id=?', (identity, ctx.project_id)).fetchone()
-        if not row or row['requirement_id'] not in (None, ctx.requirement_id):
+        if not row:
+            label = {'v1_tasks':'Task','v1_task_plans':'TaskPlan','v1_workflow_plans':'WorkflowPlan'}[table]
+            hint = (' Use the ID returned by task.plan.save; task.plan.validate does not save a plan.'
+                    if table == 'v1_task_plans' else ' Use a saved ID returned by the corresponding planning tool.')
+            raise ValueError(f'{label}NotFound: no saved {label} {identity!r} in this Project.'+hint)
+        if row['requirement_id'] not in (None, ctx.requirement_id):
             raise ValueError('Work belongs to a different Requirement')
         if table != 'v1_workflow_plans':
             version = ctx.requirement_revision or ctx.store.agents.get_requirement(ctx.project_id, ctx.requirement_id)['revision']
@@ -2183,6 +2266,33 @@ def _agent_context_read(args, ctx):
     if not worker_id or (ctx.column_run_id and worker_id != ctx.agent_instance_id):
         raise PermissionError('Leaf Workers may read only their own context')
     return ctx.store.agents.context_page(ctx.project_id, worker_id, after=args.get('after_message_id', 0), limit=args.get('limit', 20))
+
+
+def _agent_result_read(args, ctx):
+    with ctx.store.connect() as db:
+        row = db.execute('''SELECT t.result_json FROM v1_tool_invocations t
+            JOIN v1_agent_runs r ON r.id=t.agent_run_id
+            WHERE t.project_id=? AND t.agent_run_id=? AND t.tool_call_id=?
+            AND (? IS NULL OR r.agent_instance_id=?) ORDER BY t.id DESC LIMIT 1''',
+            (ctx.project_id,args['agent_run_id'],args['tool_call_id'],ctx.column_run_id,ctx.agent_instance_id)).fetchone()
+    if not row:
+        raise ValueError('Tool result is absent or outside this Agent scope')
+    content = row['result_json']
+    if args.get('field','result') != 'result':
+        content = str((json.loads(content).get('output') or {}).get(args['field'],'') or '')
+    offset, limit = int(args.get('offset',0)), min(int(args.get('limit',4000)),8000)
+    chunk = content[offset:offset+limit]
+    # Pagination must advance by exactly the data returned, including Unicode.
+    # Keep pages small enough that ordinary provider projection need not remove
+    # their middle while retaining a next_offset that skips unseen evidence.
+    byte_limit = max(128,min(2000,ctx.store.policy.context.tool_result_tokens//2))
+    while len(chunk.encode('utf8')) > byte_limit:
+        chunk = chunk[:max(1,len(chunk)//2)]
+    end = offset+len(chunk)
+    return {'agent_run_id':args['agent_run_id'],'tool_call_id':args['tool_call_id'],
+            'field':args.get('field','result'),'offset':offset,'content':chunk,
+            'total_characters':len(content),'sha256':hashlib.sha256(content.encode('utf8')).hexdigest(),
+            'next_offset':end if end<len(content) else None}
 
 
 def _task_list(args: dict[str, Any], ctx: CapabilityContext) -> list[dict[str, Any]]:

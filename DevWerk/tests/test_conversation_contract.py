@@ -312,7 +312,7 @@ def test_conversation_prose_never_mutates_state_or_forces_a_capability(store, tm
 
     assert result.status == "succeeded"
     assert require_tool_values == [False]
-    assert exposed_tools == [{"test.control"}]
+    assert exposed_tools == [{"test.control", "agent.result.read"}]
     invocations = store.tool_invocations(project["id"], result.agent_run_id)
     assert invocations == []
 
@@ -331,7 +331,7 @@ def test_current_request_never_creates_a_kernel_execution_obligation(
         assert kwargs.get("required_tool_name") is None
         assert "execution_obligation" not in json.loads(messages[-1]["content"])
         assert {item["function"]["name"] for item in tools} == {
-            "task.plan.save", "task.create"
+            "task.plan.save", "task.create", "agent.result.read"
         }
         return AgentModelResponse(text="我们先讨论核心方向，不创建任何任务。")
 

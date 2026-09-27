@@ -1,0 +1,37 @@
+{
+  "worker_handoff": {
+    "successor_assigned": true,
+    "snapshot_visible_without_assignment_filter": true,
+    "handoff_visible_in_actual_prepared_messages": false,
+    "handoff_visible_in_context_read": false
+  },
+  "memory_scope": {
+    "selected_scope_ids": [
+      "workflow_A",
+      "workflow_B"
+    ],
+    "omitted": []
+  },
+  "memory_budget": {
+    "selected_content_characters": 230380,
+    "omitted": [],
+    "error": "Required context or an unsettled tool batch exceeds the context budget",
+    "input_budget": 105216
+  },
+  "resume_ledger": {
+    "receipts": 4,
+    "ledger_characters": 443352,
+    "raw_log_copies_in_prepared_messages": 8,
+    "compactable_tool_batches": 0,
+    "estimated_tokens": 513223,
+    "input_budget": 105216,
+    "error": "Required context or an unsettled tool batch exceeds the context budget"
+  },
+  "checkpoint_replay": {
+    "critical_input_in_live_context": true,
+    "critical_input_in_reloaded_context": false,
+    "critical_input_in_source_archive": true,
+    "live_message_count": 9,
+    "reloaded_message_count": 1
+  }
+}

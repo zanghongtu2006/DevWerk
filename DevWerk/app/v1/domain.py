@@ -156,9 +156,21 @@ class AcceptanceCheck(BaseModel):
     arguments: dict[str, Any]
     evidence_kind: Literal['artifact', 'behavior'] = 'artifact'
     purpose: str = Field(default='', max_length=4000)
+    scenario_ids: list[str] = Field(default_factory=list, max_length=200,
+        description='Required behavior scenario IDs. Every ID needs a passed assertion in the fresh report.')
+    report_path: str | None = Field(default=None,
+          description='Project-relative JSON report written by this command, schema devwerk.acceptance-report.v1.')
+    launch_validation: Literal['preflight', 'deferred'] = Field(default='deferred',
+        description='preflight checks executable resolution at TaskPlan admission; deferred permits a future generated entry. Runtime always checks before execution.')
 
     @model_validator(mode='after')
     def behavior_requires_execution(self):
+        if bool(self.scenario_ids) != bool(self.report_path):
+            raise ValueError('Scenario evidence requires both scenario_ids and report_path')
+        if len(set(self.scenario_ids)) != len(self.scenario_ids) or any(not s.strip() for s in self.scenario_ids):
+            raise ValueError('Scenario IDs must be unique and nonempty')
+        if self.report_path and (self.evidence_kind != 'behavior' or self.capability != 'project.command.run'):
+            raise ValueError('A scenario report requires a behavioral command')
         if self.evidence_kind == 'behavior':
             if self.capability != 'project.command.run' or not self.purpose.strip():
                 raise ValueError('Behavior acceptance requires an executable command and a concrete purpose')
@@ -755,6 +767,8 @@ class TaskContract(BaseModel):
     acceptance_invalidated_by: list[str] = Field(default_factory=list, max_length=200)
     feedback_columns: list[str] = Field(default_factory=list, max_length=200,
         description='Columns that must expose task.feedback.record for persistent defect handoff.')
+    scenario_input_pointer: str | None = Field(default=None, pattern=r'^/',
+        description='Task input JSON pointer listing required scenario IDs. Software delivery requires scenario reports and complete coverage of this frozen list.')
     identity_pointer: str | None = Field(
         default=None,
         pattern=r"^/.*",

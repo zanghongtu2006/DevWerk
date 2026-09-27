@@ -2460,6 +2460,7 @@ class V1Store:
                 "INSERT INTO v1_agent_messages(project_id,agent_run_id,sequence,role,content,tool_calls_json,tool_call_id,created_at) VALUES((SELECT project_id FROM v1_agent_runs WHERE id=?),?,?,?,?,?,?,?)",
                 (agent_run_id, agent_run_id, sequence, role, packed_content, packed_calls, tool_call_id, now),
             )
+            message_id = db.execute('SELECT last_insert_rowid()').fetchone()[0]
             if emit_progress and run["kind"] == "conversation" and role == "assistant" and (content.strip() or tool_calls):
                 parts = [content] if content.strip() else []
                 for call in tool_calls or []:
@@ -2489,7 +2490,7 @@ class V1Store:
                 content=conversation_progress[1],
                 details=conversation_progress[2],
             )
-        return {"agent_run_id": agent_run_id, "sequence": sequence, "role": role, "content": content, "tool_calls": tool_calls or [], "tool_call_id": tool_call_id, "created_at": now}
+        return {"id": message_id, "agent_run_id": agent_run_id, "sequence": sequence, "role": role, "content": content, "tool_calls": tool_calls or [], "tool_call_id": tool_call_id, "created_at": now}
 
     def record_conversation_progress(
         self,
