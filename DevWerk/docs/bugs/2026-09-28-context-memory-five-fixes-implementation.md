@@ -33,7 +33,15 @@
 
 ## F3 — checkpoint 精确覆盖
 
-待实施。
+实施范围：
+
+- `ContextManager` 只把完整 assistant/tool 批次的真实持久化消息 ID 写入 v2 `coverage_json`，连续区间只合并相邻 ID；多次压缩累计先前的精确覆盖集合。归档失败、缺少来源 ID 或失去执行权时不提交 checkpoint。
+- `AgentRepository.session_history` 对 v2 checkpoint 只排除覆盖集中的消息。旧 checkpoint 无精确集合，保守回放原始 Assignment 消息，避免沿用 `through_message_id` 误删仍有效的指令；下一次压缩可生成 v2。
+- Worker mailbox 消费事务直接返回刚写入 AgentRun 的 `source_message_id`；当前 Assignment frame 也保留真实 ID。`session_replay` 合并相邻自然语言消息时保留各自的 source ID，供继续压缩与审计使用。
+
+覆盖用例：六条有效 Worker 输入夹杂另一 Agent 消息后压缩/重启；连续两次压缩集合累计；旧 checkpoint 原文回放并升级；Worker 消费 ID 与落库行一致。扩大回归涵盖上下文生命周期、恢复 fencing、持久化 Agent 与架构协议。
+
+验证结果：相关测试组 **66 passed**。未调用外部 Provider。
 
 ## F4 — Memory 范围绑定
 

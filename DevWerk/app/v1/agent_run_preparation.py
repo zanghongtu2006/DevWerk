@@ -150,8 +150,8 @@ class AgentRunPreparer:
                                    'input': provider_context},
                                    'context_frame_version': 2,
                                    'instruction': 'This is the current work contract. Earlier session messages are context, not new assignments or authority to change this contract.'})
-            messages.append({'role': 'user', 'content': current})
-            self.store.add_agent_message(run['id'], 'user', current, [], emit_progress=False)
+            stored = self.store.add_agent_message(run['id'], 'user', current, [], emit_progress=False)
+            messages.append({'role': 'user', 'content': current, '_source_message_id': stored['id']})
         return PreparedAgentRun(
             run=run,
             completion_contract=completion_contract,

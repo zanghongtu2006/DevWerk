@@ -23,6 +23,41 @@ def digest(value):
     return hashlib.sha256(packed(value).encode('utf-8')).hexdigest()
 
 
+def coverage_ranges(message_ids):
+    """Compress only adjacent real IDs; a gap may contain another message."""
+    ranges = []
+    for identity in sorted(set(message_ids)):
+        if ranges and identity == ranges[-1][1] + 1:
+            ranges[-1][1] = identity
+        else:
+            ranges.append([identity, identity])
+    return {'version':2,'mode':'exact_message_ids','ranges':ranges,
+            'excluded_message_count':len(set(message_ids))}
+
+
+def covered_message_ids(payload):
+    """None means a legacy or malformed checkpoint: replay raw history."""
+    try:
+        value = json.loads(payload) if isinstance(payload, str) else payload
+        if not isinstance(value, dict) or value.get('version') != 2 or value.get('mode') != 'exact_message_ids':
+            return None
+        ranges = value['ranges']
+        if not isinstance(ranges, list):
+            return None
+        covered = set()
+        for pair in ranges:
+            if (not isinstance(pair, list) or len(pair) != 2 or
+                    any(type(identity) is not int or identity <= 0 for identity in pair) or
+                    pair[1] < pair[0] or pair[1]-pair[0] > 100000):
+                return None
+            covered.update(range(pair[0],pair[1]+1))
+        if len(covered) != value.get('excluded_message_count'):
+            return None
+        return covered
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
 def provider_messages(messages):
     return [{k: v for k, v in m.items() if not k.startswith('_')} for m in messages]
 
@@ -219,10 +254,6 @@ class ContextManager:
                 previous = [m for m in retained if m.get('_checkpoint')]
                 retained = [m for m in retained if not m.get('_checkpoint')]
                 summary = self._summarize(previous + removed)
-                boundary = max((m.get('_source_message_id',0) for m in removed),default=0)
-                notes = [m for m in retained if 0 < m.get('_source_message_id',0) <= boundary and m.get('role') in {'user','assistant'} and not m.get('tool_calls')]
-                if notes:
-                    summary['archived_notes'] = [{'source_message_id':m['_source_message_id'],'content':excerpt(str(m.get('content') or ''),800)} for m in notes[-4:]]
                 summary = self._bounded_summary(summary)
                 checkpoint = {'role': 'user', '_checkpoint': True,
                               'content': packed({'context_checkpoint': summary,
@@ -308,18 +339,36 @@ class ContextManager:
         return value
 
     def _save(self, removed, summary, before, after):
-        boundary = max((m.get('_source_message_id', 0) for m in removed), default=0)
-        if not boundary:
+        ids = [m.get('_source_message_id') for m in removed]
+        if not ids or any(type(identity) is not int or identity <= 0 for identity in ids):
             return
         with self.store.tx(immediate=True) as db:
             if self.spec.execution_control:
                 self.spec.execution_control.check()
             if self.spec.assignment:
                 self.store.agents.assert_owner(self.spec.assignment, db=db)
-            previous = db.execute('SELECT COALESCE(MAX(revision),0),COALESCE(MAX(through_message_id),0) FROM v1_context_checkpoints WHERE scope_id=?', (self.scope,)).fetchone()
-            if boundary <= previous[1]:
+                # A replayed batch must belong to this exact Assignment. Source
+                # IDs from another Worker or Project never become coverage.
+                for identity in ids:
+                    owned = db.execute('''SELECT 1 FROM v1_agent_messages m
+                        JOIN v1_agent_runs r ON r.id=m.agent_run_id
+                        WHERE m.id=? AND r.project_id=? AND r.assignment_id=?''',
+                        (identity,self.spec.project['id'],self.spec.assignment['id'])).fetchone()
+                    if not owned:
+                        return
+            previous = self.store.agents.load_context_checkpoint(
+                self.spec.project['id'], self.scope, db=db)
+            prior = covered_message_ids(previous['coverage_json']) if previous else None
+            combined = set(ids) | (prior or set())
+            if prior is not None and combined == prior:
                 return
-            db.execute('INSERT INTO v1_context_checkpoints VALUES(?,?,?,?,?,?,?,?,?,?)',
-                (new_id('context'), self.spec.project['id'], self.scope, self.run_id, previous[0]+1,
+            boundary = max(max(ids), previous['through_message_id'] if previous else 0)
+            db.execute('''INSERT INTO v1_context_checkpoints
+                (id,project_id,scope_id,agent_run_id,revision,through_message_id,
+                 summary_json,source_hash,metrics_json,created_at,coverage_json)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
+                (new_id('context'), self.spec.project['id'], self.scope, self.run_id,
+                 (previous['revision'] if previous else 0)+1,
                  boundary, packed(summary), digest(removed), packed({'before':before,'after':after,'ratio':self.ratio,
-                    'model':self.limits['model'],'protocol':self.limits['protocol']}), utcnow()))
+                    'model':self.limits['model'],'protocol':self.limits['protocol']}), utcnow(),
+                 packed(coverage_ranges(combined))))

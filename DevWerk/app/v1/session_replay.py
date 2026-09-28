@@ -15,7 +15,7 @@ def replayable_session_messages(history: list[dict[str, Any]]) -> list[dict[str,
             if role in {"user", "assistant"}:
                 projected = {
                     key: item[key]
-                    for key in ("role", "content", "tool_calls", "tool_call_id", "_source_message_id", "_checkpoint")
+                    for key in ("role", "content", "tool_calls", "tool_call_id", "_source_message_id", "_source_message_ids", "_checkpoint")
                     if key in item and item[key] not in (None, [])
                 }
                 if (
@@ -30,6 +30,10 @@ def replayable_session_messages(history: list[dict[str, Any]]) -> list[dict[str,
                         + "\n\n"
                         + str(projected.get("content") or "").lstrip()
                     )
+                    prior_ids = replay[-1].get('_source_message_ids') or [replay[-1].get('_source_message_id')]
+                    next_ids = projected.get('_source_message_ids') or [projected.get('_source_message_id')]
+                    replay[-1]['_source_message_ids'] = [identity for identity in
+                        [*prior_ids,*next_ids] if isinstance(identity,int) and identity > 0]
                 else:
                     replay.append(projected)
             index += 1

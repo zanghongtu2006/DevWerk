@@ -98,6 +98,7 @@ class AgentRepository:
             self.store.schema_repository._ensure_column(db, "v1_conversation_jobs", "claim_token", "TEXT")
             self.store.schema_repository._ensure_column(db, 'v1_conversation_jobs', 'requirement_revision', 'INTEGER')
             self.store.schema_repository._ensure_column(db, 'v1_agent_runs', 'operation_protocol', 'INTEGER NOT NULL DEFAULT 0')
+            self.store.schema_repository._ensure_column(db, 'v1_context_checkpoints', 'coverage_json', 'TEXT')
             # Additive migration: legacy task-scoped sessions remain untouched.
             # New Worker sessions have explicit ownership; legacy_session_id can
             # link an audited old transcript without guessing cross-Task identity.
@@ -598,11 +599,11 @@ class AgentRepository:
             if not rows:
                 return []
             payload = [{"message_id": row["id"], "input": json.loads(row["payload_json"])} for row in rows]
-            self.store.add_agent_message(agent_run_id, "user", json.dumps({"worker_messages": payload}), [], emit_progress=False)
+            stored = self.store.add_agent_message(agent_run_id, "user", json.dumps({"worker_messages": payload}), [], emit_progress=False)
             for row in rows:
                 now = utcnow()
                 db.execute("UPDATE v1_worker_inputs SET state='acknowledged',consumed_by_run_id=?,acknowledged_at=? WHERE id=? AND state='pending'", (agent_run_id, now, row["id"]))
-            return payload
+            return {'payload':payload, 'source_message_id':stored['id']}
 
     def set_lifecycle(self, project_id, worker_id, state):
         if state not in {"available", "suspended", "retired"}:
@@ -721,8 +722,19 @@ class AgentRepository:
                         if assignment_id else db.execute("SELECT * FROM v1_agent_context_snapshots WHERE session_id=? ORDER BY revision DESC LIMIT 1", (session_id,)).fetchone())
         history = []
         if snapshot:
-            history.append({"role": "user", "_checkpoint": True, "content": json.dumps({"context_checkpoint": json.loads(snapshot["summary_json"]), "covers_through_message_id": snapshot["through_message_id"]})})
-            rows = [row for row in rows if row["id"] > snapshot["through_message_id"]]
+            if assignment_id:
+                # Old prefix checkpoints did not record which intervening user
+                # messages they preserved. Rebuild conservatively from raw rows.
+                from app.v1.context_manager import covered_message_ids
+                covered = covered_message_ids(snapshot['coverage_json']) if snapshot['coverage_json'] else None
+                if covered is not None:
+                    history.append({'role':'user','_checkpoint':True,'content':json.dumps({
+                        'context_checkpoint':json.loads(snapshot['summary_json']),
+                        'covered_message_count':len(covered)})})
+                    rows = [row for row in rows if row['id'] not in covered]
+            else:
+                history.append({"role": "user", "_checkpoint": True, "content": json.dumps({"context_checkpoint": json.loads(snapshot["summary_json"]), "covers_through_message_id": snapshot["through_message_id"]})})
+                rows = [row for row in rows if row["id"] > snapshot["through_message_id"]]
         for row in rows:
             item = self.store._decode(dict(row), "tool_calls_json")
             item['_source_message_id'] = item['id']
@@ -749,6 +761,16 @@ class AgentRepository:
                           'retrieve': 'Use agent.context.read to inspect older source messages; no source history has been deleted.'}}
             history = checkpoint_prefix + [{'role': 'user', 'content': json.dumps(checkpoint)}] + list(reversed(retained))
         return history
+
+    def load_context_checkpoint(self, project_id, scope_id, *, db=None):
+        query = ('SELECT * FROM v1_context_checkpoints WHERE project_id=? AND scope_id=? '
+                 'ORDER BY revision DESC LIMIT 1')
+        if db is not None:
+            row = db.execute(query, (project_id,scope_id)).fetchone()
+        else:
+            with self.store.connect() as connection:
+                row = connection.execute(query, (project_id,scope_id)).fetchone()
+        return dict(row) if row else None
 
     def prior_assignments(self, project_id, session_id, assignment_id):
         with self.store.connect() as db:

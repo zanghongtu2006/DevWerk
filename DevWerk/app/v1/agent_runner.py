@@ -104,13 +104,11 @@ class AgentExecutionRunner:
                 iteration += 1
                 current_iteration = iteration
                 if spec.assignment and not pending:
-                    payload = self.store.agents.consume_messages(spec.assignment, run["id"])
-                    if payload:
-                        # consume_messages atomically stores the user message with
-                        # acknowledgement. Carry its boundary into future snapshots.
-                        with self.store.connect() as db:
-                            source_id = db.execute('SELECT MAX(id) FROM v1_agent_messages WHERE agent_run_id=?',(run['id'],)).fetchone()[0]
-                        messages.append({"role": "user", "content": stable_json({"worker_messages": payload}), '_source_message_id':source_id})
+                    consumed = self.store.agents.consume_messages(spec.assignment, run["id"])
+                    if consumed:
+                        messages.append({"role": "user",
+                            "content": stable_json({"worker_messages": consumed['payload']}),
+                            '_source_message_id':consumed['source_message_id']})
                     self.store.agents.charge(spec.assignment, models=1)
                 operation_ids = None
                 if pending:
