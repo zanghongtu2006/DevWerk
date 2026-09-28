@@ -509,6 +509,11 @@ class V1Store:
     def memory_read(self, project_id: str, reference: str) -> dict[str, Any]:
         return self.memory.store.read(self.get_project(project_id), reference)
 
+    def memory_read_page(self, project_id: str, reference: str, *, offset: int = 0,
+                         max_characters: int = 2000, expected_sha256: str | None = None) -> dict[str, Any]:
+        return self.memory.read_page(self.get_project(project_id), reference,
+            offset=offset, max_characters=max_characters, expected_sha256=expected_sha256)
+
     def memory_snapshot(
         self,
         project_id: str,

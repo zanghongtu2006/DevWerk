@@ -100,6 +100,60 @@ def project_result(content, max_bytes):
         original = {'output': content}
     if not isinstance(original, dict):
         original = {'output': original}
+    if original.get('capability') == 'project.memory.search' and isinstance(original.get('output'), list):
+        view = copy.deepcopy(original)
+        while view['output'] and len(packed(view).encode('utf-8')) > max_bytes:
+            view['output'].pop()
+            for item in view['output']:
+                if isinstance(item, dict):
+                    item['search_more_matches'] = True
+                    item['search_next_offset'] = item.get('search_offset',0)+len(view['output'])
+        if len(packed(view).encode('utf-8')) <= max_bytes:
+            return packed(view)
+        return packed({'ok':original.get('ok'), 'capability':'project.memory.search',
+                       'output':[], 'projection':{'truncated':True,
+                           'retrieve':'project.memory.search with a narrower query'}})
+    if original.get('capability') == 'project.memory.read' and isinstance(original.get('output'), dict):
+        output = original['output']
+        if isinstance(output.get('content'), str) and isinstance(output.get('offset'), int):
+            from app.v1.context_projection import slice_source_text
+            source = output['content']
+            offset = output['offset']
+            budget = min(max_bytes, len(source.encode('utf-8')))
+            while budget >= 4:
+                page, _ = slice_source_text(source, offset=0, max_characters=len(source), max_bytes=budget)
+                next_offset = offset + len(page)
+                view = {**original, 'output': {**output, 'content': page,
+                    'next_offset': next_offset if next_offset < output['total_characters'] else None,
+                    'content_complete': next_offset >= output['total_characters']}}
+                encoded = packed(view)
+                if len(encoded.encode('utf-8')) <= max_bytes:
+                    return encoded
+                compact_output = {key: output.get(key) for key in
+                    ('reference','sha256','offset','total_characters') if key in output}
+                scope_metadata = output.get('metadata') or {}
+                compact_output['scope'] = scope_metadata.get('scope')
+                compact_output['scope_id'] = scope_metadata.get('scope_id')
+                compact_output['scope_resolution'] = output.get('scope_resolution')
+                compact_output.update(content=page,
+                    next_offset=next_offset if next_offset < output['total_characters'] else None,
+                    content_complete=next_offset >= output['total_characters'],
+                    metadata_omitted=True)
+                compact = {'ok': original.get('ok'), 'capability': original.get('capability'),
+                           'output': compact_output}
+                encoded = packed(compact)
+                if len(encoded.encode('utf-8')) <= max_bytes:
+                    return encoded
+                budget //= 2
+            view = {**original, 'output': {key: output.get(key) for key in
+                ('reference','sha256','offset','total_characters') if key in output}}
+            scope_metadata = output.get('metadata') or {}
+            view['output']['scope'] = scope_metadata.get('scope')
+            view['output']['scope_id'] = scope_metadata.get('scope_id')
+            view['output']['scope_resolution'] = output.get('scope_resolution')
+            view['output'].update(content='', next_offset=offset, content_complete=False,
+                                  projection_deferred=True)
+            return packed(view)
     reference = bounded_value(original.get('evidence') or {}, 120)
     planning = planning_projection(original)
     if planning is not None:
@@ -233,6 +287,9 @@ class ContextManager:
             if item.get('role') == 'tool':
                 item['content'] = project_result(str(item.get('content') or ''),
                     max(512, int(self.policy.tool_result_tokens / (self.ratio*1.15))))
+        self._project_memory(projected, tools, force=force)
+        self._project_reference_dialogue(projected, tools, force=force)
+        self._project_execution_references(projected, tools, force=force)
         estimate = self.estimate(projected, tools)
         compact = force or estimate >= self.hard*self.policy.soft_fraction
         removed = []
@@ -261,17 +318,161 @@ class ContextManager:
                 projected = retained[:1] + [checkpoint] + retained[1:]
                 estimate = self.estimate(projected, tools)
                 if estimate > self.hard:
-                    raise ContextExhausted('Required instructions/current input exceed the context budget after compaction')
+                    raise self._required_overflow(projected, tools)
                 self._save(removed, summary, before, estimate)
                 messages[:] = projected
         estimate = self.estimate(projected, tools)
         if estimate > self.hard:
-            raise ContextExhausted('Required context or an unsettled tool batch exceeds the context budget')
+            raise self._required_overflow(projected, tools)
         self.last_bytes = len(packed({'messages': provider_messages(projected), 'tools': tools}).encode('utf-8'))
         self.last_metrics = {'estimated_tokens': estimate, 'before_tokens': before,
                              'input_budget': self.hard, 'compacted_messages': len(removed),
                              'estimator': 'utf8-conservative-usage-calibrated', 'ratio': self.ratio}
         return provider_messages(projected)
+
+    def _project_memory(self, messages, tools, *, force):
+        from app.v1.context_projection import slice_source_text
+        sources = []
+        parsed = []
+        source_cache = {}
+        for index, item in enumerate(messages):
+            if item.get('role') != 'user':
+                continue
+            try:
+                payload = json.loads(item.get('content') or '')
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            state = payload.get('authoritative_project_state') or {}
+            assignment = payload.get('current_assignment') or {}
+            contract_input = assignment.get('input') or {} if isinstance(assignment, dict) else {}
+            nested_input = contract_input.get('input') or {} if isinstance(contract_input, dict) else {}
+            memory = (state.get('memory') if isinstance(state, dict) else None) or (
+                contract_input.get('memory') or nested_input.get('memory')
+                if isinstance(contract_input, dict) and isinstance(nested_input, dict) else None)
+            if not isinstance(memory, dict) or not isinstance(memory.get('records'), list):
+                continue
+            parsed.append((index, payload, memory))
+            for record in memory['records']:
+                if not isinstance(record, dict):
+                    continue
+                source = str(record.get('content') or '')
+                reference, expected_sha = record.get('reference'), record.get('sha256')
+                if reference and expected_sha:
+                    cache_key = (reference, expected_sha)
+                    if cache_key not in source_cache:
+                        try:
+                            current = self.store.memory.store.read(self.spec.project, reference)
+                            source_cache[cache_key] = current if current.get('sha256') == expected_sha else None
+                        except (KeyError, FileNotFoundError, ValueError):
+                            source_cache[cache_key] = None
+                    current = source_cache[cache_key]
+                    if current is None:
+                        record['source_changed_or_unavailable'] = True
+                        source = ''
+                    else:
+                        source = str(current.get('content') or '')
+                sources.append((record, source))
+                record['content'] = ''
+                record['content_complete'] = not source and bool(record.get('content_complete'))
+                record['next_offset'] = 0 if source else record.get('next_offset')
+            item['content'] = packed(payload)
+        if not sources:
+            return
+        base = self.estimate(messages, tools)
+        target = self.hard * (0.4 if force else self.policy.target_fraction)
+        available = max(0, min(self.policy.memory_view_tokens * (0.5 if force else 1.0),
+            target-base) / (self.ratio*1.15))
+        # The estimator includes JSON escaping and request framing, so recheck
+        # the complete request after choosing contiguous source prefixes.
+        for _attempt in range(8):
+            remaining = int(available)
+            for record, source in sources:
+                if source and remaining >= 4:
+                    page, next_offset = slice_source_text(source, offset=0,
+                        max_characters=len(source),
+                        max_bytes=min(remaining, max(4,int(self.policy.memory_record_tokens *
+                            (0.5 if force else 1.0)/(self.ratio*1.15)))))
+                else:
+                    page, next_offset = '', 0 if source else None
+                record['content'] = page
+                record['content_complete'] = bool(next_offset is None and not record.get('source_changed_or_unavailable'))
+                record['next_offset'] = (len(page) if not record['content_complete'] else None)
+                remaining -= len(page.encode('utf-8'))
+            for index, payload, memory in parsed:
+                complete = {record.get('reference'):record.get('content_complete')
+                            for record in memory['records'] if isinstance(record, dict)}
+                manifest = memory.get('manifest') or {}
+                for selected in manifest.get('selected', []):
+                    if selected.get('reference') in complete:
+                        selected['content_complete'] = complete[selected['reference']]
+                manifest['provider_view_partial_count'] = sum(not value for value in complete.values())
+                messages[index]['content'] = packed(payload)
+            if self.estimate(messages, tools) <= target or available < 4:
+                break
+            available /= 2
+
+    def _required_overflow(self, messages, tools):
+        sizes = {'system_bytes': sum(len(str(m.get('content') or '').encode('utf-8'))
+            for m in messages if m.get('role') == 'system'),
+            'user_bytes': sum(len(str(m.get('content') or '').encode('utf-8'))
+            for m in messages if m.get('role') == 'user'),
+            'tool_schema_bytes': len(packed(tools).encode('utf-8')),
+            'estimated_tokens': self.estimate(messages, tools), 'input_budget_tokens': self.hard}
+        return ContextExhausted('required_context_overflow: '+packed(sizes))
+
+    def _project_reference_dialogue(self, messages, tools, *, force):
+        target = self.hard * (0.4 if force else self.policy.target_fraction)
+        for item in messages:
+            if item.get('role') != 'user':
+                continue
+            try:
+                payload = json.loads(item.get('content') or '')
+            except (ValueError, TypeError):
+                continue
+            dialogue = payload.get('reference_dialogue') if isinstance(payload, dict) else None
+            if not isinstance(dialogue, list):
+                continue
+            target_count = len(dialogue)//2 if force else len(dialogue)
+            while dialogue and (len(dialogue) > target_count or self.estimate(messages, tools) > target):
+                dialogue.pop(0)
+                payload['reference_dialogue_omitted'] = payload.get('reference_dialogue_omitted', 0)+1
+                payload['reference_dialogue_retrieve'] = 'conversation.history.read'
+                item['content'] = packed(payload)
+
+    def _project_execution_references(self, messages, tools, *, force):
+        if not force and self.estimate(messages, tools) <= self.hard:
+            return
+        for item in messages:
+            if item.get('role') != 'user':
+                continue
+            try:
+                payload = json.loads(item.get('content') or '')
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            assignment = payload.get('current_assignment') or {}
+            contract = assignment.get('input') or {} if isinstance(assignment, dict) else {}
+            evidence = contract.get('execution_evidence') if isinstance(contract, dict) else None
+            if isinstance(evidence, dict) and isinstance(evidence.get('entries'), list):
+                target_length = len(evidence['entries'])//2 if force else len(evidence['entries'])
+                while evidence['entries'] and (len(evidence['entries']) > target_length or
+                                               self.estimate(messages, tools) > self.hard):
+                    evidence['entries'].pop()
+                    evidence['included_operations'] = len(evidence['entries'])
+                    evidence['omitted_operations'] = max(0,
+                        int(evidence.get('total_operations') or 0)-len(evidence['entries']))
+                    item['content'] = packed(payload)
+            handoff = payload.get('session_handoff')
+            if isinstance(handoff, dict) and isinstance(handoff.get('summary_excerpt'), str):
+                target_length = len(handoff['summary_excerpt'])//2 if force else len(handoff['summary_excerpt'])
+                while handoff['summary_excerpt'] and (len(handoff['summary_excerpt']) > target_length or
+                                                      self.estimate(messages, tools) > self.hard):
+                    handoff['summary_excerpt'] = handoff['summary_excerpt'][:len(handoff['summary_excerpt'])//2]
+                    handoff['content_complete'] = False
+                    item['content'] = packed(payload)
 
     def _summarize(self, messages):
         facts = []

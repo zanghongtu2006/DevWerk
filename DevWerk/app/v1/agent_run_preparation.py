@@ -68,6 +68,11 @@ class AgentRunPreparer:
             allowed.append('agent.context.read')
         if spec.kind == 'column' and self.registry.contains('agent.evidence.list') and 'agent.evidence.list' not in allowed:
             allowed.append('agent.evidence.list')
+        if (spec.context.get('memory') or
+                (spec.context.get('input') or {}).get('memory')):
+            for capability_id in ('project.memory.read', 'project.memory.search'):
+                if self.registry.contains(capability_id) and capability_id not in allowed:
+                    allowed.append(capability_id)
         capabilities = self.registry.resolve(allowed, pre_run_context)
         effect_kinds = {item.id: item.side_effect_kind for item in capabilities}
         tools = [item.tool_schema() for item in capabilities]
@@ -144,7 +149,8 @@ class AgentRunPreparer:
         if spec.assignment:
             provider_context = {key: value for key, value in spec.context.items() if key != 'action_ledger'}
             if logical_ledger:
-                provider_context['execution_evidence'] = project_ledger(logical_ledger)
+                provider_context['execution_evidence'] = project_ledger(logical_ledger,
+                    max_bytes=min(6000, self.runtime_policy.context.ledger_view_tokens*2))
             current = stable_json({'current_assignment': {'id': spec.assignment['id'], 'task_id': spec.task_id,
                                    'requirement_id': spec.requirement_id, 'generation': spec.assignment['generation'],
                                    'input': provider_context},
@@ -234,7 +240,8 @@ class AgentRunPreparer:
                         spec.agent_instance_id, spec.requirement_id):
                     raise ValueError('Worker handoff is outside this Assignment scope')
                 messages.append({'role':'user','content':stable_json({
-                    'session_handoff':project_handoff(handoff)})})
+                    'session_handoff':project_handoff(handoff,
+                        max_bytes=min(2500, self.runtime_policy.context.handoff_view_tokens*2))})})
             prior = self.store.agents.prior_assignments(spec.project['id'], spec.agent_session_id, spec.assignment['id'])
             if prior:
                 messages.append({'role':'user', 'content':stable_json({

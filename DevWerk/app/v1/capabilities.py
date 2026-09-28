@@ -18,6 +18,7 @@ from app.v1.files import ProjectFiles, SystemFiles
 from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, V1RuntimePolicy
 from app.v1.execution_control import ExecutionControl, ExecutionOwnershipLost, ExecutionBudgetExceeded, ExecutionReplayUncertain
 from app.v1.execution_ledger import normalized_operation_arguments
+from app.v1.context_projection import slice_source_text
 from app.v1.memory import MemoryScopeContext, resolve_selector_scope
 
 
@@ -401,7 +402,11 @@ def _validate_memory_scope_id(ctx: CapabilityContext, scope: str, scope_id: str)
 
 
 def _memory_read(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
-    item = ctx.store.memory_read(ctx.project_id, str(args["reference"]))
+    item = ctx.store.memory_read_page(ctx.project_id, str(args["reference"]),
+        offset=int(args.get('offset') or 0), max_characters=int(args.get('max_characters') or 2000),
+        expected_sha256=args.get('expected_sha256'))
+    if item.get('source_changed'):
+        return item
     metadata = item.get("metadata") or {}
     scope, scope_id = metadata.get("scope"), metadata.get("scope_id")
     if scope in ("task", "workflow", "conversation"):
@@ -426,15 +431,32 @@ def _memory_search(args: dict[str, Any], ctx: CapabilityContext) -> list[dict[st
     elif scope == "project" and scope_id:
         _validate_memory_scope_id(ctx, scope, scope_id)
         scope_id = None
-    items = ctx.store.memory_search(ctx.project_id, str(args.get("query") or ""),
+    requested_limit = int(args.get('limit') or 8)
+    applied_limit = min(requested_limit, 8)
+    search_offset = int(args.get('offset') or 0)
+    candidates = ctx.store.memory_search(ctx.project_id, str(args.get("query") or ""),
         scope=scope, scope_id=scope_id, kinds=list(args.get("kinds") or []),
-        limit=int(args.get("limit") or 20))
+        limit=search_offset+applied_limit+1)
+    more_matches = len(candidates) > search_offset+applied_limit
+    items = candidates[search_offset:search_offset+applied_limit]
+    search_next_offset = search_offset+len(items) if more_matches else None
+    projected = []
     for item in items:
         metadata = item.get("metadata") or {}
-        item["scope_resolution"] = "unbound_or_legacy" if (
+        scope_resolution = "unbound_or_legacy" if (
             metadata.get("scope") in ("task", "workflow", "conversation") and
             not metadata.get("scope_id")) else "resolved"
-    return items
+        content = item['content']
+        page, next_offset = slice_source_text(content, offset=0,
+            max_characters=min(len(content), 160), max_bytes=320)
+        projected.append({'reference':item['reference'], 'sha256':item['sha256'],
+            'metadata':{key:metadata.get(key) for key in
+                ('id','kind','scope','scope_id','revision','authority','status') if key in metadata},
+            'scope_resolution':scope_resolution, 'content':page,
+            'content_complete':next_offset is None, 'next_offset':next_offset,
+            'search_more_matches':more_matches,'search_limit_applied':applied_limit,
+            'search_offset':search_offset,'search_next_offset':search_next_offset})
+    return projected
 
 
 def _memory_write(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
@@ -558,7 +580,10 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         {
             "type": "object",
             "required": ["reference"],
-            "properties": {"reference": {"type": "string", "minLength": 1}},
+            "properties": {"reference": {"type": "string", "minLength": 1},
+                           "offset": {"type": "integer", "minimum": 0},
+                           "max_characters": {"type": "integer", "minimum": 1, "maximum": 4000},
+                           "expected_sha256": {"type": "string", "minLength": 64, "maxLength": 64}},
             "additionalProperties": False,
         },
         _memory_read,
@@ -576,6 +601,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
                 "scope_id": {"type": "string", "maxLength": 500},
                 "kinds": {"type": "array", "items": {"type": "string"}, "maxItems": 100},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                "offset": {"type": "integer", "minimum": 0, "maximum": 5000},
             },
             "additionalProperties": False,
         },

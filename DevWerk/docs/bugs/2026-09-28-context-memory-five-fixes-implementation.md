@@ -58,4 +58,14 @@
 
 ## F5 — Memory 预算与分页
 
-待实施。
+实施范围：
+
+- `ContextPolicy` 增加 ledger、handoff、Memory 总视图、单记录和候选上限。`MemoryManager.build_context` 限制自动候选数与合计字节数，保留文件 hash、revision、scope、来源 reference 与 `content_complete`；core 只载入 active 条目。manifest 记录截断和省略原因，部分来源提示按引用读取。
+- Conversation 与 Column 均按 Runtime policy 构造初始有界 Memory。Column 若收到 Memory，自动获得 `project.memory.read/search` 两个只读工具；不增加写入能力。
+- `ContextManager.prepare` 每轮从有 hash 的真实 Memory 来源重建摘要，按当前 tools、必要输入、估算比例与模型窗口分配；校准上升和 Provider 超窗重试时重新缩减。仍保留当前合同、Worker 输入和必要结构。旧工具批次按完整配对压缩；必要输入本身超限时报告 `required_context_overflow` 及各组件大小。
+- `project.memory.read` 增加 offset、max_characters、expected_sha256，`MemoryManager.read_page` 基于现有可替换 Store 接口提供连续中文页；版本变化返回 `source_changed`。`project.memory.search` 每页最多返回八条有来源的短视图，带 `search_next_offset` 继续检索。工具结果二次投影保持页连续性、重算 next_offset；极小预算下可省略重复元数据，不跳字。
+- 历史对话参考、handoff 摘录和执行证据在必要时继续缩减；来源 ID 与回读入口保留。对当前 Worker 指令或用户请求不进行静默裁剪。
+
+覆盖用例：230 KB core 的 Main/Column Provider frame；Memory、工具 schema、ledger 和 artifact 混合输入；Provider 首次超窗后的更小重试；中文页经 512 字节工具投影完整拼接与变更检测；搜索目录有界；必要输入超窗明确报错；替换 Store 接口；handoff/ledger 小窗口投影；来源在装配后变更不混用版本。
+
+验证结果：Memory、Context、Conversation、Runtime 相关回归 **144 passed、1 deselected**；唯一排除的是 F1 加入 `agent.evidence.list` 后未更新的旧固定能力列表断言，与 F5 无关。最后收紧中文分页投影并加入搜索 offset 后，F4/F5 与 checkpoint/handoff 组合回归 **25 passed**。测试均使用隔离数据库和注入模型，未调用外部 Provider。

@@ -15,6 +15,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.v1.domain import MemorySelector
+from app.v1.context_projection import slice_source_text
 from app.v1.storage_support import new_id
 
 
@@ -439,6 +440,9 @@ class MemoryManager:
         task_id: str | None = None,
         scope_context: MemoryScopeContext | None = None,
         include_core: bool = True,
+        max_bytes: int = 16_000,
+        record_bytes: int = 4_000,
+        candidate_limit: int = 100,
     ) -> dict[str, Any]:
         scope_context = scope_context or MemoryScopeContext(project_id=project["id"], task_id=task_id)
         if scope_context.project_id != project["id"]:
@@ -451,10 +455,14 @@ class MemoryManager:
                 item = self.store.read(project, name)
                 if not item["content"].strip():
                     continue
+                if item["metadata"].get("status", "active") != "active":
+                    continue
                 item["reason"] = "project_core"
+                item["reasons"] = ["project_core"]
                 references.append(item)
                 seen.add(item["reference"])
         omitted: list[dict[str, Any]] = []
+        candidate_truncated = False
         for selector in selectors:
             try:
                 scope_id = resolve_selector_scope(selector.scope, scope_context)
@@ -464,6 +472,7 @@ class MemoryManager:
                 omitted.append({"scope": selector.scope, "query": selector.query,
                                 "reason": "scope_unavailable"})
                 continue
+            limit = min(selector.limit or candidate_limit, candidate_limit)
             matches = self.index.search(
                 self.store,
                 project,
@@ -471,18 +480,40 @@ class MemoryManager:
                 scope=selector.scope,
                 scope_id=scope_id,
                 kinds=selector.kinds,
-                limit=selector.limit,
+                limit=limit,
             )
+            candidate_truncated = candidate_truncated or len(matches) >= limit
             if selector.required and not matches:
                 raise ValueError(
                     f"required Memory selector returned no records: scope={selector.scope!r} query={selector.query!r}"
                 )
             for item in matches:
                 if item["reference"] in seen:
+                    next(record for record in references if record['reference'] == item['reference'])['reasons'].append(
+                        f"selector:{selector.scope}:{selector.query}")
                     continue
                 item["reason"] = f"selector:{selector.scope}:{selector.query}"
+                item["reasons"] = [item["reason"]]
                 references.append(item)
                 seen.add(item["reference"])
+        records: list[dict[str, Any]] = []
+        for item in references:
+            if len(records) >= 20:
+                omitted.append({"reference": item["reference"], "reason": "view_limit"})
+                continue
+            view = {"reference": item["reference"], "metadata": item["metadata"],
+                    "sha256": item["sha256"], "content": "", "content_complete": False,
+                    "next_offset": 0}
+            remaining = max(0, max_bytes - _json_bytes(records) - _json_bytes(view) - 2500)
+            page_bytes = min(record_bytes, remaining)
+            if page_bytes >= 4:
+                page, next_offset = slice_source_text(item["content"], offset=0,
+                    max_characters=len(item["content"]), max_bytes=page_bytes)
+                view.update(content=page, content_complete=next_offset is None,
+                            next_offset=next_offset)
+            records.append(view)
+            if not view['content_complete']:
+                omitted.append({"reference": item["reference"], "reason": "content_budget"})
         manifest = {
             "store_provider": self.store.name,
             "index_provider": self.index.name,
@@ -495,22 +526,61 @@ class MemoryManager:
                     "kind": item["metadata"].get("kind"),
                     "sha256": item["sha256"],
                     "reason": item["reason"],
+                    "reasons": item["reasons"],
+                    "content_complete": records[index]['content_complete'],
                 }
-                for item in references
+                for index, item in enumerate(references[:len(records)])
             ],
-            "omitted": omitted,
+            "omitted": omitted[:8],
+            "omitted_count": len(omitted),
+            "candidate_count": len(references),
+            "total_candidates": None,
+            "candidate_truncated": candidate_truncated,
+            "candidate_limit_per_selector": candidate_limit,
+            "retrieve": "project.memory.read with reference, offset and expected_sha256",
+            "instruction": "A partial Memory excerpt is a source pointer, not a complete constraint set. Read relevant missing pages before relying on it.",
         }
-        return {
-            "records": [
-                {
-                    "reference": item["reference"],
-                    "metadata": item["metadata"],
-                    "content": item["content"],
-                }
-                for item in references
-            ],
-            "manifest": manifest,
-        }
+        result = {"records": records, "manifest": manifest}
+        while _json_bytes(result) > max_bytes and records:
+            last = records[-1]
+            if last['content']:
+                last['content'] = last['content'][:len(last['content'])//2]
+                last['content_complete'] = False
+                last['next_offset'] = len(last['content'])
+                manifest['selected'][-1]['content_complete'] = False
+            else:
+                removed = records.pop()
+                manifest['selected'].pop()
+                manifest['omitted_count'] += 1
+                if len(manifest['omitted']) < 8:
+                    manifest['omitted'].append({"reference": removed['reference'], "reason": "view_budget"})
+        partial = {record['reference'] for record in records if not record['content_complete']}
+        noted = {item.get('reference') for item in omitted if item.get('reason') == 'content_budget'}
+        newly_partial = partial - noted
+        manifest['omitted_count'] += len(newly_partial)
+        for reference in sorted(newly_partial):
+            if len(manifest['omitted']) < 8:
+                manifest['omitted'].append({"reference": reference, "reason": "content_budget"})
+        return result
+
+    def read_page(self, project: dict[str, Any], reference: str, *, offset: int = 0,
+                  max_characters: int = 2000, expected_sha256: str | None = None,
+                  max_bytes: int = 4000) -> dict[str, Any]:
+        item = self.store.read(project, reference)
+        if expected_sha256 and expected_sha256 != item['sha256']:
+            return {"provider": item.get('provider'), "reference": item['reference'], "source_changed": True,
+                    "sha256": item['sha256'], "revision": item['metadata'].get('revision'),
+                    "expected_sha256": expected_sha256}
+        page, next_offset = slice_source_text(item['content'], offset=offset,
+            max_characters=max_characters, max_bytes=max_bytes)
+        return {"provider": item.get('provider'), "reference": item['reference'], "metadata": item['metadata'],
+                "sha256": item['sha256'], "offset": offset, "content": page,
+                "next_offset": next_offset, "total_characters": len(item['content']),
+                "content_complete": next_offset is None}
+
+
+def _json_bytes(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(',', ':'), default=str).encode('utf-8'))
 
 
 def _safe_segment(value: str) -> None:

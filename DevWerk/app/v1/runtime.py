@@ -449,6 +449,9 @@ class WorkflowRuntime:
                 scope_context=MemoryScopeContext(project_id=project["id"], task_id=task["id"],
                     workflow_revision_id=task["workflow_revision_id"]),
                 include_core=selection.include_project,
+                max_bytes=self.policy.context.memory_view_tokens * 2,
+                record_bytes=self.policy.context.memory_record_tokens * 2,
+                candidate_limit=self.policy.context.memory_candidate_limit,
             )
         data["context_manifest"] = {
             "preloaded_project_artifacts": preloaded_artifacts,
