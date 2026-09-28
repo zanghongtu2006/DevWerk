@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
 from app.v1.agent_models import AgentRunSpec
 from app.v1.agent_prompt import (
+    build_column_system_envelope,
     build_conversation_system_envelope,
     build_run_envelope,
     stable_json,
 )
+from app.v1.context_projection import project_ledger
 from app.v1.capabilities import CapabilityContext, CapabilityRegistry
 from app.v1.completion_protocol import CompletionContract, completion_tool_schema
 from app.v1.policy import PlatformPolicySnapshot, V1RuntimePolicy
@@ -63,6 +66,8 @@ class AgentRunPreparer:
             allowed.append('conversation.reply')
         if spec.assignment and self.registry.contains('agent.context.read') and 'agent.context.read' not in allowed:
             allowed.append('agent.context.read')
+        if spec.kind == 'column' and self.registry.contains('agent.evidence.list') and 'agent.evidence.list' not in allowed:
+            allowed.append('agent.evidence.list')
         capabilities = self.registry.resolve(allowed, pre_run_context)
         effect_kinds = {item.id: item.side_effect_kind for item in capabilities}
         tools = [item.tool_schema() for item in capabilities]
@@ -100,8 +105,25 @@ class AgentRunPreparer:
         provider_envelope = (
             build_conversation_system_envelope(spec, platform_policy)
             if spec.kind == "conversation"
-            else envelope
+            else build_column_system_envelope(spec, platform_policy)
         )
+        logical_ledger = [dict(item) for item in (
+            spec.runtime_ledger if spec.runtime_ledger is not None
+            else spec.context.get('action_ledger') or []) if isinstance(item, dict)]
+        for item in logical_ledger:
+            # Await completion is a real runtime receipt, but the handle only
+            # knows its ColumnRun before this AgentRun exists. Give it a durable
+            # source Run so the model's evidence reference can be read later.
+            call_id = str(item.get('tool_call_id') or '')
+            if (spec.runtime_ledger is not None and spec.column_run_id and
+                    item.get('agent_run_id') == spec.column_run_id and
+                    call_id.startswith('await-resume-')):
+                facts = item.get('facts') or {}
+                item['agent_run_id'] = run['id']
+                item['evidence_id'] = f"{run['id']}:{call_id}"
+                self.store.record_tool_invocation(agent_run_id=run['id'], tool_call_id=call_id,
+                    capability=item['capability'], arguments=dict(facts.get('arguments') or {}),
+                    result=dict(facts.get('result') or {}), ok=bool(item.get('ok')))
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": stable_json(provider_envelope)}
         ]
@@ -120,17 +142,16 @@ class AgentRunPreparer:
             current_request,
         )
         if spec.assignment:
+            provider_context = {key: value for key, value in spec.context.items() if key != 'action_ledger'}
+            if logical_ledger:
+                provider_context['execution_evidence'] = project_ledger(logical_ledger)
             current = stable_json({'current_assignment': {'id': spec.assignment['id'], 'task_id': spec.task_id,
                                    'requirement_id': spec.requirement_id, 'generation': spec.assignment['generation'],
-                                   'input': spec.context},
+                                   'input': provider_context},
+                                   'context_frame_version': 2,
                                    'instruction': 'This is the current work contract. Earlier session messages are context, not new assignments or authority to change this contract.'})
             messages.append({'role': 'user', 'content': current})
             self.store.add_agent_message(run['id'], 'user', current, [], emit_progress=False)
-        logical_ledger = [
-            dict(item)
-            for item in (spec.context.get("action_ledger") or [])
-            if isinstance(item, dict)
-        ]
         return PreparedAgentRun(
             run=run,
             completion_contract=completion_contract,
@@ -209,9 +230,13 @@ class AgentRunPreparer:
                 messages.append({'role':'user', 'content':stable_json({
                     'prior_assignments_reference':prior,
                     'instruction':'These are archived work references, not completion of the current Assignment. Use agent.context.read for source details. Complete the current Assignment against its current input and contract.'})})
-            history = replayable_session_messages(self.store.agents.session_history(
-                spec.project["id"], spec.agent_session_id, before_run_id=run_id, assignment_id=spec.assignment['id']))
-            messages.extend(history)
+            history = self.store.agents.session_history(
+                spec.project["id"], spec.agent_session_id,
+                before_run_id=run_id, assignment_id=spec.assignment['id'])
+            # Filter individual stored messages before replay can merge adjacent
+            # user messages. Worker steering alongside an old frame must survive.
+            history = [item for item in history if not self._old_assignment_frame(item, spec.assignment['id'])]
+            messages.extend(replayable_session_messages(history))
             return
         history = self.store.agent_session_messages(
             spec.project["id"], spec.agent_session_id
@@ -232,6 +257,18 @@ class AgentRunPreparer:
         self.store.add_agent_message(
             run_id, "user", item["content"], [], emit_progress=False
         )
+
+    @staticmethod
+    def _old_assignment_frame(item: dict[str, Any], assignment_id: str) -> bool:
+        if item.get('role') != 'user':
+            return False
+        try:
+            payload = json.loads(item.get('content') or '')
+        except (TypeError, ValueError):
+            return False
+        return (isinstance(payload, dict) and
+                isinstance(payload.get('current_assignment'), dict) and
+                payload['current_assignment'].get('id') == assignment_id)
 
     def _append_explicit_history(
         self,

@@ -1213,6 +1213,11 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
             'field':{'type':'string','enum':['result','stdout','stderr']},
             'offset':{'type':'integer','minimum':0},'limit':{'type':'integer','minimum':1,'maximum':8000}},'additionalProperties':False},
         _agent_result_read, side_effect_kind='read')
+    add('agent.evidence.list', 'List bounded receipt references from this ColumnRun; use agent.result.read for full evidence.',
+        {'type':'object', 'properties':{
+            'column_run_id':{'type':'string'}, 'after_invocation_id':{'type':'integer','minimum':0},
+            'limit':{'type':'integer','minimum':1,'maximum':50}}, 'additionalProperties':False},
+        _agent_evidence_list, side_effect_kind='read')
     add('agent.context.read', 'Read bounded excerpts of earlier Worker context by source message ID. Continue after the last returned ID; use agent.result.read for full tool evidence. Main may specify a Worker.',
         {'type': 'object', 'properties': {'worker_id': {'type': 'string'}, 'after_message_id': {'type': 'integer', 'minimum': 0}, 'limit': {'type': 'integer', 'minimum': 1, 'maximum': 50}}, 'additionalProperties': False},
         _agent_context_read, side_effect_kind='read')
@@ -2266,6 +2271,17 @@ def _agent_context_read(args, ctx):
     if not worker_id or (ctx.column_run_id and worker_id != ctx.agent_instance_id):
         raise PermissionError('Leaf Workers may read only their own context')
     return ctx.store.agents.context_page(ctx.project_id, worker_id, after=args.get('after_message_id', 0), limit=args.get('limit', 20))
+
+
+def _agent_evidence_list(args, ctx):
+    run_id = args.get('column_run_id') or ctx.column_run_id
+    if not run_id:
+        raise ValueError('column_run_id is required outside a Column')
+    if ctx.column_run_id and run_id != ctx.column_run_id:
+        raise PermissionError('Leaf Workers may inspect only their current ColumnRun evidence')
+    return ctx.store.agents.evidence_page(ctx.project_id, run_id,
+        after=args.get('after_invocation_id', 0), limit=args.get('limit', 20),
+        worker_id=ctx.agent_instance_id if ctx.column_run_id else None)
 
 
 def _agent_result_read(args, ctx):

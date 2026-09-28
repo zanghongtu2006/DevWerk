@@ -356,6 +356,49 @@ class AgentRepository:
             used += size
         return page
 
+    def evidence_page(self, project_id, column_run_id, *, after=0, limit=20, worker_id=None):
+        """Page receipt identities without returning archived tool payloads."""
+        from app.v1.context_projection import project_ledger
+        from app.v1.domain import ToolResult
+        from app.v1.execution_ledger import ledger_entry
+
+        page_limit = min(max(int(limit), 1), 50)
+        with self.store.connect() as db:
+            column = db.execute('SELECT id FROM v1_column_runs WHERE id=? AND project_id=?',
+                                (column_run_id, project_id)).fetchone()
+            if not column:
+                raise ValueError('ColumnRun is outside this Project')
+            rows = db.execute('''SELECT t.* FROM v1_tool_invocations t
+                JOIN v1_agent_runs r ON r.id=t.agent_run_id
+                WHERE t.project_id=? AND r.project_id=? AND r.column_run_id=?
+                  AND (? IS NULL OR r.agent_instance_id=?) AND t.id>?
+                  AND t.capability NOT IN ('column.complete','column.await',
+                      'agent.evidence.list','agent.result.read','agent.context.read')
+                ORDER BY t.id LIMIT ?''',
+                (project_id, project_id, column_run_id, worker_id, worker_id,
+                 int(after), page_limit + 1)).fetchall()
+        entries, used, last_id = [], 0, int(after)
+        for row in rows[:page_limit]:
+            result = ToolResult.model_validate(json.loads(row['result_json']))
+            if (row['capability'] in {'project.command.run', 'system.command.run'}
+                    and isinstance(result.output, dict)
+                    and result.output.get('exit_code') not in (None, 0)):
+                result = ToolResult(ok=False, capability=row['capability'], output=result.output,
+                    error={'type':'CommandFailed', 'message':'Recorded command exit code is nonzero'})
+            item = ledger_entry(row['agent_run_id'], row['tool_call_id'],
+                row['capability'], ('read' if str(row['tool_call_id']).startswith('await-resume-')
+                                   else self.store.registry.side_effect_kind(row['capability'])),
+                result, arguments=json.loads(row['arguments_json']))
+            view = project_ledger([item], max_bytes=1600)['entries'][0]
+            size = len(json.dumps(view, ensure_ascii=False).encode('utf-8'))
+            if entries and used + size > 12000:
+                break
+            entries.append(view)
+            used += size
+            last_id = row['id']
+        return {'entries': entries, 'next_cursor': last_id if entries else None,
+                'has_more': bool(rows) and (len(rows) > len(entries))}
+
     def assign(self, task, run, column, *, worker_key=None):
         now = utcnow()
         main = self.main(task["project_id"])

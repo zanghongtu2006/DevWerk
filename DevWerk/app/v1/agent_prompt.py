@@ -42,6 +42,16 @@ def build_run_envelope(
     }
 
 
+def build_column_system_envelope(
+    spec: AgentRunSpec,
+    platform_policy: PlatformPolicySnapshot,
+) -> dict[str, Any]:
+    """Keep the column's stable instructions separate from its changing work input."""
+    envelope = build_run_envelope(spec, platform_policy)
+    envelope.pop("context")
+    return envelope
+
+
 def build_conversation_system_envelope(
     spec: AgentRunSpec,
     platform_policy: PlatformPolicySnapshot,

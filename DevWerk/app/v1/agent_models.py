@@ -19,6 +19,7 @@ class AgentRunSpec:
     instruction_revision: int
     context: dict[str, Any]
     capability_ids: list[str]
+    runtime_ledger: list[dict[str, Any]] | None = None
     history: list[dict[str, Any]] = field(default_factory=list)
     task_id: str | None = None
     column_run_id: str | None = None

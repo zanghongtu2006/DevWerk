@@ -97,7 +97,7 @@ def test_durable_await_handle_resumes_by_declared_outcome(store, tmp_path):
                 id="await", name="column.await",
                 arguments={"provider": "generic", "poll_capability": "project.files.read", "poll_arguments": {"path": "ready.txt"}, "next_check_seconds": 5},
             )])
-        evidence_id = json.loads(messages[0]["content"])["context"]["action_ledger"][0]["evidence_id"]
+        evidence_id = json.loads(messages[-1]["content"])["current_assignment"]["input"]["execution_evidence"]["entries"][0]["evidence_id"]
         return AgentModelResponse(tool_calls=[AgentToolCall(
             id="complete", name="column.complete",
             arguments={"outcome": "success", "output": {"content": "ready"}, "summary": "external result accepted", "evidence_ids": [evidence_id]},
@@ -114,6 +114,10 @@ def test_durable_await_handle_resumes_by_declared_outcome(store, tmp_path):
     assert segments == 2
     assert terminal["terminal_artifact_id"]
     assert terminal["notified_at"]
+    with store.connect() as db:
+        resume = db.execute("SELECT r.id,t.result_json FROM v1_tool_invocations t JOIN v1_agent_runs r ON r.id=t.agent_run_id WHERE t.tool_call_id LIKE 'await-resume-%' AND r.project_id=?",
+                            (project['id'],)).fetchone()
+    assert resume is not None and json.loads(resume['result_json'])['ok']
 
 
 def test_agent_payload_is_persisted_without_hidden_projection(store, tmp_path):

@@ -694,6 +694,10 @@ class WorkflowRuntime:
         ) if "writable_paths" in column.metadata else None
         if writable_path_values is not None and not isinstance(writable_path_values, list):
             raise ValueError("Column metadata writable_paths must resolve to a list")
+        runtime_ledger = self._column_action_ledger(task["project_id"], run["id"])
+        seen_receipts = {(item.get('capability'), item.get('tool_call_id')) for item in runtime_ledger}
+        runtime_ledger.extend(item for item in (prior_action_ledger or [])
+                              if (item.get('capability'), item.get('tool_call_id')) not in seen_receipts)
         result = self.agent_core.run(
             AgentRunSpec(
                 kind="column",
@@ -711,8 +715,8 @@ class WorkflowRuntime:
                                   for c in workflow.columns for check in c.acceptance_checks],
                         'instruction':'Before reporting a defect/rework outcome, persist task.feedback.record with a responsible Column and frozen check references. Read existing feedback to avoid duplicates. Runtime handles the declared handoff; do not send instructions through Mailbox or run other Workers.'}}
                        if 'task.feedback.record' in column.executor.capabilities else {}),
-                    "action_ledger": self._column_action_ledger(task["project_id"], run["id"]) + (prior_action_ledger or []),
                 },
+                runtime_ledger=runtime_ledger,
                 capability_ids=column.executor.capabilities,
                 task_id=task["id"],
                 column_run_id=run["id"],
@@ -792,7 +796,8 @@ class WorkflowRuntime:
                     result = ToolResult(ok=False, capability=item["capability"], output=result.output,
                                         error={"type": "CommandFailed", "message": "Recorded command exit code is nonzero"})
                 ledger.append(ledger_entry(row[0], item["tool_call_id"], item["capability"],
-                                           self.registry.side_effect_kind(item["capability"]), result,
+                                           ('read' if str(item['tool_call_id']).startswith('await-resume-')
+                                            else self.registry.side_effect_kind(item["capability"])), result,
                                            arguments=item["arguments"]))
         return ledger
 
