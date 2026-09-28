@@ -45,7 +45,16 @@
 
 ## F4 — Memory 范围绑定
 
-待实施。
+实施范围：
+
+- `MemoryScopeContext` 显式承载 Project、Task、冻结 Workflow 修订与 Conversation Session 身份。自动 selector 缺少身份时，required 抛出范围错误，optional 在 manifest 记录 `scope_unavailable`，不会把 `scope_id=None` 解释成全 Project 同类记录。
+- `WorkflowRuntime._input_for` 从 Task 绑定冻结修订；Conversation 从已持久化 Job 绑定主会话。Agent 工具上下文继承真实 Task/Conversation 身份，Worker 私有 Session 不作为 Conversation Memory 范围。
+- `project.memory.search/write/supersede` 默认从真实执行上下文解析范围；显式 task/workflow/conversation ID 验证 Project 归属，写入预校验先于执行回执。`project.memory.read` 保留按引用读取旧数据，并标记未绑定旧记录。Project 管理性 Store facade 保持兼容，未自动迁移历史文件。
+- Memory manifest 带选中记录的 `scope_id`；未绑定旧 workflow/task/conversation 记录不会混入自动 selector。
+
+覆盖用例：两个 Workflow 修订与旧 Task 冻结读取；Project/Task/Conversation 选择；缺身份 optional/required；真实 capability dispatch 的默认写入、搜索与跨 Project 拒绝；旧未绑定记录按引用读取。
+
+验证结果：`test_memory_scope_binding.py`、`test_memory_workcell_contract.py`、`test_scope_extension.py`、`test_runtime_contract.py`、`test_conversation_contract.py`、`test_conversation_reply_tool.py`、`test_architecture_conformance.py` 共 **79 passed、1 failed**。唯一失败 `test_persistent_column_worker_uses_same_tool_loop_and_declared_contract` 仍断言 F1 前的固定能力列表，实际在 F1 已增加 `agent.evidence.list`；与 F4 范围绑定无关，本项提交不混入该测试维护。未调用外部 Provider。
 
 ## F5 — Memory 预算与分页
 

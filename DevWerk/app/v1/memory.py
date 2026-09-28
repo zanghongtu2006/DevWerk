@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Literal
@@ -23,6 +24,27 @@ MemoryScope = Literal[
     "workflow",
     "task",
 ]
+
+
+@dataclass(frozen=True)
+class MemoryScopeContext:
+    project_id: str
+    task_id: str | None = None
+    workflow_revision_id: str | None = None
+    conversation_session_id: str | None = None
+
+
+def resolve_selector_scope(scope: MemoryScope, context: MemoryScopeContext) -> str | None:
+    if scope == "project":
+        return None
+    identity = {
+        "task": context.task_id,
+        "workflow": context.workflow_revision_id,
+        "conversation": context.conversation_session_id,
+    }[scope]
+    if not identity:
+        raise ValueError(f"Memory scope identity unavailable: scope={scope}")
+    return identity
 
 _SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9_.-]+$")
 _CORE_FILES = (
@@ -415,8 +437,12 @@ class MemoryManager:
         *,
         selectors: Iterable[MemorySelector] = (),
         task_id: str | None = None,
+        scope_context: MemoryScopeContext | None = None,
         include_core: bool = True,
     ) -> dict[str, Any]:
+        scope_context = scope_context or MemoryScopeContext(project_id=project["id"], task_id=task_id)
+        if scope_context.project_id != project["id"]:
+            raise ValueError("Memory scope context belongs to another Project")
         self.store.initialize_project(project)
         references: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -430,7 +456,14 @@ class MemoryManager:
                 seen.add(item["reference"])
         omitted: list[dict[str, Any]] = []
         for selector in selectors:
-            scope_id = _scope_id(selector.scope, task_id)
+            try:
+                scope_id = resolve_selector_scope(selector.scope, scope_context)
+            except ValueError:
+                if selector.required:
+                    raise
+                omitted.append({"scope": selector.scope, "query": selector.query,
+                                "reason": "scope_unavailable"})
+                continue
             matches = self.index.search(
                 self.store,
                 project,
@@ -458,6 +491,7 @@ class MemoryManager:
                     "reference": item["reference"],
                     "id": item["metadata"].get("id"),
                     "scope": item["metadata"].get("scope"),
+                    "scope_id": item["metadata"].get("scope_id"),
                     "kind": item["metadata"].get("kind"),
                     "sha256": item["sha256"],
                     "reason": item["reason"],
@@ -477,15 +511,6 @@ class MemoryManager:
             ],
             "manifest": manifest,
         }
-
-
-def _scope_id(
-    scope: str,
-    task_id: str | None,
-) -> str | None:
-    if scope == "task":
-        return task_id
-    return None
 
 
 def _safe_segment(value: str) -> None:

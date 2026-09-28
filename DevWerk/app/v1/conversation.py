@@ -15,6 +15,7 @@ from app.v1.execution_control import ExecutionControl
 from app.v1.capabilities import CapabilityRegistry
 from app.v1.domain import ToolResult
 from app.v1.execution_ledger import ledger_entry
+from app.v1.memory import MemoryScopeContext
 from app.v1.store import V1Store
 from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, PlatformPolicySnapshot, V1RuntimePolicy
 
@@ -327,7 +328,9 @@ class ConversationGateway:
                     "workers": self.store.agents.list_workers(project_id),
                     "active_workflow": ({k: workflow.get(k) for k in ('id','revision','name','requirement_id','requirement_revision')} if workflow else None),
                     "global_settings": self.global_settings,
-                    "memory": self.store.memory.build_context(project),
+                    "memory": self.store.memory.build_context(project,
+                        scope_context=MemoryScopeContext(project_id=project_id,
+                            conversation_session_id=job["conversation_session_id"])),
                     "loops": self.store.list_loops(limit=20),
                     "workflow_plans": [{k: p.get(k) for k in ('id','created_at','content_hash')} for p in self.store.list_workflow_plans(project_id, 5)],
                     "task_plans": [{k: p.get(k) for k in ('id','created_at','content_hash')} for p in self.store.list_task_plans(project_id, 5)],

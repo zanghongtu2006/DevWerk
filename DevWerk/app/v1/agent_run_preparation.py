@@ -185,6 +185,9 @@ class AgentRunPreparer:
             assignment=spec.assignment,
             agent_instance_id=spec.agent_instance_id,
             requirement_id=spec.requirement_id,
+            workflow_revision_id=(self.store.get_project_task(spec.project['id'], spec.task_id)['workflow_revision_id']
+                                  if spec.task_id else None),
+            conversation_session_id=(spec.agent_session_id if spec.kind == 'conversation' else None),
         )
 
     def _append_session_history(

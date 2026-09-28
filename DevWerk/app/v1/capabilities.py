@@ -18,6 +18,7 @@ from app.v1.files import ProjectFiles, SystemFiles
 from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, V1RuntimePolicy
 from app.v1.execution_control import ExecutionControl, ExecutionOwnershipLost, ExecutionBudgetExceeded, ExecutionReplayUncertain
 from app.v1.execution_ledger import normalized_operation_arguments
+from app.v1.memory import MemoryScopeContext, resolve_selector_scope
 
 
 CapabilityHandler = Callable[[dict[str, Any], "CapabilityContext"], Any]
@@ -44,6 +45,8 @@ class CapabilityContext:
     agent_instance_id: str | None = None
     requirement_id: str | None = None
     requirement_revision: int | None = None
+    workflow_revision_id: str | None = None
+    conversation_session_id: str | None = None
 
     @property
     def files(self) -> ProjectFiles:
@@ -191,6 +194,10 @@ class CapabilityRegistry:
             if capability_id == 'project.command.run':
                 from app.v1.command_resolution import resolve_command
                 resolve_command(arguments['argv'], context.files.resolve(str(arguments.get('cwd') or '.')))
+            if capability_id == 'project.memory.write':
+                _memory_write_scope(arguments, context)
+            if capability_id == 'project.memory.supersede':
+                _memory_write_scope(arguments['replacement'], context)
             if context.agent_run_id and not context.column_run_id and entry.side_effect_kind in {"write", "process"}:
                 with context.store.connect() as db:
                     busy = db.execute("SELECT 1 FROM v1_tasks WHERE project_id=? AND (status IN ('running','waiting') OR failure_code='effect_outcome_unknown') LIMIT 1",
@@ -366,6 +373,101 @@ class CapabilityRegistry:
 OBJECT = {"type": "object"}
 
 
+def _memory_scope_context(ctx: CapabilityContext) -> MemoryScopeContext:
+    workflow_id = ctx.workflow_revision_id
+    if ctx.task_id and not workflow_id:
+        workflow_id = ctx.store.get_project_task(ctx.project_id, ctx.task_id)["workflow_revision_id"]
+    return MemoryScopeContext(project_id=ctx.project_id, task_id=ctx.task_id,
+                              workflow_revision_id=workflow_id,
+                              conversation_session_id=ctx.conversation_session_id)
+
+
+def _validate_memory_scope_id(ctx: CapabilityContext, scope: str, scope_id: str) -> None:
+    try:
+        if scope == "project":
+            if scope_id != ctx.project_id:
+                raise KeyError(scope_id)
+        elif scope == "task":
+            ctx.store.get_project_task(ctx.project_id, scope_id)
+        elif scope == "workflow":
+            ctx.store.get_workflow_revision(ctx.project_id, scope_id)
+        elif scope == "conversation":
+            if ctx.store.conversation_agent(ctx.project_id)["logical_id"] != scope_id:
+                raise KeyError(scope_id)
+        else:
+            raise ValueError(f"unknown Memory scope: {scope}")
+    except KeyError as exc:
+        raise ValueError(f"Memory {scope} scope_id does not belong to this Project: {scope_id}") from exc
+
+
+def _memory_read(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
+    item = ctx.store.memory_read(ctx.project_id, str(args["reference"]))
+    metadata = item.get("metadata") or {}
+    scope, scope_id = metadata.get("scope"), metadata.get("scope_id")
+    if scope in ("task", "workflow", "conversation"):
+        try:
+            _validate_memory_scope_id(ctx, scope, scope_id)
+            item["scope_resolution"] = "resolved"
+        except ValueError:
+            item["scope_resolution"] = "unbound_or_legacy"
+    return item
+
+
+def _memory_search(args: dict[str, Any], ctx: CapabilityContext) -> list[dict[str, Any]]:
+    scope = args.get("scope")
+    scope_id = args.get("scope_id")
+    if scope_id and not scope:
+        raise ValueError("Memory scope_id requires scope")
+    if scope and scope != "project":
+        if scope_id:
+            _validate_memory_scope_id(ctx, scope, scope_id)
+        else:
+            scope_id = resolve_selector_scope(scope, _memory_scope_context(ctx))
+    elif scope == "project" and scope_id:
+        _validate_memory_scope_id(ctx, scope, scope_id)
+        scope_id = None
+    items = ctx.store.memory_search(ctx.project_id, str(args.get("query") or ""),
+        scope=scope, scope_id=scope_id, kinds=list(args.get("kinds") or []),
+        limit=int(args.get("limit") or 20))
+    for item in items:
+        metadata = item.get("metadata") or {}
+        item["scope_resolution"] = "unbound_or_legacy" if (
+            metadata.get("scope") in ("task", "workflow", "conversation") and
+            not metadata.get("scope_id")) else "resolved"
+    return items
+
+
+def _memory_write(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
+    scope_id = _memory_write_scope(args, ctx)
+    return ctx.store.memory_write(ctx.project_id, {
+        **args, "scope_id": scope_id,
+        "source_id": args.get("source_id") or ctx.agent_run_id,
+        "source_type": args.get("source_type") or "agent_run",
+    })
+
+
+def _memory_write_scope(args: dict[str, Any], ctx: CapabilityContext) -> str | None:
+    scope = str(args["scope"])
+    scope_id = args.get("scope_id")
+    if scope == "project":
+        if scope_id:
+            _validate_memory_scope_id(ctx, scope, scope_id)
+        scope_id = None
+    elif scope_id:
+        _validate_memory_scope_id(ctx, scope, str(scope_id))
+    else:
+        scope_id = resolve_selector_scope(scope, _memory_scope_context(ctx))
+    return scope_id
+
+
+def _memory_supersede(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
+    replacement = dict(args['replacement'])
+    replacement['scope_id'] = _memory_write_scope(replacement, ctx)
+    replacement['source_id'] = replacement.get('source_id') or ctx.agent_run_id
+    replacement['source_type'] = replacement.get('source_type') or 'agent_run'
+    return ctx.store.memory_supersede(ctx.project_id, str(args['reference']), replacement)
+
+
 def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegistry:
     policy = policy or DEFAULT_V1_RUNTIME_POLICY
     registry = CapabilityRegistry(policy)
@@ -459,7 +561,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
             "properties": {"reference": {"type": "string", "minLength": 1}},
             "additionalProperties": False,
         },
-        lambda args, ctx: ctx.store.memory_read(ctx.project_id, str(args["reference"])),
+        _memory_read,
         side_effect_kind="read",
     )
     add(
@@ -477,14 +579,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
             },
             "additionalProperties": False,
         },
-        lambda args, ctx: ctx.store.memory_search(
-            ctx.project_id,
-            str(args.get("query") or ""),
-            scope=str(args["scope"]) if args.get("scope") else None,
-            scope_id=str(args["scope_id"]) if args.get("scope_id") else None,
-            kinds=list(args.get("kinds") or []),
-            limit=int(args.get("limit") or 20),
-        ),
+        _memory_search,
         side_effect_kind="read",
     )
     add(
@@ -496,14 +591,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
             "properties": memory_record_properties,
             "additionalProperties": False,
         },
-        lambda args, ctx: ctx.store.memory_write(
-            ctx.project_id,
-            {
-                **args,
-                "source_id": args.get("source_id") or ctx.agent_run_id,
-                "source_type": args.get("source_type") or "agent_run",
-            },
-        ),
+        _memory_write,
         side_effect_kind="write",
     )
     add(
@@ -546,15 +634,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
             },
             "additionalProperties": False,
         },
-        lambda args, ctx: ctx.store.memory_supersede(
-            ctx.project_id,
-            str(args["reference"]),
-            {
-                **dict(args["replacement"]),
-                "source_id": dict(args["replacement"]).get("source_id") or ctx.agent_run_id,
-                "source_type": dict(args["replacement"]).get("source_type") or "agent_run",
-            },
-        ),
+        _memory_supersede,
         side_effect_kind="write",
     )
     add(

@@ -26,6 +26,7 @@ from app.v1.capabilities import (
     resolve_references,
 )
 from app.v1.contracts import validate_contract
+from app.v1.memory import MemoryScopeContext
 from app.v1.completion_protocol import (
     CompletionContract,
     CompletionOutcomeRule,
@@ -445,7 +446,8 @@ class WorkflowRuntime:
             data["memory"] = self.store.memory.build_context(
                 project,
                 selectors=selection.memory,
-                task_id=task["id"],
+                scope_context=MemoryScopeContext(project_id=project["id"], task_id=task["id"],
+                    workflow_revision_id=task["workflow_revision_id"]),
                 include_core=selection.include_project,
             )
         data["context_manifest"] = {
