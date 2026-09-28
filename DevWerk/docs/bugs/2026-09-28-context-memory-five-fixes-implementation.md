@@ -69,3 +69,9 @@
 覆盖用例：230 KB core 的 Main/Column Provider frame；Memory、工具 schema、ledger 和 artifact 混合输入；Provider 首次超窗后的更小重试；中文页经 512 字节工具投影完整拼接与变更检测；搜索目录有界；必要输入超窗明确报错；替换 Store 接口；handoff/ledger 小窗口投影；来源在装配后变更不混用版本。
 
 验证结果：Memory、Context、Conversation、Runtime 相关回归 **144 passed、1 deselected**；唯一排除的是 F1 加入 `agent.evidence.list` 后未更新的旧固定能力列表断言，与 F5 无关。最后收紧中文分页投影并加入搜索 offset 后，F4/F5 与 checkpoint/handoff 组合回归 **25 passed**。测试均使用隔离数据库和注入模型，未调用外部 Provider。
+
+## 回归断言维护（独立于 F1–F5 修复提交）
+
+`test_runtime_contract.py::test_persistent_column_worker_uses_same_tool_loop_and_declared_contract` 的固定能力列表仍是 F1 前的值。仅把已存在的 `agent.evidence.list` 加入期望，不改变运行时代码；单独提交，避免混入 F5。
+
+最终完整单元测试：**442 passed**（`pytest -q --disable-warnings --maxfail=1`）；隔离数据与注入模型，不调用真实外部 Provider。历史生产任务未自动恢复或重跑；真实模型任务的交付效果仍需发布后按原有操作验收。
