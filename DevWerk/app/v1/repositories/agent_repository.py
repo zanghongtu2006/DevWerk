@@ -246,10 +246,14 @@ class AgentRepository:
             db.execute('INSERT INTO v1_agent_instances(id,project_id,requirement_id,parent_id,role,reuse_key,active_session_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',
                        (identity, ctx.project_id, requirement['id'], old['parent_id'], 'leaf', key+':successor:'+identity, session, now, now))
             db.execute('INSERT INTO v1_agent_context_sessions(id,project_id,instance_id,session_key,created_at,updated_at) VALUES(?,?,?,?,?,?)', (session, ctx.project_id, identity, key, now, now))
-            db.execute('INSERT INTO v1_agent_context_snapshots VALUES(?,?,1,0,?,?)', (new_id('snapshot'), session, json.dumps({'summary': summary, 'predecessor_worker_id': worker_id}), now))
+            snapshot_id = new_id('snapshot')
+            db.execute('INSERT INTO v1_agent_context_snapshots VALUES(?,?,1,0,?,?)',
+                       (snapshot_id, session, json.dumps({'summary': summary, 'predecessor_worker_id': worker_id}, ensure_ascii=False), now))
             db.execute('INSERT INTO v1_agent_worker_slots VALUES(?,?,?) ON CONFLICT(requirement_id,worker_key) DO UPDATE SET instance_id=excluded.instance_id', (requirement['id'], key, identity))
             self.store._event(db, ctx.project_id, None, None, 'agent.worker.replaced', {'predecessor_worker_id': worker_id, 'worker_id': identity, 'worker_key': key})
-            return {'worker': self.get_worker(ctx.project_id, identity), 'predecessor_worker_id': worker_id, 'worker_key': key}
+            return {'worker': self.get_worker(ctx.project_id, identity),
+                    'predecessor_worker_id': worker_id, 'worker_key': key,
+                    'snapshot_id': snapshot_id}
 
     def planning_cause(self, ctx):
         if not ctx.agent_run_id or not ctx.requirement_id:
@@ -355,6 +359,65 @@ class AgentRepository:
             page.append(item)
             used += size
         return page
+
+    def session_handoff(self, project_id, session_id):
+        with self.store.connect() as db:
+            row = db.execute('''SELECT c.id,c.revision,c.through_message_id,c.summary_json,
+                       s.instance_id,s.project_id,w.requirement_id
+                       FROM v1_agent_context_snapshots c
+                       JOIN v1_agent_context_sessions s ON s.id=c.session_id
+                       JOIN v1_agent_instances w ON w.id=s.instance_id
+                       WHERE s.id=? AND s.project_id=? AND w.project_id=?
+                       ORDER BY c.revision DESC LIMIT 1''',
+                       (session_id,project_id,project_id)).fetchone()
+        if not row:
+            return None
+        return {'id':row['id'], 'revision':row['revision'],
+                'through_message_id':row['through_message_id'],
+                'summary':json.loads(row['summary_json']),
+                'instance_id':row['instance_id'], 'requirement_id':row['requirement_id']}
+
+    def context_source_page(self, project_id, worker_id, *, snapshot_id=None,
+                            source_message_id=None, offset=0, max_characters=4000,
+                            expected_sha256=None):
+        from app.v1.context_projection import slice_source_text
+
+        worker = self.get_worker(project_id, worker_id)
+        if bool(snapshot_id) == bool(source_message_id):
+            raise ValueError('Choose exactly one snapshot_id or source_message_id')
+        with self.store.connect() as db:
+            if snapshot_id:
+                row = db.execute('''SELECT c.summary_json FROM v1_agent_context_snapshots c
+                    JOIN v1_agent_context_sessions s ON s.id=c.session_id
+                    WHERE c.id=? AND s.project_id=? AND s.instance_id=?''',
+                    (snapshot_id,project_id,worker_id)).fetchone()
+                if not row:
+                    raise ValueError('Snapshot is outside this Worker context')
+                source_text = json.dumps(json.loads(row['summary_json']),ensure_ascii=False,
+                                         sort_keys=True,separators=(',',':'))
+                kind, identity = 'snapshot', snapshot_id
+            else:
+                row = db.execute('''SELECT m.role,m.content,m.tool_calls_json FROM v1_agent_messages m
+                    JOIN v1_agent_runs r ON r.id=m.agent_run_id
+                    JOIN v1_agent_context_sessions s ON s.id=r.agent_session_id
+                    WHERE m.id=? AND r.project_id=? AND s.project_id=? AND s.instance_id=?
+                      AND r.agent_instance_id=? AND m.role!='system' ''',
+                    (source_message_id,project_id,project_id,worker_id,worker_id)).fetchone()
+                if not row:
+                    raise ValueError('Message is outside this Worker context')
+                source_text = json.dumps({'role':row['role'],'content':row['content'],
+                    'tool_calls':json.loads(row['tool_calls_json'] or '[]')},
+                    ensure_ascii=False,sort_keys=True,separators=(',',':'))
+                kind, identity = 'message', source_message_id
+        sha = hashlib.sha256(source_text.encode('utf-8')).hexdigest()
+        if expected_sha256 and expected_sha256 != sha:
+            raise ValueError('Source changed; restart reading from the current hash')
+        byte_limit = max(256,min(1500,self.store.policy.context.tool_result_tokens//3))
+        page, next_offset = slice_source_text(source_text,offset=int(offset),
+            max_characters=min(max(int(max_characters),1),4000),max_bytes=byte_limit)
+        return {'source_kind':kind,'source_id':identity,'sha256':sha,'offset':offset,
+                'content':page,'next_offset':next_offset,'complete':next_offset is None,
+                'total_characters':len(source_text)}
 
     def evidence_page(self, project_id, column_run_id, *, after=0, limit=20, worker_id=None):
         """Page receipt identities without returning archived tool payloads."""
@@ -697,8 +760,8 @@ class AgentRepository:
     def save_context_snapshot(self, project_id, worker_id, through_message_id, summary):
         if len(json.dumps(summary)) > self.store.policy.context.worker_context_max_characters // 2:
             raise ValueError('Context summary exceeds half of the Worker context window')
-        worker = self.get_worker(project_id, worker_id)
         with self.store.tx(immediate=True) as db:
+            worker = self.get_worker(project_id, worker_id)
             if worker["active_assignment_id"]:
                 raise AgentBusy("Context compaction requires an idle Worker")
             source = db.execute("SELECT m.id FROM v1_agent_messages m JOIN v1_agent_runs r ON r.id=m.agent_run_id WHERE m.id=? AND r.agent_session_id=? AND r.project_id=?", (through_message_id, worker["active_session_id"], project_id)).fetchone()
@@ -707,4 +770,10 @@ class AgentRepository:
             previous = db.execute("SELECT COALESCE(MAX(revision),0),COALESCE(MAX(through_message_id),0) FROM v1_agent_context_snapshots WHERE session_id=?", (worker["active_session_id"],)).fetchone()
             if through_message_id < previous[1]:
                 raise ValueError("Context coverage cannot move backwards")
-            db.execute("INSERT INTO v1_agent_context_snapshots VALUES(?,?,?,?,?,?)", (new_id("ctx"), worker["active_session_id"], previous[0]+1, through_message_id, json.dumps(summary), utcnow()))
+            snapshot_id = new_id('ctx')
+            revision = previous[0] + 1
+            db.execute("INSERT INTO v1_agent_context_snapshots VALUES(?,?,?,?,?,?)",
+                       (snapshot_id, worker["active_session_id"], revision,
+                        through_message_id, json.dumps(summary, ensure_ascii=False), utcnow()))
+        return {'snapshot_id':snapshot_id, 'revision':revision,
+                'through_message_id':through_message_id}

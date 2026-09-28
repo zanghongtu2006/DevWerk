@@ -11,7 +11,7 @@ from app.v1.agent_prompt import (
     build_run_envelope,
     stable_json,
 )
-from app.v1.context_projection import project_ledger
+from app.v1.context_projection import project_handoff, project_ledger
 from app.v1.capabilities import CapabilityContext, CapabilityRegistry
 from app.v1.completion_protocol import CompletionContract, completion_tool_schema
 from app.v1.policy import PlatformPolicySnapshot, V1RuntimePolicy
@@ -225,6 +225,13 @@ class AgentRunPreparer:
             messages.extend(reversed(selected))
             return
         if spec.assignment:
+            handoff = self.store.agents.session_handoff(spec.project['id'], spec.agent_session_id)
+            if handoff:
+                if (handoff['instance_id'], handoff['requirement_id']) != (
+                        spec.agent_instance_id, spec.requirement_id):
+                    raise ValueError('Worker handoff is outside this Assignment scope')
+                messages.append({'role':'user','content':stable_json({
+                    'session_handoff':project_handoff(handoff)})})
             prior = self.store.agents.prior_assignments(spec.project['id'], spec.agent_session_id, spec.assignment['id'])
             if prior:
                 messages.append({'role':'user', 'content':stable_json({

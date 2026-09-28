@@ -1219,7 +1219,13 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
             'limit':{'type':'integer','minimum':1,'maximum':50}}, 'additionalProperties':False},
         _agent_evidence_list, side_effect_kind='read')
     add('agent.context.read', 'Read bounded excerpts of earlier Worker context by source message ID. Continue after the last returned ID; use agent.result.read for full tool evidence. Main may specify a Worker.',
-        {'type': 'object', 'properties': {'worker_id': {'type': 'string'}, 'after_message_id': {'type': 'integer', 'minimum': 0}, 'limit': {'type': 'integer', 'minimum': 1, 'maximum': 50}}, 'additionalProperties': False},
+        {'type': 'object', 'properties': {
+            'worker_id': {'type': 'string'}, 'after_message_id': {'type': 'integer', 'minimum': 0},
+            'limit': {'type': 'integer', 'minimum': 1, 'maximum': 50},
+            'snapshot_id': {'type': 'string'}, 'source_message_id': {'type': 'integer', 'minimum': 1},
+            'offset': {'type': 'integer', 'minimum': 0},
+            'max_characters': {'type': 'integer', 'minimum': 1, 'maximum': 4000},
+            'expected_sha256': {'type': 'string', 'maxLength': 128}}, 'additionalProperties': False},
         _agent_context_read, side_effect_kind='read')
     add('agent.context.compact', 'Save an explicit coverage summary for an idle Worker, preserving the full source transcript for later inspection.',
         {'type': 'object', 'required': ['worker_id', 'through_message_id', 'summary'], 'properties': {'worker_id': {'type': 'string'}, 'through_message_id': {'type': 'integer', 'minimum': 1}, 'summary': {'type': 'object'}}, 'additionalProperties': False},
@@ -2270,6 +2276,15 @@ def _agent_context_read(args, ctx):
     worker_id = args.get('worker_id') or ctx.agent_instance_id
     if not worker_id or (ctx.column_run_id and worker_id != ctx.agent_instance_id):
         raise PermissionError('Leaf Workers may read only their own context')
+    if 'snapshot_id' in args or 'source_message_id' in args:
+        if 'after_message_id' in args or 'limit' in args:
+            raise ValueError('Exact source mode cannot be combined with the message directory cursor')
+        return [ctx.store.agents.context_source_page(ctx.project_id, worker_id,
+            snapshot_id=args.get('snapshot_id'),source_message_id=args.get('source_message_id'),
+            offset=args.get('offset',0),max_characters=args.get('max_characters',4000),
+            expected_sha256=args.get('expected_sha256'))]
+    if any(key in args for key in ('offset','max_characters','expected_sha256')):
+        raise ValueError('Source offsets require snapshot_id or source_message_id')
     return ctx.store.agents.context_page(ctx.project_id, worker_id, after=args.get('after_message_id', 0), limit=args.get('limit', 20))
 
 

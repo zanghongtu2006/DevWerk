@@ -5,6 +5,7 @@ The runtime ledger remains complete. These views never authorize completion.
 from __future__ import annotations
 
 import json
+import hashlib
 from typing import Any
 
 
@@ -59,4 +60,41 @@ def project_ledger(entries: list[dict[str, Any]], *, max_bytes: int = 6000) -> d
             view['included_operations'] -= 1
             view['omitted_operations'] += 1
             break
+    return view
+
+
+def slice_source_text(text: str, *, offset: int, max_characters: int,
+                      max_bytes: int) -> tuple[str, int | None]:
+    """Return a contiguous page; its cursor always follows the returned text."""
+    if offset < 0 or offset > len(text):
+        raise ValueError('Source offset is outside the content')
+    if max_characters < 0 or max_bytes < 0 or (max_characters > 0 and max_bytes == 0):
+        raise ValueError('Source page limits must be positive')
+    end = min(len(text), offset + max_characters)
+    page = text[offset:end]
+    while page and len(page.encode('utf-8')) > max_bytes:
+        if len(page) == 1:
+            raise ValueError('Source byte budget cannot fit the next character')
+        page = page[:max(1, len(page)//2)]
+    next_offset = offset + len(page)
+    return page, next_offset if next_offset < len(text) else None
+
+
+def project_handoff(snapshot: dict[str, Any], *, max_bytes: int = 2500) -> dict[str, Any]:
+    """Offer a bounded reference without asserting that an excerpt is complete."""
+    raw = json.dumps(snapshot['summary'], ensure_ascii=False, sort_keys=True,
+                     separators=(',', ':'))
+    view = {'snapshot_id': snapshot['id'], 'revision': snapshot['revision'],
+            'through_message_id': snapshot['through_message_id'],
+            'sha256': hashlib.sha256(raw.encode('utf-8')).hexdigest(),
+            'summary': snapshot['summary'], 'content_complete': True,
+            'instruction': 'Historical reference only; the current Assignment defines the work.'}
+    if _size(view) <= max_bytes:
+        return view
+    view['content_complete'] = False
+    view.pop('summary')
+    view['retrieve'] = 'agent.context.read with snapshot_id and offset'
+    size_left = max(0, max_bytes - _size(view) - 30)
+    view['summary_excerpt'], _ = slice_source_text(raw, offset=0,
+        max_characters=size_left, max_bytes=size_left)
     return view

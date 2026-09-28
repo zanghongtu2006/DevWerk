@@ -20,7 +20,16 @@
 
 ## F2 — Session 交接摘要
 
-待实施。
+实施范围：
+
+- `AgentRepository.session_handoff` 按 Project / Session / Worker / Requirement 取最新 Session snapshot。`AgentRunPreparer._append_session_history` 在当前 Assignment 历史前加入有来源、有限大小的交接 reference；当前合同仍由唯一 current frame 提供。
+- `agent.worker.replace` 返回新 Session 的 snapshot ID；`agent.context.compact` 对 idle Worker 的检查移入写事务，并返回 snapshot ID / revision。
+- `context_projection.project_handoff` 对大摘要输出 hash、引用与部分连续原文，标明 `content_complete=false`；短摘要可完整送入。完整存储内容未被覆盖。
+- `agent.context.read` 保持原消息目录调用方式，新增 `snapshot_id` 或 `source_message_id` 精确分页。Repository 验证叶子 Worker 的 Session 归属；`slice_source_text` 的 next_offset 按实际返回字符递进，读取中 hash 改变时拒绝继续。
+
+覆盖用例：successor 实际 Assignment 输入包含交接内容；长中文摘要分页可原样重组且旧 Worker 无法读取继任 Session；空闲 Worker 摘要进入下一 Assignment，旧消息可按 ID 精确读取；保留旧 snapshot/session_history 查询行为。
+
+验证结果：`test_scope_extension.py`、`test_context_handoff.py`、`test_persistent_agents.py`、`test_agent_recovery_and_fencing.py` 及 mailbox 通知断言共 **31 passed**。针对性的 successor / idle compact / 长中文分页与旧查询路径先行运行 **13 passed**。所有模型入口使用隔离注入模型，未调用外部 Provider。
 
 ## F3 — checkpoint 精确覆盖
 
