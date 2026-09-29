@@ -163,6 +163,27 @@ class RecoveryManager:
         now = utcnow()
         context = {} if clear_context else task["context"]
         with self.store.tx(immediate=True) as db:
+            if (task["status"] == "recovering"
+                    and task.get("failure_code") == "execution_budget_exceeded"
+                    and target == task["current_column"]):
+                latest = db.execute(
+                    "SELECT r.sequence,r.status,a.status AS assignment_status,a.result_json "
+                    "FROM v1_column_runs r LEFT JOIN v1_agent_assignments a ON a.column_run_id=r.id "
+                    "WHERE r.task_id=? AND r.column_key=? ORDER BY r.sequence DESC LIMIT 1",
+                    (task_id, target),
+                ).fetchone()
+                if (latest and latest["status"] == "interrupted"
+                        and latest["assignment_status"] == "blocked"
+                        and json.loads(latest["result_json"] or "{}").get("code") == "execution_budget_exceeded"):
+                    sequence = db.execute(
+                        "SELECT COALESCE(MAX(sequence),0)+1 FROM v1_column_runs WHERE task_id=?",
+                        (task_id,),
+                    ).fetchone()[0]
+                    db.execute(
+                        "INSERT INTO v1_column_runs(id,project_id,task_id,column_key,sequence,status,attempt,input_json,created_at) "
+                        "VALUES(?,?,?,?,?,'pending',0,'{}',?)",
+                        (new_id("run"), task["project_id"], task_id, target, sequence, now),
+                    )
             changed = db.execute(
                 "UPDATE v1_tasks SET status='pending',control_state='active',current_column=?,attempt=0,context_json=?,error=NULL,lease_owner=NULL,lease_until=NULL,finished_at=NULL,state_version=state_version+1,updated_at=? WHERE id=? AND status=? AND state_version=?",
                 (target, json.dumps(context, ensure_ascii=False), now, task_id, task['status'], task['state_version']),

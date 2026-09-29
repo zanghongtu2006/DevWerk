@@ -512,6 +512,24 @@ class AgentRepository:
                        agent_instance_id,session_id,task_generation,lease_owner,input_json,contract_json,budget_json,created_at,updated_at)
                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (identity, task["project_id"], requirement["id"], requirement["revision"], task["id"], run["id"], worker["id"], worker["active_session_id"], task["state_version"], task.get("lease_owner"), json.dumps(task.get("input") or {}), column.model_dump_json(), self.store.policy.execution.model_dump_json(), now, now))
             db.execute("UPDATE v1_agent_instances SET active_assignment_id=?,updated_at=? WHERE id=?", (identity, now, worker["id"]))
+            previous = db.execute(
+                "SELECT r.column_key,r.status AS run_status,a.id AS assignment_id,"
+                "a.agent_instance_id,a.status AS assignment_status,a.result_json "
+                "FROM v1_column_runs r LEFT JOIN v1_agent_assignments a ON a.column_run_id=r.id "
+                "WHERE r.task_id=? AND r.sequence=(SELECT MAX(sequence) FROM v1_column_runs "
+                "WHERE task_id=? AND sequence<?)",
+                (task['id'], task['id'], run['sequence']),
+            ).fetchone()
+            if (previous and previous['column_key'] == run['column_key']
+                    and previous['run_status'] == 'interrupted'
+                    and previous['assignment_status'] == 'blocked'
+                    and previous['agent_instance_id'] == worker['id']
+                    and json.loads(previous['result_json'] or '{}').get('code') == 'execution_budget_exceeded'):
+                db.execute(
+                    "UPDATE v1_worker_inputs SET assignment_id=? WHERE project_id=? "
+                    "AND recipient_agent_id=? AND assignment_id=? AND state='pending'",
+                    (identity, task['project_id'], worker['id'], previous['assignment_id']),
+                )
             prior = db.execute('SELECT COALESCE(SUM(iterations),0),COALESCE(SUM(tool_calls),0),COUNT(*) FROM v1_agent_runs WHERE column_run_id=?', (run['id'],)).fetchone()
             db.execute('UPDATE v1_agent_assignments SET model_calls=?,tool_calls=?,resumes=? WHERE id=?', (*prior, identity))
             self.store._event(db, task["project_id"], task["id"], run["id"], "agent.assigned", {"assignment_id": identity, "agent_instance_id": worker["id"], "session_id": worker["active_session_id"]})
@@ -561,6 +579,8 @@ class AgentRepository:
                 raise ValueError('Message Assignment does not belong to this Worker')
             if assignment['status'] in {'completed', 'failed', 'cancelled'}:
                 raise ValueError('Message Assignment has ended')
+            if assignment['status'] == 'blocked' and worker['active_assignment_id'] not in (None, assignment_id):
+                raise ValueError('Message Assignment has been superseded')
 
     def _fail_pending_messages(self, db, project_id, worker_id, reason, *, assignment_id=None):
         db.execute("UPDATE v1_worker_inputs SET state='failed',failed_at=?,last_error=? "

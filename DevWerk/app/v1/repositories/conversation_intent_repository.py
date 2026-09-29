@@ -14,6 +14,11 @@ def merge_intent_updates(state, field, updates):
     merged = {item['key']:item for item in state[field]}
     for update in updates:
         if field == 'open_questions':
+            if update.key not in merged and update.question is None and update.state == 'resolved':
+                decided = any(item['key'] == update.key and item['status'] in {'user_decided', 'delegated_choice'}
+                              for item in state['decisions'])
+                if decided:
+                    continue
             item = {**merged.get(update.key, {}), **update.model_dump(mode='json', exclude_unset=True, exclude_none=True)}
             if not item.get('question'):
                 raise ValueError(f'NewQuestionMissing: {update.key} needs question text; existing keys may update state only')

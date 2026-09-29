@@ -385,3 +385,47 @@ def test_repeated_await_without_progress_stops_before_model_budget(store, tmp_pa
     with store.connect() as db:
         assert db.execute('SELECT model_calls FROM v1_agent_assignments').fetchone()[0] == 4
     assert store.get_task(task['id'])['control_state'] == 'paused'
+
+
+def test_explicit_retry_after_assignment_budget_exhaustion_gets_new_run_and_budget(store, tmp_path):
+    wf = agent_workflow()
+    project, task, _ = setup(store, tmp_path, wf, [])
+    claimed = store.claim_task(task['id'], 'worker-1')
+    run = store.begin_run(claimed, {})
+    old = store.agents.assign(claimed, run, wf.column('work'))
+    with store.tx(immediate=True) as db:
+        db.execute("UPDATE v1_agent_assignments SET status='blocked',model_calls=100,result_json=? WHERE id=?",
+                   (json.dumps({'code': 'execution_budget_exceeded'}), old['id']))
+        db.execute("UPDATE v1_agent_instances SET active_assignment_id=NULL WHERE id=?", (old['agent_instance_id'],))
+        db.execute("UPDATE v1_column_attempts SET status='interrupted' WHERE column_run_id=?", (run['id'],))
+        db.execute("UPDATE v1_column_runs SET status='interrupted' WHERE id=?", (run['id'],))
+        db.execute("UPDATE v1_tasks SET status='recovering',control_state='paused',failure_code='execution_budget_exceeded',"
+                   "lease_owner=NULL,lease_until=NULL WHERE id=?", (task['id'],))
+    first_input = store.agents.send(project['id'], old['agent_instance_id'],
+                                    'Keep the failed check detail', assignment_id=old['id'])
+    second_input = store.agents.send(project['id'], old['agent_instance_id'],
+                                     'Run the current browser check', assignment_id=old['id'])
+
+    retried = store.retry_task(task['id'], column_key='work', clear_context=True)
+    assert retried['status'] == 'pending'
+    claimed_again = store.claim_task(task['id'], 'worker-2')
+    new_run = store.begin_run(claimed_again, {})
+    fresh = store.agents.assign(claimed_again, new_run, wf.column('work'))
+    assert new_run['id'] != run['id']
+    assert fresh['id'] != old['id']
+    assert fresh['agent_instance_id'] == old['agent_instance_id']
+    assert fresh['model_calls'] == 0
+    pending = {m['id']: m for m in store.agents.messages(project['id'], fresh['agent_instance_id'])}
+    assert {pending[first_input['id']]['assignment_id'], pending[second_input['id']]['assignment_id']} == {fresh['id']}
+    with pytest.raises(ValueError, match='superseded'):
+        store.agents.send(project['id'], fresh['agent_instance_id'], 'stale input', assignment_id=old['id'])
+    agent = store.begin_agent_run(project_id=project['id'], instruction_revision=1,
+        instruction_snapshot='test', context_snapshot={}, capabilities=[],
+        platform_policy=store.latest_platform_policy(), runtime_policy=store.policy,
+        kind='column', task_id=task['id'], column_run_id=new_run['id'],
+        agent_session_id=fresh['session_id'])
+    consumed = store.agents.consume_messages(fresh, agent['id'])
+    assert {item['message_id'] for item in consumed['payload']} == {first_input['id'], second_input['id']}
+    assert store.agents.consume_messages(fresh, agent['id']) == []
+    with store.connect() as db:
+        assert db.execute('SELECT status FROM v1_column_runs WHERE id=?', (run['id'],)).fetchone()[0] == 'interrupted'

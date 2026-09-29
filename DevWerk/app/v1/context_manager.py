@@ -100,6 +100,24 @@ def project_result(content, max_bytes):
         original = {'output': content}
     if not isinstance(original, dict):
         original = {'output': original}
+    if original.get('capability') == 'project.files.read' and isinstance(original.get('output'), dict):
+        output = original['output']
+        if isinstance(output.get('content'), str) and isinstance(output.get('offset'), int):
+            from app.v1.context_projection import slice_source_text
+            source, offset = output['content'], output['offset']
+            total = output.get('total_characters', offset + len(source))
+            budget = max_bytes
+            while budget >= 4:
+                page, _ = slice_source_text(source, offset=0,
+                                            max_characters=len(source), max_bytes=budget)
+                next_offset = offset + len(page)
+                view = {**original, 'output': {**output, 'content': page,
+                    'next_offset': next_offset if next_offset < total else None,
+                    'content_complete': next_offset >= total}}
+                encoded = packed(view)
+                if len(encoded.encode('utf-8')) <= max_bytes:
+                    return encoded
+                budget //= 2
     if original.get('capability') == 'project.memory.search' and isinstance(original.get('output'), list):
         view = copy.deepcopy(original)
         while view['output'] and len(packed(view).encode('utf-8')) > max_bytes:
@@ -211,8 +229,8 @@ def planning_projection(result):
     elif capability == 'workflow.inspect':
         definition = output.get('definition') or {}
         view = {k:output[k] for k in ('id','definition_hash','workflow_plan_id','source_loop_key','source_loop_version','source_loop_digest') if k in output}
-        view['column_contracts'] = [{'key':c['key'],'acceptance_checks':c.get('acceptance_checks',[]),
-            'transitions':c.get('transitions',[]),'writable_paths':c.get('metadata',{}).get('writable_paths',[])} for c in definition.get('columns',[])]
+        view['column_contracts'] = [{'key':c['key'],'acceptance_checks':c.get('acceptance_checks',[])}
+                                    for c in definition.get('columns',[])]
         view['acceptance_obligations'] = definition.get('acceptance_obligations',[])
     else:
         return None
@@ -283,6 +301,8 @@ class ContextManager:
             control.check()
         before = self.estimate(messages, tools)
         projected = copy.deepcopy(messages)
+        self._refresh_conversation_authority(projected)
+        self._refresh_runtime_failures(projected)
         for item in projected:
             if item.get('role') == 'tool':
                 item['content'] = project_result(str(item.get('content') or ''),
@@ -329,6 +349,83 @@ class ContextManager:
                              'input_budget': self.hard, 'compacted_messages': len(removed),
                              'estimator': 'utf8-conservative-usage-calibrated', 'ratio': self.ratio}
         return provider_messages(projected)
+
+    def _refresh_conversation_authority(self, messages):
+        if self.spec.kind != 'conversation' or not self.spec.conversation_job_id:
+            return
+        job = self.store.get_conversation_job(self.spec.conversation_job_id)
+        contract = self.store.intents.contract(job)
+        requirement = None
+        current = None
+        if job.get('requirement_id'):
+            requirement = self.store.scopes.requirement_version(
+                job['project_id'], job['requirement_id'], job.get('requirement_revision'))
+            current = self.store.agents.get_requirement(job['project_id'], job['requirement_id'])
+        allowed = bool(job['start_task'] and contract['phase'] == 'execution'
+                       and requirement and requirement['status'] == 'active'
+                       and current and current['status'] == 'active'
+                       and current['revision'] == requirement['revision'])
+        for item in reversed(messages):
+            if item.get('role') != 'user':
+                continue
+            try:
+                payload = json.loads(item.get('content') or '')
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict) or not isinstance(payload.get('authoritative_current_request'), dict):
+                continue
+            if payload['authoritative_current_request'].get('message_id') != job['user_message_id']:
+                continue
+            state = payload.get('authoritative_project_state')
+            if not isinstance(state, dict):
+                return
+            state['turn_contract'] = contract
+            state['work_intent'] = self.store.intents.context(job)
+            state['requirement'] = requirement
+            for key in ('conversation_job', 'turn_authority'):
+                if isinstance(state.get(key), dict):
+                    state[key]['task_graph_mutation_allowed'] = allowed
+            item['content'] = packed(payload)
+            return
+
+    def _refresh_runtime_failures(self, messages):
+        if not (self.spec.kind == 'column' and self.spec.assignment and
+                self.spec.task_id and self.spec.column_run_id):
+            return
+        failures = self.store.feedback.latest_failed_checks(
+            self.spec.task_id, self.spec.column_run_id)
+        previous_failure = self.store.feedback.latest_agent_failure(
+            self.spec.task_id, self.spec.column_run_id, exclude_agent_run_id=self.run_id)
+        column_key = self.store.get_project_task(
+            self.spec.project['id'], self.spec.task_id)['current_column']
+        feedback = self.store.feedback.pending_for_column(self.spec.task_id, column_key)
+        for item in reversed(messages):
+            if item.get('role') != 'user':
+                continue
+            try:
+                payload = json.loads(item.get('content') or '')
+            except (TypeError, ValueError):
+                continue
+            assignment = payload.get('current_assignment') if isinstance(payload, dict) else None
+            if not isinstance(assignment, dict) or assignment.get('id') != self.spec.assignment['id']:
+                continue
+            contract_input = assignment.get('input')
+            if not isinstance(contract_input, dict):
+                return
+            if failures:
+                contract_input['unresolved_acceptance_failures'] = failures
+            else:
+                contract_input.pop('unresolved_acceptance_failures', None)
+            if previous_failure:
+                contract_input['previous_agent_failure'] = previous_failure
+            else:
+                contract_input.pop('previous_agent_failure', None)
+            if feedback:
+                contract_input['unresolved_task_feedback'] = feedback
+            else:
+                contract_input.pop('unresolved_task_feedback', None)
+            item['content'] = packed(payload)
+            return
 
     def _project_memory(self, messages, tools, *, force):
         from app.v1.context_projection import slice_source_text

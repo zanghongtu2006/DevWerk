@@ -66,6 +66,8 @@ class TurnResolution(BaseModel):
             raise ValueError('only an execution request can release a discussion hold')
         if self.act == 'control' and not (self.control_task_id and self.control_capability):
             raise ValueError('control requires an explicit Task and control capability')
+        if self.act != 'control' and (self.control_task_id or self.control_capability):
+            raise ValueError('Task control fields require act=control; do not attach pause/resume to execute')
         return self
 
 
@@ -98,13 +100,31 @@ Record decisions separately from open questions; user-approved implementation di
 Pure discussion/status may finish tool-free with a ConversationReport containing turn_resolution. That path cannot
 grant execution. Persist proposals in conversation data while discussing; do not publish a Workflow/TaskPlan or
 write implementation files. New-scope discussion does not stop authorized existing Workers.
+An explicit user request to publish or change a Workflow, configure its acceptance, or save a TaskPlan
+authorizes that named planning mutation: resolve act=execute and execution_request=continue for an existing
+scope. If the user also says not to create or run a Task in this turn, keep that narrower limit; it does not
+turn the authorized Workflow/TaskPlan change into read-only discussion.
+When the user asks to repair, retry or resume an existing Task in the same Requirement, resolve
+act=execute, execution_request=continue and focus=current; a repair summary is not a new Requirement.
+When the user explicitly asks only to pause a specific Task, resolve act=control with
+control_capability=task.pause and control_task_id set to that Task; do not attach those fields
+to act=execute. A direct Task resume control uses act=control with task.resume in the same way.
+If begin is rejected with RequirementConflict while that user request is still unresolved, correct it
+to continue for the existing scope. Do not resolve status or discuss just to escape that rejection.
 After conversation.turn.resolve has succeeded, omit turn_resolution from final output. A discussion reply can
 finish in natural language. Save further discussion details with conversation.draft.update before answering;
 it cannot change the committed turn boundary. For execution results return the factual JSON report with evidence IDs.
 One Task is one independently accepted flow_unit that traverses all Columns. Columns are lifecycle stages,
 not another list of Tasks. For a single login demo plan ONE software delivery Task, not eight stage Tasks.
+If this Requirement already has a Workflow and Workflow Plan, reuse them; do not repeat loop.apply or
+workflow.plan.save merely because the current user asks to continue from existing work.
 When task input has no deterministic string references, leave exact_input_strings empty; booleans never belong there.
 When a Loop declares entry_requirements, populate each TaskPlan item's entry_evidence from actual receipts.
+Before assembling a software TaskPlan, read task.plan.contract for the active revision, exact input schema,
+frozen scenario IDs and real evidence candidates. Build one Task for one delivery through all Columns;
+use task.plan.validate before task.plan.save. Correct its diagnostics without inventing IDs or relaxing facts.
+Recheck the accepted user's exact decision messages before writing a requirement baseline; do not let a
+paraphrased baseline override an explicit user decision.
 For software.ddd_delivery: confirmed_scope is the resolve receipt's execution_grant_id; requirements_file is the
 execution_key in the successful project.files.write receipt for the accepted requirements_path baseline.
 The software Loop is a template: before saving a TaskPlan, publish concrete behavioral acceptance_checks

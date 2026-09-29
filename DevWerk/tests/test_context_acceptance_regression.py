@@ -28,6 +28,71 @@ def batch(identity, content, source_id=0):
             {'role':'tool','tool_call_id':identity,'content':'{"ok":true}', '_source_message_id':source_id+1 if source_id else 0}]
 
 
+def test_project_text_search_skips_compiled_binary_and_keeps_later_matches(store, tmp_path):
+    project = store.create_project('binary-search', '', str(tmp_path/'project'))
+    root = tmp_path/'project'
+    root.mkdir(exist_ok=True)
+    (root/'aaa.class').write_bytes(b'\xca\xfe\xba\xbe')
+    (root/'zzz.txt').write_text('find this requirement', encoding='utf-8')
+    result = store.registry.dispatch('project.files.search', {'pattern':'requirement'},
+                                     CapabilityContext(project['id'], project, store))
+    assert result.ok
+    assert result.output['matches'] == [{'path':'zzz.txt','line':1,'text':'find this requirement'}]
+
+
+def test_large_project_file_result_projects_contiguous_page_and_cursor(store, tmp_path):
+    from app.v1.context_manager import packed, project_result
+    from app.v1.files import ProjectFiles
+
+    project = store.create_project('file-page', '', str(tmp_path/'project'))
+    ProjectFiles(project['base_dir']).write_text('source.txt', '甲乙丙丁' * 1500)
+    ctx = CapabilityContext(project['id'], project, store)
+    full = store.registry.dispatch('project.files.read', {'path':'source.txt'}, ctx)
+    assert full.ok
+    projected = json.loads(project_result(packed(full.model_dump(mode='json')), 4000))
+    first = projected['output']
+    assert first['content']
+    assert 0 < first['next_offset'] < first['total_characters']
+    assert not first['content_complete']
+    next_page = store.registry.dispatch('project.files.read',
+        {'path':'source.txt', 'offset':first['next_offset'], 'max_chars':100}, ctx)
+    assert next_page.ok
+    assert first['content'] + next_page.output['content'] == full.output['content'][:first['next_offset']+100]
+
+
+def test_invalid_search_regex_is_a_tool_error_not_an_agent_crash(store, tmp_path):
+    from app.v1.files import SystemFiles
+    project = store.create_project('invalid-search', '', str(tmp_path/'project'))
+    result = store.registry.dispatch('project.files.search', {'pattern':'*'},
+                                     CapabilityContext(project['id'], project, store, agent_run_id='test-run'))
+    assert not result.ok
+    assert result.error['type'] == 'ValueError'
+    assert 'invalid search pattern' in result.error['message']
+    with pytest.raises(ValueError, match='invalid search pattern'):
+        SystemFiles(tmp_path).search_text('.', '*', '**/*', limit=10)
+
+
+def test_workflow_projection_keeps_acceptance_configuration_with_large_graph():
+    from app.v1.context_manager import packed, project_result
+    keys = ['backend_development', 'frontend_development', 'system_test', 'delivery', 'accept']
+    columns = [{'key': key, 'transitions': [{'when': 'x'*3000}],
+                'metadata': {'writable_paths': ['y'*2000]},
+                'acceptance_checks': [{'key': key+'_check', 'scenario_ids': ['S-01'],
+                                       'report_path': 'docs/'+key+'.json'}]} for key in keys]
+    source = {'ok': True, 'capability': 'workflow.inspect',
+              'output': {'id': 'revision-4', 'definition_hash': 'digest',
+                         'workflow_plan_id': 'plan', 'definition': {'columns': columns,
+                         'acceptance_obligations': [{'column': key, 'check_key': key+'_check'}
+                                                    for key in keys]}}}
+    projected = json.loads(project_result(packed(source), 4000))
+    assert projected['output']['id'] == 'revision-4'
+    assert projected['output']['definition_hash'] == 'digest'
+    assert [item['key'] for item in projected['output']['column_contracts']] == keys
+    assert len(projected['output']['acceptance_obligations']) == 5
+    assert 'transitions' not in projected['output']['column_contracts'][0]
+    assert projected['projection']['retrieve'] == 'agent.result.read'
+
+
 def test_compaction_archives_large_arguments_but_never_partial_batches(store, tmp_path):
     project = store.create_project('projection','',str(tmp_path/'project'))
     ctx = manager(store, project)
@@ -173,6 +238,82 @@ def test_partial_acceptance_configure_preserves_graph_and_rejects_stale_base(sto
     assert store.get_workflow(project['id'])['id'] == after['id']
 
 
+def test_acceptance_can_be_configured_one_column_at_a_time_without_weaker_task_admission(store, tmp_path):
+    from tests.test_task_entry_admission import software_plan
+    from app.v1.domain import WorkflowDefinition
+
+    project, plan, ctx = software_plan(store, tmp_path)
+    complete = store.get_workflow(project['id'])
+    checks = {column['key']: column['acceptance_checks']
+              for column in complete['definition']['columns']}
+    empty = WorkflowDefinition.model_validate(complete['definition'])
+    for column in empty.columns:
+        column.acceptance_checks = []
+    empty.acceptance_obligations = []
+    current = store.publish_workflow(project['id'], empty, complete['workflow_plan_id'])
+    required = ['backend_development', 'frontend_development', 'system_test', 'delivery', 'accept']
+    for index, key in enumerate(required):
+        configured = store.registry.dispatch('workflow.acceptance.configure', {
+            'base_revision_id': current['id'], 'base_digest': current['definition_hash'],
+            'columns': [{'key': key, 'acceptance_checks': checks[key]}],
+        }, replace(ctx, execution_key=f'configure-stage-{index}'))
+        assert configured.ok, configured.error
+        assert configured.output['ready_for_task_plan'] is (index == len(required) - 1)
+        assert bool(configured.output['remaining_diagnostics']) is (index < len(required) - 1)
+        current = store.get_workflow(project['id'])
+        assert current['id'] == configured.output['id']
+        obligations = {(item['column'], item['check_key']): item['invalidated_by']
+                       for item in current['definition']['acceptance_obligations']}
+        assert set(column for column, _ in obligations) == set(required[:index + 1])
+        expected_invalidators = ([key] if key.endswith('_development')
+                                 else ['backend_development', 'frontend_development'])
+        assert obligations[(key, 'verify_fixture')] == expected_invalidators
+        plan.workflow_revision_id = current['id']
+        validation = store.registry.dispatch('task.plan.validate',
+            {'plan': plan.model_dump(mode='json')},
+            replace(ctx, execution_key=f'validate-stage-{index}'))
+        assert validation.ok, validation.error
+        assert validation.output['valid'] is (index == len(required) - 1)
+
+
+def test_rejects_one_backend_runner_as_distinct_frontend_and_delivery_proof(store, tmp_path):
+    from tests.test_task_entry_admission import software_plan
+    from app.v1.domain import WorkflowDefinition, WorkflowPlan
+    from app.v1.services.task_plan_compiler import acceptance_diagnostics
+    project, _, ctx = software_plan(store, tmp_path)
+    current = store.get_workflow(project['id'])
+    definition = WorkflowDefinition.model_validate(current['definition'])
+    definition.column('frontend_development').acceptance_checks[0].scenario_ids = ['frontend-ui']
+    definition.column('delivery').acceptance_checks[0].scenario_ids = ['delivery-cleanup']
+    method = WorkflowPlan.model_validate(store.get_workflow_plan(
+        project['id'], current['workflow_plan_id'])['plan'])
+    errors = acceptance_diagnostics(definition, method)
+    assert sum('AcceptanceEvidenceScopeCollision' in error['message'] for error in errors) == 2
+    args = {'base_revision_id':current['id'], 'base_digest':current['definition_hash'],
+            'columns':[{'key':column.key, 'acceptance_checks':[check.model_dump(mode='json')
+                        for check in column.acceptance_checks]} for column in definition.columns
+                       if column.key in {'frontend_development','delivery'}],
+            'acceptance_obligations':[item.model_dump(mode='json')
+                                      for item in definition.acceptance_obligations]}
+    rejected = store.registry.dispatch('workflow.acceptance.configure', args, ctx)
+    assert not rejected.ok and 'AcceptanceEvidenceScopeCollision' in str(rejected.error)
+    assert store.get_workflow(project['id'])['id'] == current['id']
+    published = store.registry.dispatch('workflow.publish', {
+        'workflow_plan_id': current['workflow_plan_id'],
+        'workflow': definition.model_dump(mode='json')},
+        replace(ctx, execution_key='direct-collision-publication'))
+    assert not published.ok and 'AcceptanceEvidenceScopeCollision' in str(published.error)
+    assert store.get_workflow(project['id'])['id'] == current['id']
+    definition.column('frontend_development').acceptance_checks[0].arguments['argv'].append('frontend-test')
+    definition.column('delivery').acceptance_checks[0].arguments['argv'].append('delivery-test')
+    assert not acceptance_diagnostics(definition, method)
+    for key in ('backend_development', 'frontend_development', 'delivery'):
+        definition.column(key).acceptance_checks[0].arguments['argv'] = ['python', '-m', 'pytest', 'all_tests.py']
+        definition.column(key).acceptance_checks[0].scenario_ids = ['one', 'two']
+    definition.column('frontend_development').acceptance_checks[0].scenario_ids.reverse()
+    assert not acceptance_diagnostics(definition, method)
+
+
 def test_task_plan_validation_collects_all_columns_without_writes(store, tmp_path):
     from tests.test_task_entry_admission import software_plan
     from app.v1.domain import WorkflowDefinition
@@ -277,6 +418,9 @@ def test_second_overflow_stops_without_effect_replay(store, tmp_path):
     ['cmd','/c','cmd /c if exist FINAL_ACCEPTANCE.md (echo OK)'],
     ['cmd.exe','/d','/s','/c','"cmd /c if exist "folder name/report.json" (echo OK)"'],
     ['mvnw.cmd','clean','compile','-q'],
+    ['cmd','/c','echo Backend JUnit T-01~T-10 passed'],
+    ['cmd','/c','type README.md'],
+    ['cmd','/c','findstr /C:"Windows" README.md 2>&1'],
 ])
 def test_obviously_nonbehavior_commands_are_rejected_at_admission(argv):
     from app.v1.services.task_plan_compiler import known_nonbehavior_command
@@ -284,9 +428,37 @@ def test_obviously_nonbehavior_commands_are_rejected_at_admission(argv):
     assert known_nonbehavior_command(['mvn','test','-DskipTests=false']) is None
     assert known_nonbehavior_command(['cmd','/c','dir README.md && python verify.py']) is None
     assert known_nonbehavior_command(['cmd','/c','if exist report.json (echo OK) && python verify.py']) is None
+    assert known_nonbehavior_command(['cmd','/c','echo preparing && python verify.py']) is None
     assert known_nonbehavior_command(['mvn','compile','test']) is None
     assert known_nonbehavior_command(['mvn','compile','-Pacceptance']) is None
     assert known_nonbehavior_command(['npm.cmd','run','build']) is None
+
+
+def test_software_workflow_rejects_echo_behavior_before_publication(store, tmp_path):
+    from tests.test_task_entry_admission import software_plan
+    from app.v1.domain import WorkflowDefinition, WorkflowPlan
+    from app.v1.services.task_plan_compiler import acceptance_diagnostics
+    project, _, ctx = software_plan(store, tmp_path)
+    current = store.get_workflow(project['id'])
+    definition = WorkflowDefinition.model_validate(current['definition'])
+    check = definition.column('backend_development').acceptance_checks[0]
+    check.arguments['argv'] = ['cmd', '/c', 'echo Backend JUnit tests passed']
+    method = WorkflowPlan.model_validate(store.get_workflow_plan(
+        project['id'], current['workflow_plan_id'])['plan'])
+    assert any('NonBehaviorCheck:' in issue['message'] for issue in acceptance_diagnostics(definition, method))
+    denied = store.registry.dispatch('workflow.acceptance.configure', {
+        'base_revision_id': current['id'], 'base_digest': current['definition_hash'],
+        'columns': [{'key': 'backend_development', 'acceptance_checks': [check.model_dump(mode='json')]}],
+        'acceptance_obligations': current['definition']['acceptance_obligations'],
+    }, ctx)
+    assert not denied.ok and 'NonBehaviorCheck:' in str(denied.error)
+    assert store.get_workflow(project['id'])['id'] == current['id']
+    direct = store.registry.dispatch('workflow.publish', {
+        'workflow_plan_id': current['workflow_plan_id'],
+        'workflow': definition.model_dump(mode='json')},
+        replace(ctx, execution_key='echo-direct-publish'))
+    assert not direct.ok and 'NonBehaviorCheck:' in str(direct.error)
+    assert store.get_workflow(project['id'])['id'] == current['id']
 
 
 def test_checkpoint_notes_share_the_whole_summary_budget(store, tmp_path):

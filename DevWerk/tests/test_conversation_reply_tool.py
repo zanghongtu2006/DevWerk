@@ -70,6 +70,55 @@ def test_reply_cannot_cite_invented_task(store, tmp_path):
     assert not store.list_tasks(project['id'])
 
 
+def test_execution_reply_cannot_use_old_task_status_without_current_effect(store, tmp_path):
+    import json
+
+    from app.v1.conversation_report import render_report
+
+    project = store.create_project('execution report admission', '', str(tmp_path/'project'))
+    first, first_ctx = turn(store, project, '开始交付')
+    assert resolve(first_ctx, first, act='execute', execution_request='begin',
+                   scope_summary='demo', user_evidence=[{
+                       'message_id': first['user_message_id'], 'quote': first['message']}]).ok
+    store.finish_conversation_job(first['id'], None, first_ctx.agent_run_id, {})
+    publish_planned_workflow(store, project['id'], sequence_workflow())
+    task = create_planned_task(store, project['id'], 'Existing task')
+
+    job, ctx = turn(store, project, '继续执行当前交付')
+    assert resolve(ctx, job, act='execute', execution_request='continue',
+                   user_evidence=[{'message_id': job['user_message_id'], 'quote': job['message']}]).ok
+    with pytest.raises(ValueError, match='successful write, process or control receipt'):
+        render_report(store, project['id'], ctx.agent_run_id,
+                      json.dumps({'mode': 'work_result', 'task_ids': [task['id']]}))
+
+    written = store.registry.dispatch('project.files.write',
+        {'path': 'current-work.txt', 'content': 'real effect'}, ctx)
+    assert written.ok, written.error
+    store.record_tool_invocation(agent_run_id=ctx.agent_run_id, tool_call_id='current-write',
+        capability='project.files.write', arguments={'path': 'current-work.txt'},
+        result=written.model_dump(mode='json'), ok=True)
+    rendered, _ = render_report(store, project['id'], ctx.agent_run_id,
+        json.dumps({'mode': 'work_result', 'task_ids': [task['id']],
+                    'tool_call_ids': ['current-write']}))
+    assert '项目文件已写入' in rendered
+
+
+def test_execution_reply_reports_partial_workflow_configuration_as_incomplete(store, tmp_path):
+    from app.v1.conversation_report import render_report
+
+    project = store.create_project('partial workflow reply', '', str(tmp_path/'project'))
+    job, ctx = turn(store, project, '配置工作流验收')
+    assert resolve(ctx, job, act='execute', execution_request='begin', scope_summary='demo',
+                   user_evidence=[{'message_id': job['user_message_id']}]).ok
+    store.record_tool_invocation(agent_run_id=ctx.agent_run_id, tool_call_id='partial-check',
+        capability='workflow.acceptance.configure', arguments={}, ok=True,
+        result={'ok': True, 'capability': 'workflow.acceptance.configure',
+                'output': {'ready_for_task_plan': False, 'remaining_diagnostic_count': 4}})
+    rendered, _ = render_report(store, project['id'], ctx.agent_run_id,
+        json.dumps({'mode': 'work_result', 'tool_call_ids': ['partial-check']}))
+    assert 'Task 计划准入仍缺 4 项' in rendered
+
+
 def test_reply_and_mutation_batch_is_rejected_before_any_effect(store, tmp_path):
     project = store.create_project('reply batch', '', str(tmp_path/'project'))
     queued = store.create_conversation_job(project['id'], '开始写文件', True)

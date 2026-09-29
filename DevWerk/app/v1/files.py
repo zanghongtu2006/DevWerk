@@ -101,6 +101,20 @@ class ProjectFiles:
         text = self.resolve(relative_path).read_text(encoding="utf-8")
         return text if max_chars is None else text[:max_chars]
 
+    def read_text_page(self, relative_path: str, *, offset: int = 0,
+                       max_chars: int | None = None) -> dict[str, Any]:
+        text = self.resolve(relative_path).read_text(encoding="utf-8")
+        start = min(offset, len(text))
+        end = len(text) if max_chars is None else min(start + max_chars, len(text))
+        return {
+            "path": relative_path,
+            "content": text[start:end],
+            "offset": start,
+            "next_offset": end if end < len(text) else None,
+            "total_characters": len(text),
+            "content_complete": end >= len(text),
+        }
+
     def measure_text(self, relative_path: str) -> dict[str, Any]:
         target = self.resolve(relative_path)
         data = target.read_bytes()
@@ -330,7 +344,10 @@ class SystemFiles:
         *,
         limit: int,
     ) -> dict[str, Any]:
-        expression = re.compile(pattern)
+        try:
+            expression = re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(f"invalid search pattern: {exc}") from exc
         matches: list[dict[str, Any]] = []
         directory = self.resolve(path)
         if not directory.is_dir():

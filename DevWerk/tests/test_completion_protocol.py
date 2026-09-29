@@ -61,6 +61,26 @@ def test_custom_intermediate_outcome_requires_declared_evidence() -> None:
     assert decision.rejection.code == "successful_evidence_required"
 
 
+def test_acceptance_rejection_exposes_bounded_check_failure() -> None:
+    contract = CompletionContract(
+        tool_name='column.complete',
+        outcomes={'advance': CompletionOutcomeRule(target='next')},
+        acceptance_checks=({'key': 'backend_unit_tests'},),
+    )
+    submission = CompletionSubmission(outcome='advance', output={}, summary='ready', evidence_ids=())
+    missing = CompletionAdmissionService().evaluate(submission, contract, [])
+    assert missing.rejection.message == 'Required acceptance check has not passed: backend_unit_tests'
+    failed = ledger_entry('run-1', 'check', 'project.command.run', 'process',
+        ToolResult(ok=False, capability='project.command.run',
+                   error={'type': 'AcceptanceEvidenceInvalid',
+                          'message': 'Scenario assertion mismatch: S-07' + 'x'*1000}))
+    failed['acceptance_check'] = 'backend_unit_tests'
+    decision = CompletionAdmissionService().evaluate(submission, contract, [failed])
+    assert decision.rejection.code == 'acceptance_check_failed'
+    assert 'AcceptanceEvidenceInvalid: Scenario assertion mismatch: S-07' in decision.rejection.message
+    assert len(decision.rejection.message) < 450
+
+
 def test_declared_failure_outcome_can_carry_failed_evidence() -> None:
     failed = _entry("failed", "project.command.run", "process", ok=False)
     contract = CompletionContract(

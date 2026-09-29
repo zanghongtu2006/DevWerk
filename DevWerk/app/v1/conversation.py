@@ -337,7 +337,11 @@ class ConversationGateway:
                     "loops": self.store.list_loops(limit=20),
                     "workflow_plans": [{k: p.get(k) for k in ('id','created_at','content_hash')} for p in self.store.list_workflow_plans(project_id, 5)],
                     "task_plans": [{k: p.get(k) for k in ('id','created_at','content_hash')} for p in self.store.list_task_plans(project_id, 5)],
-                    "tasks": self.store.task_summaries(project_id, self.policy.context.task_summary_limit),
+                    "tasks": [
+                        {**task, 'failure_detail': self.store.feedback.failure_detail(project_id, task['id'])}
+                        if task['status'] in {'failed','recovering'} else task
+                        for task in self.store.task_summaries(project_id, self.policy.context.task_summary_limit)
+                    ],
                     "mailbox": [{k: item.get(k) for k in ('id', 'event_type', 'task_id', 'run_id')} for item in mailbox],
                     "conversation_job": {
                         "id": job_id,
@@ -594,8 +598,18 @@ class ConversationGateway:
         parts = []
         for task in tasks.values():
             text = f"{task['title']}：{labels.get(task['status'],task['status'])}"
-            if task.get('error'):
-                text += '；' + str(task['error'])[:800]
+            if task['status'] in {'failed','recovering'}:
+                detail = self.store.feedback.failure_detail(job['project_id'], task['id'])
+                if detail and detail.get('column_key'):
+                    text += f"；失败列：{detail['column_key']}"
+                if detail and detail.get('reported_reason'):
+                    text += '；Worker 报告：' + detail['reported_reason']
+                if detail and detail.get('completion_rejection'):
+                    text += '；完成拒绝：' + detail['completion_rejection']
+                elif task.get('error') and not (detail and detail.get('reported_reason')):
+                    text += '；' + str(task['error'])[:300]
+            elif task.get('error'):
+                text += '；' + str(task['error'])[:300]
             parts.append(text)
         for item in mailbox:
             if not item.get('task_id'):
@@ -650,6 +664,7 @@ def _has_durable_governance_progress(
         "workflow.publish",
         "workflow.acceptance.configure",
         "loop.apply",
+        "agent.worker.send",
     }
     return any(
         item.get("ok")

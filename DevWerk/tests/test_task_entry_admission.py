@@ -49,6 +49,38 @@ def test_software_receipts_save_and_materialize_one_task(store, tmp_path):
     assert replay['materialization'] == {'created_task_ids':[], 'reused_task_ids':[created.output['id']]}
 
 
+def test_plan_contract_exposes_only_real_entry_evidence(store, tmp_path):
+    project, plan, ctx = software_plan(store, tmp_path)
+    result = store.registry.dispatch('task.plan.contract', {}, ctx)
+    assert result.ok, result.error
+    guide = result.output
+    assert guide['workflow_revision_id'] == plan.workflow_revision_id
+    assert set(guide['input_schema']['required']) == {
+        'requirements_path', 'requirements_confirmed', 'acceptance_scenarios'}
+    assert guide['entry_evidence']['confirmed_scope']['candidate_ids'] == [
+        plan.tasks[0].entry_evidence['confirmed_scope']]
+    assert guide['entry_evidence']['requirements_file']['candidates'] == [{
+        'execution_key': plan.tasks[0].entry_evidence['requirements_file'],
+        'path': 'docs/baseline.md',
+        'execution_grant_id': plan.tasks[0].entry_evidence['confirmed_scope']}]
+    assert not store.list_task_plans(project['id']) and not store.list_tasks(project['id'])
+    with store.tx(immediate=True) as db:
+        db.execute('''INSERT INTO v1_execution_grants
+            (id,project_id,source_job_id,requirement_id,requirement_revision,kind,state,snapshot_json,snapshot_hash,created_at)
+            SELECT 'grant_newer',project_id,source_job_id,requirement_id,requirement_revision,
+                   kind,state,snapshot_json,snapshot_hash,'9999-01-01T00:00:00+00:00'
+            FROM v1_execution_grants WHERE id=?''',
+            (plan.tasks[0].entry_evidence['confirmed_scope'],))
+    paired = store.registry.dispatch('task.plan.contract', {}, replace(ctx, execution_key='read-paired-contract'))
+    assert paired.ok
+    assert paired.output['entry_evidence']['confirmed_scope']['candidate_ids'][0] == 'grant_newer'
+    assert paired.output['entry_evidence']['requirements_file']['candidates'][0]['execution_grant_id'] == (
+        plan.tasks[0].entry_evidence['confirmed_scope'])
+    (tmp_path/'project'/'docs'/'baseline.md').write_text('changed', encoding='utf-8')
+    stale = store.registry.dispatch('task.plan.contract', {}, replace(ctx, execution_key='read-stale-contract'))
+    assert stale.ok and stale.output['entry_evidence']['requirements_file']['candidates'] == []
+
+
 def test_unsaved_plan_is_not_misdiagnosed_as_requirement_conflict(store, tmp_path):
     project, plan, ctx = software_plan(store, tmp_path)
     before = store.get_project(project['id'])
@@ -65,6 +97,35 @@ def test_unsaved_plan_is_not_misdiagnosed_as_requirement_conflict(store, tmp_pat
     created = store.registry.dispatch('task.create',{'task_plan_id':saved.output['id'],'proposed_task_ref':'primary'},ctx)
     assert created.ok, created.error
     assert len(store.list_tasks(project['id'])) == 1
+
+
+def test_plan_validate_rejects_stale_terminal_repair_predecessor(store, tmp_path):
+    project, plan, ctx = software_plan(store, tmp_path)
+    first_plan = store.create_task_plan(project['id'], plan)
+    first = store.materialize_task_plan(project['id'],task_plan_id=first_plan['id'],
+                                        proposed_task_ref='primary')
+    store.route_task_to_failed(first['id'],'first attempt failed')
+    second_plan = plan.model_copy(deep=True)
+    second_plan.objective = 'Corrected second attempt'
+    second_plan.repair_of_task_id = first['id']
+    second_saved = store.create_task_plan(project['id'],second_plan)
+    second = store.materialize_task_plan(project['id'],task_plan_id=second_saved['id'],
+        proposed_task_ref='primary',rerun_of_task_id=first['id'])
+    store.route_task_to_failed(second['id'],'second attempt failed')
+    candidate = plan.model_copy(deep=True)
+    candidate.objective = 'Third attempt with correct predecessor'
+    candidate.repair_of_task_id = first['id']
+    stale = store.registry.dispatch('task.plan.validate',{'plan':candidate.model_dump(mode='json')},ctx)
+    assert stale.ok and not stale.output['valid']
+    assert any('DuplicateTaskIdentity' in issue['message'] and second['id'] in issue['message']
+               for issue in stale.output['diagnostics'])
+    rejected = store.registry.dispatch('task.plan.save',{'plan':candidate.model_dump(mode='json')},ctx)
+    assert not rejected.ok and 'DuplicateTaskIdentity' in str(rejected.error)
+    candidate.repair_of_task_id = second['id']
+    valid = store.registry.dispatch('task.plan.validate',{'plan':candidate.model_dump(mode='json')},ctx)
+    assert valid.ok and valid.output['valid'], valid.output
+    accepted = store.registry.dispatch('task.plan.save',{'plan':candidate.model_dump(mode='json')},ctx)
+    assert accepted.ok, accepted.error
 
 
 @pytest.mark.parametrize('invalid', ['missing','wrong_grant','foreign_receipt','changed_file'])

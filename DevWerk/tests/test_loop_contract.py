@@ -140,7 +140,7 @@ def test_workflow_column_rejects_nested_multi_agent_executor():
 def test_ddd_software_delivery_loop_has_generic_engineering_lifecycle(store):
     loop = store.get_loop("software.ddd_delivery")
     assert loop["directory"] == "ddd-software-delivery"
-    assert loop["version"] == "1.4.0"
+    assert loop["version"] == "1.4.1"
     assert loop["category"] == "software_delivery"
     assert set(loop["tags"]) >= {
         "domain-driven-design",
@@ -186,7 +186,8 @@ def test_ddd_software_delivery_loop_has_generic_engineering_lifecycle(store):
     assert columns["requirements"]["metadata"]["writable_paths"] == [
         "docs/requirements-traceability.md"
     ]
-    assert columns["system_test"]["metadata"]["writable_paths"] == ["docs/test-report.md"]
+    assert columns["system_test"]["metadata"]["writable_paths"] == [
+        "docs/test-report.md", "e2e/**", "tests/**", "scripts/acceptance/**"]
     assert columns["accept"]["metadata"]["writable_paths"] == ["FINAL_ACCEPTANCE.md"]
 
 

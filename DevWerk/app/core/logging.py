@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import sys
+import time
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,25 @@ from typing import Any
 
 _CONFIGURED = False
 _DEFAULT_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+
+
+class _RecoveringDailyFileHandler(TimedRotatingFileHandler):
+    """Keep the current log writable when Windows cannot rename an open file."""
+
+    def doRollover(self) -> None:
+        try:
+            super().doRollover()
+        except PermissionError as exc:
+            if self.stream is None or self.stream.closed:
+                self.stream = self._open()
+            now = int(time.time())
+            self.rolloverAt = self.computeRollover(now)
+            while self.rolloverAt <= now:
+                self.rolloverAt += self.interval
+            if not getattr(self, "_rollover_warning_emitted", False):
+                print(f"DevWerk log rollover deferred; continuing to append devwerk.log: {exc}",
+                      file=sys.stderr)
+                self._rollover_warning_emitted = True
 
 
 def configure_logging(config: Any) -> None:
@@ -38,7 +58,7 @@ def configure_logging(config: Any) -> None:
             raise ValueError("DevWerk log_file_name must be devwerk.log")
         log_path = (log_dir / file_name).resolve()
         retention_days = _positive_int(getattr(config, "log_retention_days", 30))
-        file_handler = TimedRotatingFileHandler(
+        file_handler = _RecoveringDailyFileHandler(
             log_path,
             when="midnight",
             interval=1,

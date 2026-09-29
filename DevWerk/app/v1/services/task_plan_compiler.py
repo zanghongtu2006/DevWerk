@@ -25,6 +25,7 @@ def acceptance_diagnostics(definition, method, data=None):
             reason = known_nonbehavior_command(check.arguments.get('argv', []))
             if reason:
                 issue(column_paths[column.key]+f'/acceptance_checks/{index}/arguments', reason)
+    errors.extend(acceptance_scope_collision_diagnostics(definition, method))
     for key in method.task_contract.feedback_columns:
         executor = definition.column(key).executor
         if executor.kind != 'agent' or 'task.feedback.record' not in executor.capabilities:
@@ -61,6 +62,26 @@ def acceptance_diagnostics(definition, method, data=None):
     return errors
 
 
+def acceptance_scope_collision_diagnostics(definition, method):
+    """Reject one proven false-scope reuse shape without interpreting scripts."""
+    errors = []
+    distinct_stages = ('backend_development', 'frontend_development', 'delivery')
+    known = {column.key for column in definition.columns}
+    if all(key in method.task_contract.required_behavior_columns and key in known for key in distinct_stages):
+        checks_by_stage = [[check for check in definition.column(key).acceptance_checks
+                            if check.evidence_kind == 'behavior'] for key in distinct_stages]
+        if all(len(checks) == 1 and checks[0].capability == 'project.command.run'
+               for checks in checks_by_stage):
+            checks = [items[0] for items in checks_by_stage]
+            signatures = {(tuple(check.arguments.get('argv', [])), check.arguments.get('cwd', '.'),
+                           check.report_path) for check in checks}
+            if len(signatures) == 1 and len({frozenset(check.scenario_ids) for check in checks}) > 1:
+                for key in distinct_stages[1:]:
+                    errors.append({'path': f'/workflow/columns/{next(i for i,c in enumerate(definition.columns) if c.key == key)}/acceptance_checks',
+                                   'message': 'AcceptanceEvidenceScopeCollision: backend, frontend and delivery cannot use the same sole command and report for different scenario sets; configure stage-specific evidence'})
+    return errors
+
+
 def known_nonbehavior_command(argv):
     """Reject a few provably non-testing commands, not arbitrary script semantics.
 
@@ -91,6 +112,10 @@ def known_nonbehavior_command(argv):
                 return None  # Malformed shell syntax is diagnosed by execution, not guessed here.
     if command and command[0] in {'dir','ls','get-childitem','test-path'} and not any(any(c in token for c in '&|;><') for token in command):
         return 'NonBehaviorCheck: listing or checking file existence is artifact evidence, not a behavior assertion/report producer'
+    if command and command[0] in {'echo', 'type', 'findstr'} and not any(
+        token in {'&', '&&', '|', '||', ';'} for token in command
+    ):
+        return 'NonBehaviorCheck: printing text or searching a file cannot execute behavior assertions and write a fresh scenario report'
     if re.fullmatch(r'if\s+(?:not\s+)?exist\s+(?:"[^"]+"|[^\s&|;<>]+)\s+\(?\s*echo\s+[^&|;<>]+?\)?', ' '.join(command)):
         return 'NonBehaviorCheck: if exist/echo only checks an artifact; configure an entry script that executes assertions and writes a fresh scenario report'
     # Only built-in Maven lifecycle prefixes before test, with simple logging flags.

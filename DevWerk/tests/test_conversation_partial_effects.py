@@ -4,6 +4,7 @@ import pytest
 
 from app.v1.agent import AgentCore, AgentRunSpec
 from app.v1.conversation_failure import failure_summary
+from app.v1.conversation import _has_durable_governance_progress
 from app.v1.domain import AgentModelResponse, AgentToolCall
 from app.v1.runtime import WorkflowRuntime
 from tests.helpers import create_planned_task, publish_planned_workflow, sequence_workflow
@@ -66,3 +67,46 @@ def test_partial_failure_reports_saved_work_and_actual_started_count(store, tmp_
     assert '工作流已保存' in reply and '任务计划已保存' in reply
     assert 'ExactInputTargetType' in reply and '重复失败调用已停止' in reply
     assert '复用 1' not in reply
+
+
+def test_failed_final_reply_reports_queued_worker_input_as_partial_effect(store, tmp_path):
+    project = store.create_project('worker input receipt', '', str(tmp_path/'project'))
+    ledger = [
+        {'capability': 'agent.worker.send', 'ok': True, 'status': 'completed',
+         'effect_kind': 'control', 'facts': {'result': {'output': {'id': 'winput_1'}}}},
+        {'capability': 'conversation.reply', 'ok': False, 'status': 'failed',
+         'effect_kind': 'session_control', 'facts': {'result': {'error': {
+             'message': 'The report references a tool call absent from this turn'}}}},
+    ]
+    assert _has_durable_governance_progress(ledger)
+    reply = failure_summary(store, project['id'], ledger, 'ConversationProtocolStalled')
+    assert '已向 Worker 排队 1 条输入' in reply
+    assert '是否消费需另查' in reply
+    assert 'tool call absent' in reply
+
+
+def test_validation_failure_summary_keeps_paths_and_business_reason_without_debug_payload(store, tmp_path):
+    project = store.create_project('validation failure', '', str(tmp_path/'project'))
+    detail = ('2 validation errors for WorkflowDefinition\n'
+              'columns.6.acceptance_checks.0\n'
+              "  Value error, A scenario report requires a behavioral command [type=value_error, input_value={'arguments': {'secret': 'not-for-ui'}}, input_type=dict]\n"
+              '    For further information visit https://errors.pydantic.dev/2.13/v/value_error\n'
+              'columns.6.acceptance_checks.1\n'
+              '  Value error, A scenario report requires a behavioral command [type=value_error, input_value={}, input_type=dict]')
+    ledger = [{'capability': 'workflow.acceptance.configure', 'ok': False,
+               'facts': {'result': {'error': {'message': detail}}}}]
+    reply = failure_summary(store, project['id'], ledger, 'ConversationProtocolStalled')
+    assert 'columns.6.acceptance_checks.0: A scenario report requires a behavioral command' in reply
+    assert 'columns.6.acceptance_checks.1' in reply
+    assert 'not-for-ui' not in reply and 'pydantic.dev' not in reply
+
+
+def test_contract_failure_summary_omits_serialized_plan_arguments(store, tmp_path):
+    project = store.create_project('contract failure', '', str(tmp_path/'project'))
+    detail = "task.plan.save input rejected value at plan: '{\"secret\": \"not-for-ui\"}'"
+    ledger = [{'capability': 'task.plan.save', 'ok': False,
+               'facts': {'result': {'error': {'message': detail}}}}]
+    reply = failure_summary(store, project['id'], ledger, 'ConversationProtocolStalled')
+    assert 'task.plan.save input rejected value at plan' in reply
+    assert 'JSON 字符串' in reply
+    assert 'not-for-ui' not in reply

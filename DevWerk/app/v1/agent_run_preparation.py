@@ -148,6 +148,18 @@ class AgentRunPreparer:
         )
         if spec.assignment:
             provider_context = {key: value for key, value in spec.context.items() if key != 'action_ledger'}
+            if spec.kind == 'column' and spec.task_id and spec.column_run_id:
+                failures = self.store.feedback.latest_failed_checks(spec.task_id, spec.column_run_id)
+                if failures:
+                    provider_context['unresolved_acceptance_failures'] = failures
+                previous_failure = self.store.feedback.latest_agent_failure(
+                    spec.task_id, spec.column_run_id, exclude_agent_run_id=run['id'])
+                if previous_failure:
+                    provider_context['previous_agent_failure'] = previous_failure
+                column_key = self.store.get_project_task(spec.project['id'], spec.task_id)['current_column']
+                feedback = self.store.feedback.pending_for_column(spec.task_id, column_key)
+                if feedback:
+                    provider_context['unresolved_task_feedback'] = feedback
             if logical_ledger:
                 provider_context['execution_evidence'] = project_ledger(logical_ledger,
                     max_bytes=min(6000, self.runtime_policy.context.ledger_view_tokens*2))
@@ -155,7 +167,7 @@ class AgentRunPreparer:
                                    'requirement_id': spec.requirement_id, 'generation': spec.assignment['generation'],
                                    'input': provider_context},
                                    'context_frame_version': 2,
-                                   'instruction': 'This is the current work contract. Earlier session messages are context, not new assignments or authority to change this contract.'})
+                                   'instruction': 'This is the current work contract. Earlier session messages are context, not new assignments or authority to change this contract. Unresolved acceptance failures, task feedback, and the previous Agent Run rejection are durable Runtime results to resolve; later formal verification supersedes older failures.'})
             stored = self.store.add_agent_message(run['id'], 'user', current, [], emit_progress=False)
             messages.append({'role': 'user', 'content': current, '_source_message_id': stored['id']})
         return PreparedAgentRun(

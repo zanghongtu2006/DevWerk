@@ -24,6 +24,40 @@ def test_project_files_reject_escape_and_write_hash_tracked_atomic_content(tmp_p
     assert list((tmp_path / "project" / "nested").glob("*.tmp")) == []
 
 
+def test_project_file_read_pages_advance_by_unicode_characters(tmp_path):
+    files = ProjectFiles(str(tmp_path / "project"))
+    files.write_text("source.txt", "甲乙丙丁尾")
+
+    first = files.read_text_page("source.txt", max_chars=2)
+    assert first == {"path": "source.txt", "content": "甲乙", "offset": 0,
+                     "next_offset": 2, "total_characters": 5, "content_complete": False}
+    second = files.read_text_page("source.txt", offset=first["next_offset"], max_chars=2)
+    assert second["content"] == "丙丁"
+    assert second["next_offset"] == 4
+    last = files.read_text_page("source.txt", offset=second["next_offset"], max_chars=2)
+    assert last["content"] == "尾"
+    assert last["next_offset"] is None
+    assert last["content_complete"]
+    assert files.read_text_page("source.txt")["content"] == files.read_text("source.txt")
+
+
+def test_project_files_read_capability_exposes_next_offset(store, tmp_path):
+    from app.v1.capabilities import CapabilityContext
+
+    project = store.create_project("read-pages", "", str(tmp_path / "project"))
+    files = ProjectFiles(project["base_dir"])
+    files.write_text("source.txt", "甲乙丙丁")
+    first = store.registry.dispatch("project.files.read",
+        {"path": "source.txt", "max_chars": 2},
+        CapabilityContext(project["id"], project, store))
+    assert first.ok and first.output["content"] == "甲乙"
+    second = store.registry.dispatch("project.files.read",
+        {"path": "source.txt", "offset": first.output["next_offset"], "max_chars": 2},
+        CapabilityContext(project["id"], project, store))
+    assert second.ok and second.output["content"] == "丙丁"
+    assert second.output["content_complete"]
+
+
 def test_context_file_reads_respect_character_budget(tmp_path):
     files = ProjectFiles(str(tmp_path / "project"))
     files.write_text("a.md", "a" * 10)

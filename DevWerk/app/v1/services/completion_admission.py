@@ -62,7 +62,11 @@ class CompletionAdmissionService:
                 verified = next((item for item in reversed(ledger)
                                  if item.get('acceptance_check') == check['key']), None)
                 if not verified or not verified.get('ok') or verified.get('status') != 'completed':
-                    return self._reject('acceptance_check_failed', f"Required acceptance check has not passed: {check['key']}")
+                    message = f"Required acceptance check has not passed: {check['key']}"
+                    error = ((verified or {}).get('facts') or {}).get('result', {}).get('error')
+                    if isinstance(error, dict) and error.get('message'):
+                        message += f" ({str(error.get('type') or 'CheckFailed')[:80]}: {str(error['message'])[:300]})"
+                    return self._reject('acceptance_check_failed', message)
             unresolved = {}
         unresolved_by_evidence = {
             str(item.get("evidence_id")): item

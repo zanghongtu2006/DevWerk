@@ -4,6 +4,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import logging
+import time
+from logging.handlers import TimedRotatingFileHandler
 import pytest
 
 from app.core.logging import _daily_archive_name, configure_logging
@@ -52,3 +54,30 @@ def test_current_business_log_is_devwerk_log(tmp_path):
         "written to the single business log\n"
     )
     assert [path.name for path in log_dir.iterdir()] == ["devwerk.log"]
+
+
+def test_locked_daily_rollover_keeps_appending_to_devwerk_log(tmp_path, monkeypatch, capsys):
+    log_dir = tmp_path / "logs"
+    configure_logging(SimpleNamespace(log_level="info", log_format="%(message)s",
+        log_file_enabled=True, log_dir=str(log_dir), log_file_name="devwerk.log",
+        log_retention_days=30))
+    logger = logging.getLogger("devwerk.test")
+    logger.info("before midnight")
+    handler = next(item for item in logging.getLogger().handlers
+                   if isinstance(item, TimedRotatingFileHandler))
+    attempts = []
+
+    def locked(*args):
+        attempts.append(args)
+        raise PermissionError(32, "file locked by another process")
+
+    monkeypatch.setattr(handler, "rotate", locked)
+    handler.rolloverAt = int(time.time()) - 1
+    logger.info("after locked rollover")
+    logger.info("still writable")
+    handler.flush()
+    content = (log_dir / "devwerk.log").read_text(encoding="utf-8")
+    assert content.splitlines() == ["before midnight", "after locked rollover", "still writable"]
+    assert len(attempts) == 1
+    assert handler.rolloverAt > time.time()
+    assert capsys.readouterr().err.count("rollover deferred") == 1

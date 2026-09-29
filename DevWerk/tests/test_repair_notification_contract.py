@@ -114,6 +114,43 @@ def test_two_cross_column_repair_cycles_use_real_files_checks_and_same_workers(s
     assert len(store.list_tasks(project['id'])) == 1
 
 
+def test_explicit_failed_test_edge_precedes_older_unrelated_feedback(store, tmp_path):
+    workflow = agent_workflow()
+    test = workflow.column('work')
+    test.key, test.name = 'system_test', 'System test'
+    test.transitions = [Transition(outcome='tests_passed',target='delivery'),
+        Transition(outcome='tests_failed',target='integration_review',allows_unresolved_failures=True),
+        Transition(outcome='execution_failed',target='failed')]
+    review = test.model_copy(deep=True)
+    review.key, review.name = 'integration_review', 'Integration review'
+    review.transitions = [Transition(outcome='backend_changes_requested',target='backend_development',
+        allows_unresolved_failures=True),Transition(outcome='accepted',target='system_test')]
+    backend = test.model_copy(deep=True)
+    backend.key, backend.name = 'backend_development', 'Backend development'
+    backend.transitions = [Transition(outcome='backend_ready',target='integration_review')]
+    delivery = test.model_copy(deep=True)
+    delivery.key, delivery.name = 'delivery', 'Delivery'
+    delivery.transitions = [Transition(outcome='delivered',target='done')]
+    workflow.entry = 'system_test'
+    workflow.columns = [test,review,backend,delivery]
+    project = store.create_project('failed test route','',str(tmp_path/'project'))
+    publish_planned_workflow(store,project['id'],workflow)
+    task = create_planned_task(store,project['id'],'route test failure')
+    owned = store.claim_task(task['id'],'route-owner')
+    run = store.begin_run(owned,{})
+    with store.tx(immediate=True) as db:
+        db.execute('''INSERT INTO v1_task_feedback
+            (id,project_id,task_id,dedupe_key,responsible_column,description,
+             checks_json,reported_sequence,created_at)
+             VALUES(?,?,?,?,?,?,?,?,?)''',
+            ('old-delivery-feedback',project['id'],task['id'],'old-delivery','delivery',
+             'README still needs work','[]',0,'2026-09-29T00:00:00Z'))
+    store.finish_run(owned,run['id'],{'delivered':False},'tests_failed','integration_review')
+    current = store.get_task(task['id'])
+    assert current['current_column'] == 'integration_review'
+    assert store.feedback.list(project['id'],task['id'])[0]['state'] == 'open'
+
+
 def test_successor_keeps_old_revision_and_uses_explicit_new_plan(store, tmp_path):
     workflow = agent_workflow()
     project = store.create_project('successor','',str(tmp_path/'project'))

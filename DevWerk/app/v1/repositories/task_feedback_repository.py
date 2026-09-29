@@ -126,6 +126,93 @@ class TaskFeedbackRepository:
                  spec.column_attempt_id,agent_run_id,key,execution_key,int(result.ok),
                  result.model_dump_json(),utcnow()))
 
+    def latest_failed_checks(self, task_id, column_run_id):
+        """Return bounded, still-failing formal checks for this Column visit."""
+        with self.store.connect() as db:
+            rows = db.execute('''SELECT result.id,result.check_key,result.result_json
+                FROM v1_acceptance_results AS result
+                JOIN (SELECT check_key,MAX(rowid) AS latest_rowid
+                    FROM v1_acceptance_results
+                    WHERE task_id=? AND column_run_id=? AND workflow_revision_id=(
+                        SELECT workflow_revision_id FROM v1_tasks WHERE id=?)
+                    GROUP BY check_key) AS latest ON result.rowid=latest.latest_rowid
+                WHERE result.ok=0 ORDER BY result.rowid DESC LIMIT 8''',
+                (task_id,column_run_id,task_id)).fetchall()
+        failures = []
+        for row in rows:
+            error = (json.loads(row['result_json']).get('error') or {})
+            failures.append({'check_key':row['check_key'], 'acceptance_result_id':row['id'],
+                'error_type':str(error.get('type') or 'CheckFailed')[:80],
+                'error_message':str(error.get('message') or 'Formal acceptance check failed')[:300]})
+        return failures
+
+    def failure_detail(self, project_id, task_id):
+        """Expose a bounded delivery failure, not a command log or model summary."""
+        task = self.store.get_project_task(project_id, task_id)
+        if task['status'] not in {'failed', 'recovering'}:
+            return None
+        with self.store.connect() as db:
+            row = db.execute('''SELECT id,column_key,status,output_json,error FROM v1_column_runs
+                WHERE project_id=? AND task_id=? ORDER BY sequence DESC LIMIT 1''',
+                (project_id,task_id)).fetchone()
+        output = json.loads(row['output_json'] or '{}') if row else {}
+        if not isinstance(output, dict):
+            output = {}
+        reason_keys = ('failure_reason','environment_limitation') + (
+            ('reason','error','summary') if row and row['status'] == 'failed' else ())
+        reported = next((value for key in reason_keys
+                         if isinstance(value := output.get(key), str) and value.strip()), None)
+        runtime_error = task.get('error') or (row['error'] if row else None) or ''
+        agent_failure = self.latest_agent_failure(task_id, row['id']) if row else None
+        return {'column_key':row['column_key'] if row else task.get('current_column'),
+                'column_run_id':row['id'] if row else None,
+                'reported_reason':reported[:400] if reported else None,
+                'runtime_error':str(runtime_error)[:300],
+                'completion_rejection':agent_failure.get('completion_rejection') if agent_failure else None}
+
+    def latest_agent_failure(self, task_id, column_run_id, *, exclude_agent_run_id=None):
+        """Surface the last terminal attempt's bounded rejection on this Column visit."""
+        with self.store.connect() as db:
+            run = db.execute('''SELECT id,status,error FROM v1_agent_runs
+                WHERE task_id=? AND column_run_id=? AND id!=?
+                  AND status IN ('failed','succeeded','completed')
+                ORDER BY rowid DESC LIMIT 1''',
+                (task_id,column_run_id,exclude_agent_run_id or '')).fetchone()
+            if not run or run['status'] != 'failed':
+                return None
+            rejection = db.execute('''SELECT result_json FROM v1_tool_invocations
+                WHERE agent_run_id=? AND capability='column.complete' AND ok=0
+                ORDER BY sequence DESC LIMIT 1''',(run['id'],)).fetchone()
+        error = {}
+        if rejection:
+            try:
+                error = (json.loads(rejection['result_json']).get('error') or {})
+            except (TypeError, ValueError):
+                pass
+        message = str(error.get('message') or '').strip() if isinstance(error, dict) else ''
+        return {'agent_run_id':run['id'],
+                'runtime_error':str(run['error'] or 'Agent Run failed')[:300],
+                'completion_rejection':message[:600] if message else None}
+
+    def pending_for_column(self, task_id, column_key):
+        """Current bounded repair obligations for one Worker, from durable feedback."""
+        with self.store.connect() as db:
+            rows = db.execute('''SELECT id,state,responsible_column,description,checks_json
+                FROM v1_task_feedback AS feedback WHERE task_id=? AND state!='resolved'
+                AND (responsible_column=? OR EXISTS (
+                    SELECT 1 FROM json_each(feedback.checks_json) AS check_item
+                    WHERE json_extract(check_item.value,'$.column')=?))
+                ORDER BY CASE WHEN responsible_column=? THEN 0 ELSE 1 END,
+                         feedback.rowid DESC LIMIT 8''',
+                (task_id,column_key,column_key,column_key)).fetchall()
+        return [{'feedback_id':row['id'], 'state':row['state'],
+                 'responsible_column':row['responsible_column'],
+                 'description':row['description'][:500],
+                 'verification_checks':[
+                     {'column':check.get('column'), 'check_key':check.get('check_key')}
+                     for check in json.loads(row['checks_json'])[:8]]}
+                for row in rows]
+
     def verified(self, db, task, column, key, *, after_sequence=0, current_run=None, after_check_rowid=0):
         # The latest visit invalidates all receipts from previous visits, even if
         # the old run succeeded. A pending/failed latest visit is not evidence.
@@ -179,6 +266,10 @@ class TaskFeedbackRepository:
                     db.execute("UPDATE v1_task_feedback SET state='resolved',verification_json=?,resolved_at=? WHERE id=?", (json.dumps(verified),utcnow(),item['id']))
                 else:
                     db.execute("UPDATE v1_task_feedback SET state='verifying',verification_json=NULL,resolved_at=NULL WHERE id=?", (item['id'],))
+        # An explicit rework outcome is the Column's frozen control decision.
+        # Older unrelated feedback must not turn a failed test into a success edge.
+        if transition.allows_unresolved_failures:
+            return next_column, terminal
         remaining = db.execute("SELECT * FROM v1_task_feedback WHERE task_id=? AND state!='resolved' ORDER BY rowid", (task['id'],)).fetchall()
         if remaining:
             item = remaining[0]

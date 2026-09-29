@@ -33,6 +33,32 @@ def test_default_true_is_not_authorization_and_discussion_creates_no_requirement
     assert store.agents.list_requirements(project['id']) == []
 
 
+def test_task_pause_requires_this_turns_targeted_control_contract(store, tmp_path):
+    from app.v1.capabilities import _task_pause
+    from tests.helpers import agent_workflow, create_planned_task, publish_planned_workflow
+
+    project = store.create_project('pause contract','',str(tmp_path/'project'))
+    publish_planned_workflow(store,project['id'],agent_workflow())
+    task = create_planned_task(store,project['id'],'keep running')
+    unrelated, ctx = turn(store,project,'只通知 Worker 返修，不暂停 Task')
+    inconsistent = resolve(ctx,unrelated,act='execute',execution_request='continue',
+        control_capability='task.pause',control_task_id=task['id'])
+    assert not inconsistent.ok
+    assert 'control' in inconsistent.error['message']
+    with pytest.raises(PermissionError, match='TaskPauseRequiresTargetedControl'):
+        _task_pause({'task_id':task['id']},ctx)
+    assert store.get_task(task['id'])['control_state'] == 'active'
+    store.finish_conversation_job(unrelated['id'],None,ctx.agent_run_id,{})
+
+    pause_turn, pause_ctx = turn(store,project,f'请暂停 Task {task["id"]}')
+    resolved = resolve(pause_ctx,pause_turn,act='control',
+        control_capability='task.pause',control_task_id=task['id'])
+    assert resolved.ok, resolved.error
+    paused = store.registry.dispatch('task.pause',{'task_id':task['id']},pause_ctx)
+    assert paused.ok, paused.error
+    assert store.get_task(task['id'])['control_state'] == 'paused'
+
+
 def test_hold_survives_next_turn_and_explicit_start_can_release_it(store, tmp_path):
     project = store.create_project('discussion', '', str(tmp_path/'project'))
     first, ctx = turn(store, project, '先不要启动开发')
@@ -200,6 +226,27 @@ def test_provider_catalog_follows_durable_phase(store, tmp_path):
         user_evidence=[{'message_id':job['user_message_id'],'quote':job['message']}]).ok
     provider.request([], tools, iteration=2, require_tool=False, required_tool_name=None)
     assert 'project.files.write' in seen[-1]
+    assert 'conversation.turn.resolve' not in seen[-1]
+
+
+def test_status_turn_exposes_reads_and_reply_after_resolution(store, tmp_path):
+    from app.v1.agent import AgentRunSpec
+    from app.v1.agent_provider import ProviderTurnRequester
+    from app.v1.domain import AgentModelResponse
+    project = store.create_project('status catalog', '', str(tmp_path/'project'))
+    job, ctx = turn(store, project, '为什么失败？')
+    assert resolve(ctx, job, act='status').ok
+    seen = []
+    def model(messages, tools, **kwargs):
+        seen.append({tool['function']['name'] for tool in tools})
+        return AgentModelResponse(text='状态说明')
+    spec = AgentRunSpec(kind='conversation', project=project, instruction='', instruction_revision=1,
+        context={}, capability_ids=[], conversation_job_id=job['id'])
+    provider = ProviderTurnRequester(store=store, model_complete=model, spec=spec, run_id=ctx.agent_run_id)
+    tools = store.registry.schemas([
+        'conversation.turn.resolve', 'conversation.reply', 'workflow.inspect', 'project.files.write'], ctx)
+    provider.request([], tools, iteration=1, require_tool=False, required_tool_name=None)
+    assert seen == [{'conversation.reply', 'workflow.inspect'}]
 
 
 @pytest.mark.parametrize('act', ['unresolved','discuss','status','execute'])
@@ -255,6 +302,31 @@ def test_reference_only_evidence_can_start_but_new_question_needs_text(store, tm
     result = resolve(ctx,job,act='execute',execution_request='begin',scope_summary='demo',
         user_evidence=[{'message_id':job['user_message_id']}])
     assert result.ok, result.error
+
+
+def test_resolving_decided_topic_without_prior_question_is_idempotent(store, tmp_path):
+    project = store.create_project('decided topic', '', str(tmp_path/'project'))
+    first, ctx = turn(store, project, '成功后清零计数')
+    message_id = first['user_message_id']
+    result = resolve(ctx, first, decision_updates=[{'key':'count-reset', 'value':'成功后清零',
+        'status':'user_decided', 'source_message_ids':[message_id]}],
+        open_question_updates=[{'key':'count-reset', 'state':'resolved', 'source_message_ids':[message_id]}])
+    assert result.ok, result.error
+    assert result.output['work_intent']['open_questions'] == []
+    store.finish_conversation_job(first['id'], None, ctx.agent_run_id, {})
+    second, ctx = turn(store, project, '继续确认计数重置')
+    result = resolve(ctx, second, open_question_updates=[{'key':'count-reset', 'state':'resolved',
+        'source_message_ids':[second['user_message_id']]}])
+    assert result.ok, result.error
+    assert result.output['work_intent']['open_questions'] == []
+
+
+def test_resolving_undecided_topic_without_question_still_rejected(store, tmp_path):
+    project = store.create_project('undecided topic', '', str(tmp_path/'project'))
+    job, ctx = turn(store, project, '讨论计数重置')
+    result = resolve(ctx, job, decision_updates=[{'key':'count-reset', 'value':'建议清零',
+        'status':'agent_proposed'}], open_question_updates=[{'key':'count-reset', 'state':'resolved'}])
+    assert not result.ok and 'NewQuestionMissing' in result.error['message']
 
 
 def test_continued_discussion_keeps_original_hold_source(store, tmp_path):

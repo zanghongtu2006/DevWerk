@@ -32,6 +32,7 @@ REPORT_INSTRUCTION = (
     'If the boundary was already resolved, omit turn_resolution. Optional draft_update only saves discussion decisions/questions/proposal and cannot change authority. '
     'mode=discussion or proposal: message contains discussion/questions or proposed future work only, never completed actions or task states. '
     'mode=work_result: cite real task_ids and/or successful tool_call_ids from this turn; Runtime renders the result from stored facts, ignoring message. '
+    'An execution turn needs at least one successful write/process/control receipt; old Task status alone cannot complete it. '
     'mode=blocked: cite failed tool_call_ids when available; explain only the remaining question in message. '
     'Do not invent IDs. Creating a scope/plan is not creating or running Tasks. No plain-text execution claims are published. '
     'Example discussion: {"mode":"discussion","message":"Which character should narrate the next chapter?"}. '
@@ -90,6 +91,11 @@ def render_report(store, project_id, run_id, text, *, execution_control=None):
     elif report.mode == 'work_result':
         if not selected and not tasks:
             raise ValueError('A work result requires a real Task or a successful tool receipt')
+        if (job and job['trigger_kind'] == 'user'
+                and store.intents.contract(job)['phase'] == 'execution'
+                and not any(item['ok'] and store.registry.side_effect_kind(item['capability']) in
+                            {'write', 'process', 'control'} for item in invocations.values())):
+            raise ValueError('An execution work result requires a successful write, process or control receipt from this turn; inspect/status of an existing Task is not execution')
         # A task.create receipt may materialize a whole plan. Report all actual
         # tasks created by that plan, without claiming they have started.
         for item in selected:
@@ -101,15 +107,34 @@ def render_report(store, project_id, run_id, text, *, execution_control=None):
         rendered_parts = []
         actions = {'project.scope.revise': '需求范围已修订', 'task.plan.save': '任务计划已保存', 'workflow.publish': '工作流已更新',
                    'loop.apply': '工作流已建立', 'requirement.create': '需求已建立', 'requirement.close': '需求已关闭',
-                   'agent.worker.replace': '执行代理已完成交接', 'project.files.write': '项目文件已写入', 'system.files.write': '文件已写入'}
+                   'agent.worker.replace': '执行代理已完成交接', 'agent.worker.send': 'Worker 输入已排队',
+                   'project.files.write': '项目文件已写入', 'system.files.write': '文件已写入'}
         for item in selected:
+            if item['capability'] == 'workflow.acceptance.configure':
+                output = item['result'].get('output') or {}
+                if output.get('ready_for_task_plan') is False:
+                    rendered_parts.append(
+                        f"工作流验收配置已保存，Task 计划准入仍缺 {output.get('remaining_diagnostic_count', 0)} 项")
+                else:
+                    rendered_parts.append('工作流验收配置已保存，可验证 Task 计划')
             if item['capability'] in actions:
                 rendered_parts.append(actions[item['capability']])
         for task in tasks:
             status = labels.get(task['status'], task['status'])
             if task.get('control_state') == 'paused' and task['status'] not in {'done', 'failed'}:
                 status = '已暂停'
-            rendered_parts.append(f"{task['title']}：{status}")
+            task_text = f"{task['title']}：{status}"
+            if task['status'] in {'failed','recovering'}:
+                detail = store.feedback.failure_detail(project_id, task['id'])
+                if detail and detail.get('column_key'):
+                    task_text += f"；失败列：{detail['column_key']}"
+                if detail and detail.get('reported_reason'):
+                    task_text += '；Worker 报告：' + detail['reported_reason']
+                if detail and detail.get('completion_rejection'):
+                    task_text += '；完成拒绝：' + detail['completion_rejection']
+                elif detail and detail.get('runtime_error') and not detail.get('reported_reason'):
+                    task_text += '；' + detail['runtime_error']
+            rendered_parts.append(task_text)
         rendered = '；'.join(dict.fromkeys(rendered_parts))+'。' if rendered_parts else '所引用的操作已完成。'
     else:
         errors = [str((i['result'].get('error') or {}).get('message') or '操作失败') for i in selected]

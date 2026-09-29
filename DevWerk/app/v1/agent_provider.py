@@ -59,6 +59,10 @@ class ProviderTurnRequester:
                         permitted.add(contract['control_capability'])
                     tools = [tool for tool in tools if tool['function']['name'] in permitted or
                         self.registry.side_effect_kind(tool['function']['name']) in {'none','read'}]
+                if phase != 'unresolved':
+                    # A committed turn cannot be resolved again. Keep the Provider
+                    # catalog aligned with the durable boundary for every phase.
+                    tools = [tool for tool in tools if tool['function']['name'] != 'conversation.turn.resolve']
         if self.context is None:
             self.context = ContextManager(self.store, self.spec, self.run_id, self.model_complete)
         working_messages = messages

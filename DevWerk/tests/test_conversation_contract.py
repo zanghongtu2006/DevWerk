@@ -799,6 +799,13 @@ def test_missing_project_file_is_returned_for_model_repair(store, tmp_path):
 
 def test_current_request_is_authoritative_and_not_duplicated(store, tmp_path):
     project = store.create_project("history", "", str(tmp_path / "project"))
+    publish_planned_workflow(store, project['id'], sequence_workflow())
+    failed_task = create_planned_task(store, project['id'], 'earlier failed work')
+    store.route_task_to_failed(failed_task['id'], 'Column transitioned to failed')
+    with store.tx(immediate=True) as db:
+        db.execute('''UPDATE v1_column_runs SET output_json=? WHERE id=(
+            SELECT id FROM v1_column_runs WHERE task_id=? ORDER BY sequence DESC LIMIT 1)''',
+            (json.dumps({'failure_reason':'integration script could not reach the backend'}),failed_task['id']))
     captured: list[list[dict]] = []
 
     def model(messages, _tools, **_kwargs):
@@ -811,6 +818,7 @@ def test_current_request_is_authoritative_and_not_duplicated(store, tmp_path):
     assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
     encoded = json.dumps(captured[0], ensure_ascii=False)
     assert encoded.count("current instruction") == 1
+    assert 'integration script could not reach the backend' in encoded
 
 
 def test_terminal_mailbox_reports_durable_state_without_model(store, tmp_path):
@@ -818,6 +826,20 @@ def test_terminal_mailbox_reports_durable_state_without_model(store, tmp_path):
     publish_planned_workflow(store, project["id"], sequence_workflow())
     task = create_planned_task(store, project["id"], "visible failure")
     store.route_task_to_failed(task["id"], "synthetic terminal failure")
+    with store.tx(immediate=True) as db:
+        db.execute('''UPDATE v1_column_runs SET output_json=? WHERE id=(
+            SELECT id FROM v1_column_runs WHERE task_id=? ORDER BY sequence DESC LIMIT 1)''',
+            (json.dumps({'environment_limitation':'backend process exits between commands',
+                         'stdout':'RAW_INTERNAL_LOG_'+'x'*5000}),task['id']))
+        latest = db.execute('SELECT id FROM v1_column_runs WHERE task_id=? ORDER BY sequence DESC LIMIT 1',
+                            (task['id'],)).fetchone()
+    from tests.test_agent_recovery_and_fencing import begin_agent
+    failed = begin_agent(store,project,kind='column',task_id=task['id'],column_run_id=latest['id'])
+    store.record_tool_invocation(agent_run_id=failed['id'],tool_call_id='completion-reject',
+        capability='column.complete',arguments={'outcome':'accepted'},
+        result={'ok':False,'error':{'type':'ValueError','message':'TypeError: readinto() requires a writable buffer'},
+                'output':{'stdout':'PRIVATE_COMMAND_STDOUT'}},ok=False)
+    store.finish_agent_run(failed['id'],'failed','','CompletionProtocolStalled',2,1)
     calls = 0
 
     def model(_messages, _tools, **_kwargs):
@@ -841,10 +863,28 @@ def test_terminal_mailbox_reports_durable_state_without_model(store, tmp_path):
     asyncio.run(execute())
     assistant = [item for item in store.messages(project["id"]) if item["role"] == "assistant"]
     assert "visible failure：失败" in assistant[-1]["content"]
+    assert 'backend process exits between commands' in assistant[-1]['content']
+    assert 'TypeError: readinto() requires a writable buffer' in assistant[-1]['content']
+    assert 'RAW_INTERNAL_LOG_' not in assistant[-1]['content']
+    assert 'PRIVATE_COMMAND_STDOUT' not in assistant[-1]['content']
     assert assistant[-1]["meta"]["subject_status"] == "failed"
     assert calls == 0
     assert assistant[-1]['meta']['llm_used'] is False
     assert store.get_task(task['id'])['status'] == 'failed'
+    detail = store.feedback.failure_detail(project['id'],task['id'])
+    assert detail['reported_reason'] == 'backend process exits between commands'
+    assert detail['completion_rejection'] == 'TypeError: readinto() requires a writable buffer'
+    other = store.create_project('different project','',str(tmp_path/'other'))
+    with pytest.raises(KeyError):
+        store.feedback.failure_detail(other['id'],task['id'])
+    from app.v1.conversation_report import render_report
+    from tests.test_agent_recovery_and_fencing import begin_agent
+    run = begin_agent(store,project,kind='conversation')
+    rendered, _ = render_report(store,project['id'],run['id'],json.dumps({
+        'mode':'work_result','task_ids':[task['id']]}))
+    assert 'backend process exits between commands' in rendered
+    assert 'TypeError: readinto() requires a writable buffer' in rendered
+    assert 'RAW_INTERNAL_LOG_' not in rendered
 
 
 def test_project_session_replays_human_dialogue_without_raw_tool_evidence(store, tmp_path):

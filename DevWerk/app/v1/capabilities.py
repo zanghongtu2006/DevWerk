@@ -783,11 +783,11 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     )
     add(
         "project.files.read",
-        "Read a UTF-8 file inside the Project base directory.",
+        "Read a UTF-8 file inside the Project base directory. For later pages, pass the returned next_offset as offset with max_chars; repeating the same path/offset/max_chars repeats the same content.",
         {
             "type": "object",
             "required": ["path"],
-            "properties": {"path": {"type": "string", "minLength": 1}, "max_chars": {"type": "integer", "minimum": 1}},
+            "properties": {"path": {"type": "string", "minLength": 1}, "max_chars": {"type": "integer", "minimum": 1}, "offset": {"type": "integer", "minimum": 0}},
             "additionalProperties": False,
         },
         _files_read,
@@ -1025,8 +1025,10 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
             "the existing Project predecessor. Never repeat an already materialized work item merely to make a new "
             "plan start at the configured first value. Saving the plan creates no Tasks. "
             "This is a mutating capability, never a schema probe: do not submit placeholder, test, TODO, or partial "
-            "plans. If validation rejects a call before persistence, correct and resubmit the same complete user-owned "
-            "plan. A queue readiness decision is automatically admitted when dependencies and WIP constraints allow."
+            "plans. Read task.plan.contract first for the current frozen input and evidence candidates, then "
+            "task.plan.validate before saving. If validation rejects a call before persistence, correct and "
+            "resubmit the same complete user-owned plan. A queue readiness decision is automatically admitted "
+            "when dependencies and WIP constraints allow."
         ),
         {"type": "object", "required": ["plan"], "properties": {"plan": task_plan_schema}, "additionalProperties": False, "$defs": task_plan_defs},
         _task_plan_save,
@@ -1191,8 +1193,11 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     add('task.plan.validate', 'Read-only admission diagnostics for a concrete Task Plan. Returns all independent contract errors, paths and legal columns. Does not persist plans or execute future commands.',
         {'type':'object','required':['plan'],'properties':{'plan':{'type':'object'}},'additionalProperties':False},
         lambda args, ctx: _task_plan_validate(args, ctx, registry), side_effect_kind='read', delegable_to_column=False)
-    add('workflow.acceptance.configure', 'Instantiate acceptance on the exact active Workflow revision without resending its instructions or graph. base_digest is definition_hash from workflow.inspect or loop.apply. Replaces checks only on listed columns and replaces obligations; validates before publication. Every required behavior column needs at least one behavior check with scenario_ids AND report_path. Build/file-only checks are artifacts. Obligation invalidated_by must include the Task Contract invalidators (the implementation column itself for backend/frontend, all implementation columns for later gates). Report schema: devwerk.acceptance-report.v1, scenarios [{id,status:passed,assertions:[{expected,actual}],test_source:{path,sha256}}]. Frozen Tasks retain their old revision.',
-        {'type':'object','required':['base_revision_id','base_digest','columns','acceptance_obligations'],
+    add('task.plan.contract', 'Read the active Workflow Task input contract, frozen scenario IDs and real entry-evidence candidates before building a Task Plan. Read-only; it does not create or validate a plan.',
+        {'type':'object','additionalProperties':False},
+        lambda args, ctx: _task_plan_contract(ctx), side_effect_kind='read', delegable_to_column=False)
+    add('workflow.acceptance.configure', 'Configure acceptance on the exact active Workflow revision without resending its graph. base_digest is definition_hash from workflow.inspect or loop.apply. Listed columns replace only their own checks. Omit acceptance_obligations to derive required behavior obligations from the frozen Task Contract and retain untouched columns; explicit obligations replace the full list. Partial revisions are saved, but TaskPlan admission still rejects missing behavior checks or scenario coverage; read ready_for_task_plan and remaining_diagnostics, then configure the next column on the new revision. Each required behavior column needs an executable assertion command, scenario_ids and a fresh devwerk.acceptance-report.v1 report_path. Build/package-only checks are artifacts and cannot replace a behavior check or carry a scenario report. Future entry scripts use launch_validation=deferred. Frozen Tasks retain their old revision.',
+        {'type':'object','required':['base_revision_id','base_digest','columns'],
          'properties':{'base_revision_id':{'type':'string'},'base_digest':{'type':'string'},
            'columns':{'type':'array','minItems':1,'items':{'type':'object','required':['key','acceptance_checks'],
               'properties':{'key':{'type':'string'},'acceptance_checks':{'type':'array','items':{'$ref':'#/$defs/AcceptanceCheck'}}},'additionalProperties':False}},
@@ -2032,7 +2037,11 @@ def _files_list(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
 
 def _files_read(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
     path = str(args["path"])
-    return {"path": path, "content": ctx.files.read_text(path, int(args["max_chars"]) if args.get("max_chars") is not None else None)}
+    return ctx.files.read_text_page(
+        path,
+        offset=int(args.get("offset") or 0),
+        max_chars=int(args["max_chars"]) if args.get("max_chars") is not None else None,
+    )
 
 
 def _files_measure(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
@@ -2124,11 +2133,17 @@ def _files_write_owned(args: dict[str, Any], ctx: CapabilityContext) -> dict[str
 
 
 def _files_search(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
-    expression = re.compile(str(args["pattern"]))
+    try:
+        expression = re.compile(str(args["pattern"]))
+    except re.error as exc:
+        raise ValueError(f"invalid search pattern: {exc}") from exc
     limit = int(args.get("limit") or ctx.store.policy.service_limits.default_search_results)
     matches: list[dict[str, Any]] = []
     for path in ctx.files.list_paths(str(args.get("glob") or "**/*"), limit=ctx.store.policy.service_limits.max_file_list_size):
-        content = ctx.files.read_text(path)
+        try:
+            content = ctx.files.read_text(path)
+        except UnicodeDecodeError:
+            continue
         for number, line in enumerate(content.splitlines(), 1):
             if expression.search(line):
                 matches.append({"path": path, "line": number, "text": line[:1000]})
@@ -2268,8 +2283,95 @@ def _task_plan_validate(args, ctx, registry):
             check()
         except ValueError as exc:
             result['diagnostics'].append({'path':'/tasks','message':str(exc)})
+    if not result['diagnostics']:
+        from app.v1.task_identity import logical_task_key
+        if plan.repair_of_task_id:
+            try:
+                predecessor = ctx.store.get_project_task(ctx.project_id,plan.repair_of_task_id)
+                if predecessor['status'] not in {'done','failed'} or not any(
+                        item.proposed_task_ref == predecessor['proposed_task_ref'] for item in plan.tasks):
+                    raise ValueError('repair_of_task_id must name a terminal Task whose proposed_task_ref is preserved')
+            except (KeyError,ValueError) as exc:
+                result['diagnostics'].append({'path':'/repair_of_task_id','message':str(exc)})
+        with ctx.store.connect() as db:
+            for item in plan.tasks:
+                identity = logical_task_key(method.task_contract,item.input)
+                prior = db.execute('''SELECT id,status,proposed_task_ref FROM v1_tasks
+                    WHERE project_id=? AND logical_task_key=? ORDER BY created_at DESC LIMIT 1''',
+                    (ctx.project_id,identity)).fetchone() if identity else None
+                if prior and not (plan.repair_of_task_id == prior['id'] and prior['status'] in {'done','failed'}
+                                  and item.proposed_task_ref == prior['proposed_task_ref']):
+                    result['diagnostics'].append({'path':'/repair_of_task_id',
+                        'message':f'DuplicateTaskIdentity: {identity} already belongs to Task {prior["id"]}; '
+                                  'repair_of_task_id must name this latest terminal predecessor'})
     result['valid'] = not result['diagnostics']
     return result
+
+
+def _task_plan_contract(ctx):
+    """Expose a compact, factual planning guide without fabricating Task inputs."""
+    try:
+        workflow = ctx.store.get_workflow(ctx.project_id)
+    except KeyError:
+        return {'workflow_revision_id': None, 'next_action': 'Create or select a Workflow before planning a Task.'}
+    method = WorkflowPlan.model_validate(ctx.store.get_workflow_plan(
+        ctx.project_id, workflow['workflow_plan_id'])['plan'])
+    contract = method.task_contract
+    scope = ctx.store.scopes.for_workflow(workflow['id']) or {}
+    scenario_ids = list(dict.fromkeys(
+        identity for column in workflow['definition']['columns']
+        for check in column.get('acceptance_checks', [])
+        for identity in check.get('scenario_ids', [])))
+    evidence = {}
+    with ctx.store.connect() as db:
+        grants = [dict(row) for row in db.execute(
+            "SELECT id,created_at FROM v1_execution_grants WHERE project_id=? AND requirement_id=? "
+            "AND requirement_revision=? AND state='active' ORDER BY created_at DESC LIMIT 5",
+            (ctx.project_id, scope.get('requirement_id'), scope.get('requirement_revision')))]
+        for rule in contract.entry_requirements:
+            if rule.kind == 'accepted_scope_snapshot':
+                evidence[rule.key] = {'kind': rule.kind, 'candidate_ids': [g['id'] for g in grants]}
+                continue
+            candidates = []
+            for row in db.execute(
+                "SELECT execution_key,arguments_json FROM v1_execution_receipts WHERE project_id=? "
+                "AND capability='project.files.write' AND status='completed' ORDER BY started_at DESC LIMIT 100",
+                (ctx.project_id,)):
+                args = json.loads(row['arguments_json'])
+                operation = db.execute(
+                    'SELECT source_run_id FROM v1_agent_operations WHERE id=? AND project_id=?',
+                    (row['execution_key'], ctx.project_id)).fetchone()
+                source_run = operation['source_run_id'] if operation else row['execution_key'].split(':', 1)[0]
+                job = ctx.store.intents.job_for_run(source_run, ctx.project_id)
+                if not job or job.get('execution_grant_id') not in {g['id'] for g in grants}:
+                    continue
+                try:
+                    target = ctx.files.resolve(args['path'])
+                    if hashlib.sha256(target.read_bytes()).hexdigest() != hashlib.sha256(
+                        args['content'].encode('utf-8')).hexdigest():
+                        continue
+                except (KeyError, TypeError, OSError, ValueError):
+                    continue
+                candidates.append({'execution_key': row['execution_key'], 'path': args.get('path'),
+                                   'execution_grant_id': job['execution_grant_id']})
+                if len(candidates) >= 5:
+                    break
+            evidence[rule.key] = {'kind': rule.kind, 'input_pointer': rule.input_pointer,
+                                  'candidates': candidates}
+    return {
+        'workflow_revision_id': workflow['id'],
+        'flow_unit': method.flow_unit,
+        'input_schema': contract.input_schema,
+        'required_behavior_columns': contract.required_behavior_columns,
+        'required_acceptance_invalidators': {
+            key: [key] if key in contract.acceptance_invalidated_by else contract.acceptance_invalidated_by
+            for key in contract.required_behavior_columns},
+        'scenario_input_pointer': contract.scenario_input_pointer,
+        'identity_pointer': contract.identity_pointer,
+        'frozen_scenario_ids': scenario_ids[:100],
+        'entry_evidence': evidence,
+        'next_action': 'Pair each file receipt with its execution_grant_id as confirmed_scope; submit actual input and matching evidence through task.plan.validate before task.plan.save.',
+    }
 
 
 def _workflow_acceptance_configure(args, ctx, registry):
@@ -2290,23 +2392,46 @@ def _workflow_acceptance_configure(args, ctx, registry):
                 raise ValueError('Unknown or duplicate column; legal columns: '+', '.join(columns))
             seen.add(item['key'])
             columns[item['key']]['acceptance_checks'] = item['acceptance_checks']
-        value['acceptance_obligations'] = args['acceptance_obligations']
-        definition = WorkflowDefinition.model_validate(canonicalize_workflow_capability_arguments(value, registry))
         method = WorkflowPlan.model_validate(ctx.store.get_workflow_plan(ctx.project_id, base['workflow_plan_id'])['plan'])
+        if 'acceptance_obligations' in args:
+            value['acceptance_obligations'] = args['acceptance_obligations']
+        else:
+            value['acceptance_obligations'] = [item for item in value.get('acceptance_obligations', [])
+                                               if item['column'] not in seen]
+            contract = method.task_contract
+            for key in sorted(seen & set(contract.required_behavior_columns)):
+                invalidators = ([key] if key in contract.acceptance_invalidated_by
+                                else list(contract.acceptance_invalidated_by))
+                for check in columns[key]['acceptance_checks']:
+                    if check.get('evidence_kind') == 'behavior':
+                        value['acceptance_obligations'].append({
+                            'column': key, 'check_key': check['key'], 'invalidated_by': invalidators})
+        definition = WorkflowDefinition.model_validate(canonicalize_workflow_capability_arguments(value, registry))
         errors = acceptance_diagnostics(definition, method)
-        if errors:
-            raise PlanAdmissionError(errors)
+        impossible = [item for item in errors if item['message'].startswith((
+            'NonBehaviorCheck:', 'AcceptanceEvidenceScopeCollision:', 'FeedbackContractMissing:'))]
+        if impossible:
+            raise PlanAdmissionError(impossible)
         result = _workflow_publish({'workflow_plan_id':base['workflow_plan_id'],'workflow':definition.model_dump(mode='json')},ctx,registry)
         return {key:result[key] for key in ('id','definition_hash','workflow_plan_id')} | {
-            'changed_columns':sorted(seen),'details_capability':'workflow.inspect'}
+            'changed_columns':sorted(seen),'details_capability':'workflow.inspect',
+            'ready_for_task_plan':not errors, 'remaining_diagnostic_count':len(errors),
+            'remaining_diagnostics':errors[:12]}
 
 
 def _workflow_publish(args: dict[str, Any], ctx: CapabilityContext, registry: CapabilityRegistry) -> dict[str, Any]:
+    from app.v1.services.task_plan_compiler import acceptance_diagnostics, PlanAdmissionError
     _require_user_planning_turn(ctx, "workflow.publish")
     _bind_requirement(ctx, 'v1_workflow_plans', str(args['workflow_plan_id']))
     workflow = WorkflowDefinition.model_validate(
         canonicalize_workflow_capability_arguments(args["workflow"], registry)
     )
+    method = WorkflowPlan.model_validate(ctx.store.get_workflow_plan(
+        ctx.project_id, str(args['workflow_plan_id']))['plan'])
+    impossible_checks = [issue for issue in acceptance_diagnostics(workflow, method)
+                         if issue['message'].startswith(('AcceptanceEvidenceScopeCollision:', 'NonBehaviorCheck:'))]
+    if impossible_checks:
+        raise PlanAdmissionError(impossible_checks)
     result = ctx.store.publish_workflow(ctx.project_id, workflow, str(args["workflow_plan_id"]))
     scope = ctx.store.scopes.for_workflow(result['id'])
     ctx.store.scopes.bind_workflow(result['id'], scope['binding_id'], ctx.requirement_id, ctx.requirement_revision)
@@ -2537,6 +2662,13 @@ def _resolve_current_turn(args, ctx):
 
 def _task_pause(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
     task = ctx.store.get_project_task(ctx.project_id, str(args["task_id"]))
+    job = ctx.store.intents.job_for_run(ctx.agent_run_id, ctx.project_id)
+    contract = ctx.store.intents.contract(job) if job else {}
+    if not (ctx.user_initiated and job and job['trigger_kind'] == 'user' and
+            contract.get('phase') == 'targeted_control' and
+            contract.get('control_capability') == 'task.pause' and
+            contract.get('control_task_id') == task['id']):
+        raise PermissionError('TaskPauseRequiresTargetedControl: the current user turn must explicitly target task.pause for this Task')
     return ctx.store.pause_task(task["id"])
 
 

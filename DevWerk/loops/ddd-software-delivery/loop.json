@@ -162,14 +162,14 @@
         },
         {
           "key": "system_test",
-          "responsibility": "独立QA从用户边界执行后端、前端和集成测试，保留真实命令、退出码和结果。",
+          "responsibility": "一个独立QA Agent 按用户验收边界补充必要的自动化测试源码，执行后端、前端和集成测试，保留真实命令、退出码和结果。",
           "execution_mode": "agent",
           "entry_evidence": [
             "已结对审查的实现",
             "需求验收标准"
           ],
           "exit_evidence": [
-            "自动化测试与集成验证报告"
+            "必要的独立自动化测试源码与集成验证报告"
           ],
           "context_boundary": "不得以阅读代码代替运行测试。",
           "review_or_rework_role": "产品或代码问题携带测试证据返回 integration_review，由其按责任路由。"
@@ -657,7 +657,7 @@
         {
           "key": "system_test",
           "name": "独立自动化与集成测试",
-          "instruction": "作为独立QA读取需求、测试设计和当前实现。真实执行适合项目的单元测试、后端接口测试、前端构建检查和用户关键路径集成测试；记录命令、退出码、环境和结果到 docs/test-report.md。全部通过 complete tests_passed；发现产品或代码问题 complete tests_failed 并给出可执行反馈；环境本身无法验证 complete execution_failed。不得仅凭代码阅读宣称测试通过。",
+          "instruction": "作为独立QA读取需求、测试设计和当前实现。在本 Column 的 e2e/**、tests/** 或 scripts/acceptance/** 中补齐缺失的独立自动化测试及新鲜验收报告生成入口，不修改前后端产品实现；真实执行适合项目的单元测试、后端接口测试、前端构建检查和用户关键路径集成测试。记录命令、退出码、环境和结果到 docs/test-report.md。全部通过 complete tests_passed；发现产品或代码问题 complete tests_failed 并给出可执行反馈；环境本身无法验证 complete execution_failed。不得仅凭代码阅读、构建成功或跳过项宣称行为测试通过。",
           "executor": {
             "kind": "agent",
             "capabilities": [
@@ -706,7 +706,10 @@
             "purpose": "以真实执行证明软件行为",
             "derives_agent": true,
             "writable_paths": [
-              "docs/test-report.md"
+              "docs/test-report.md",
+              "e2e/**",
+              "tests/**",
+              "scripts/acceptance/**"
             ]
           }
         },
