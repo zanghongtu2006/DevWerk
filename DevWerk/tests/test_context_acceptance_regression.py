@@ -276,6 +276,75 @@ def test_acceptance_can_be_configured_one_column_at_a_time_without_weaker_task_a
         assert validation.output['valid'] is (index == len(required) - 1)
 
 
+def test_simple_behavior_runners_freeze_checks_and_derive_obligations(store, tmp_path):
+    from tests.test_task_entry_admission import software_plan
+    from app.v1.domain import WorkflowDefinition
+
+    project, plan, ctx = software_plan(store, tmp_path)
+    complete = store.get_workflow(project['id'])
+    empty = WorkflowDefinition.model_validate(complete['definition'])
+    for column in empty.columns:
+        column.acceptance_checks = []
+    empty.acceptance_obligations = []
+    current = store.publish_workflow(project['id'], empty, complete['workflow_plan_id'])
+    required = ['backend_development', 'frontend_development', 'system_test', 'delivery', 'accept']
+
+    def runner(key):
+        report = f'reports/{key}.json'
+        return {'column':key, 'argv':['python', f'scripts/{key}.py', '--report', report],
+            'report_path':report, 'scenario_ids':['entry-fixture'],
+            'purpose':f'Run real {key} assertions and write the fresh report'}
+
+    for index, batch in enumerate((required[:2], required[2:])):
+        result = store.registry.dispatch('workflow.acceptance.runners', {
+            'base_revision_id':current['id'], 'base_digest':current['definition_hash'],
+            'runners':[runner(key) for key in batch]},
+            replace(ctx, execution_key=f'runner-batch-{index}'))
+        assert result.ok, result.error
+        assert result.output['ready_for_task_plan'] is (index == 1)
+        current = store.get_workflow(project['id'])
+    definition = WorkflowDefinition.model_validate(current['definition'])
+    for key in required:
+        check = definition.column(key).acceptance_checks[0]
+        assert check.evidence_kind == 'behavior' and check.launch_validation == 'deferred'
+        assert check.report_path in check.arguments['argv']
+        obligation = next(item for item in definition.acceptance_obligations
+            if item.column == key and item.check_key == check.key)
+        assert obligation.invalidated_by == ([key] if key.endswith('_development')
+            else ['backend_development','frontend_development'])
+    plan.workflow_revision_id = current['id']
+    validation = store.registry.dispatch('task.plan.validate',
+        {'plan':plan.model_dump(mode='json')}, replace(ctx, execution_key='runner-validate'))
+    assert validation.ok and validation.output['valid'], validation.error
+
+    stale = store.registry.dispatch('workflow.acceptance.runners', {
+        'base_revision_id':complete['id'], 'base_digest':complete['definition_hash'],
+        'runners':[runner('accept')]}, replace(ctx, execution_key='runner-stale'))
+    assert not stale.ok and 'WorkflowRevisionChanged' in str(stale.error)
+
+
+def test_simple_behavior_runner_rejects_missing_report_argument_and_fake_check(store, tmp_path):
+    from tests.test_task_entry_admission import software_plan
+    project, _, ctx = software_plan(store, tmp_path)
+    current = store.get_workflow(project['id'])
+    report = 'reports/backend.json'
+    base = {'base_revision_id':current['id'], 'base_digest':current['definition_hash']}
+    runner = {'column':'backend_development', 'argv':['mvn','compile'],
+        'report_path':report, 'scenario_ids':['entry-fixture'], 'purpose':'Compile backend'}
+    missing = store.registry.dispatch('workflow.acceptance.runners',
+        {**base,'runners':[runner]}, replace(ctx, execution_key='runner-no-report'))
+    assert not missing.ok and 'BehaviorRunnerReportArgumentMissing' in str(missing.error)
+    fake = store.registry.dispatch('workflow.acceptance.runners',
+        {**base,'runners':[{**runner,'argv':['echo',report]}]},
+        replace(ctx, execution_key='runner-echo'))
+    assert not fake.ok and 'NonBehaviorCheck' in str(fake.error)
+    no_scenarios = store.registry.dispatch('workflow.acceptance.runners',
+        {**base,'runners':[{**runner,'argv':['python','backend/acceptance.py',report],
+            'scenario_ids':[]}]}, replace(ctx, execution_key='runner-no-scenarios'))
+    assert not no_scenarios.ok
+    assert store.get_workflow(project['id'])['id'] == current['id']
+
+
 def test_rejects_one_backend_runner_as_distinct_frontend_and_delivery_proof(store, tmp_path):
     from tests.test_task_entry_admission import software_plan
     from app.v1.domain import WorkflowDefinition, WorkflowPlan

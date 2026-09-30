@@ -311,10 +311,9 @@ class ConversationGateway:
                     workflow = self.store.get_workflow(project_id)
                 except KeyError:
                     workflow = None
-                # A Project Session keeps one stable model-visible capability
-                # surface. Turn-specific authority is enforced at dispatch;
-                # changing tool schemas between turns destroys prompt-prefix
-                # reuse and makes the same logical Agent appear to lose tools.
+                # Keep a stable Run capability snapshot. Provider presentation
+                # only hides one-shot authorization tools after a committed grant;
+                # dispatch remains the authority for every business effect.
                 capabilities = [capability for capability in self.registry.all_ids()
                     if capability not in {'conversation.turn.resolve', 'conversation.draft.update'}]
                 trigger_kind = str(job.get("trigger_kind") or "user")
@@ -445,7 +444,7 @@ class ConversationGateway:
                 workflow_publications = [
                     item["result"]["output"]
                     for item in all_invocations
-                    if item["capability"] in {"workflow.publish", "workflow.acceptance.configure"}
+                    if item["capability"] in {"workflow.publish", "workflow.acceptance.configure", "workflow.acceptance.runners"}
                     and item["ok"]
                     and isinstance(item.get("result", {}).get("output"), dict)
                 ]
@@ -695,6 +694,7 @@ def _has_durable_governance_progress(
         "workflow.plan.save",
         "workflow.publish",
         "workflow.acceptance.configure",
+        "workflow.acceptance.runners",
         "loop.apply",
         "agent.worker.send",
     }

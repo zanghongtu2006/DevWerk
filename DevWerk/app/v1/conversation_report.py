@@ -107,7 +107,7 @@ def render_report(store, project_id, run_id, text, *, execution_control=None):
                    'agent.worker.replace': '执行代理已完成交接', 'agent.worker.send': 'Worker 输入已排队',
                    'project.files.write': '项目文件已写入', 'system.files.write': '文件已写入'}
         for item in selected:
-            if item['capability'] == 'workflow.acceptance.configure':
+            if item['capability'] in {'workflow.acceptance.configure', 'workflow.acceptance.runners'}:
                 output = item['result'].get('output') or {}
                 if output.get('ready_for_task_plan') is False:
                     rendered_parts.append(

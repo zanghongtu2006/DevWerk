@@ -1209,7 +1209,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     add('task.plan.contract', 'Read the active Workflow Task input contract, frozen scenario IDs and real entry-evidence candidates before building a Task Plan. Read-only; it does not create or validate a plan.',
         {'type':'object','additionalProperties':False},
         lambda args, ctx: _task_plan_contract(ctx), side_effect_kind='read', delegable_to_column=False)
-    add('workflow.acceptance.configure', 'Configure acceptance on the exact active Workflow revision without resending its graph. base_digest is definition_hash from workflow.inspect or loop.apply. Listed columns replace only their own checks. Omit acceptance_obligations to derive required behavior obligations from the frozen Task Contract and retain untouched columns; explicit obligations replace the full list. Partial revisions are saved, but TaskPlan admission still rejects missing behavior checks or scenario coverage; read ready_for_task_plan and remaining_diagnostics, then configure the next column on the new revision. Each required behavior column needs an executable assertion command, scenario_ids and a fresh devwerk.acceptance-report.v1 report_path. Build/package-only checks are artifacts and cannot replace a behavior check or carry a scenario report. Future entry scripts use launch_validation=deferred. Frozen Tasks retain their old revision.',
+    add('workflow.acceptance.configure', 'Advanced raw acceptance editor. For ordinary behavior runners use workflow.acceptance.runners instead. Configure the exact active Workflow revision without resending its graph. base_digest is definition_hash from workflow.inspect or loop.apply. Listed columns replace only their own checks. Omit acceptance_obligations to derive required behavior obligations from the frozen Task Contract and retain untouched columns; explicit obligations replace the full list. Partial revisions are saved, but TaskPlan admission still rejects missing behavior checks or scenario coverage; read ready_for_task_plan and remaining_diagnostics, then configure the next column on the new revision. Each required behavior column needs an executable assertion command, scenario_ids and a fresh devwerk.acceptance-report.v1 report_path. Build/package-only checks are artifacts and cannot replace a behavior check or carry a scenario report. Future entry scripts use launch_validation=deferred. Frozen Tasks retain their old revision.',
         {'type':'object','required':['base_revision_id','base_digest','columns'],
          'properties':{'base_revision_id':{'type':'string'},'base_digest':{'type':'string'},
            'columns':{'type':'array','minItems':1,'items':{'type':'object','required':['key','acceptance_checks'],
@@ -1217,6 +1217,18 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
            'acceptance_obligations':workflow_schema['properties']['acceptance_obligations']},
          'additionalProperties':False,'$defs':{k:workflow_defs[k] for k in ('AcceptanceCheck','AcceptanceObligation')}},
         lambda args, ctx: _workflow_acceptance_configure(args, ctx, registry), side_effect_kind='control', delegable_to_column=False)
+    add('workflow.acceptance.runners', 'Configure simple behavioral test runners on the active Workflow revision. Each argv starts at the Project root and must include report_path as a separate argument; the future script must execute real assertions and write a fresh devwerk.acceptance-report.v1 JSON there. For example argv=["python","backend/acceptance.py","--report","reports/backend.json"], report_path="reports/backend.json". The script may be created by its Column Worker later. Host fills in behavior check fields and derives invalidation obligations. Submit required columns, then use ready_for_task_plan/remaining_diagnostics before saving the TaskPlan.',
+        {'type':'object','required':['base_revision_id','base_digest','runners'],
+         'properties':{'base_revision_id':{'type':'string'},'base_digest':{'type':'string'},
+           'runners':{'type':'array','minItems':1,'maxItems':30,'items':{
+             'type':'object','required':['column','argv','report_path','scenario_ids','purpose'],
+             'properties':{'column':{'type':'string'},'argv':{'type':'array','minItems':1,
+                 'items':{'type':'string'}},'report_path':{'type':'string','minLength':1},
+               'scenario_ids':{'type':'array','minItems':1,'items':{'type':'string'}},
+               'purpose':{'type':'string','minLength':1}},'additionalProperties':False}}},
+         'additionalProperties':False},
+        lambda args, ctx: _workflow_acceptance_runners(args, ctx, registry),
+        side_effect_kind='control', delegable_to_column=False)
     add('task.successor',
         'Create a terminal Task successor using an explicitly selected corrected TaskPlan and the same proposed_task_ref. The predecessor remains immutable.',
         {'type':'object', 'required':['task_id','task_plan_id'],
@@ -2430,6 +2442,27 @@ def _workflow_acceptance_configure(args, ctx, registry):
             'changed_columns':sorted(seen),'details_capability':'workflow.inspect',
             'ready_for_task_plan':not errors, 'remaining_diagnostic_count':len(errors),
             'remaining_diagnostics':errors[:12]}
+
+
+def _workflow_acceptance_runners(args, ctx, registry):
+    columns = {}
+    for runner in args['runners']:
+        report_path = runner['report_path']
+        ctx.files.resolve(report_path)
+        if report_path not in runner['argv']:
+            raise ValueError('BehaviorRunnerReportArgumentMissing: argv must include report_path as a separate argument')
+        if not runner['scenario_ids'] or not runner['purpose'].strip():
+            raise ValueError('BehaviorRunnerIncomplete: scenario_ids and purpose are required')
+        checks = columns.setdefault(runner['column'], [])
+        checks.append({'key':f'{runner["column"][:90]}_behavior_{len(checks)+1}',
+            'capability':'project.command.run', 'arguments':{'argv':runner['argv']},
+            'evidence_kind':'behavior', 'purpose':runner['purpose'],
+            'scenario_ids':runner['scenario_ids'], 'report_path':report_path,
+            'launch_validation':'deferred'})
+    return _workflow_acceptance_configure({
+        'base_revision_id':args['base_revision_id'], 'base_digest':args['base_digest'],
+        'columns':[{'key':key,'acceptance_checks':checks} for key,checks in columns.items()],
+    }, ctx, registry)
 
 
 def _workflow_publish(args: dict[str, Any], ctx: CapabilityContext, registry: CapabilityRegistry) -> dict[str, Any]:

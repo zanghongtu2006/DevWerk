@@ -200,7 +200,7 @@ def project_result(content, max_bytes):
     if planning is not None:
         planning['projection'] = {'truncated':True,'source_bytes':len(content.encode('utf8')),
             'sha256':digest(original),'reference':reference,'retrieve':'agent.result.read',
-            'note':'Complete planning contract fields; omitted prose and graph instructions remain in the archived result. Use workflow.acceptance.configure to preserve them.'}
+            'note':'Complete planning contract fields; omitted prose and graph instructions remain in the archived result. Use workflow.acceptance.runners for ordinary behavioral checks.'}
         if len(packed(planning).encode('utf8')) <= max_bytes:
             return packed(planning)
     for limit in (2400, 1200, 600, 200, 40):
@@ -248,7 +248,7 @@ def planning_projection(result):
         method = output.get('workflow_plan') or {}
         view = {'workflow':{k:workflow[k] for k in ('id','definition_hash','workflow_plan_id') if k in workflow},
                 'workflow_plan':{'id':method.get('id'),'task_contract':method.get('plan',{}).get('task_contract',{})},
-                'next':'Configure all required column checks and obligations using workflow.acceptance.configure; validate the concrete plan with task.plan.validate.'}
+                'next':'Configure behavioral checks with workflow.acceptance.runners; then validate the concrete plan with task.plan.validate.'}
     elif capability == 'workflow.inspect':
         definition = output.get('definition') or {}
         view = {k:output[k] for k in ('id','definition_hash','workflow_plan_id','source_loop_key','source_loop_version','source_loop_digest') if k in output}
