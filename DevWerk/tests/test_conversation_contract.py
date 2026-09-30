@@ -63,6 +63,7 @@ def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text
         current = next(json.loads(item['content']) for item in reversed(_messages)
             if item['role'] == 'user' and 'authoritative_current_request' in item['content'])
         state = current['authoritative_project_state']
+        assert 'Workers cannot start while this Conversation turn holds the Project planning lease' in state['turn_authority']['instruction']
         if calls <= 2:
             assert state['active_workflow'] is None
         exposed = {item["function"]["name"] for item in tools}
