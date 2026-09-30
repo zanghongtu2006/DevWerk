@@ -184,6 +184,52 @@ def test_committed_execution_hides_one_shot_authorization_from_next_model_reques
     assert len(store.agents.list_requirements(project['id'])) == 1
 
 
+def test_committed_authorization_replay_in_batch_cannot_upgrade_scope_or_stall_delivery(store, tmp_path):
+    project = store.create_project('authorization replay', '', str(tmp_path / 'project'))
+    calls = 0
+
+    def model(_messages, _tools, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return AgentModelResponse(tool_calls=[AgentToolCall(id='first-grant',
+                name='conversation.execution.authorize',
+                arguments={'request':'begin','scope_summary':'original demo'})])
+        if calls == 2:
+            requirement_id = store.agents.list_requirements(project['id'])[0]['id']
+            return AgentModelResponse(tool_calls=[
+                AgentToolCall(id='replayed-grant',name='conversation.execution.authorize',
+                    arguments={'request':'extend','scope_summary':'unapproved extension'}),
+                AgentToolCall(id='inspect',name='project.inspect',arguments={}),
+                AgentToolCall(id='same-requirement',name='requirement.select',
+                    arguments={'requirement_id':requirement_id}),
+            ])
+        if calls == 3:
+            return AgentModelResponse(tool_calls=[AgentToolCall(id='write',
+                name='project.files.write',arguments={'path':'proof.txt','content':'delivered'})])
+        return AgentModelResponse(text=json.dumps({'mode':'work_result',
+            'message':'The original demo scope received its file.', 'tool_call_ids':['write']}))
+
+    registry = build_core_registry()
+    gateway = ConversationGateway(store, registry, agent_core=AgentCore(store, registry, model))
+    accepted = run_turn(gateway, project['id'], 'Build the original demo now.', True)
+    job = store.get_conversation_job(accepted['job']['id'])
+    assert job['status'] == 'succeeded'
+    receipts = {item['tool_call_id']:item for item in store.tool_invocations(
+        project['id'], job['agent_run_id'], hydrate_payloads=True)}
+    assert all(receipts[key]['ok'] for key in ('first-grant','replayed-grant','inspect',
+        'same-requirement','write'))
+    assert receipts['replayed-grant']['result']['output']['already_authorized']
+    assert receipts['first-grant']['result']['output']['turn_contract']['execution_grant_id'] == (
+        receipts['replayed-grant']['result']['output']['turn_contract']['execution_grant_id'])
+    assert store.agents.list_requirements(project['id'])[0]['objective'] == 'original demo'
+    with store.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM v1_execution_grants WHERE project_id=?',
+            (project['id'],)).fetchone()[0] == 1
+        assert db.execute('SELECT COUNT(*) FROM v1_work_intents WHERE project_id=?',
+            (project['id'],)).fetchone()[0] == 1
+
+
 def test_start_task_false_hides_mutations_and_rejects_injected_calls(store, tmp_path):
     project = store.create_project("discussion", "", str(tmp_path / "project"))
     exposed: list[set[str]] = []

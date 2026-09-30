@@ -2733,6 +2733,15 @@ def _resolve_current_turn(args, ctx):
 
 def _authorize_execution(args, ctx):
     job = ctx.store.agents.assert_conversation(ctx)
+    if ctx.store.intents.contract(job).get('phase') == 'execution':
+        with ctx.store.connect() as db:
+            prior = db.execute('SELECT result_json FROM v1_turn_resolutions WHERE job_id=?',
+                (job['id'],)).fetchone()
+        if not prior:
+            raise ValueError('ExecutionGrantMissing: committed turn has no resolution receipt')
+        return {**json.loads(prior['result_json']), 'already_authorized':True,
+            'requested_change_ignored':True,
+            'next_action':'Use the existing execution_grant_id and continue the already authorized work; this replay did not change scope or create a new grant.'}
     state = ctx.store.intents.context(job)
     action = json.loads(job.get('user_action_json') or 'null')
     arguments = {

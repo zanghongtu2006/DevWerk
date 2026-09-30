@@ -49,6 +49,17 @@ def test_narrow_execution_authorization_binds_current_message_and_releases_hold(
         {'path':'proof.txt','content':'authorized'}, ctx).ok
 
 
+def test_committed_discussion_cannot_be_upgraded_by_execution_replay(store, tmp_path):
+    project = store.create_project('discussion replay', '', str(tmp_path/'project'))
+    job, ctx = turn(store, project, '先只讨论')
+    assert resolve(ctx, job).ok
+    denied = store.registry.dispatch('conversation.execution.authorize',
+        {'request':'begin','scope_summary':'unapproved work'},
+        replace(ctx, execution_key='discussion-upgrade'))
+    assert not denied.ok and 'TurnAlreadyResolved' in str(denied.error)
+    assert store.agents.list_requirements(project['id']) == []
+
+
 def test_narrow_authorization_respects_discussion_only_transport_and_task_scope(store, tmp_path):
     from tests.helpers import agent_workflow, create_planned_task, publish_planned_workflow
 

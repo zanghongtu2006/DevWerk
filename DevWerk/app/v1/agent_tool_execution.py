@@ -81,9 +81,17 @@ class AgentToolBatchExecutor:
             if self.spec.kind == "column"
             else None
         )
+        committed_execution = False
+        if self.spec.kind == 'conversation' and self.spec.conversation_job_id:
+            job = self.store.get_conversation_job(self.spec.conversation_job_id)
+            committed_execution = (self.store.intents.contract(job).get('phase') == 'execution'
+                                   and bool(job.get('execution_grant_id')))
+        exclusive = {'conversation.turn.resolve', 'conversation.task.control.authorize',
+                     'conversation.reply'}
+        if not committed_execution:
+            exclusive.add('conversation.execution.authorize')
         if self.spec.kind == 'conversation' and len(tool_calls) > 1 and any(
-            call.name in {'conversation.turn.resolve','conversation.execution.authorize',
-                          'conversation.task.control.authorize','conversation.reply'} for call in tool_calls
+            call.name in exclusive for call in tool_calls
         ):
             protocol_error = 'Submit an execution/control authorization or conversation.reply alone; read its receipt before choosing the next action. This batch had no effects.'
         if protocol_error is not None:
