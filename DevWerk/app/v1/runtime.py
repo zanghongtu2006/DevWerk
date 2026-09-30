@@ -247,6 +247,20 @@ class WorkflowRuntime:
         project = self.store.get_project(task["project_id"])
         selection = context_selection or column.context
         data: dict[str, Any] = {"column": {"key": column.key, "name": column.name}}
+        if task.get('failure_code'):
+            with self.store.connect() as db:
+                previous = db.execute('''SELECT id,error FROM v1_column_runs
+                    WHERE task_id=? AND column_key=? AND status IN ('interrupted','failed')
+                    ORDER BY sequence DESC LIMIT 1''', (task['id'], column.key)).fetchone()
+            if previous:
+                data['retry_failure'] = {
+                    'column_run_id': previous['id'],
+                    'failure_code': task['failure_code'],
+                    'runtime_error': str(previous['error'] or task.get('error') or '')[:300],
+                    'failed_checks': self.store.feedback.latest_failed_checks(task['id'], previous['id']),
+                    'previous_agent_failure': self.store.feedback.latest_agent_failure(
+                        task['id'], previous['id']),
+                }
         preloaded_loop_assets: list[dict[str, Any]] = []
         preloaded_artifacts: list[dict[str, Any]] = []
         revision = self.store.get_workflow_revision(task["project_id"], task["workflow_revision_id"])

@@ -389,7 +389,7 @@ def test_repeated_await_without_progress_stops_before_model_budget(store, tmp_pa
 
 def test_explicit_retry_after_assignment_budget_exhaustion_gets_new_run_and_budget(store, tmp_path):
     wf = agent_workflow()
-    project, task, _ = setup(store, tmp_path, wf, [])
+    project, task, runtime = setup(store, tmp_path, wf, [])
     claimed = store.claim_task(task['id'], 'worker-1')
     run = store.begin_run(claimed, {})
     old = store.agents.assign(claimed, run, wf.column('work'))
@@ -398,8 +398,8 @@ def test_explicit_retry_after_assignment_budget_exhaustion_gets_new_run_and_budg
                    (json.dumps({'code': 'execution_budget_exceeded'}), old['id']))
         db.execute("UPDATE v1_agent_instances SET active_assignment_id=NULL WHERE id=?", (old['agent_instance_id'],))
         db.execute("UPDATE v1_column_attempts SET status='interrupted' WHERE column_run_id=?", (run['id'],))
-        db.execute("UPDATE v1_column_runs SET status='interrupted' WHERE id=?", (run['id'],))
-        db.execute("UPDATE v1_tasks SET status='recovering',control_state='paused',failure_code='execution_budget_exceeded',"
+        db.execute("UPDATE v1_column_runs SET status='interrupted',error='Assignment budget exhausted' WHERE id=?", (run['id'],))
+        db.execute("UPDATE v1_tasks SET status='recovering',control_state='paused',error='Assignment budget exhausted',failure_code='execution_budget_exceeded',"
                    "lease_owner=NULL,lease_until=NULL WHERE id=?", (task['id'],))
     first_input = store.agents.send(project['id'], old['agent_instance_id'],
                                     'Keep the failed check detail', assignment_id=old['id'])
@@ -409,6 +409,10 @@ def test_explicit_retry_after_assignment_budget_exhaustion_gets_new_run_and_budg
     retried = store.retry_task(task['id'], column_key='work', clear_context=True)
     assert retried['status'] == 'pending'
     claimed_again = store.claim_task(task['id'], 'worker-2')
+    retry_failure = runtime._input_for(claimed_again, wf, wf.column('work'))['retry_failure']
+    assert retry_failure['column_run_id'] == run['id']
+    assert retry_failure['failure_code'] == 'execution_budget_exceeded'
+    assert retry_failure['runtime_error'] == 'Assignment budget exhausted'
     new_run = store.begin_run(claimed_again, {})
     fresh = store.agents.assign(claimed_again, new_run, wf.column('work'))
     assert new_run['id'] != run['id']
