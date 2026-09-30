@@ -394,6 +394,29 @@ def test_simple_behavior_runner_rejects_missing_report_argument_and_fake_check(s
     assert flexible.ok, flexible.error
 
 
+def test_advanced_acceptance_editor_rejects_unowned_script(store, tmp_path):
+    from tests.test_task_entry_admission import software_plan
+
+    project, _, ctx = software_plan(store, tmp_path)
+    current = store.get_workflow(project['id'])
+    check = {'key':'verify_backend', 'capability':'project.command.run',
+        'arguments':{'argv':['python','tests/backend_acceptance.py','--report','reports/backend.json']},
+        'evidence_kind':'behavior', 'purpose':'Run backend assertions',
+        'scenario_ids':['entry-fixture'], 'report_path':'reports/backend.json',
+        'launch_validation':'deferred'}
+    base = {'base_revision_id':current['id'], 'base_digest':current['definition_hash']}
+    rejected = store.registry.dispatch('workflow.acceptance.configure',
+        {**base, 'columns':[{'key':'backend_development', 'acceptance_checks':[check]}]},
+        replace(ctx, execution_key='advanced-unowned'))
+    assert not rejected.ok and 'BehaviorRunnerScriptUnowned' in str(rejected.error)
+    assert store.get_workflow(project['id'])['id'] == current['id']
+    check['arguments']['argv'][1] = 'backend/acceptance.py'
+    accepted = store.registry.dispatch('workflow.acceptance.configure',
+        {**base, 'columns':[{'key':'backend_development', 'acceptance_checks':[check]}]},
+        replace(ctx, execution_key='advanced-owned'))
+    assert accepted.ok, accepted.error
+
+
 def test_rejects_one_backend_runner_as_distinct_frontend_and_delivery_proof(store, tmp_path):
     from tests.test_task_entry_admission import software_plan
     from app.v1.domain import WorkflowDefinition, WorkflowPlan

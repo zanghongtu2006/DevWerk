@@ -2431,6 +2431,7 @@ def _workflow_acceptance_configure(args, ctx, registry):
                     if check.get('evidence_kind') == 'behavior':
                         value['acceptance_obligations'].append({
                             'column': key, 'check_key': check['key'], 'invalidated_by': invalidators})
+        _validate_acceptance_script_owners(value, ctx)
         definition = WorkflowDefinition.model_validate(canonicalize_workflow_capability_arguments(value, registry))
         errors = acceptance_diagnostics(definition, method)
         impossible = [item for item in errors if item['message'].startswith((
@@ -2445,36 +2446,6 @@ def _workflow_acceptance_configure(args, ctx, registry):
 
 
 def _workflow_acceptance_runners(args, ctx, registry):
-    base = ctx.store.get_workflow(ctx.project_id)
-    if (base['id'], base['definition_hash']) != (args['base_revision_id'], args['base_digest']):
-        raise ValueError('WorkflowRevisionChanged: inspect the current revision before configuring acceptance')
-    workflow_columns = base['definition']['columns']
-    column_positions = {column['key']: index for index, column in enumerate(workflow_columns)}
-    replacements = {}
-    for runner in args['runners']:
-        replacements.setdefault(runner['column'], []).append(runner)
-
-    def writable(column, script):
-        if 'writable_paths' not in column.get('metadata', {}):
-            return True
-        return any(fnmatch.fnmatchcase(script, pattern.replace('\\', '/'))
-                   for pattern in column.get('metadata', {}).get('writable_paths', []))
-
-    def prior_script_owner(column_key, script):
-        for column in workflow_columns[:column_positions[column_key]]:
-            if not writable(column, script):
-                continue
-            if column['key'] in replacements:
-                candidates = [item['argv'] for item in replacements[column['key']]]
-            else:
-                candidates = [check.get('arguments', {}).get('argv', [])
-                              for check in column.get('acceptance_checks', [])]
-            for argv in candidates:
-                index = _behavior_runner_script_index(argv)
-                if index is not None and argv[index].replace('\\', '/') == script:
-                    return True
-        return False
-
     columns = {}
     for runner in args['runners']:
         report_path = runner['report_path']
@@ -2482,20 +2453,7 @@ def _workflow_acceptance_runners(args, ctx, registry):
         script_index = _behavior_runner_script_index(runner['argv'])
         if script_index is None:
             raise ValueError('BehaviorRunnerScriptMissing: use a dedicated Project-relative .py, .js, .mjs, .ps1, .sh, .cmd or .bat script; Maven/npm with --report cannot write the required report')
-        script = runner['argv'][script_index].replace('\\', '/')
-        script_file = ctx.files.resolve(script)
-        column = next((item for item in workflow_columns
-                       if item['key'] == runner['column']), None)
-        if column is None:
-            raise ValueError('Unknown column; legal columns: '+', '.join(column_positions))
-        if not (script_file.is_file() or writable(column, script)
-                or prior_script_owner(runner['column'], script)):
-            raise ValueError(
-                f'BehaviorRunnerScriptUnowned: {script!r} cannot be created by '
-                f'{runner["column"]}; use its writable_paths '
-                f'{column.get("metadata", {}).get("writable_paths", [])!r}, '
-                'reuse a prior Column acceptance script, or create the script '
-                'before Task planning')
+        ctx.files.resolve(runner['argv'][script_index])
         if report_path not in runner['argv'][script_index+1:]:
             raise ValueError('BehaviorRunnerReportArgumentMissing: argv must include report_path as a separate argument')
         if not runner['scenario_ids'] or not runner['purpose'].strip():
@@ -2510,6 +2468,42 @@ def _workflow_acceptance_runners(args, ctx, registry):
         'base_revision_id':args['base_revision_id'], 'base_digest':args['base_digest'],
         'columns':[{'key':key,'acceptance_checks':checks} for key,checks in columns.items()],
     }, ctx, registry)
+
+
+def _validate_acceptance_script_owners(definition, ctx):
+    columns = definition['columns']
+
+    def writable(column, script):
+        metadata = column.get('metadata') or {}
+        if 'writable_paths' not in metadata:
+            return True
+        return any(fnmatch.fnmatchcase(script, pattern.replace('\\', '/'))
+                   for pattern in metadata['writable_paths'])
+
+    for position, column in enumerate(columns):
+        for check in column.get('acceptance_checks', []):
+            if check.get('evidence_kind') != 'behavior' or check.get('capability') != 'project.command.run':
+                continue
+            argv = (check.get('arguments') or {}).get('argv') or []
+            script_index = _behavior_runner_script_index(argv)
+            if script_index is None:
+                continue
+            script = argv[script_index].replace('\\', '/')
+            if ctx.files.resolve(script).is_file() or writable(column, script):
+                continue
+            owned_earlier = any(
+                writable(prior, script) and any(
+                    (index := _behavior_runner_script_index(
+                        (earlier.get('arguments') or {}).get('argv') or [])) is not None
+                    and (earlier.get('arguments') or {})['argv'][index].replace('\\', '/') == script
+                    for earlier in prior.get('acceptance_checks', []))
+                for prior in columns[:position])
+            if not owned_earlier:
+                raise ValueError(
+                    f'BehaviorRunnerScriptUnowned: {script!r} cannot be created by '
+                    f'{column["key"]}; use its writable_paths '
+                    f'{(column.get("metadata") or {}).get("writable_paths", [])!r}, '
+                    'reuse a prior Column acceptance script, or create the script before Task planning')
 
 
 def _behavior_runner_script_index(argv):
