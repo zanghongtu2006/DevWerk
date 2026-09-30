@@ -41,9 +41,10 @@ class ProviderTurnRequester:
         require_tool: bool,
         required_tool_name: str | None,
     ) -> AgentModelResponse:
-        # Keep one stable tool catalog throughout the Project Agent's session.
-        # Dispatch checks the durable turn grant before business mutations;
-        # discussion, inspection and memory reads need no preliminary tool call.
+        # Keep the Run's capability snapshot stable, but stop advertising
+        # one-shot authorization tools after this Job has committed its boundary.
+        # Dispatch still enforces the durable grant for every business effect.
+        tools = self._visible_tools(tools)
         if self.context is None:
             self.context = ContextManager(self.store, self.spec, self.run_id, self.model_complete)
         working_messages = messages
@@ -101,6 +102,15 @@ class ProviderTurnRequester:
         self.context.observe(response)
         trace_json(trace_log, 'agent.context_budget', **self._trace_context(iteration), **self.context.last_metrics)
         return response
+
+    def _visible_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if self.spec.kind != 'conversation' or not self.spec.conversation_job_id:
+            return tools
+        job = self.store.get_conversation_job(self.spec.conversation_job_id)
+        if self.store.intents.contract(job).get('phase') not in {'execution', 'targeted_control'}:
+            return tools
+        one_shot = {'conversation.execution.authorize', 'conversation.task.control.authorize'}
+        return [tool for tool in tools if tool.get('function', {}).get('name') not in one_shot]
 
     def _trace_context(self, iteration: int) -> dict[str, Any]:
         return {

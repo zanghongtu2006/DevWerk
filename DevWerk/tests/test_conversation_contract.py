@@ -152,6 +152,38 @@ def test_conversation_with_loop_workflow_can_revise_but_cannot_reapply_loop(stor
     assert exposed[0] == exposed[-1]
 
 
+def test_committed_execution_hides_one_shot_authorization_from_next_model_request(store, tmp_path):
+    project = store.create_project('one-shot authorization', '', str(tmp_path / 'project'))
+    exposed = []
+
+    def model(_messages, tools, **_kwargs):
+        names = {item['function']['name'] for item in tools}
+        exposed.append(names)
+        if len(exposed) == 1:
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id='authorize', name='conversation.execution.authorize',
+                arguments={'request':'begin', 'scope_summary':'Build the requested demo'},
+            )])
+        assert 'conversation.execution.authorize' not in names
+        assert 'conversation.task.control.authorize' not in names
+        assert 'project.files.write' in names
+        return AgentModelResponse(tool_calls=[AgentToolCall(
+            id='write', name='project.files.write',
+            arguments={'path':'authorized.txt', 'content':'authorized'},
+        )]) if len(exposed) == 2 else AgentModelResponse(text=json.dumps({
+            'mode':'work_result', 'message':'The requested file was written.',
+            'tool_call_ids':['write'],
+        }))
+
+    registry = build_core_registry()
+    gateway = ConversationGateway(store, registry, agent_core=AgentCore(store, registry, model))
+    accepted = run_turn(gateway, project['id'], 'Build the requested demo now.', True)
+    assert store.get_conversation_job(accepted['job']['id'])['status'] == 'succeeded'
+    assert 'conversation.execution.authorize' in exposed[0]
+    assert len(exposed) == 3
+    assert len(store.agents.list_requirements(project['id'])) == 1
+
+
 def test_start_task_false_hides_mutations_and_rejects_injected_calls(store, tmp_path):
     project = store.create_project("discussion", "", str(tmp_path / "project"))
     exposed: list[set[str]] = []
