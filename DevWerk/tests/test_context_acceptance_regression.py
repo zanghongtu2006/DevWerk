@@ -501,13 +501,29 @@ def test_archive_unicode_pages_are_contiguous_and_project_scoped(store, tmp_path
         arguments={'argv':['unused']},result={'ok':True,'output':{'stdout':source}},ok=True)
     ctx = CapabilityContext(project['id'],project,store)
     from app.v1.capabilities import _agent_result_read
+    from app.v1.context_manager import packed, project_result
     text, offset = '', 0
     while offset is not None:
         result = _agent_result_read({'agent_run_id':run['id'],'tool_call_id':'large','field':'stdout','offset':offset,'limit':8000},ctx)
-        assert len(result['content'].encode('utf8')) <= 2000
+        assert len(result['content'].encode('utf8')) <= 6000
+        if offset == 0:
+            assert len(result['content'].encode('utf8')) > 2000
         text += result['content']
         offset = result['next_offset']
     assert text == source
+    projected_text, offset = '', 0
+    while offset is not None:
+        page = _agent_result_read({'agent_run_id':run['id'],'tool_call_id':'large',
+            'field':'stdout','offset':offset,'limit':8000},ctx)
+        visible = json.loads(project_result(packed({'ok':True,'capability':'agent.result.read',
+            'output':page}), 1200))['output']
+        assert visible['content']
+        assert visible['next_offset'] == (offset+len(visible['content'])
+            if offset+len(visible['content']) < len(source) else None)
+        assert len(packed({'ok':True,'capability':'agent.result.read','output':visible}).encode('utf8')) <= 1200
+        projected_text += visible['content']
+        offset = visible['next_offset']
+    assert projected_text == source
     other = store.create_project('other','',str(tmp_path/'other'))
     with pytest.raises(ValueError,match='outside'):
         _agent_result_read({'agent_run_id':run['id'],'tool_call_id':'large'},CapabilityContext(other['id'],other,store))

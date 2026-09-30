@@ -2544,6 +2544,7 @@ def _agent_evidence_list(args, ctx):
 
 
 def _agent_result_read(args, ctx):
+    from app.v1.context_projection import slice_source_text
     with ctx.store.connect() as db:
         row = db.execute('''SELECT t.result_json FROM v1_tool_invocations t
             JOIN v1_agent_runs r ON r.id=t.agent_run_id
@@ -2556,18 +2557,13 @@ def _agent_result_read(args, ctx):
     if args.get('field','result') != 'result':
         content = str((json.loads(content).get('output') or {}).get(args['field'],'') or '')
     offset, limit = int(args.get('offset',0)), min(int(args.get('limit',4000)),8000)
-    chunk = content[offset:offset+limit]
-    # Pagination must advance by exactly the data returned, including Unicode.
-    # Keep pages small enough that ordinary provider projection need not remove
-    # their middle while retaining a next_offset that skips unseen evidence.
-    byte_limit = max(128,min(2000,ctx.store.policy.context.tool_result_tokens//2))
-    while len(chunk.encode('utf8')) > byte_limit:
-        chunk = chunk[:max(1,len(chunk)//2)]
-    end = offset+len(chunk)
+    byte_limit = max(512,min(6000,ctx.store.policy.context.tool_result_tokens*3//2))
+    chunk, next_offset = slice_source_text(content, offset=offset,
+        max_characters=limit, max_bytes=byte_limit)
     return {'agent_run_id':args['agent_run_id'],'tool_call_id':args['tool_call_id'],
             'field':args.get('field','result'),'offset':offset,'content':chunk,
             'total_characters':len(content),'sha256':hashlib.sha256(content.encode('utf8')).hexdigest(),
-            'next_offset':end if end<len(content) else None}
+            'next_offset':next_offset}
 
 
 def _task_list(args: dict[str, Any], ctx: CapabilityContext) -> list[dict[str, Any]]:

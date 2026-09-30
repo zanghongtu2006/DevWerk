@@ -100,6 +100,29 @@ def project_result(content, max_bytes):
         original = {'output': content}
     if not isinstance(original, dict):
         original = {'output': original}
+    if original.get('capability') == 'agent.result.read' and isinstance(original.get('output'), dict):
+        output = original['output']
+        if isinstance(output.get('content'), str) and isinstance(output.get('offset'), int):
+            from app.v1.context_projection import slice_source_text
+            source, offset = output['content'], output['offset']
+            total = output.get('total_characters', offset + len(source))
+            budget = max_bytes
+            while budget >= 4:
+                page, _ = slice_source_text(source, offset=0,
+                    max_characters=len(source), max_bytes=budget)
+                next_offset = offset + len(page)
+                view = {**original, 'output': {**output, 'content': page,
+                    'next_offset': next_offset if next_offset < total else None,
+                    'content_complete': next_offset >= total}}
+                encoded = packed(view)
+                if len(encoded.encode('utf-8')) <= max_bytes:
+                    return encoded
+                budget //= 2
+            view = {**original, 'output': {key:output.get(key) for key in
+                ('agent_run_id','tool_call_id','field','offset','total_characters','sha256')}}
+            view['output'].update(content='', next_offset=offset,
+                content_complete=False, projection_deferred=True)
+            return packed(view)
     if original.get('capability') == 'project.files.read' and isinstance(original.get('output'), dict):
         output = original['output']
         if isinstance(output.get('content'), str) and isinstance(output.get('offset'), int):
