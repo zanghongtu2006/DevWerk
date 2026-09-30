@@ -145,6 +145,7 @@ def repeats_failed_operation(
             for index in range(len(entries) - 1, -1, -1)
             if str(entries[index].get("capability") or "") == capability
             and str(entries[index].get("operation_sha256") or "") == operation_hash
+            and not _batch_protocol_rejection(entries[index])
             and (
                 not entries[index].get("ok")
                 or entries[index].get("status") != "completed"
@@ -192,6 +193,14 @@ def _rejected_before_effect(item: dict[str, Any]) -> bool:
         )
         == "rejected_before_effect"
     )
+
+
+def _batch_protocol_rejection(item: dict[str, Any]) -> bool:
+    result = ((item.get('facts') or {}).get('result') or {})
+    error = result.get('error') or {}
+    return (_rejected_before_effect(item)
+            and error.get('type') == 'ConversationTurnProtocolError'
+            and 'This batch had no effects.' in str(error.get('message') or ''))
 
 
 def _entity_ids(value: Any) -> set[str]:

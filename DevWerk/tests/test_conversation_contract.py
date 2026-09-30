@@ -240,6 +240,50 @@ def test_committed_authorization_replay_in_batch_cannot_upgrade_scope_or_stall_d
             (project['id'],)).fetchone()[0] == 1
 
 
+def test_rejected_authorization_batch_can_be_corrected_with_same_solo_call(store, tmp_path):
+    project = store.create_project('authorization batch correction', '', str(tmp_path / 'project'))
+    calls = 0
+
+    def model(_messages, _tools, **_kwargs):
+        nonlocal calls
+        calls += 1
+        authorization = {'request':'begin', 'scope_summary':'original demo'}
+        if calls == 1:
+            return AgentModelResponse(tool_calls=[
+                AgentToolCall(id='batched-grant', name='conversation.execution.authorize',
+                    arguments=authorization),
+                AgentToolCall(id='batched-read', name='loop.inspect',
+                    arguments={'loop_key':'software.ddd_delivery'}),
+            ])
+        if calls == 2:
+            assert store.agents.list_requirements(project['id']) == []
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id='solo-grant', name='conversation.execution.authorize',
+                arguments=authorization)])
+        if calls == 3:
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id='write', name='project.files.write',
+                arguments={'path':'proof.txt', 'content':'delivered'})])
+        return AgentModelResponse(text=json.dumps({'mode':'work_result',
+            'message':'The authorized demo received its file.', 'tool_call_ids':['write']}))
+
+    registry = build_core_registry()
+    gateway = ConversationGateway(store, registry, agent_core=AgentCore(store, registry, model))
+    accepted = run_turn(gateway, project['id'], 'Build the original demo now.', True)
+    job = store.get_conversation_job(accepted['job']['id'])
+    assert job['status'] == 'succeeded'
+    receipts = {item['tool_call_id']:item for item in store.tool_invocations(
+        project['id'], job['agent_run_id'], hydrate_payloads=True)}
+    assert not receipts['batched-grant']['ok']
+    assert receipts['batched-grant']['result']['checkpoint']['failure_disposition'] == 'rejected_before_effect'
+    assert not receipts['batched-read']['ok']
+    assert receipts['solo-grant']['ok'] and receipts['write']['ok']
+    assert len(store.agents.list_requirements(project['id'])) == 1
+    with store.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM v1_execution_grants WHERE project_id=?',
+            (project['id'],)).fetchone()[0] == 1
+
+
 def test_start_task_false_hides_mutations_and_rejects_injected_calls(store, tmp_path):
     project = store.create_project("discussion", "", str(tmp_path / "project"))
     exposed: list[set[str]] = []
