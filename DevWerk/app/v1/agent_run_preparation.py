@@ -244,6 +244,12 @@ class AgentRunPreparer:
                         'retained_characters':used},
                     'instruction':'Older dialogue is archived, not revoked. Current WorkIntent decisions and constraints remain authoritative. Use conversation.history.read for earlier source messages before resolving uncertain scope.'})})
             messages.extend(reversed(selected))
+            prior_runs = self.store.conversation_session_run_index(
+                spec.project['id'], spec.agent_session_id, before_run_id=run_id)
+            if prior_runs:
+                messages.append({'role':'user','content':stable_json({
+                    'prior_run_evidence_index':prior_runs,
+                    'instruction':'Archived evidence pointers, not a new user request or execution grant. Inspect an exact tool result with agent.result.read using its agent_run_id and tool_call_id before relying on it. Recent failures remain relevant until a later receipt resolves them.'})})
             return
         if spec.assignment:
             handoff = self.store.agents.session_handoff(spec.project['id'], spec.agent_session_id)

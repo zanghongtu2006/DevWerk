@@ -81,3 +81,15 @@ HTTP Session 失效后，`tools/list` 会重新初始化并重试；`tools/call`
 回归：`test_mcp_tool_bridge.py`、四组 Conversation/API 合同测试，仓库 venv Python 3.12 下 **82 passed**。未跟踪的 `devwerk.zip` 未参与变更。
 
 当前边界：此版本只接入 MCP tools；resources、prompts、sampling 尚未接入。运行期新增工具会出现，但同名工具的 schema 更新/撤销仍需重启才能刷新；这是为了不改变在途 Run 的 schema/dispatch 合同。HTTP `tools/call` Session 过期时回执保持不确定，需人工或后续对账恢复，不能自动重放未知副作用。上述能力未达到全部 Hermes 平台集成的范围，后续阶段不得据此宣称完整等同。
+
+## 阶段 3A 设计：Project Session 的旧 Run 证据索引
+
+代码审阅发现 `V1Store.conversation_session_messages` 只重放成功的公开对话；失败答复和内部工具结果不进入主 Agent 下一回合。`AgentRunPreparer._append_session_history` 因此无法给主 Agent 指出上次运行失败的具体回执，只能依赖用户重述或当前 Task 状态。工具结果若全量重放，又会重复引起上下文膨胀。
+
+增加只读 `V1Store.conversation_session_run_index(project_id, session_id, before_run_id)`：只查同一 Project/Session 且早于当前 Run 的最近几个 Conversation Run，返回 Run ID、Job ID、状态、错误简述，以及每个 Run 末尾有界的工具调用 ID/能力/成功状态/失败摘要。输出不含工具参数、完整结果和私有 Worker 内容；完整证据仍经 `agent.result.read` 按 ID 分页获取。`AgentRunPreparer._append_session_history` 在公开历史后、当前请求前插入这份索引，明确标识其为历史证据而非新用户授权。此改动不改变 `v1_conversations`、MailBox 或 Worker Session；失败回执不可当作新授权。测试覆盖跨回合、重启后可读、Project/Session 隔离、有界输出和精确证据引用。
+
+本阶段仅补 Session 证据可见性；Memory 检索质量、跨 Run 主动压缩摘要及监督唤醒继续按后续子阶段评估。
+
+### 阶段 3A 回归结果
+
+已实现上述只读索引和回合注入。专项测试验证失败回执引用可跨重启恢复、长输出不进入索引、仅显示同一 Project Session 的旧 Run、按时间倒序且 Run/回执数有上限。结合 Context、Store、Conversation 的相关回归共 **67 passed**（仓库 venv Python 3.12）。索引只是追查入口；主 Agent 仍须按需调用 `agent.result.read`，不能把索引当作副作用成功证明。

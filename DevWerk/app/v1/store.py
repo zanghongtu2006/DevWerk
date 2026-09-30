@@ -2330,6 +2330,58 @@ class V1Store:
                 projected.append({"role": role, "content": str(row["content"] or "")})
         return projected
 
+    def conversation_session_run_index(
+        self,
+        project_id: str,
+        conversation_session_id: str,
+        *,
+        before_run_id: str,
+        run_limit: int = 3,
+        receipt_limit: int = 6,
+    ) -> list[dict[str, Any]]:
+        """Bounded pointers to prior Project Agent runs, not a tool-log replay."""
+        run_limit = min(max(run_limit, 1), 5)
+        receipt_limit = min(max(receipt_limit, 1), 10)
+        with self.connect() as db:
+            current = db.execute(
+                "SELECT rowid FROM v1_agent_runs WHERE id=? AND project_id=? "
+                "AND agent_session_id=? AND kind='conversation'",
+                (before_run_id, project_id, conversation_session_id),
+            ).fetchone()
+            if current is None:
+                raise ValueError('Conversation Run is outside this Project Session')
+            runs = db.execute(
+                "SELECT id,conversation_job_id,status,error FROM v1_agent_runs "
+                "WHERE project_id=? AND agent_session_id=? AND kind='conversation' "
+                "AND rowid<? ORDER BY rowid DESC LIMIT ?",
+                (project_id, conversation_session_id, current['rowid'], run_limit),
+            ).fetchall()
+            index = []
+            for run in runs:
+                receipts = db.execute(
+                    "SELECT tool_call_id,capability,ok,result_json FROM v1_tool_invocations "
+                    "WHERE project_id=? AND agent_run_id=? ORDER BY sequence DESC LIMIT ?",
+                    (project_id, run['id'], receipt_limit),
+                ).fetchall()
+                summary = []
+                for receipt in reversed(receipts):
+                    item = {'tool_call_id':receipt['tool_call_id'],
+                            'capability':receipt['capability'], 'ok':bool(receipt['ok'])}
+                    if not receipt['ok']:
+                        try:
+                            result = json.loads(receipt['result_json'])
+                            error = result.get('error') or {}
+                            item['error_type'] = str(error.get('type') or '')[:100]
+                            item['error_message'] = str(error.get('message') or '')[:300]
+                        except (TypeError, ValueError, AttributeError):
+                            item['error_type'] = 'UnreadableReceipt'
+                    summary.append(item)
+                index.append({'agent_run_id':run['id'],
+                              'conversation_job_id':run['conversation_job_id'],
+                              'status':run['status'], 'error':str(run['error'] or '')[:400],
+                              'recent_receipts':summary})
+        return index
+
     def agent_session_messages(self, project_id: str, agent_session_id: str) -> list[dict[str, Any]]:
         with self.connect() as db:
             rows = db.execute(
