@@ -291,7 +291,12 @@ def test_simple_behavior_runners_freeze_checks_and_derive_obligations(store, tmp
 
     def runner(key):
         report = f'reports/{key}.json'
-        return {'column':key, 'argv':['python', f'scripts/{key}.py', '--report', report],
+        script = {'backend_development':'backend/acceptance.py',
+                  'frontend_development':'frontend/acceptance.py',
+                  'system_test':'scripts/acceptance/system_test.py',
+                  'delivery':'scripts/acceptance/system_test.py',
+                  'accept':'scripts/acceptance/system_test.py'}[key]
+        return {'column':key, 'argv':['python', script, '--report', report],
             'report_path':report, 'scenario_ids':['entry-fixture'],
             'purpose':f'Run real {key} assertions and write the fresh report'}
 
@@ -325,6 +330,7 @@ def test_simple_behavior_runners_freeze_checks_and_derive_obligations(store, tmp
 
 def test_simple_behavior_runner_rejects_missing_report_argument_and_fake_check(store, tmp_path):
     from tests.test_task_entry_admission import software_plan
+    from app.v1.domain import WorkflowDefinition
     project, _, ctx = software_plan(store, tmp_path)
     current = store.get_workflow(project['id'])
     report = 'reports/backend.json'
@@ -348,6 +354,17 @@ def test_simple_behavior_runner_rejects_missing_report_argument_and_fake_check(s
         {**base,'runners':[{**runner,'argv':['python','../outside.py',report]}]},
         replace(ctx, execution_key='runner-outside'))
     assert not outside.ok and 'escapes project' in str(outside.error)
+    unowned = store.registry.dispatch('workflow.acceptance.runners',
+        {**base,'runners':[{**runner,'argv':['python','scripts/backend_acceptance.py',report]}]},
+        replace(ctx, execution_key='runner-unowned'))
+    assert not unowned.ok and 'BehaviorRunnerScriptUnowned' in str(unowned.error)
+    ctx.files.write_text('scripts/preexisting.py', 'print("ready")\n')
+    existing = store.registry.dispatch('workflow.acceptance.runners',
+        {**base,'runners':[{**runner,'argv':['python','scripts/preexisting.py',report]}]},
+        replace(ctx, execution_key='runner-existing'))
+    assert existing.ok, existing.error
+    current = store.get_workflow(project['id'])
+    base = {'base_revision_id':current['id'], 'base_digest':current['definition_hash']}
     no_scenarios = store.registry.dispatch('workflow.acceptance.runners',
         {**base,'runners':[{**runner,'argv':['python','backend/acceptance.py',report],
             'scenario_ids':[]}]}, replace(ctx, execution_key='runner-no-scenarios'))
@@ -366,6 +383,15 @@ def test_simple_behavior_runner_rejects_missing_report_argument_and_fake_check(s
                 'frontend/acceptance.ps1','-Report',ps_report],
             'report_path':ps_report}]}, replace(ctx, execution_key='runner-powershell'))
     assert powershell.ok, powershell.error
+    current = store.get_workflow(project['id'])
+    unrestricted = WorkflowDefinition.model_validate(current['definition'])
+    unrestricted.column('backend_development').metadata.pop('writable_paths')
+    current = store.publish_workflow(project['id'], unrestricted, current['workflow_plan_id'])
+    flexible = store.registry.dispatch('workflow.acceptance.runners', {
+        'base_revision_id':current['id'], 'base_digest':current['definition_hash'],
+        'runners':[{**runner, 'argv':['python','scripts/unrestricted.py',report]}]},
+        replace(ctx, execution_key='runner-unrestricted'))
+    assert flexible.ok, flexible.error
 
 
 def test_rejects_one_backend_runner_as_distinct_frontend_and_delivery_proof(store, tmp_path):
