@@ -1217,7 +1217,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
            'acceptance_obligations':workflow_schema['properties']['acceptance_obligations']},
          'additionalProperties':False,'$defs':{k:workflow_defs[k] for k in ('AcceptanceCheck','AcceptanceObligation')}},
         lambda args, ctx: _workflow_acceptance_configure(args, ctx, registry), side_effect_kind='control', delegable_to_column=False)
-    add('workflow.acceptance.runners', 'Configure simple behavioral test runners on the active Workflow revision. Each argv starts at the Project root and must include report_path as a separate argument; the future script must execute real assertions and write a fresh devwerk.acceptance-report.v1 JSON there. For example argv=["python","backend/acceptance.py","--report","reports/backend.json"], report_path="reports/backend.json". The script may be created by its Column Worker later. Host fills in behavior check fields and derives invalidation obligations. Submit required columns, then use ready_for_task_plan/remaining_diagnostics before saving the TaskPlan.',
+    add('workflow.acceptance.runners', 'Configure simple behavioral test runners on the active Workflow revision. Each argv starts at the Project root and must invoke a dedicated Project-relative Python/Node/PowerShell/shell script, then pass report_path as a separate argument. Maven/npm commands with --report are not report-producing scripts. The Column Worker may create the script later; it must execute real assertions and write fresh devwerk.acceptance-report.v1 JSON. Example: argv=["python","backend/acceptance.py","--report","reports/backend.json"], report_path="reports/backend.json". Host derives check fields and invalidation obligations. Submit required columns, then inspect ready_for_task_plan/remaining_diagnostics before saving the TaskPlan.',
         {'type':'object','required':['base_revision_id','base_digest','runners'],
          'properties':{'base_revision_id':{'type':'string'},'base_digest':{'type':'string'},
            'runners':{'type':'array','minItems':1,'maxItems':30,'items':{
@@ -2449,7 +2449,11 @@ def _workflow_acceptance_runners(args, ctx, registry):
     for runner in args['runners']:
         report_path = runner['report_path']
         ctx.files.resolve(report_path)
-        if report_path not in runner['argv']:
+        script_index = _behavior_runner_script_index(runner['argv'])
+        if script_index is None:
+            raise ValueError('BehaviorRunnerScriptMissing: use a dedicated Project-relative .py, .js, .mjs, .ps1, .sh, .cmd or .bat script; Maven/npm with --report cannot write the required report')
+        ctx.files.resolve(runner['argv'][script_index])
+        if report_path not in runner['argv'][script_index+1:]:
             raise ValueError('BehaviorRunnerReportArgumentMissing: argv must include report_path as a separate argument')
         if not runner['scenario_ids'] or not runner['purpose'].strip():
             raise ValueError('BehaviorRunnerIncomplete: scenario_ids and purpose are required')
@@ -2463,6 +2467,31 @@ def _workflow_acceptance_runners(args, ctx, registry):
         'base_revision_id':args['base_revision_id'], 'base_digest':args['base_digest'],
         'columns':[{'key':key,'acceptance_checks':checks} for key,checks in columns.items()],
     }, ctx, registry)
+
+
+def _behavior_runner_script_index(argv):
+    if not argv:
+        return None
+    executable = argv[0].replace('\\', '/').rsplit('/', 1)[-1].lower()
+    if executable in {'python', 'python.exe', 'py', 'py.exe'}:
+        index, extensions = 1, ('.py',)
+    elif executable in {'node', 'node.exe'}:
+        index, extensions = 1, ('.js', '.mjs', '.cjs')
+    elif executable in {'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe'}:
+        lowered = [str(item).lower() for item in argv]
+        if '-file' not in lowered:
+            return None
+        index, extensions = lowered.index('-file')+1, ('.ps1',)
+    elif executable in {'bash', 'bash.exe', 'sh', 'sh.exe'}:
+        index, extensions = 1, ('.sh',)
+    elif executable in {'cmd', 'cmd.exe'}:
+        lowered = [str(item).lower() for item in argv]
+        if '/c' not in lowered:
+            return None
+        index, extensions = lowered.index('/c')+1, ('.cmd', '.bat')
+    else:
+        return None
+    return index if index < len(argv) and argv[index].lower().endswith(extensions) else None
 
 
 def _workflow_publish(args: dict[str, Any], ctx: CapabilityContext, registry: CapabilityRegistry) -> dict[str, Any]:

@@ -329,7 +329,7 @@ def test_simple_behavior_runner_rejects_missing_report_argument_and_fake_check(s
     current = store.get_workflow(project['id'])
     report = 'reports/backend.json'
     base = {'base_revision_id':current['id'], 'base_digest':current['definition_hash']}
-    runner = {'column':'backend_development', 'argv':['mvn','compile'],
+    runner = {'column':'backend_development', 'argv':['python','backend/acceptance.py'],
         'report_path':report, 'scenario_ids':['entry-fixture'], 'purpose':'Compile backend'}
     missing = store.registry.dispatch('workflow.acceptance.runners',
         {**base,'runners':[runner]}, replace(ctx, execution_key='runner-no-report'))
@@ -337,12 +337,35 @@ def test_simple_behavior_runner_rejects_missing_report_argument_and_fake_check(s
     fake = store.registry.dispatch('workflow.acceptance.runners',
         {**base,'runners':[{**runner,'argv':['echo',report]}]},
         replace(ctx, execution_key='runner-echo'))
-    assert not fake.ok and 'NonBehaviorCheck' in str(fake.error)
+    assert not fake.ok and 'BehaviorRunnerScriptMissing' in str(fake.error)
+    for name, argv in [('maven',['mvnw.cmd','test','--report',report]),
+                       ('npm',['npm','test','--report',report])]:
+        rejected = store.registry.dispatch('workflow.acceptance.runners',
+            {**base,'runners':[{**runner,'argv':argv}]},
+            replace(ctx, execution_key=f'runner-{name}'))
+        assert not rejected.ok and 'BehaviorRunnerScriptMissing' in str(rejected.error)
+    outside = store.registry.dispatch('workflow.acceptance.runners',
+        {**base,'runners':[{**runner,'argv':['python','../outside.py',report]}]},
+        replace(ctx, execution_key='runner-outside'))
+    assert not outside.ok and 'escapes project' in str(outside.error)
     no_scenarios = store.registry.dispatch('workflow.acceptance.runners',
         {**base,'runners':[{**runner,'argv':['python','backend/acceptance.py',report],
             'scenario_ids':[]}]}, replace(ctx, execution_key='runner-no-scenarios'))
     assert not no_scenarios.ok
     assert store.get_workflow(project['id'])['id'] == current['id']
+    node = store.registry.dispatch('workflow.acceptance.runners',
+        {**base,'runners':[{**runner,'argv':['node','backend/acceptance.mjs',report]}]},
+        replace(ctx, execution_key='runner-node'))
+    assert node.ok, node.error
+    current = store.get_workflow(project['id'])
+    ps_report = 'reports/frontend.json'
+    powershell = store.registry.dispatch('workflow.acceptance.runners', {
+        'base_revision_id':current['id'],'base_digest':current['definition_hash'],
+        'runners':[{**runner,'column':'frontend_development',
+            'argv':['powershell','-ExecutionPolicy','Bypass','-File',
+                'frontend/acceptance.ps1','-Report',ps_report],
+            'report_path':ps_report}]}, replace(ctx, execution_key='runner-powershell'))
+    assert powershell.ok, powershell.error
 
 
 def test_rejects_one_backend_runner_as_distinct_frontend_and_delivery_proof(store, tmp_path):

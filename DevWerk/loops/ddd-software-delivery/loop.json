@@ -468,7 +468,7 @@
         {
           "key": "backend_development",
           "name": "后端实现与定向返修",
-          "instruction": "读取需求、DDD、架构、API契约、测试设计、当前后端源码和前序 Column 反馈。实现服务端领域、应用和适配器代码并运行后端开发测试；不得修改 frontend/**、交付文件或最终验收文件。完成后 complete backend_ready；需求无法支持实现 complete requirement_gap；无法继续 complete execution_failed。",
+          "instruction": "读取需求、DDD、架构、API契约、测试设计、当前后端源码和前序 Column 反馈。实现服务端领域、应用和适配器代码并运行后端开发测试；读取本列冻结的 acceptance_checks，在 backend/** 实现其专用测试入口，运行真实断言并每次生成新鲜的 devwerk.acceptance-report.v1 报告。开发测试和冻结检查可通过后尽快 complete backend_ready；不得修改 frontend/**、交付文件或最终验收文件。需求无法支持实现 complete requirement_gap；无法继续 complete execution_failed。",
           "executor": {
             "kind": "agent",
             "capabilities": [
@@ -528,7 +528,7 @@
         {
           "key": "frontend_development",
           "name": "前端实现与定向返修",
-          "instruction": "读取需求、架构、API契约、已实现后端、当前前端源码和前序 Column 反馈。实现客户端交互、状态、接口适配和前端开发测试，并用真实命令验证前后端契约；不得修改 backend/**、交付文件或最终验收文件。完成后 complete frontend_ready；发现后端契约问题 complete backend_contract_issue 并给出端点、请求、响应和期望；需求无法支持实现 complete requirement_gap；无法继续 complete execution_failed。",
+          "instruction": "读取需求、架构、API契约、已实现后端、当前前端源码和前序 Column 反馈。实现客户端交互、状态、接口适配和前端开发测试，并用真实命令验证前后端契约；读取本列冻结的 acceptance_checks，在 frontend/** 实现其专用测试入口，运行真实断言并每次生成新鲜的 devwerk.acceptance-report.v1 报告。开发测试和冻结检查可通过后尽快 complete frontend_ready；不得修改 backend/**、交付文件或最终验收文件。发现后端契约问题 complete backend_contract_issue 并给出端点、请求、响应和期望；需求无法支持实现 complete requirement_gap；无法继续 complete execution_failed。",
           "executor": {
             "kind": "agent",
             "capabilities": [
@@ -657,7 +657,7 @@
         {
           "key": "system_test",
           "name": "独立自动化与集成测试",
-          "instruction": "作为独立QA读取需求、测试设计和当前实现。在本 Column 的 e2e/**、tests/** 或 scripts/acceptance/** 中补齐缺失的独立自动化测试及新鲜验收报告生成入口，不修改前后端产品实现；真实执行适合项目的单元测试、后端接口测试、前端构建检查和用户关键路径集成测试。记录命令、退出码、环境和结果到 docs/test-report.md。全部通过 complete tests_passed；发现产品或代码问题 complete tests_failed 并给出可执行反馈；环境本身无法验证 complete execution_failed。不得仅凭代码阅读、构建成功或跳过项宣称行为测试通过。",
+          "instruction": "作为独立QA读取需求、测试设计和当前实现。在本 Column 的 e2e/**、tests/** 或 scripts/acceptance/** 中补齐缺失的独立自动化测试及冻结 acceptance_checks 所需的新鲜验收报告入口，不修改前后端产品实现；真实执行适合项目的单元测试、后端接口测试、前端构建检查和用户关键路径集成测试，报告遵循 devwerk.acceptance-report.v1。记录命令、退出码、环境和结果到 docs/test-report.md。全部通过后尽快 complete tests_passed；发现产品或代码问题 complete tests_failed 并给出可执行反馈；环境本身无法验证 complete execution_failed。不得仅凭代码阅读、构建成功或跳过项宣称行为测试通过。",
           "executor": {
             "kind": "agent",
             "capabilities": [
