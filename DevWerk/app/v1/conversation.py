@@ -229,7 +229,9 @@ class ConversationGateway:
             self._pending.pop(project_id, None)
 
     async def _run_turn(self, job: dict[str, Any], session_owner: str) -> None:
-        control = ExecutionControl(time.monotonic()+self.policy.execution.agent_wall_seconds,
+        wall_seconds = (min(self.policy.execution.agent_wall_seconds, 600)
+                        if job.get('trigger_kind') != 'user' else self.policy.execution.agent_wall_seconds)
+        control = ExecutionControl(time.monotonic()+wall_seconds,
                                    validate_owner=lambda: self.store.assert_conversation_owner(job))
         lease_task = asyncio.create_task(
             self._renew_session_lease(str(job["project_id"]), session_owner, control),
@@ -367,6 +369,8 @@ class ConversationGateway:
                             + (" This is a supervision wakeup for one failed Task under an existing user Grant. "
                                "The mailbox only identifies the event; inspect the Task and feedback yourself. "
                                "Only same-Task retry/reopen or input to its current Worker Assignment is permitted. "
+                               "For a blocked Worker, inspect concrete failure evidence and send concise diagnostic input before retrying; the input follows its next Assignment. "
+                               "One successful recovery ends this notification turn, so send any Worker input first. "
                                "Do not create scope, Workflow, Task, files or a new user grant. "
                                "Finish with conversation.reply and cite real receipts; the user notification is rendered from current Task state."
                                if supervision else "")

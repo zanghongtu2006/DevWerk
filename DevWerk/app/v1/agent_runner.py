@@ -99,7 +99,9 @@ class AgentExecutionRunner:
                         ).fetchone()
                     if uncertain:
                         raise ExecutionReplayUncertain('Runtime acceptance effect requires reconciliation: '+uncertain['execution_key'])
-                if iteration >= limits.agent_max_iterations or calls_used >= limits.agent_max_tool_calls:
+                max_iterations = min(limits.agent_max_iterations, 20) if spec.supervision_turn else limits.agent_max_iterations
+                max_tool_calls = min(limits.agent_max_tool_calls, 50) if spec.supervision_turn else limits.agent_max_tool_calls
+                if iteration >= max_iterations or calls_used >= max_tool_calls:
                     raise ExecutionBudgetExceeded("Agent iteration/tool-call ceiling reached")
                 iteration += 1
                 current_iteration = iteration
@@ -148,7 +150,7 @@ class AgentExecutionRunner:
 
                 if response.tool_calls:
                     control.check()
-                    if calls_used + len(response.tool_calls) > limits.agent_max_tool_calls:
+                    if calls_used + len(response.tool_calls) > max_tool_calls:
                         raise ExecutionBudgetExceeded("Agent tool-call ceiling reached")
                     calls_used += len(response.tool_calls)
                     batch = tool_batch_executor.execute(
@@ -171,6 +173,18 @@ class AgentExecutionRunner:
                             run["id"], response.text, batch.wait_request,
                             iteration, calls_used,
                         )
+                    if spec.supervision_turn:
+                        recovery = next((entry for entry in batch.ledger_entries
+                            if entry['ok'] and entry['capability'] in {'task.retry','task.reopen'}), None)
+                        if recovery:
+                            from app.v1.conversation_report import render_report
+                            task_id = spec.context['turn_contract']['supervised_task_id']
+                            report_text = json.dumps({'mode':'work_result','task_ids':[task_id],
+                                'tool_call_ids':[recovery['tool_call_id']]})
+                            rendered, evidence = render_report(self.store, spec.project['id'],
+                                run['id'], report_text, execution_control=control)
+                            result = self._finish_text(run['id'], rendered, iteration, calls_used)
+                            return replace(result, completion={'conversation_report':evidence})
                     continue
 
                 if spec.kind == "column":

@@ -309,7 +309,7 @@ class ConversationIntentRepository:
         with self.store.connect() as db:
             grant = db.execute("SELECT state,requirement_id,requirement_revision FROM v1_execution_grants WHERE id=? AND project_id=?",
                                (job['execution_grant_id'],ctx.project_id)).fetchone()
-            task = db.execute('SELECT requirement_id,requirement_revision,status FROM v1_tasks WHERE id=? AND project_id=?',
+            task = db.execute('SELECT requirement_id,requirement_revision,status,current_column FROM v1_tasks WHERE id=? AND project_id=?',
                               (task_id,ctx.project_id)).fetchone()
             requirement = db.execute('SELECT status,revision FROM v1_requirements WHERE id=? AND project_id=?',
                                      (job['requirement_id'],ctx.project_id)).fetchone()
@@ -339,11 +339,24 @@ class ConversationIntentRepository:
                 return None
             if capability == 'agent.worker.send':
                 assignment_id = arguments.get('assignment_id')
-                assignment = db.execute('SELECT task_id,agent_instance_id,status FROM v1_agent_assignments WHERE id=?',
-                                        (assignment_id,)).fetchone() if assignment_id else None
+                assignment = db.execute(
+                    'SELECT a.task_id,a.agent_instance_id,a.status,r.column_key,r.sequence '
+                    'FROM v1_agent_assignments a JOIN v1_column_runs r ON r.id=a.column_run_id '
+                    'WHERE a.id=? AND a.project_id=?',
+                    (assignment_id,ctx.project_id),
+                ).fetchone() if assignment_id else None
+                latest = db.execute(
+                    'SELECT a.id FROM v1_agent_assignments a '
+                    'JOIN v1_column_runs r ON r.id=a.column_run_id '
+                    'WHERE a.task_id=? AND r.column_key=? ORDER BY r.sequence DESC LIMIT 1',
+                    (task_id,task['current_column']),
+                ).fetchone()
                 if (not assignment or assignment['task_id'] != task_id or
                         assignment['agent_instance_id'] != arguments.get('worker_id') or
-                        assignment['status'] != 'running'):
+                        assignment['column_key'] != task['current_column'] or
+                        not latest or latest['id'] != assignment_id or
+                        not ((task['status'] == 'recovering' and assignment['status'] == 'blocked') or
+                             (task['status'] == 'running' and assignment['status'] == 'running'))):
                     return 'SupervisionWorkerMismatch: target the current Assignment of this Task'
                 return None
         return 'SupervisionMutationDisabled: this event only permits same-Task recovery or Worker input'

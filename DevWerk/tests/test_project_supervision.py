@@ -27,6 +27,38 @@ def failed_task_with_user_grant(store, tmp_path):
     return project, requirement, task
 
 
+def blocked_task_with_user_grant(store, tmp_path):
+    project = store.create_project('blocked-supervision', '', str(tmp_path / 'blocked-project'))
+    user_job, ctx = turn(store, project, '交付这个项目')
+    grant = store.registry.dispatch('conversation.execution.authorize',
+        {'request':'begin','scope_summary':'交付这个项目'}, ctx)
+    assert grant.ok, grant.error
+    requirement = grant.output['requirement']
+    store.finish_conversation_job(user_job['id'], None, ctx.agent_run_id, {})
+    workflow = agent_workflow()
+    publish_planned_workflow(store, project['id'], workflow)
+    task = create_planned_task(store, project['id'], 'deliver')
+    with store.tx(immediate=True) as db:
+        db.execute('UPDATE v1_tasks SET requirement_id=?,requirement_revision=? WHERE id=?',
+                   (requirement['id'],requirement['revision'],task['id']))
+    claimed = store.claim_task(task['id'], 'blocked-worker')
+    column_run = store.begin_run(claimed, {})
+    assignment = store.agents.assign(claimed, column_run, workflow.column('work'))
+    with store.tx(immediate=True) as db:
+        db.execute("UPDATE v1_agent_assignments SET status='blocked',result_json=? WHERE id=?",
+                   ('{"code":"execution_budget_exceeded"}', assignment['id']))
+        db.execute('UPDATE v1_agent_instances SET active_assignment_id=NULL WHERE id=?',
+                   (assignment['agent_instance_id'],))
+        db.execute("UPDATE v1_column_attempts SET status='interrupted' WHERE column_run_id=?", (column_run['id'],))
+        db.execute("UPDATE v1_column_runs SET status='interrupted' WHERE id=?", (column_run['id'],))
+        db.execute("UPDATE v1_tasks SET status='recovering',control_state='paused',"
+                   "failure_code='execution_budget_exceeded',lease_owner=NULL,lease_until=NULL WHERE id=?",
+                   (task['id'],))
+        store._mailbox(db, project['id'], 'task.runtime_blocked', task['id'], column_run['id'],
+                       {'error':'ExecutionBudgetExceeded'})
+    return project, task, assignment
+
+
 def claim_event(store, project):
     event_id = store.enqueue_governance_jobs()[0]
     job = store.claim_conversation_job(event_id, 'supervision-test')
@@ -119,11 +151,11 @@ def test_supervision_reopens_only_failed_task_under_prior_grant(store, tmp_path)
     gateway._process(job)
     result = store.get_conversation_job(job['id'])
     assert result['status'] == 'succeeded'
-    assert calls == 3
+    assert calls == 2
     assert store.get_task(task['id'])['status'] == 'pending'
     assert '待执行' in result['result']['reply']
     assert [item['capability'] for item in store.tool_invocations(project['id'], result['agent_run_id'])] == [
-        'task.inspect','task.reopen','conversation.reply']
+        'task.inspect','task.reopen']
 
 
 def test_supervision_can_recover_only_once_per_notification(store, tmp_path):
@@ -155,6 +187,47 @@ def test_supervision_can_recover_only_once_per_notification(store, tmp_path):
             (task['id'],)).fetchone()[0] == 0
 
 
+def test_supervision_hands_diagnosis_to_blocked_worker_then_stops_after_retry(store, tmp_path):
+    project, task, old_assignment = blocked_task_with_user_grant(store, tmp_path)
+    job, mailbox = claim_event(store, project)
+    assert store.bind_supervision_job(job['id'], mailbox)
+    calls = 0
+
+    def model(messages, tools, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id='send-diagnosis', name='agent.worker.send', arguments={
+                    'worker_id':old_assignment['agent_instance_id'],
+                    'assignment_id':old_assignment['id'],
+                    'content':'Inspect the failed lockout receipt before changing the code.'})])
+        if calls == 2:
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id='retry-after-input', name='task.retry', arguments={
+                    'task_id':task['id'], 'column_key':'work', 'clear_context':False})])
+        raise AssertionError('a successful supervision retry must end the notification turn')
+
+    gateway = ConversationGateway(store, store.registry,
+                                  agent_core=AgentCore(store, store.registry, model))
+    gateway._process(job)
+    assert calls == 2
+    result = store.get_conversation_job(job['id'])
+    assert result['status'] == 'succeeded'
+    assert result['result']['business_outcome'] == 'completed'
+    assert store.get_task(task['id'])['status'] == 'pending'
+    messages = store.agents.messages(project['id'], old_assignment['agent_instance_id'])
+    assert len(messages) == 1
+    assert messages[0]['state'] == 'pending'
+    claimed = store.claim_task(task['id'], 'new-worker')
+    new_run = store.begin_run(claimed, {})
+    fresh = store.agents.assign(claimed, new_run, agent_workflow().column('work'))
+    assert fresh['id'] != old_assignment['id']
+    assert fresh['agent_instance_id'] == old_assignment['agent_instance_id']
+    queued = store.agents.messages(project['id'], fresh['agent_instance_id'])
+    assert queued[0]['assignment_id'] == fresh['id']
+
+
 def test_supervision_model_failure_still_notifies_original_task_failure(store, tmp_path):
     project, _, task = failed_task_with_user_grant(store, tmp_path)
     job, _ = claim_event(store, project)
@@ -170,6 +243,29 @@ def test_supervision_model_failure_still_notifies_original_task_failure(store, t
     assert 'test failure' in notifications[0]['content']
     assert '自动监督未完成' in notifications[0]['content']
     assert 'model failed' not in notifications[0]['content']
+
+
+def test_supervision_without_recovery_has_smaller_run_budget_and_preserves_failure(store, tmp_path):
+    project, _, task = failed_task_with_user_grant(store, tmp_path)
+    job, _ = claim_event(store, project)
+    calls = 0
+
+    def model(messages, tools, **kwargs):
+        nonlocal calls
+        calls += 1
+        return AgentModelResponse(tool_calls=[AgentToolCall(
+            id=f'inspect-{calls}', name='task.inspect', arguments={'task_id':task['id']})])
+
+    gateway = ConversationGateway(store, store.registry,
+                                  agent_core=AgentCore(store, store.registry, model))
+    with pytest.raises(Exception, match='iteration/tool-call ceiling reached'):
+        gateway._process(job)
+    assert calls == 20
+    assert store.get_conversation_job(job['id'])['status'] == 'failed'
+    notifications = [item for item in store.messages(project['id'])
+                     if item['role'] == 'assistant' and item['meta'].get('job_id') == job['id']]
+    assert len(notifications) == 1
+    assert 'test failure' in notifications[0]['content']
 
 
 def test_supervision_stops_after_two_durable_recoveries(store, tmp_path):
