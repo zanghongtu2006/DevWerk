@@ -119,3 +119,15 @@ HTTP Session 失效后，`tools/list` 会重新初始化并重试；`tools/call`
 `V1Store.bind_supervision_job` 只绑定同一失败 Task、同一活跃 Requirement revision 和既有用户 Grant；无授权/已关闭范围走原确定性 reducer。监督 Run 读取现有 Project Agent Session，`denial` 只准同一 Task 的 retry/reopen 或向当前 Assignment 投递显式 Worker input，且不允许清空 Worker context；文件、命令、MCP 写、规划和新授权仍拒绝。成功与失败通知都由 Runtime 从当前 Task 状态和反馈生成，模型失败时原 Task 失败信息仍通知用户。对同一 Task 的成功自动 retry/reopen 最多两次，后续失败只播报并等待用户，避免通知驱动的无限重开。
 
 专项回归 5 passed，覆盖有效 Grant 唤醒、关闭范围回退、真实 reopen、模型异常通知和两次上限。通知绑定还要求传入 MailBox ID 与 Job 实际接收的 ID 完全一致；恢复后用户通知的 `subject_status` 来自当前 Task 状态而不是旧失败事件。Conversation、通知、Assignment 相关回归 **95 passed**；最后两处校验修改后专项 5 passed。此阶段只允许有限恢复；自发修改 Workflow/TaskPlan、创建 successor 和更复杂的计划修复尚未开放给事件 Run。
+
+## 后续阶段设计：按需工具目录与结果目标
+
+当前主 Agent 的内建模型工具目录有 70 个 schema，JSON 约 76 KB（粗略按四字符/token 为 1.9 万 token）；MCP server 增加工具后还会增长。完整目录保证能力可见，却使每次模型请求的上下文成本偏高。后续引入 **按需 schema 加载**，不做业务权限分层：初始暴露对话、授权、读项目状态、文件/命令基础工具和 `agent.tools.search`；Search 根据显式查询或分页列出完整 Registry 能力 ID/短说明，再在同一个 Run 的下一次模型请求加入所选 schema。未加载的工具调用返回“先发现 schema”，不产生副作用；Run 仍冻结全量可用 ID、版本和授权边界，Worker 仅能搜索分配给其 Column 的能力。回归要比较平均输入 token、达到相同任务完成率和检索失败率，不能只凭 schema 字节下降宣称更省。此阶段尚未实现。
+
+另一个待解决边界是 **执行目标—真实效果**：当用户自然语言明确要求实施而 Agent 无工具直接答复时，当前 Runtime 只能确定“本轮无副作用”，无法从自由文本确定用户意图。不能用 `start_task=true`（默认值）、关键词、MailBox 或历史承诺伪造授权。可验证的方案需把用户明确动作或 Agent 声明的具体完成目标与真实回执绑定，并在结果中显示“目标未完成”；模型选择目标本身仍可能误判，需真实黑盒验证。阶段 3B 的 `business_outcome=discussion` 只是准确标记无效果，不是此缺陷的完整修复。
+
+## 黑盒迭代：监督恢复的边界
+
+新 Project `prj_b2ff5d6dae2243828f5d6ae34a2b3ccf` 已完成六轮讨论（第五轮自然语言合同漂移由第六轮纠正）并在单独授权后创建一个八列 Task。Requirements、Domain Design 自动交接成功；后端两次 Assignment 各用尽 100 模型请求，完整 Maven 验收没有通过。首个失败事件唤醒了同一 Project Agent Session，但其监督回合重复 retry、无法向 blocked Worker 投递诊断，并消耗约 100 轮读工具循环。证据和测试细节见 `2026-09-30-hermes-core-blackbox.md`。
+
+已分两个独立提交修复：`fa63c91` 让每个通知 Job 最多成功恢复一次、已 pending Task 不产生伪 retry、历史额度按不同通知 Job 计；`8ae8c4f` 允许主 Agent 在 retry 前给当前 blocked Worker 排队证据输入，并在真实 retry/reopen 回执后结束监督 Run，对无效果监督设独立小预算。MailBox 仍只通知，Worker 输入通过显式 `agent.worker.send`；用户普通 Conversation 回合的工具和权限没有被缩小。尚需在重启后的新 Project 黑盒验证。主 Agent 在既有授权内修订失败的 TaskPlan/组织更小修复单元仍未实现，若下一轮仍因同一 Column 预算耗尽而无法交付，应作为下一阶段架构问题处理，不能只提高预算或循环 retry。
