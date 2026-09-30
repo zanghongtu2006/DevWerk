@@ -1287,6 +1287,55 @@ class V1Store:
             row.update(source_loop_key=binding['loop_key'], source_loop_version=binding['loop_version'], source_loop_digest=binding['loop_digest'])
         return row
 
+    def bind_supervision_job(self, job_id: str, mailbox: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Reuse one active user grant for one failed Task; notification is only a wakeup."""
+        if not mailbox or any(not item.get('task_id') for item in mailbox):
+            return None
+        task_ids = {item['task_id'] for item in mailbox}
+        if len(task_ids) != 1 or not any(item.get('event_type') in
+                {'task.failed', 'task.runtime_blocked'} for item in mailbox):
+            return None
+        task_id = next(iter(task_ids))
+        with self.tx(immediate=True) as db:
+            job = db.execute("SELECT * FROM v1_conversation_jobs WHERE id=? AND status='running'",
+                             (job_id,)).fetchone()
+            if not job or job['trigger_kind'] != 'mailbox' or job['scheduled_review_id']:
+                return None
+            if {item['id'] for item in mailbox} != set(json.loads(job['mailbox_ids_json'] or '[]')):
+                return None
+            task = db.execute('SELECT project_id,requirement_id,requirement_revision,status FROM v1_tasks WHERE id=? AND project_id=?',
+                              (task_id, job['project_id'])).fetchone()
+            if not task or task['status'] not in {'failed','recovering'} or not task['requirement_id']:
+                return None
+            requirement = db.execute('SELECT status,revision FROM v1_requirements WHERE id=? AND project_id=?',
+                                     (task['requirement_id'],job['project_id'])).fetchone()
+            if not requirement or requirement['status'] != 'active' or requirement['revision'] != task['requirement_revision']:
+                return None
+            grant = db.execute("SELECT g.id FROM v1_execution_grants g JOIN v1_conversation_jobs source ON source.id=g.source_job_id "
+                               "WHERE g.project_id=? AND g.requirement_id=? AND g.requirement_revision=? "
+                               "AND g.state='active' AND source.trigger_kind='user' ORDER BY g.created_at DESC LIMIT 1",
+                               (job['project_id'],task['requirement_id'],task['requirement_revision'])).fetchone()
+            if not grant:
+                return None
+            recoveries = db.execute(
+                "SELECT COUNT(*) FROM v1_tool_invocations invocation "
+                "JOIN v1_agent_runs run ON run.id=invocation.agent_run_id "
+                "JOIN v1_conversation_jobs earlier ON earlier.id=run.conversation_job_id "
+                "WHERE earlier.project_id=? AND invocation.ok=1 "
+                "AND invocation.capability IN ('task.retry','task.reopen') "
+                "AND json_extract(earlier.turn_contract_json,'$.phase')='supervision' "
+                "AND json_extract(earlier.turn_contract_json,'$.supervised_task_id')=?",
+                (job['project_id'],task_id),
+            ).fetchone()[0]
+            if recoveries >= 2:
+                return None
+            contract = {'phase':'supervision','act':'supervise','source_message_id':job['user_message_id'],
+                        'execution_grant_id':grant['id'],'supervised_task_id':task_id}
+            db.execute('UPDATE v1_conversation_jobs SET requirement_id=?,requirement_revision=?,execution_grant_id=?,turn_contract_json=? WHERE id=?',
+                       (task['requirement_id'],task['requirement_revision'],grant['id'],
+                        json.dumps(contract,ensure_ascii=False),job_id))
+            return contract
+
     def get_project_loop_binding(self, project_id: str, workflow_revision_id: str | None = None) -> dict[str, Any] | None:
         with self.connect() as db:
             if workflow_revision_id is None:

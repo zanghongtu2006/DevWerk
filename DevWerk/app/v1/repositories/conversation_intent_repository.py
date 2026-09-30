@@ -275,6 +275,8 @@ class ConversationIntentRepository:
         if capability == 'conversation.draft.update':
             return None if job['trigger_kind'] == 'user' and contract['phase'] == 'discussion' else 'DraftUpdateOutsideDiscussion'
         if job['trigger_kind'] != 'user':
+            if contract.get('phase') == 'supervision':
+                return self._supervision_denial(ctx, job, contract, capability, arguments)
             return 'EventMutationDisabled: notifications cannot authorize planning, execution or Task control; Runtime follows the frozen Workflow'
         if not job['start_task'] or job['requested_mode'] == 'discuss':
             return 'ConversationMutationDisabled: this user turn explicitly permits discussion only'
@@ -299,6 +301,40 @@ class ConversationIntentRepository:
         if capability == 'requirement.create' and (arguments.get('scope_key'), arguments.get('objective')) != (req['scope_key'], req['objective']):
             return 'ExecutionScopeMismatch: resolve a new user scope instead of replacing this turn requirement'
         return None
+
+    def _supervision_denial(self, ctx, job, contract, capability, arguments):
+        task_id = contract.get('supervised_task_id')
+        if not task_id or not job.get('execution_grant_id'):
+            return 'SupervisionGrantMissing'
+        with self.store.connect() as db:
+            grant = db.execute("SELECT state,requirement_id,requirement_revision FROM v1_execution_grants WHERE id=? AND project_id=?",
+                               (job['execution_grant_id'],ctx.project_id)).fetchone()
+            task = db.execute('SELECT requirement_id,requirement_revision FROM v1_tasks WHERE id=? AND project_id=?',
+                              (task_id,ctx.project_id)).fetchone()
+            requirement = db.execute('SELECT status,revision FROM v1_requirements WHERE id=? AND project_id=?',
+                                     (job['requirement_id'],ctx.project_id)).fetchone()
+            if (not grant or grant['state'] != 'active' or not task or not requirement or
+                    requirement['status'] != 'active' or
+                    (grant['requirement_id'],grant['requirement_revision']) !=
+                    (job['requirement_id'],job['requirement_revision']) or
+                    (task['requirement_id'],task['requirement_revision']) !=
+                    (job['requirement_id'],job['requirement_revision']) or
+                    requirement['revision'] != job['requirement_revision']):
+                return 'SupervisionScopeExpired'
+            if capability in {'task.retry','task.reopen'}:
+                if arguments.get('task_id') != task_id or arguments.get('clear_context'):
+                    return 'SupervisionTaskMismatch: preserve the same Task and Worker context'
+                return None
+            if capability == 'agent.worker.send':
+                assignment_id = arguments.get('assignment_id')
+                assignment = db.execute('SELECT task_id,agent_instance_id,status FROM v1_agent_assignments WHERE id=?',
+                                        (assignment_id,)).fetchone() if assignment_id else None
+                if (not assignment or assignment['task_id'] != task_id or
+                        assignment['agent_instance_id'] != arguments.get('worker_id') or
+                        assignment['status'] != 'running'):
+                    return 'SupervisionWorkerMismatch: target the current Assignment of this Task'
+                return None
+        return 'SupervisionMutationDisabled: this event only permits same-Task recovery or Worker input'
 
     def bind_revised_scope(self, ctx, requirement):
         job = self.job_for_run(ctx.agent_run_id, ctx.project_id)

@@ -298,9 +298,13 @@ class ConversationGateway:
                     if item["id"] in captured_ids
                 ]
                 mailbox_requires_user_update = _mailbox_requires_user_update(mailbox)
-                if job.get('trigger_kind', 'user') != 'user':
+                supervision = (self.store.bind_supervision_job(job_id, mailbox)
+                               if job.get('trigger_kind', 'user') != 'user' else None)
+                if job.get('trigger_kind', 'user') != 'user' and not supervision:
                     self._reduce_notification(job, mailbox, control)
                     return
+                if supervision:
+                    job = self.store.get_conversation_job(job_id)
                 try:
                     workflow = self.store.get_workflow(project_id)
                 except KeyError:
@@ -315,11 +319,8 @@ class ConversationGateway:
                 is_user_turn = trigger_kind == "user"
                 main = self.store.agents.main(project_id)
                 requirement = self.store.agents.turn_requirement(job, mailbox)
-                graph_mutation_allowed = bool(requirement and requirement['status'] == 'active' and
-                    (self.store.intents.contract(job)['phase'] == 'execution' or not is_user_turn))
-                if requirement and not is_user_turn:
-                    current_requirement = self.store.agents.get_requirement(project_id, requirement['id'])
-                    graph_mutation_allowed = graph_mutation_allowed and current_requirement['status'] == 'active' and current_requirement['revision'] == requirement['revision']
+                graph_mutation_allowed = bool(is_user_turn and requirement and
+                    requirement['status'] == 'active' and self.store.intents.contract(job)['phase'] == 'execution')
                 context = {
                     "turn_contract": self.store.intents.contract(job),
                     "work_intent": self.store.intents.context(job),
@@ -363,6 +364,12 @@ class ConversationGateway:
                             "If a frozen method must change, inspect its current Loop digest and pass loop_digest explicitly. "
                             "For continued novels use ending_policy=continue; do not raise chapter length limits without the user's request. "
                             "Columns execute one leaf Worker each; collaboration belongs in the workflow."
+                            + (" This is a supervision wakeup for one failed Task under an existing user Grant. "
+                               "The mailbox only identifies the event; inspect the Task and feedback yourself. "
+                               "Only same-Task retry/reopen or input to its current Worker Assignment is permitted. "
+                               "Do not create scope, Workflow, Task, files or a new user grant. "
+                               "Finish with conversation.reply and cite real receipts; the user notification is rendered from current Task state."
+                               if supervision else "")
                         ),
                     },
                     "current_request": {
@@ -459,6 +466,8 @@ class ConversationGateway:
                     and item["result"]["output"]["artifact"].get("id")
                 ]
                 conversation_reply = result.text.strip()
+                if supervision:
+                    conversation_reply = _notification_text(self.store, job, mailbox)
                 publish_reply = trigger_kind == "user" or mailbox_requires_user_update
                 notification = (
                     {
@@ -472,7 +481,8 @@ class ConversationGateway:
                             "task_ids": [task["id"] for task in tasks],
                             "workflow_revision_ids": [item["id"] for item in workflow_publications],
                             "mailbox_ids": [item["id"] for item in mailbox],
-                            "subject_status": _mailbox_subject_status(mailbox),
+                            "subject_status": (self.store.get_project_task(project_id, supervision['supervised_task_id'])['status']
+                                               if supervision else _mailbox_subject_status(mailbox)),
                         },
                     }
                     if publish_reply
@@ -574,9 +584,19 @@ class ConversationGateway:
                         "durable_progress": durable_progress,
                     },
                 }
+            elif _mailbox_requires_user_update(mailbox):
+                notification = {
+                    'content': _notification_text(self.store, job, mailbox) + '；自动监督未完成，需继续处理。',
+                    'meta': {'status':'failed','kind':'notification','job_id':job_id,
+                             'agent_run_id':failed_run['id'] if failed_run else None,
+                             'subject_status':_mailbox_subject_status(mailbox),
+                             'error_code':'supervision_processing_failed',
+                             'mailbox_ids':[item['id'] for item in mailbox]},
+                }
             if notification:
-                from app.v1.conversation_failure import failure_summary
-                notification['content'] = failure_summary(self.store, project_id, action_ledger, error)
+                if str(job.get('trigger_kind') or 'user') == 'user':
+                    from app.v1.conversation_failure import failure_summary
+                    notification['content'] = failure_summary(self.store, project_id, action_ledger, error)
             self.store.fail_conversation_job(
                 job_id,
                 error,
@@ -594,38 +614,44 @@ class ConversationGateway:
         """Observe durable outcomes without granting a second planning turn."""
         if control:
             control.check()
+        reply = _notification_text(self.store, job, mailbox)
         tasks = {m['task_id']: self.store.get_project_task(job['project_id'], m['task_id'])
                  for m in mailbox if m.get('task_id')}
-        labels = {'done':'已交付', 'failed':'失败', 'recovering':'需要处理', 'running':'执行中', 'pending':'待执行', 'waiting':'等待外部结果'}
-        parts = []
-        for task in tasks.values():
-            text = f"{task['title']}：{labels.get(task['status'],task['status'])}"
-            if task['status'] in {'failed','recovering'}:
-                detail = self.store.feedback.failure_detail(job['project_id'], task['id'])
-                if detail and detail.get('column_key'):
-                    text += f"；失败列：{detail['column_key']}"
-                if detail and detail.get('reported_reason'):
-                    text += '；Worker 报告：' + detail['reported_reason']
-                if detail and detail.get('completion_rejection'):
-                    text += '；完成拒绝：' + detail['completion_rejection']
-                elif task.get('error') and not (detail and detail.get('reported_reason')):
-                    text += '；' + str(task['error'])[:300]
-            elif task.get('error'):
-                text += '；' + str(task['error'])[:300]
-            parts.append(text)
-        for item in mailbox:
-            if not item.get('task_id'):
-                payload = item.get('payload') or {}
-                detail = payload.get('error') or payload.get('reason') or payload.get('message')
-                if detail:
-                    parts.append(str(detail)[:800])
-        reply = '。'.join(parts) or '项目状态复查完成，没有新增执行操作。'
         notification = {'content':reply,'meta':{'kind':'notification','status':'succeeded',
             'subject_status':_mailbox_subject_status(mailbox),'llm_used':False,'job_id':job['id'],
             'mailbox_ids':[m['id'] for m in mailbox]}} if _mailbox_requires_user_update(mailbox) else None
         self.store.finish_conversation_job(job['id'],None,None,
             {'reply':reply,'llm_used':False,'business_outcome':'observed','action_ledger':[],
              'task_ids':list(tasks),'mailbox_ids':[m['id'] for m in mailbox]},notification=notification)
+
+
+def _notification_text(store, job, mailbox):
+    tasks = {m['task_id']: store.get_project_task(job['project_id'], m['task_id'])
+             for m in mailbox if m.get('task_id')}
+    labels = {'done':'已交付', 'failed':'失败', 'recovering':'需要处理', 'running':'执行中', 'pending':'待执行', 'waiting':'等待外部结果'}
+    parts = []
+    for task in tasks.values():
+        text = f"{task['title']}：{labels.get(task['status'],task['status'])}"
+        if task['status'] in {'failed','recovering'}:
+            detail = store.feedback.failure_detail(job['project_id'], task['id'])
+            if detail and detail.get('column_key'):
+                text += f"；失败列：{detail['column_key']}"
+            if detail and detail.get('reported_reason'):
+                text += '；Worker 报告：' + detail['reported_reason']
+            if detail and detail.get('completion_rejection'):
+                text += '；完成拒绝：' + detail['completion_rejection']
+            elif task.get('error') and not (detail and detail.get('reported_reason')):
+                text += '；' + str(task['error'])[:300]
+        elif task.get('error'):
+            text += '；' + str(task['error'])[:300]
+        parts.append(text)
+    for item in mailbox:
+        if not item.get('task_id'):
+            payload = item.get('payload') or {}
+            detail = payload.get('error') or payload.get('reason') or payload.get('message')
+            if detail:
+                parts.append(str(detail)[:800])
+    return '。'.join(parts) or '项目状态复查完成，没有新增执行操作。'
 
 
 _TASK_TERMINAL_EVENTS = {"task.done", "task.failed"}

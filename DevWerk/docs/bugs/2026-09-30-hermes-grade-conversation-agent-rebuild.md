@@ -105,3 +105,17 @@ HTTP Session 失效后，`tools/list` 会重新初始化并重试；`tools/call`
 新入口复用现有事务、当前用户消息证据、讨论上界、Requirement/Grant 和 Task 控制准入；旧入口保留在 Registry 供已有 Run 与历史测试重放，新 Conversation Run 工具目录不再展示旧入口和 draft ledger。更新 `DEVWERK.md` 的实际主 Agent 指令，避免提示它调用已隐藏的工具。专项与 API/范围扩展/通知回归共 **107 passed**。旧范围扩展测试曾把直接 Registry dispatch 当成已有 `v1_tool_invocations`，已补上真实 Run 回执作为测试前提。
 
 一次回归明确暴露仍存风险：自动模式下模型无工具自然语言声称“任务已排队”，Runtime 会记为 discussion 且标注“未新建任务”，但文本本身仍可能错误。`business_outcome` 现在明确区分 `discussion` 与 `completed`，伪造 `work_result` 引用仍拒绝。这只保证持久状态不虚报，不保证无工具自然语言一定符合用户意图；后续需专门设计可验证的执行目标与结果合同，不能把本阶段误称为完整黑盒交付。
+
+## 阶段 4A 设计：有界的 Task 监督唤醒
+
+目前 `ConversationGateway._process` 对所有非用户 Job 直接 `_reduce_notification`，主 Agent 从不会在 Task 失败时读取反馈或主动恢复。最小改动是：只对 `task.failed` 或 `task.runtime_blocked` 等需要行动的单 Task 事件，确认 Task 属于活跃 Requirement 且该 revision 存在有效的原始用户 Grant；然后把 Event Job 绑定该 Grant 和 Task，启动**同一个 Project Agent Session** 的监督 Run。多 Task/多 Requirement 混合通知、已关闭/过期 Grant、普通完成通知仍由确定性 reducer 处理。MailBox 只传 `event_type/task_id/run_id` 引用，不传 Worker 指令或自由文本；Agent 必须调用 `task.inspect`/反馈读取事实。
+
+监督 Run 使用独立的 `phase=supervision`，它不能调用 `conversation.execution.authorize` 创建新用户授权，也不能创建 Requirement/Workflow/Task 或直接改项目文件。第一步仅允许对同一 Task 的 `task.retry`/`task.reopen`，或向同一 Task 当前 Assignment 的 Worker 发 `agent.worker.send`；全部走现有回执和幂等保护。其余操作须由新用户回合授权，不能把“有历史 Grant”解释为任意新规划许可。一次通知只触发一个 durable Job；模型若没采取有效动作，照实播报失败和等待用户，不把模型文本当作修复结果。后续可扩展已授权的修订规划，但须另列合同、去重和限次，不混在此阶段。
+
+回归需覆盖：同一 Task 的有效 Grant 可唤醒并读取反馈；旧/关闭 Requirement 只能播报；混合事件不能跨范围选授权；未授权的新 Task/文件/MCP 副作用拒绝；Worker 输入只能给当前 Assignment；通知 Run 失败不吞掉真实 Task 失败信息，也不形成无限重试。
+
+### 阶段 4A 实施记录
+
+`V1Store.bind_supervision_job` 只绑定同一失败 Task、同一活跃 Requirement revision 和既有用户 Grant；无授权/已关闭范围走原确定性 reducer。监督 Run 读取现有 Project Agent Session，`denial` 只准同一 Task 的 retry/reopen 或向当前 Assignment 投递显式 Worker input，且不允许清空 Worker context；文件、命令、MCP 写、规划和新授权仍拒绝。成功与失败通知都由 Runtime 从当前 Task 状态和反馈生成，模型失败时原 Task 失败信息仍通知用户。对同一 Task 的成功自动 retry/reopen 最多两次，后续失败只播报并等待用户，避免通知驱动的无限重开。
+
+专项回归 5 passed，覆盖有效 Grant 唤醒、关闭范围回退、真实 reopen、模型异常通知和两次上限。通知绑定还要求传入 MailBox ID 与 Job 实际接收的 ID 完全一致；恢复后用户通知的 `subject_status` 来自当前 Task 状态而不是旧失败事件。Conversation、通知、Assignment 相关回归 **95 passed**；最后两处校验修改后专项 5 passed。此阶段只允许有限恢复；自发修改 Workflow/TaskPlan、创建 successor 和更复杂的计划修复尚未开放给事件 Run。
