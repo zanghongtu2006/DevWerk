@@ -170,8 +170,6 @@ class ConversationIntentRepository:
                         raise ValueError('Accept the existing proposal or a direct user scope; do not invent an accepted proposal')
                     state['proposal'] = {'id': new_id('proposal'), 'content': resolution.proposal,
                                          'hash': hashlib.sha256(resolution.proposal.encode()).hexdigest()}
-                if resolution.act == 'execute' and any(q['state'] == 'open' and q['blocking_for_start'] for q in state['open_questions']):
-                    raise ValueError('OpenScopeDecision: resolve/delegate the remaining blocking questions before execution')
                 requirement = None
                 grant_id = None
                 phase = 'discussion'

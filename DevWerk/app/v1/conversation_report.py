@@ -22,39 +22,36 @@ class ConversationReport(ConversationReply):
 
 
 REPORT_INSTRUCTION = (
-    'For execution/status results prefer the conversation.reply tool, called alone with mode and actual evidence IDs. '
-    'For a user turn ALREADY resolved as discussion, finish with a natural-language discussion answer. '
-    'Use conversation.draft.update to save further decisions/questions/proposals before that answer when needed. '
-    'This prose path never reports completed work and cannot grant execution. '
-    'For all other turns finish with a JSON object (no Markdown fence) using mode, message, task_ids, tool_call_ids. '
-    'For an unresolved discussion turn include turn_resolution (same schema as conversation.turn.resolve, but only discuss/status/clarify); '
-    'record pending decisions and a proposal there. A final reply cannot grant execution. '
-    'If the boundary was already resolved, omit turn_resolution. Optional draft_update only saves discussion decisions/questions/proposal and cannot change authority. '
-    'mode=discussion or proposal: message contains discussion/questions or proposed future work only, never completed actions or task states. '
-    'mode=work_result: cite real task_ids and/or successful tool_call_ids from this turn; Runtime renders the result from stored facts, ignoring message. '
-    'An execution turn needs at least one successful write/process/control receipt; old Task status alone cannot complete it. '
-    'mode=blocked: cite failed tool_call_ids when available; explain only the remaining question in message. '
-    'Do not invent IDs. Creating a scope/plan is not creating or running Tasks. No plain-text execution claims are published. '
-    'Example discussion: {"mode":"discussion","message":"Which character should narrate the next chapter?"}. '
-    'Example unresolved discussion metadata (replace IDs/revision with current context): '
-    '{"mode":"discussion","message":"Here is the proposed approach.","turn_resolution":'
-    '{"source_message_id":1,"based_on_intent_revision":0,"act":"discuss","constraint_change":"set_hold","proposal":"The proposed delivery scope."}}. '
-    'Example result: {"mode":"work_result","tool_call_ids":["the-actual-scope-revise-call-id"],"task_ids":["the-real-task-id"]}.'
+    'You may answer ordinary discussion or status questions in natural language. '
+    'No question-status update or boundary tool is required for a tool-free reply. '
+    'Before business mutations, bind the current user execution request with conversation.turn.resolve. '
+    'For completed work call conversation.reply alone with mode=work_result and real tool_call_ids/task_ids; '
+    'Runtime renders committed facts. For a blocker use mode=blocked and actual failed receipts. '
+    'Never claim a Workflow, Task or delivery was created merely because you proposed it.'
 )
 
 
 def render_report(store, project_id, run_id, text, *, execution_control=None):
     job = store.intents.job_for_run(run_id, project_id)
-    if (job and job['trigger_kind'] == 'user' and store.intents.contract(job)['phase'] == 'discussion'
-            and store.intents.contract(job).get('act') in {'discuss','clarify'}):
+    if (job and job['trigger_kind'] == 'user' and store.intents.contract(job)['phase'] in {'unresolved', 'discussion'}):
         try:
             json.loads(text)
         except ValueError:
-            # An immutable, enforced discussion boundary allows ordinary prose.
-            # Never apply this path to execution or to malformed JSON reports.
+            # A tool-free answer is ordinary discussion, including the first
+            # turn of a Project. Persist its hold without requiring a model
+            # call just to update an intent ledger.
             invocations = store.tool_invocations(project_id, run_id, hydrate_payloads=True)
             effects = [i for i in invocations if i['ok'] and store.registry.side_effect_kind(i['capability']) in {'write','process','control'}]
             if text.strip() and not text.lstrip().startswith(('{','[','```json')) and not effects:
+                if store.intents.contract(job)['phase'] == 'unresolved':
+                    from app.v1.capabilities import CapabilityContext
+                    ctx = CapabilityContext(project_id, store.get_project(project_id), store, agent_run_id=run_id,
+                                            execution_control=execution_control,
+                                            agent_instance_id=store.conversation_agent(project_id)['logical_id'])
+                    state = store.intents.context(job)
+                    store.intents.resolve(ctx, {'source_message_id': job['user_message_id'],
+                                                'based_on_intent_revision': state['revision'],
+                                                'act': 'discuss'}, final_only=True)
                 rendered = '本轮仅讨论，未新建任务。\n\n' + text.strip()
                 return rendered, {'report':{'mode':'discussion','message':text.strip()},
                     'tasks':[], 'invocation_ids':[], 'rendered':rendered, 'discussion_prose':True}

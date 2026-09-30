@@ -19,7 +19,7 @@ def test_reply_tool_finishes_same_run_with_real_task_state(store, tmp_path):
         nonlocal calls
         calls += 1
         if calls == 1:
-            assert kwargs['required_tool_name'] == 'conversation.turn.resolve'
+            assert kwargs['required_tool_name'] is None
             return AgentModelResponse(tool_calls=[AgentToolCall(id='resolve',name='conversation.turn.resolve',arguments={
                 'source_message_id':job['user_message_id'],'based_on_intent_revision':0,'act':'status'})])
         return AgentModelResponse(tool_calls=[AgentToolCall(id='reply',name='conversation.reply',arguments={
@@ -35,7 +35,7 @@ def test_reply_tool_finishes_same_run_with_real_task_state(store, tmp_path):
     assert result.completion['conversation_report']['tasks'][0]['id'] == task['id']
 
 
-def test_unresolved_projection_excludes_prior_tool_trace_and_restores_after_resolution(store, tmp_path):
+def test_persistent_session_preserves_prior_tool_trace_across_resolution(store, tmp_path):
     from app.v1.agent_provider import ProviderTurnRequester
     project = store.create_project('phase context', '', str(tmp_path/'project'))
     job, ctx = turn(store,project,'开始实施')
@@ -53,7 +53,7 @@ def test_unresolved_projection_excludes_prior_tool_trace_and_restores_after_reso
     provider = ProviderTurnRequester(store=store,model_complete=model,spec=spec,run_id=ctx.agent_run_id)
     tools = store.registry.schemas(['conversation.turn.resolve','project.files.read'],ctx)
     provider.request(messages,tools,iteration=1,require_tool=False,required_tool_name=None)
-    assert 'OLD_TOOL_TRACE' not in str(captured[-1])
+    assert 'OLD_TOOL_TRACE' in str(captured[-1])
     assert captured[-1][0] == messages[0]
     assert resolve(ctx,job,act='execute',execution_request='begin',scope_summary='demo',
         user_evidence=[{'message_id':job['user_message_id']}]).ok

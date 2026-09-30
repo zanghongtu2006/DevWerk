@@ -135,7 +135,7 @@ def test_conversation_with_loop_workflow_can_revise_but_cannot_reapply_loop(stor
         calls += 1
         exposed.append({item["function"]["name"] for item in tools})
         assert "conversation.turn.resolve" in exposed[-1]
-        assert {"workflow.publish", "workflow.plan.save", "task.plan.save", "task.create"}.isdisjoint(exposed[-1])
+        assert "workflow.inspect" in exposed[-1]
         if calls == 1:
             return AgentModelResponse(tool_calls=[AgentToolCall(
                 id="workflow",
@@ -148,7 +148,7 @@ def test_conversation_with_loop_workflow_can_revise_but_cannot_reapply_loop(stor
     agent = ConversationGateway(store, registry, agent_core=AgentCore(store, registry, model))
     accepted = run_turn(agent, project["id"], "Inspect the existing Workflow.", True)
     assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
-    assert "loop.apply" not in exposed[0]
+    assert exposed[0] == exposed[-1]
 
 
 def test_start_task_false_hides_mutations_and_rejects_injected_calls(store, tmp_path):
@@ -176,8 +176,8 @@ def test_start_task_false_hides_mutations_and_rejects_injected_calls(store, tmp_
     assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
     assert calls == 2
     assert "conversation.turn.resolve" in exposed[0]
-    assert "system.files.write" not in exposed[0]
-    assert "system.command.run" not in exposed[0]
+    assert "system.files.write" in exposed[0]
+    assert "system.command.run" in exposed[0]
     assert exposed[0] == exposed[1]
     assert not (tmp_path / "blocked.txt").exists()
 
@@ -268,7 +268,7 @@ def test_unresolved_conversation_accepts_legacy_blocked_report_without_business_
     )
     assert job["result"]["action_ledger"] == []
     assert turns == 1
-    assert require_tool_values == [True]
+    assert require_tool_values == [False]
     assert store.conversation_agent(project["id"])["state"] != "attention"
     assert any(
         item["role"] == "assistant" and item["content"] == job["result"]["reply"]

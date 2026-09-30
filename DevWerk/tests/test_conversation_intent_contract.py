@@ -206,7 +206,7 @@ def test_stale_proposal_action_is_rejected_before_job_creation(store, tmp_path):
     assert json.loads(accepted['user_action_json'])['proposal_id'] == proposal['id']
 
 
-def test_provider_catalog_follows_durable_phase(store, tmp_path):
+def test_provider_catalog_stays_stable_across_durable_phase(store, tmp_path):
     from app.v1.agent import AgentRunSpec
     from app.v1.agent_provider import ProviderTurnRequester
     from app.v1.domain import AgentModelResponse
@@ -221,12 +221,11 @@ def test_provider_catalog_follows_durable_phase(store, tmp_path):
     provider = ProviderTurnRequester(store=store, model_complete=model, spec=spec, run_id=ctx.agent_run_id)
     tools = store.registry.schemas(['conversation.turn.resolve','conversation.turn.inspect','project.files.write'],ctx)
     provider.request([], tools, iteration=1, require_tool=False, required_tool_name=None)
-    assert seen[-1] == {'conversation.turn.resolve'}
+    assert seen[-1] == {'conversation.turn.resolve', 'conversation.turn.inspect', 'project.files.write'}
     assert resolve(ctx, job, act='execute', execution_request='begin', scope_summary='demo',
         user_evidence=[{'message_id':job['user_message_id'],'quote':job['message']}]).ok
     provider.request([], tools, iteration=2, require_tool=False, required_tool_name=None)
-    assert 'project.files.write' in seen[-1]
-    assert 'conversation.turn.resolve' not in seen[-1]
+    assert seen[-1] == seen[0]
 
 
 def test_status_turn_exposes_reads_and_reply_after_resolution(store, tmp_path):
@@ -246,11 +245,11 @@ def test_status_turn_exposes_reads_and_reply_after_resolution(store, tmp_path):
     tools = store.registry.schemas([
         'conversation.turn.resolve', 'conversation.reply', 'workflow.inspect', 'project.files.write'], ctx)
     provider.request([], tools, iteration=1, require_tool=False, required_tool_name=None)
-    assert seen == [{'conversation.reply', 'workflow.inspect'}]
+    assert seen == [{'conversation.turn.resolve', 'conversation.reply', 'workflow.inspect', 'project.files.write'}]
 
 
 @pytest.mark.parametrize('act', ['unresolved','discuss','status','execute'])
-def test_natural_reply_only_for_committed_discussion(store, tmp_path, act):
+def test_natural_reply_for_non_execution_turns(store, tmp_path, act):
     from app.v1.conversation_report import render_report
     project = store.create_project('reply boundary', '', str(tmp_path/'project'))
     job, ctx = turn(store, project, '用户请求')
@@ -260,11 +259,13 @@ def test_natural_reply_only_for_committed_discussion(store, tmp_path, act):
             fields.update(execution_request='begin', scope_summary='demo', user_evidence=[
                 {'message_id':job['user_message_id'],'quote':job['message']}])
         assert resolve(ctx, job, **fields).ok
-    if act == 'discuss':
+    if act in {'unresolved', 'discuss', 'status'}:
         text, evidence = render_report(store, project['id'],ctx.agent_run_id,'建议先确定接口，再开始开发。')
         assert text.startswith('本轮仅讨论，未新建任务。')
         assert evidence['discussion_prose']
         assert not store.agents.list_requirements(project['id'])
+        if act == 'unresolved':
+            assert store.intents.contract(store.get_conversation_job(job['id']))['phase'] == 'discussion'
     else:
         with pytest.raises(ValueError):
             render_report(store, project['id'],ctx.agent_run_id,'任务已经完成。')
@@ -327,6 +328,22 @@ def test_resolving_undecided_topic_without_question_still_rejected(store, tmp_pa
     result = resolve(ctx, job, decision_updates=[{'key':'count-reset', 'value':'建议清零',
         'status':'agent_proposed'}], open_question_updates=[{'key':'count-reset', 'state':'resolved'}])
     assert not result.ok and 'NewQuestionMissing' in result.error['message']
+
+
+def test_agent_question_note_does_not_override_later_user_execution_request(store, tmp_path):
+    project = store.create_project('question is advisory', '', str(tmp_path/'project'))
+    first, ctx = turn(store, project, '先讨论部署选择')
+    assert resolve(ctx, first, open_question_updates=[{'key':'deployment',
+        'question':'部署到哪里？', 'blocking_for_start':True,
+        'source_message_ids':[first['user_message_id']]}]).ok
+    store.finish_conversation_job(first['id'], None, ctx.agent_run_id, {})
+    second, ctx = turn(store, project, '现在开始实现，部署形式由你决定')
+    result = resolve(ctx, second, act='execute', execution_request='begin',
+        constraint_change='release_hold', scope_summary='可运行演示项目',
+        user_evidence=[{'message_id':second['user_message_id']}])
+    assert result.ok, result.error
+    assert result.output['turn_contract']['phase'] == 'execution'
+    assert result.output['work_intent']['open_questions'][0]['state'] == 'open'
 
 
 def test_continued_discussion_keeps_original_hold_source(store, tmp_path):

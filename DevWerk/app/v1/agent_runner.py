@@ -187,7 +187,7 @@ class AgentExecutionRunner:
                         (not job or self.store.intents.contract(job)['phase'] != 'unresolved'))
                     correction = ('Your response was empty. The current turn is not finished. ' +
                         ('Call conversation.reply alone using actual evidence IDs or a discussion message.'
-                         if force_reply_tool else 'Resolve the current user turn with conversation.turn.resolve; preserve its discussion constraints.'))
+                         if force_reply_tool else 'Answer the user naturally, inspect with read-only tools, or bind the current user request with conversation.turn.resolve before a business mutation.'))
                     messages.append({'role':'user','content':correction})
                     self.store.add_agent_message(run['id'],'user',correction,[],emit_progress=False)
                     continue
@@ -206,8 +206,7 @@ class AgentExecutionRunner:
                             phase = self.store.intents.contract(job)['phase']
                             boundary_hint = (f' Current durable phase={phase}; source_message_id={job["user_message_id"]}; '
                                              f'based_on_intent_revision={state["revision"]}. Rejected calls changed nothing. '
-                                             'Do not output phase/execution_hold/decisions/open_questions inside turn_resolution. '
-                                             'Use decision_updates/open_question_updates; user_decided is the valid decision status, not user_specified. ')
+                                             'Do not copy a question or decision ledger into turn_resolution. ')
                         force_reply_tool = ('conversation.reply' in prepared.allowed and
                             (not job or self.store.intents.contract(job)['phase'] != 'unresolved'))
                         correction = ('Reply validation failed: '+str(exc)+'. '+boundary_hint+
