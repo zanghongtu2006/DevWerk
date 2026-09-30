@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import sys
@@ -399,7 +400,7 @@ def test_advanced_acceptance_editor_rejects_unowned_script(store, tmp_path):
 
     project, _, ctx = software_plan(store, tmp_path)
     current = store.get_workflow(project['id'])
-    check = {'key':'verify_backend', 'capability':'project.command.run',
+    check = {'key':'verify_fixture', 'capability':'project.command.run',
         'arguments':{'argv':['python','tests/backend_acceptance.py','--report','reports/backend.json']},
         'evidence_kind':'behavior', 'purpose':'Run backend assertions',
         'scenario_ids':['entry-fixture'], 'report_path':'reports/backend.json',
@@ -409,6 +410,13 @@ def test_advanced_acceptance_editor_rejects_unowned_script(store, tmp_path):
         {**base, 'columns':[{'key':'backend_development', 'acceptance_checks':[check]}]},
         replace(ctx, execution_key='advanced-unowned'))
     assert not rejected.ok and 'BehaviorRunnerScriptUnowned' in str(rejected.error)
+    assert store.get_workflow(project['id'])['id'] == current['id']
+    direct_definition = copy.deepcopy(current['definition'])
+    next(col for col in direct_definition['columns'] if col['key'] == 'backend_development')['acceptance_checks'] = [check]
+    direct = store.registry.dispatch('workflow.publish', {
+        'workflow_plan_id': current['workflow_plan_id'], 'workflow': direct_definition},
+        replace(ctx, execution_key='direct-unowned'))
+    assert not direct.ok and 'BehaviorRunnerScriptUnowned' in str(direct.error)
     assert store.get_workflow(project['id'])['id'] == current['id']
     check['arguments']['argv'][1] = 'backend/acceptance.py'
     accepted = store.registry.dispatch('workflow.acceptance.configure',

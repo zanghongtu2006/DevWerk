@@ -2538,6 +2538,7 @@ def _workflow_publish(args: dict[str, Any], ctx: CapabilityContext, registry: Ca
     workflow = WorkflowDefinition.model_validate(
         canonicalize_workflow_capability_arguments(args["workflow"], registry)
     )
+    _validate_acceptance_script_owners(workflow.model_dump(mode='json'), ctx)
     method = WorkflowPlan.model_validate(ctx.store.get_workflow_plan(
         ctx.project_id, str(args['workflow_plan_id']))['plan'])
     impossible_checks = [issue for issue in acceptance_diagnostics(workflow, method)

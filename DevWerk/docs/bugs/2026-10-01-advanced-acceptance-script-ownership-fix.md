@@ -13,3 +13,7 @@
 在 `tests/test_context_acceptance_regression.py` 加回归：高级配置的 backend `tests/*.py` 被 `BehaviorRunnerScriptUnowned` 拒绝且 revision 不变；合法的 backend 自有脚本以及 delivery/accept 复用前序 system_test 脚本可以配置。保留简化入口相关测试，并运行相关验收/Workflow 合同测试后独立提交。
 
 当前第八次 Project 不热改冻结 revision；观察授权 Run 是否自行纠正，再用新 Project 原样重测。交付目标仍是最终 Task 通过 Kanban。
+
+## 入口补查（`538e2f7` 之后）
+
+复核发现直接 `workflow.publish` 也能发布相同的脚本验收合同。将同一个私有校验函数加入 `_workflow_publish`，使简化配置、高级配置、直接发布三个入口一致。增加直接发布的拒绝与 revision 不变测试。此补查不改变已经运行的第八次 Task 冻结版本。
