@@ -57,3 +57,27 @@ Runtime 凭冻结 Workflow 自动推进。Mailbox 仅触发“有新事实可检
 Project Agent 不再在每轮首个 Provider 请求中被强制只看到 `conversation.turn.resolve`；整个 Session 的工具目录在相邻回合保持稳定，讨论/只读检查可直接进行。Tool-free 普通答复会由 Runtime 自动记入 discussion hold；需要业务副作用的回合仍必须先绑定当前用户请求，未授权调用由 dispatch 拦截。`open_questions[*].blocking_for_start` 不再覆盖用户后来的明确执行授权。模型指令不再要求逐项更新决定/问题状态，保留旧字段读取以便历史 Project 兼容。
 
 回归：`test_conversation_intent_contract.py`、`test_conversation_contract.py`、`test_conversation_reply_tool.py` 中旧的“工具目录必须缩到一个工具”的断言调整为稳定工具目录及 dispatch 边界。新增“Agent 自己提出的阻塞问题不挡用户后续明确授权”用例。用仓库 venv 的 Python 3.12 运行四组 Conversation/API 合同测试，**77 passed**。系统 Python 3.14 对未关闭 SQLite 连接发出 unraisable ResourceWarning，导致同一通过用例在进程退出时非零；仓库 venv 无此问题。后续测试均用仓库 venv。阶段 2 开始前仍需审视执行回合无效果时的结果准入。
+
+## 阶段 2 实施记录：MCP 工具接入
+
+新增 `app/v1/mcp_tools.py`，从 `config/mcp-servers.yaml`（或 `DEVWERK_MCP_SERVERS_PATH`）读取配置。格式：
+
+```yaml
+mcp_servers:
+  local_tools:
+    transport: stdio
+    command: python
+    args: [path/to/server.py]
+    timeout_seconds: 30
+  remote_tools:
+    transport: http
+    url: http://127.0.0.1:9000/mcp
+```
+
+当前实现使用持久 stdio 子进程或 Streamable HTTP Session，做 initialize、tools/list 分页、tools/call；工具注册成 `mcp__server__tool`，经现有 CapabilityRegistry、ToolResult、执行回执和权限边界。MCP `readOnlyHint=true` 为只读，未标注的工具保守地作为 process 操作；Column 只有在 Workflow 明确给它该 capability 时才能调用。返回内容在进入模型上下文前有大小上限。三项本地 stdio/HTTP SSE/配置校验测试通过。仓库 venv 中安装的 Python MCP SDK 引用了 Python 3.10 的 pywin32 DLL，无法在当前 3.12 Runtime 导入，因此此阶段用边界清晰的本地 JSON-RPC 适配器，不把一个不可加载的 SDK 当成完成的功能。
+
+HTTP Session 失效后，`tools/list` 会重新初始化并重试；`tools/call` 不会盲目重试，因为其外部效果可能已经发生，交给执行回执标为结果不确定。stdio 请求超时或断开会关闭旧进程，下一请求建立新 Session，避免旧响应串到新请求。工具目录每 60 秒后台刷新；新工具只在下一 Agent Run 建立时进入目录，运行中的 Run 保留开始时的工具列表。发现中重复分页游标与工具别名碰撞会被拒绝。服务器重启、HTTP 过期和输出限长的基础测试已覆盖。
+
+回归：`test_mcp_tool_bridge.py`、四组 Conversation/API 合同测试，仓库 venv Python 3.12 下 **82 passed**。未跟踪的 `devwerk.zip` 未参与变更。
+
+当前边界：此版本只接入 MCP tools；resources、prompts、sampling 尚未接入。运行期新增工具会出现，但同名工具的 schema 更新/撤销仍需重启才能刷新；这是为了不改变在途 Run 的 schema/dispatch 合同。HTTP `tools/call` Session 过期时回执保持不确定，需人工或后续对账恢复，不能自动重放未知副作用。上述能力未达到全部 Hermes 平台集成的范围，后续阶段不得据此宣称完整等同。

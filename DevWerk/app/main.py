@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -19,6 +20,7 @@ from app.core.restart import ManagedRestart
 from app.services.usage import init_usage_db
 from app.v1.api import router as v1_router
 from app.v1.capabilities import build_core_registry
+from app.v1.mcp_tools import MCPToolManager, load_mcp_servers
 from app.v1.conversation import ConversationGateway
 from app.v1.runtime import RuntimeSupervisor
 from app.v1.store import V1Store
@@ -36,6 +38,22 @@ async def lifespan(app: FastAPI):
     policy = DEFAULT_V1_RUNTIME_POLICY
     platform_policy = PlatformPolicyLoader(Path(__file__).resolve().parents[1] / "DEVWERK.md").load()
     registry = build_core_registry(policy)
+    mcp_path = Path(os.environ.get('DEVWERK_MCP_SERVERS_PATH') or
+                    Path(__file__).resolve().parents[1] / 'config' / 'mcp-servers.yaml')
+    mcp_manager = MCPToolManager(load_mcp_servers(mcp_path), registry)
+    mcp_discovery = await asyncio.to_thread(mcp_manager.discover)
+    log.info('MCP tools discovered servers=%s', {name:len(tools) for name, tools in mcp_discovery.items()})
+    mcp_refresh_stop = asyncio.Event()
+
+    async def refresh_mcp_catalog():
+        while not mcp_refresh_stop.is_set():
+            try:
+                await asyncio.wait_for(mcp_refresh_stop.wait(), timeout=60)
+            except asyncio.TimeoutError:
+                await asyncio.to_thread(mcp_manager.discover)
+
+    mcp_refresh_task = (asyncio.create_task(refresh_mcp_catalog(), name='mcp-catalog-refresh')
+                        if mcp_manager.servers else None)
     store = V1Store(cfg.devwerk_db_path, policy, registry=registry)
     startup_result = store.prepare_workflow_startup(
         global_settings.workflow.auto_resume_previous_tasks
@@ -45,6 +63,7 @@ async def lifespan(app: FastAPI):
     supervisor = RuntimeSupervisor(store, registry)
     app.state.v1_store = store
     app.state.v1_registry = registry
+    app.state.v1_mcp = mcp_manager
     app.state.v1_global_settings = global_settings
     app.state.v1_global_settings_path = cfg.global_settings_path()
     app.state.v1_restart = ManagedRestart(
@@ -72,8 +91,12 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        mcp_refresh_stop.set()
+        if mcp_refresh_task:
+            await mcp_refresh_task
         await conversation.stop()
         supervisor.stop()
+        mcp_manager.close()
         log.info("DevWerk V1 stopped")
 
 
