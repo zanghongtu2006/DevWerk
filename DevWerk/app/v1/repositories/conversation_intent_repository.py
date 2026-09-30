@@ -309,7 +309,7 @@ class ConversationIntentRepository:
         with self.store.connect() as db:
             grant = db.execute("SELECT state,requirement_id,requirement_revision FROM v1_execution_grants WHERE id=? AND project_id=?",
                                (job['execution_grant_id'],ctx.project_id)).fetchone()
-            task = db.execute('SELECT requirement_id,requirement_revision FROM v1_tasks WHERE id=? AND project_id=?',
+            task = db.execute('SELECT requirement_id,requirement_revision,status FROM v1_tasks WHERE id=? AND project_id=?',
                               (task_id,ctx.project_id)).fetchone()
             requirement = db.execute('SELECT status,revision FROM v1_requirements WHERE id=? AND project_id=?',
                                      (job['requirement_id'],ctx.project_id)).fetchone()
@@ -324,6 +324,18 @@ class ConversationIntentRepository:
             if capability in {'task.retry','task.reopen'}:
                 if arguments.get('task_id') != task_id or arguments.get('clear_context'):
                     return 'SupervisionTaskMismatch: preserve the same Task and Worker context'
+                prior_recovery = db.execute(
+                    "SELECT 1 FROM v1_tool_invocations invocation "
+                    "JOIN v1_agent_runs run ON run.id=invocation.agent_run_id "
+                    "WHERE run.conversation_job_id=? AND invocation.ok=1 "
+                    "AND invocation.capability IN ('task.retry','task.reopen') LIMIT 1",
+                    (job['id'],),
+                ).fetchone()
+                if prior_recovery:
+                    return 'SupervisionRecoveryAlreadyRequested: inspect the Task and finish this notification turn'
+                required_status = 'recovering' if capability == 'task.retry' else 'failed'
+                if task['status'] != required_status:
+                    return f'SupervisionTaskNotRecoverable: {capability} requires a {required_status} Task; current status is {task["status"]}'
                 return None
             if capability == 'agent.worker.send':
                 assignment_id = arguments.get('assignment_id')

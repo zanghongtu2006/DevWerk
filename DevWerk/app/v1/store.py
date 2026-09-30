@@ -1318,7 +1318,7 @@ class V1Store:
             if not grant:
                 return None
             recoveries = db.execute(
-                "SELECT COUNT(*) FROM v1_tool_invocations invocation "
+                "SELECT COUNT(DISTINCT earlier.id) FROM v1_tool_invocations invocation "
                 "JOIN v1_agent_runs run ON run.id=invocation.agent_run_id "
                 "JOIN v1_conversation_jobs earlier ON earlier.id=run.conversation_job_id "
                 "WHERE earlier.project_id=? AND invocation.ok=1 "

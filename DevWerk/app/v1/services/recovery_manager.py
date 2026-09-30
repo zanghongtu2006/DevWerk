@@ -160,6 +160,8 @@ class RecoveryManager:
         if workflow.terminal_kind(target):
             raise ValueError("retry target must be a non-terminal Column")
         workflow.column(target)
+        if task["status"] == "pending" and target == task["current_column"]:
+            raise ValueError("Task is already pending in the retry target Column")
         now = utcnow()
         context = {} if clear_context else task["context"]
         with self.store.tx(immediate=True) as db:

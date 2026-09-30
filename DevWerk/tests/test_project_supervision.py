@@ -126,6 +126,35 @@ def test_supervision_reopens_only_failed_task_under_prior_grant(store, tmp_path)
         'task.inspect','task.reopen','conversation.reply']
 
 
+def test_supervision_can_recover_only_once_per_notification(store, tmp_path):
+    project, _, task = failed_task_with_user_grant(store, tmp_path)
+    job, mailbox = claim_event(store, project)
+    assert store.bind_supervision_job(job['id'], mailbox)
+    run = begin_agent(store, project, kind='conversation', conversation_job_id=job['id'])
+    ctx = CapabilityContext(project['id'], project, store, agent_run_id=run['id'])
+
+    wrong_action = store.registry.dispatch('task.retry', {'task_id':task['id']}, ctx)
+    assert not wrong_action.ok
+    assert wrong_action.error['type'] == 'SupervisionTaskNotRecoverable'
+    reopened = store.registry.dispatch('task.reopen', {'task_id':task['id']}, ctx)
+    assert reopened.ok, reopened.error
+    store.record_tool_invocation(agent_run_id=run['id'], tool_call_id='first-reopen',
+        capability='task.reopen', arguments={'task_id':task['id']},
+        result=reopened.model_dump(mode='json'), ok=True)
+
+    repeated = store.registry.dispatch('task.retry',
+        {'task_id':task['id'], 'column_key':'work'}, ctx)
+    assert not repeated.ok
+    assert repeated.error['type'] == 'SupervisionRecoveryAlreadyRequested'
+    with pytest.raises(ValueError, match='already pending'):
+        store.retry_task(task['id'], column_key='work')
+    with store.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM v1_events WHERE task_id=? AND type='task.reopened'",
+            (task['id'],)).fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM v1_events WHERE task_id=? AND type='task.retry_requested'",
+            (task['id'],)).fetchone()[0] == 0
+
+
 def test_supervision_model_failure_still_notifies_original_task_failure(store, tmp_path):
     project, _, task = failed_task_with_user_grant(store, tmp_path)
     job, _ = claim_event(store, project)
@@ -153,6 +182,13 @@ def test_supervision_stops_after_two_durable_recoveries(store, tmp_path):
             tool_call_id=f'recovery-{index}', capability='task.reopen',
             arguments={'task_id':task['id']}, result={'ok':True,'output':{'id':task['id']}},
             ok=True)
+        if index == 0:
+            # Historical duplicate receipts from one notification represent
+            # one recovery opportunity, not two independent failure cycles.
+            store.record_tool_invocation(agent_run_id=run['id'],
+                tool_call_id='historical-duplicate', capability='task.retry',
+                arguments={'task_id':task['id']}, result={'ok':True,'output':{'id':task['id']}},
+                ok=True)
         store.finish_conversation_job(job['id'], None, run['id'], {})
         with store.tx(immediate=True) as db:
             store._mailbox(db, project['id'], 'task.failed', task['id'], None,
