@@ -405,6 +405,27 @@ class ContextManager:
             state['turn_contract'] = contract
             state['work_intent'] = self.store.intents.context(job)
             state['requirement'] = requirement
+            try:
+                workflow = self.store.get_workflow(job['project_id'])
+            except KeyError:
+                workflow = None
+            state['active_workflow'] = ({key:workflow.get(key) for key in
+                ('id','revision','name','requirement_id','requirement_revision',
+                 'definition_hash','workflow_plan_id')} if workflow else None)
+            state['workflow_plans'] = [{key:plan.get(key) for key in
+                ('id','created_at','content_hash')} for plan in
+                self.store.list_workflow_plans(job['project_id'], 5)]
+            state['task_plans'] = [{**{key:plan.get(key) for key in
+                ('id','workflow_revision_id','requirement_id','created_at')},
+                'proposed_task_refs':[task.get('proposed_task_ref') for task in
+                    (plan.get('plan') or {}).get('tasks', [])]}
+                for plan in self.store.list_task_plans(job['project_id'], 5)]
+            state['tasks'] = [
+                {**task, 'failure_detail':self.store.feedback.failure_detail(
+                    job['project_id'], task['id'])}
+                if task['status'] in {'failed','recovering'} else task
+                for task in self.store.task_summaries(
+                    job['project_id'], self.policy.task_summary_limit)]
             for key in ('conversation_job', 'turn_authority'):
                 if isinstance(state.get(key), dict):
                     state[key]['task_graph_mutation_allowed'] = allowed

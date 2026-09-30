@@ -60,6 +60,11 @@ def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text
     def model(_messages, tools, **_kwargs):
         nonlocal calls
         calls += 1
+        current = next(json.loads(item['content']) for item in reversed(_messages)
+            if item['role'] == 'user' and 'authoritative_current_request' in item['content'])
+        state = current['authoritative_project_state']
+        if calls <= 2:
+            assert state['active_workflow'] is None
         exposed = {item["function"]["name"] for item in tools}
         assert "loop.apply" in exposed
         assert "workflow.plan.save" in exposed
@@ -81,6 +86,8 @@ def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text
             )])
         if calls == 3:
             active = store.get_workflow(project["id"])
+            assert state['active_workflow']['id'] == active['id']
+            assert state['task_plans'] == []
             definition = WorkflowDefinition.model_validate(active["definition"])
             planned = task_plan(
                 active["id"],
@@ -98,6 +105,8 @@ def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text
             )])
         if calls == 4:
             planned = store.list_task_plans(project["id"])[0]
+            assert state['task_plans'][0]['id'] == planned['id']
+            assert state['task_plans'][0]['proposed_task_refs'] == ['primary']
             return AgentModelResponse(tool_calls=[AgentToolCall(
                 id="task",
                 name="task.create",
