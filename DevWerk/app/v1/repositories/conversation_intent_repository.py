@@ -214,7 +214,7 @@ class ConversationIntentRepository:
                             'control_task_id': resolution.control_task_id}
                 result = {'turn_contract': contract, 'work_intent': state, 'requirement': requirement,
                           'next_reply_contract': 'Boundary committed. Do not include turn_resolution in the final report. '
-                          'For discussion answer naturally; save further decisions/questions/proposals with conversation.draft.update if needed. '
+                          'For discussion answer naturally; save durable work notes with project.memory.write if needed. '
                           'For work_result use conversation.reply with actual tool/task IDs. '
                           'A Task traverses all Columns. Never describe lifecycle steps as separate Tasks of the same delivery.'}
                 db.execute('INSERT INTO v1_work_intents VALUES(?,?,?,?,?,?)',
@@ -268,7 +268,8 @@ class ConversationIntentRepository:
             return None
         if job['status'] != 'running':
             return 'ConversationTurnInactive: no mutations after a turn has finished'
-        if capability in {'conversation.turn.resolve', 'conversation.reply'}:
+        if capability in {'conversation.turn.resolve', 'conversation.execution.authorize',
+                          'conversation.task.control.authorize', 'conversation.reply'}:
             return None
         contract = self.contract(job)
         if capability == 'conversation.draft.update':
@@ -280,7 +281,7 @@ class ConversationIntentRepository:
         if contract['phase'] == 'targeted_control':
             return None if (capability == contract['control_capability'] and arguments.get('task_id') == contract['control_task_id']) else 'TurnControlScopeMismatch: only the requested Task control is allowed'
         if contract['phase'] != 'execution':
-            return 'TurnUnresolved: submit conversation.turn.resolve before business mutations' if contract['phase'] == 'unresolved' else 'ConversationMutationDisabled: continue discussing; no work was authorized'
+            return 'TurnUnresolved: call conversation.execution.authorize or conversation.task.control.authorize before business mutations' if contract['phase'] == 'unresolved' else 'ConversationMutationDisabled: continue discussing; no work was authorized'
         with self.store.connect() as db:
             grant = db.execute('SELECT * FROM v1_execution_grants WHERE id=? AND project_id=?',
                                (job['execution_grant_id'],ctx.project_id)).fetchone()

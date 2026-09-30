@@ -134,7 +134,8 @@ def test_conversation_with_loop_workflow_can_revise_but_cannot_reapply_loop(stor
         nonlocal calls
         calls += 1
         exposed.append({item["function"]["name"] for item in tools})
-        assert "conversation.turn.resolve" in exposed[-1]
+        assert "conversation.execution.authorize" in exposed[-1]
+        assert "conversation.turn.resolve" not in exposed[-1]
         assert "workflow.inspect" in exposed[-1]
         if calls == 1:
             return AgentModelResponse(tool_calls=[AgentToolCall(
@@ -175,7 +176,8 @@ def test_start_task_false_hides_mutations_and_rejects_injected_calls(store, tmp_
     accepted = run_turn(agent, project["id"], "Only discuss this.", False)
     assert store.get_conversation_job(accepted["job"]["id"])["status"] == "succeeded"
     assert calls == 2
-    assert "conversation.turn.resolve" in exposed[0]
+    assert "conversation.execution.authorize" in exposed[0]
+    assert "conversation.turn.resolve" not in exposed[0]
     assert "system.files.write" in exposed[0]
     assert "system.command.run" in exposed[0]
     assert exposed[0] == exposed[1]

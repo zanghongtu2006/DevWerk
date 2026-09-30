@@ -33,6 +33,43 @@ def test_default_true_is_not_authorization_and_discussion_creates_no_requirement
     assert store.agents.list_requirements(project['id']) == []
 
 
+def test_narrow_execution_authorization_binds_current_message_and_releases_hold(store, tmp_path):
+    project = store.create_project('narrow authorization', '', str(tmp_path/'project'))
+    discussion, ctx = turn(store, project, '先只讨论')
+    assert resolve(ctx, discussion).ok
+    store.finish_conversation_job(discussion['id'], None, ctx.agent_run_id, {})
+    start, ctx = turn(store, project, '现在开始实现登录系统')
+    authorized = store.registry.dispatch('conversation.execution.authorize',
+        {'request':'begin','scope_summary':'登录系统'}, ctx)
+    assert authorized.ok, authorized.error
+    assert authorized.output['turn_contract']['phase'] == 'execution'
+    assert not authorized.output['work_intent']['execution_hold']
+    assert authorized.output['turn_contract']['source_message_id'] == start['user_message_id']
+    assert store.registry.dispatch('project.files.write',
+        {'path':'proof.txt','content':'authorized'}, ctx).ok
+
+
+def test_narrow_authorization_respects_discussion_only_transport_and_task_scope(store, tmp_path):
+    from tests.helpers import agent_workflow, create_planned_task, publish_planned_workflow
+
+    project = store.create_project('narrow denial', '', str(tmp_path/'project'))
+    job, ctx = turn(store, project, '只讨论', False)
+    denied = store.registry.dispatch('conversation.execution.authorize',
+        {'request':'begin','scope_summary':'demo'}, ctx)
+    assert not denied.ok
+    assert store.agents.list_requirements(project['id']) == []
+    store.finish_conversation_job(job['id'], None, ctx.agent_run_id, {})
+
+    publish_planned_workflow(store, project['id'], agent_workflow())
+    task = create_planned_task(store, project['id'], 'task control')
+    control, ctx = turn(store, project, f'暂停 Task {task["id"]}')
+    authorized = store.registry.dispatch('conversation.task.control.authorize',
+        {'action':'task.pause','task_id':task['id']}, ctx)
+    assert authorized.ok, authorized.error
+    assert authorized.output['turn_contract']['source_message_id'] == control['user_message_id']
+    assert store.registry.dispatch('task.pause', {'task_id':task['id']}, ctx).ok
+
+
 def test_task_pause_requires_this_turns_targeted_control_contract(store, tmp_path):
     from app.v1.capabilities import _task_pause
     from tests.helpers import agent_workflow, create_planned_task, publish_planned_workflow

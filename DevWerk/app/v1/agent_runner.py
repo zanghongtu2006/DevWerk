@@ -187,7 +187,7 @@ class AgentExecutionRunner:
                         (not job or self.store.intents.contract(job)['phase'] != 'unresolved'))
                     correction = ('Your response was empty. The current turn is not finished. ' +
                         ('Call conversation.reply alone using actual evidence IDs or a discussion message.'
-                         if force_reply_tool else 'Answer the user naturally, inspect with read-only tools, or bind the current user request with conversation.turn.resolve before a business mutation.'))
+                         if force_reply_tool else 'Answer the user naturally, inspect with read-only tools, or bind the current user request with conversation.execution.authorize before a business mutation.'))
                     messages.append({'role':'user','content':correction})
                     self.store.add_agent_message(run['id'],'user',correction,[],emit_progress=False)
                     continue

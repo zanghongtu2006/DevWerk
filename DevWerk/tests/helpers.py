@@ -22,13 +22,12 @@ def resolve_execution_before(model, *, request='begin', requirement_id=None):
             identity = current['message_id']
             if identity not in resolved and state.get('turn_contract', {}).get('phase') == 'unresolved':
                 resolved.add(identity)
-                intent = state['work_intent']
-                return AgentModelResponse(tool_calls=[AgentToolCall(id='resolve-user-turn', name='conversation.turn.resolve', arguments={
-                    'source_message_id': identity, 'based_on_intent_revision': intent['revision'],
-                    'act':'execute', 'execution_request':request, 'requirement_id':requirement_id,
-                    'constraint_change':'release_hold' if intent['execution_hold'] else 'retain',
-                    'scope_summary':current['content'], 'user_evidence':[{'message_id':identity,'quote':current['content']}],
-                })])
+                arguments = {'request':request, 'scope_summary':current['content']}
+                if requirement_id:
+                    arguments['requirement_id'] = requirement_id
+                return AgentModelResponse(tool_calls=[AgentToolCall(
+                    id='resolve-user-turn', name='conversation.execution.authorize',
+                    arguments=arguments)])
             break
         return model(messages, tools, **kwargs)
     return wrapped

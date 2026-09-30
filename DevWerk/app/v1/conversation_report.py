@@ -24,7 +24,7 @@ class ConversationReport(ConversationReply):
 REPORT_INSTRUCTION = (
     'You may answer ordinary discussion or status questions in natural language. '
     'No question-status update or boundary tool is required for a tool-free reply. '
-    'Before business mutations, bind the current user execution request with conversation.turn.resolve. '
+    'Before business mutations, bind the current user execution request with conversation.execution.authorize. '
     'For completed work call conversation.reply alone with mode=work_result and real tool_call_ids/task_ids; '
     'Runtime renders committed facts. For a blocker use mode=blocked and actual failed receipts. '
     'Never claim a Workflow, Task or delivery was created merely because you proposed it.'

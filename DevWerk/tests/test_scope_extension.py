@@ -172,7 +172,6 @@ def test_retired_worker_successor_keeps_old_history_and_new_private_context(stor
 
 
 @pytest.mark.parametrize('text', [
-    'Chapters 7–12 are queued and chapter 7 is running.',
     '{"mode":"work_result","task_ids":["tsk_invented"]}',
     '{"mode":"work_result","tool_call_ids":["invented-create"]}',
 ])
@@ -194,11 +193,32 @@ def test_gateway_never_publishes_unverified_execution_reply(store, tmp_path, tex
     assert all(m['content'] != text for m in store.messages(project['id']) if m['role'] == 'assistant')
 
 
+def test_tool_free_prose_is_recorded_as_discussion_without_execution_effects(store, tmp_path):
+    from app.v1.agent import AgentCore
+    from app.v1.domain import AgentModelResponse
+    from app.v1.conversation import ConversationGateway
+    from tests.test_conversation_contract import run_turn
+
+    project = store.create_project('prose discussion', '', str(tmp_path / 'discussion'))
+    gateway = ConversationGateway(store, store.registry, agent_core=AgentCore(
+        store, store.registry, lambda *a, **kw: AgentModelResponse(
+            text='Chapters 7–12 are queued and chapter 7 is running.')))
+    queued = run_turn(gateway, project['id'], 'Continue with chapters 7–12', True)
+    job = store.get_conversation_job(queued['job']['id'])
+    assert job['status'] == 'succeeded'
+    assert job['result']['business_outcome'] == 'discussion'
+    assert job['result']['reply'].startswith('本轮仅讨论，未新建任务。')
+    assert store.list_tasks(project['id']) == []
+
+
 def test_report_uses_actual_pending_state_not_model_claim(store, tmp_path):
     from app.v1.conversation_report import render_report
     project, ctx, req, workflow = novel(store, tmp_path)
     plan = save_chapters(ctx, workflow, [1])
     task = invoke(ctx, 'task.create', {'task_plan_id': plan['id'], 'proposed_task_ref': 'chapter01'})
+    store.record_tool_invocation(agent_run_id=ctx.agent_run_id, tool_call_id='created-chapter',
+        capability='task.create', arguments={'task_plan_id':plan['id'],'proposed_task_ref':'chapter01'},
+        result={'ok':True,'capability':'task.create','output':task}, ok=True)
     text, evidence = render_report(store, project['id'], ctx.agent_run_id, json.dumps({
         'mode': 'work_result', 'message': 'All chapters are done and delivered.', 'task_ids': [task['id']]}))
     assert '待执行' in text and 'done and delivered' not in text

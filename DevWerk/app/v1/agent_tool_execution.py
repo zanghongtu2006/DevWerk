@@ -82,9 +82,10 @@ class AgentToolBatchExecutor:
             else None
         )
         if self.spec.kind == 'conversation' and len(tool_calls) > 1 and any(
-            call.name in {'conversation.turn.resolve','conversation.reply'} for call in tool_calls
+            call.name in {'conversation.turn.resolve','conversation.execution.authorize',
+                          'conversation.task.control.authorize','conversation.reply'} for call in tool_calls
         ):
-            protocol_error = 'Submit conversation.turn.resolve or conversation.reply alone; read other receipts before choosing the next action. This batch had no effects.'
+            protocol_error = 'Submit an execution/control authorization or conversation.reply alone; read its receipt before choosing the next action. This batch had no effects.'
         if protocol_error is not None:
             self.completion_guard.observe_rejection(
                 {

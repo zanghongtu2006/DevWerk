@@ -93,3 +93,15 @@ HTTP Session 失效后，`tools/list` 会重新初始化并重试；`tools/call`
 ### 阶段 3A 回归结果
 
 已实现上述只读索引和回合注入。专项测试验证失败回执引用可跨重启恢复、长输出不进入索引、仅显示同一 Project Session 的旧 Run、按时间倒序且 Run/回执数有上限。结合 Context、Store、Conversation 的相关回归共 **67 passed**（仓库 venv Python 3.12）。索引只是追查入口；主 Agent 仍须按需调用 `agent.result.read`，不能把索引当作副作用成功证明。
+
+## 阶段 3B 设计：收窄模型面向的执行授权
+
+`conversation.turn.resolve` 仍暴露完整 `TurnResolution` schema，包含问题、决定、proposal、source message ID 和 revision。虽然阶段 1 不强制讨论回合调用它，模型要执行时仍容易把已决定议题误编成状态更新。增加 `conversation.execution.authorize`：模型只提供 `request=begin/continue/extend`、可选范围摘要、Requirement ID、是否新范围；Host 从当前 Job 绑定用户消息 ID、revision、当前消息证据，以及用户选中的 proposal，沿用原来的事务和 Grant 校验。另加 `conversation.task.control.authorize`，只提供 `action=task.pause/task.resume/task.cancel` 与 Task ID，Host 绑定同样的当前消息证据。两个新入口都只接受当前真实用户 Job；未授权 event/讨论模式照旧拒绝。旧 `conversation.turn.resolve` 继续可被存量 Run/回执 replay 调用，但不再进入新 Conversation Run 的模型目录；`conversation.draft.update` 也不进入目录，工作笔记用 Memory。
+
+本阶段不凭关键词推断用户意思，也不放宽 `denial`/Grant；模型仍须判断用户是否要求执行。因而它解决重复状态账本与接口复杂度，不单独解决“Agent 错把执行请求当讨论答复”的语义误判。后者需独立结果准入/用户明确动作合同，不应靠暗中自动执行实现。
+
+### 阶段 3B 回归结果
+
+新入口复用现有事务、当前用户消息证据、讨论上界、Requirement/Grant 和 Task 控制准入；旧入口保留在 Registry 供已有 Run 与历史测试重放，新 Conversation Run 工具目录不再展示旧入口和 draft ledger。更新 `DEVWERK.md` 的实际主 Agent 指令，避免提示它调用已隐藏的工具。专项与 API/范围扩展/通知回归共 **107 passed**。旧范围扩展测试曾把直接 Registry dispatch 当成已有 `v1_tool_invocations`，已补上真实 Run 回执作为测试前提。
+
+一次回归明确暴露仍存风险：自动模式下模型无工具自然语言声称“任务已排队”，Runtime 会记为 discussion 且标注“未新建任务”，但文本本身仍可能错误。`business_outcome` 现在明确区分 `discussion` 与 `completed`，伪造 `work_result` 引用仍拒绝。这只保证持久状态不虚报，不保证无工具自然语言一定符合用户意图；后续需专门设计可验证的执行目标与结果合同，不能把本阶段误称为完整黑盒交付。

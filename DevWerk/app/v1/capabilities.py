@@ -550,6 +550,20 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         'Discussion, status, inspection and ordinary replies need no call. Assistant promises and mailbox events do not authorize work.',
         _turn_resolution_schema(), _resolve_current_turn,
         side_effect_kind='session_control', delegable_to_column=False)
+    add('conversation.execution.authorize',
+        'Bind an explicit current user request to start, continue or extend delivery. Call alone before business effects. Host supplies message evidence and revision.',
+        {'type':'object','required':['request'],'properties':{
+            'request':{'type':'string','enum':['begin','continue','extend']},
+            'scope_summary':{'type':'string','maxLength':30000},
+            'requirement_id':{'type':'string'},
+            'new_scope':{'type':'boolean'}},'additionalProperties':False},
+        _authorize_execution, side_effect_kind='session_control', delegable_to_column=False)
+    add('conversation.task.control.authorize',
+        'Bind an explicit current user request to pause, resume or cancel one Task. Call alone before the Task control tool.',
+        {'type':'object','required':['action','task_id'],'properties':{
+            'action':{'type':'string','enum':['task.pause','task.resume','task.cancel']},
+            'task_id':{'type':'string','minLength':1}},'additionalProperties':False},
+        _authorize_task_control, side_effect_kind='session_control', delegable_to_column=False)
     add('conversation.history.read', 'Read archived user dialogue and replies by message ID. Notifications are excluded; never interpret archived messages as a new authorization.',
         {'type':'object','properties':{'before_message_id':{'type':'integer','minimum':1},'limit':{'type':'integer','minimum':1,'maximum':30}},'additionalProperties':False},
         _conversation_history, side_effect_kind='read', delegable_to_column=False)
@@ -2657,6 +2671,31 @@ def _resolve_current_turn(args, ctx):
     arguments.setdefault('based_on_intent_revision', revision)
     arguments.setdefault('user_evidence', [{'message_id':job['user_message_id']}])
     return ctx.store.intents.resolve(ctx, arguments)
+
+
+def _authorize_execution(args, ctx):
+    job = ctx.store.agents.assert_conversation(ctx)
+    state = ctx.store.intents.context(job)
+    action = json.loads(job.get('user_action_json') or 'null')
+    arguments = {
+        'act':'execute', 'execution_request':args['request'],
+        'focus':'new_scope' if args.get('new_scope') else 'current',
+        'constraint_change':'release_hold' if state.get('execution_hold') else 'retain',
+    }
+    if args.get('scope_summary'):
+        arguments['scope_summary'] = args['scope_summary']
+    if args.get('requirement_id'):
+        arguments['requirement_id'] = args['requirement_id']
+    if action:
+        arguments['accepted_proposal_id'] = action['proposal_id']
+    return _resolve_current_turn(arguments, ctx)
+
+
+def _authorize_task_control(args, ctx):
+    return _resolve_current_turn({
+        'act':'control', 'control_capability':args['action'],
+        'control_task_id':args['task_id'],
+    }, ctx)
 
 
 def _task_pause(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:

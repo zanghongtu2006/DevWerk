@@ -309,7 +309,8 @@ class ConversationGateway:
                 # surface. Turn-specific authority is enforced at dispatch;
                 # changing tool schemas between turns destroys prompt-prefix
                 # reuse and makes the same logical Agent appear to lose tools.
-                capabilities = self.registry.all_ids()
+                capabilities = [capability for capability in self.registry.all_ids()
+                    if capability not in {'conversation.turn.resolve', 'conversation.draft.update'}]
                 trigger_kind = str(job.get("trigger_kind") or "user")
                 is_user_turn = trigger_kind == "user"
                 main = self.store.agents.main(project_id)
@@ -479,7 +480,8 @@ class ConversationGateway:
                 )
                 first_task_id = tasks[0]["id"] if tasks else None
                 report = (result.completion or {}).get('conversation_report', {}).get('report', {})
-                business_outcome = 'blocked' if report.get('mode') == 'blocked' else 'completed'
+                business_outcome = ('blocked' if report.get('mode') == 'blocked' else
+                                    'discussion' if report.get('mode') in {'discussion','proposal'} else 'completed')
                 if notification:
                     notification['meta']['business_outcome'] = business_outcome
                 if business_outcome == 'blocked':
