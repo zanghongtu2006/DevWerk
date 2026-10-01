@@ -172,6 +172,9 @@ def test_ddd_software_delivery_loop_has_generic_engineering_lifecycle(store):
         "docs/frontend-development.md",
     ]
     assert columns["integration_review"]["metadata"]["writable_paths"] == ["docs/pair-review.md"]
+    assert "scripts/acceptance/**" in columns["system_test"]["metadata"]["writable_paths"]
+    assert "scripts/delivery/**" in columns["delivery"]["metadata"]["writable_paths"]
+    assert "scripts/accept/**" in columns["accept"]["metadata"]["writable_paths"]
     assert columns["backend_development"]["metadata"]["agent_session_key"] == "backend_development"
     assert columns["frontend_development"]["metadata"]["agent_session_key"] == "frontend_development"
     transitions = {
@@ -188,7 +191,7 @@ def test_ddd_software_delivery_loop_has_generic_engineering_lifecycle(store):
     ]
     assert columns["system_test"]["metadata"]["writable_paths"] == [
         "docs/test-report.md", "e2e/**", "tests/**", "scripts/acceptance/**"]
-    assert columns["accept"]["metadata"]["writable_paths"] == ["FINAL_ACCEPTANCE.md"]
+    assert columns["accept"]["metadata"]["writable_paths"] == ["FINAL_ACCEPTANCE.md", "scripts/accept/**"]
 
 
 def test_preset_loop_definitions_are_not_stored_in_sqlite(store):

@@ -764,7 +764,8 @@
               "README.md",
               "docs/delivery-report.md",
               "startup.*",
-              "shutdown.*"
+              "shutdown.*",
+              "scripts/delivery/**"
             ]
           }
         },
@@ -822,7 +823,8 @@
             "purpose": "根据需求和真实证据完成最终验收",
             "derives_agent": true,
             "writable_paths": [
-              "FINAL_ACCEPTANCE.md"
+              "FINAL_ACCEPTANCE.md",
+              "scripts/accept/**"
             ]
           }
         }
