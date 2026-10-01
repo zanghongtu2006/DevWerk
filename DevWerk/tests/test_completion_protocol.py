@@ -211,6 +211,30 @@ def test_worker_selected_behavior_check_repairs_earlier_command_failure() -> Non
     assert 'later successful behavior command' in completion_tool_schema(contract)['function']['description']
 
 
+def test_unfrozen_acceptance_column_can_complete_after_later_successful_behavior_check() -> None:
+    failed = _entry('failed', 'project.command.run', 'process', ok=False,
+                    arguments={'argv': ['mvn', 'spring-boot:run']})
+    passed = _entry('passed', 'project.command.run', 'process', ok=True,
+                    arguments={'argv': ['powershell', '-File', 'acceptance-test.ps1']})
+    cleanup = _entry('cleanup', 'project.command.run', 'process', ok=True,
+                     arguments={'argv': ['cmd', '/c', 'del', 'temporary.java']})
+    contract = CompletionContract('column.complete',
+        {'done': CompletionOutcomeRule(target='done')}, evidence_collection='runtime')
+
+    def decision(ledger, *, frozen=False):
+        selected = contract if not frozen else CompletionContract(
+            'column.complete', contract.outcomes, evidence_collection='runtime',
+            acceptance_checks=({'key': 'http_check'},))
+        return CompletionAdmissionService().evaluate(
+            CompletionSubmission('done', {}, 'verified',
+                                 tuple(item['evidence_id'] for item in ledger)), selected, ledger)
+
+    assert decision([failed, passed]).accepted
+    assert decision([passed, failed]).rejection.code == 'unresolved_execution_failure'
+    assert decision([failed, cleanup]).rejection.code == 'unresolved_execution_failure'
+    assert decision([failed, passed], frozen=True).rejection.code == 'acceptance_check_failed'
+
+
 def test_runtime_evidence_collection_ignores_model_supplied_evidence_ids() -> None:
     successful = _entry("read", "project.files.read", "read", ok=True)
     contract = CompletionContract(

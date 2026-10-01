@@ -14,7 +14,7 @@
 
 - Project `prj_d0e210ee28414908ae370984815895b4`：重放完全相同的六轮讨论和第七轮授权。六轮期间无 Task。授权轮的 `workflow.plan.save` 曾四次被 schema/领域契约拒绝，第五次保存成功；Agent 后续调用 `loop.apply`、`task.plan.contract/validate/save` 与 `task.create`，已创建 Task `tsk_df63ca677bc941d08c332ecd5e93fdb6`。该项目选择了 Loop 模板，符合“模板可选”路径；是否顺利派生 Worker 与完成交付仍待回归。
 - Agent 在 Task 创建前写了 `SPEC.md`、`CREDENTIALS.md` 两个项目文档，没有写测试脚本。此行为属于当前通用 Conversation Agent 的直接工具权限；不应把“通用 Agent 可写文件”误判为必须预写脚本的旧门槛。
-- 截至观察点，Task 已依次完成 `requirements` 与 `domain_design`，正在 `backend_development`。
+- Task 已依次完成 `requirements`、`domain_design`、`backend_development`，正在 `frontend_development`。第一次后端 Assignment 累计 94 次模型迭代、114 次工具调用后触发 `execution_budget_exceeded`；Runtime 自动新建同一 Column 的下一次 Assignment，并保留 Worker 实例与 Agent Session，后端最终成功。这验证了 Worker 生命周期续接，但该列的重试成本较高，仍需在最终统计中记录。
 
 ## 测试环境隔离注意
 
@@ -25,3 +25,11 @@
 1. 两个 Task 的 Column 转移、失败反馈、责任列重验、Mailbox 通知及最终状态。
 2. 交付完成后，再核对 Vue/Java 登录、防刷、401/429、两条 API 与无登出端点等约定；区分流程缺陷与交付物质量问题。
 3. 记录无效工具调用、模型/工具调用数与长命令的成本。仅在有阻塞证据时再改代码，保持小范围提交。
+
+原项目验收 Worker 的有界脚本曾报告“5 次失败后未见 429”，后续独立检查发现第 1–5 次为 401、第 6–7 次为 429，与已批准的“允许五次失败，封锁时 429”相符。脚本自身的阈值断言需要修正；截至观察点没有持久化错误 Task 反馈，也不能把该脚本误判当作后端缺陷。
+
+## 验收列完成阻塞与修复方案
+
+项目一的验收 Worker 后来执行了包含 8 个 HTTP 场景且成功退出的有界命令，却在 `column.complete` 连续五次被旧探索命令 `mvn spring-boot:run -q` 的失败回执拒绝，Task 转为 `recovering/paused`。`90987b3` 的“后续成功行为命令修复探索失败”分支只对 `required_capability=project.command.run` 生效；该 Workflow 的 `acceptance_testing` 没有这一标记，所以实际独立验收列落在规则外。Worker 随后尝试给自身记录 `runtime.behavior` 反馈，也被正确拒绝，因为该引用只属于 Plan 明确列出的行为列。这是完成协议覆盖面缺陷，不是后端交付失败。
+
+最小修复：`app/v1/services/completion_admission.py::evaluate` 对**所有无固定 acceptance checks 的 Column**采用相同的探索命令规则：只有晚于最后一条未解决命令失败的、成功且非已知非行为的 `project.command.run` 回执，才能解除先前的命令失败；非命令动作失败、固定检查失败、只读/noop/清理命令仍阻止成功。保留执行历史与最终证据核验。`completion_protocol.py` 的工具说明与拒绝提示同步表述，不新增状态位或列特例。增单测覆盖无 `required_capability` 的独立验收列、固定检查、清理命令和时间顺序。新项目仍在运行，服务重启应等它达到安全边界；之后由 Conversation Agent 恢复同一 Task，再跑新 Project 串行回归。

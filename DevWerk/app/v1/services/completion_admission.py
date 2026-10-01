@@ -68,7 +68,7 @@ class CompletionAdmissionService:
                         message += f" ({str(error.get('type') or 'CheckFailed')[:80]}: {str(error['message'])[:300]})"
                     return self._reject('acceptance_check_failed', message)
             unresolved = {}
-        elif rule.required_capability == 'project.command.run' and not rule.allows_unresolved_failures:
+        elif not rule.allows_unresolved_failures:
             # Worker-selected checks have no frozen command to retry verbatim.
             # A later successful behavior command can supersede exploratory
             # command failures, while other failed actions still block success.
@@ -147,8 +147,7 @@ class CompletionAdmissionService:
             repair_hint = (
                 "Retry this operation successfully, run a later successful behavior check, "
                 "or submit a declared failure/rework outcome. "
-                if rule.required_capability == 'project.command.run' and not contract.acceptance_checks
-                and failed.get('capability') == 'project.command.run'
+                if not contract.acceptance_checks and failed.get('capability') == 'project.command.run'
                 else "Retry this operation successfully, or submit a declared failure/rework outcome. "
             )
             return self._reject("unresolved_execution_failure", message +
