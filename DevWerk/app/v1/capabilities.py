@@ -2499,7 +2499,8 @@ def _validate_acceptance_script_owners(definition, ctx):
             if script_index is None:
                 continue
             script = argv[script_index].replace('\\', '/')
-            if ctx.files.resolve(script).is_file() or writable(column, script):
+            ctx.files.resolve(script)
+            if writable(column, script):
                 continue
             owned_earlier = any(
                 writable(prior, script) and any(
@@ -2513,7 +2514,8 @@ def _validate_acceptance_script_owners(definition, ctx):
                     f'BehaviorRunnerScriptUnowned: {script!r} cannot be created by '
                     f'{column["key"]}; use its writable_paths '
                     f'{(column.get("metadata") or {}).get("writable_paths", [])!r}, '
-                    'reuse a prior Column acceptance script, or create the script before Task planning')
+                    'reuse a prior Column acceptance script with a repair owner; '
+                    'a pre-existing script outside every responsible Column remains unrepairable')
 
 
 def _behavior_runner_script_index(argv):

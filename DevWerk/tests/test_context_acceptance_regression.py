@@ -363,7 +363,8 @@ def test_simple_behavior_runner_rejects_missing_report_argument_and_fake_check(s
     existing = store.registry.dispatch('workflow.acceptance.runners',
         {**base,'runners':[{**runner,'argv':['python','scripts/preexisting.py',report]}]},
         replace(ctx, execution_key='runner-existing'))
-    assert existing.ok, existing.error
+    assert not existing.ok and 'BehaviorRunnerScriptUnowned' in str(existing.error)
+    assert store.get_workflow(project['id'])['id'] == current['id']
     current = store.get_workflow(project['id'])
     base = {'base_revision_id':current['id'], 'base_digest':current['definition_hash']}
     no_scenarios = store.registry.dispatch('workflow.acceptance.runners',
@@ -436,6 +437,7 @@ def test_direct_acceptance_script_uses_same_column_ownership_rule(store, tmp_pat
               'argv': ['scripts/run-backend-tests.bat', '--report', report],
               'report_path': report, 'scenario_ids': ['entry-fixture'],
               'purpose': 'Run backend behavior assertions'}
+    ctx.files.write_text('scripts/run-backend-tests.bat', '@echo off\r\nexit /b 0\r\n')
     rejected = store.registry.dispatch('workflow.acceptance.runners',
         {**base, 'runners': [runner]}, replace(ctx, execution_key='direct-unowned-runner'))
     assert not rejected.ok and 'BehaviorRunnerScriptUnowned' in str(rejected.error)
