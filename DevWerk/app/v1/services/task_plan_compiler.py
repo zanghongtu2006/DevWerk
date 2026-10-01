@@ -25,6 +25,9 @@ def acceptance_diagnostics(definition, method, data=None):
             reason = known_nonbehavior_command(check.arguments.get('argv', []))
             if reason:
                 issue(column_paths[column.key]+f'/acceptance_checks/{index}/arguments', reason)
+            if check.report_path and check.report_path not in check.arguments.get('argv', []):
+                issue(column_paths[column.key]+f'/acceptance_checks/{index}/arguments',
+                      'BehaviorRunnerReportArgumentMissing: argv must include report_path as a separate argument')
     errors.extend(acceptance_scope_collision_diagnostics(definition, method))
     for key in method.task_contract.feedback_columns:
         executor = definition.column(key).executor

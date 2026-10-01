@@ -2444,7 +2444,8 @@ def _workflow_acceptance_configure(args, ctx, registry):
         definition = WorkflowDefinition.model_validate(canonicalize_workflow_capability_arguments(value, registry))
         errors = acceptance_diagnostics(definition, method)
         impossible = [item for item in errors if item['message'].startswith((
-            'NonBehaviorCheck:', 'AcceptanceEvidenceScopeCollision:', 'FeedbackContractMissing:'))]
+            'NonBehaviorCheck:', 'BehaviorRunnerReportArgumentMissing:',
+            'AcceptanceEvidenceScopeCollision:', 'FeedbackContractMissing:'))]
         if impossible:
             raise PlanAdmissionError(impossible)
         result = _workflow_publish({'workflow_plan_id':base['workflow_plan_id'],'workflow':definition.model_dump(mode='json')},ctx,registry)
@@ -2555,7 +2556,8 @@ def _workflow_publish(args: dict[str, Any], ctx: CapabilityContext, registry: Ca
     method = WorkflowPlan.model_validate(ctx.store.get_workflow_plan(
         ctx.project_id, str(args['workflow_plan_id']))['plan'])
     impossible_checks = [issue for issue in acceptance_diagnostics(workflow, method)
-                         if issue['message'].startswith(('AcceptanceEvidenceScopeCollision:', 'NonBehaviorCheck:'))]
+                         if issue['message'].startswith(('AcceptanceEvidenceScopeCollision:', 'NonBehaviorCheck:',
+                                                         'BehaviorRunnerReportArgumentMissing:'))]
     if impossible_checks:
         raise PlanAdmissionError(impossible_checks)
     result = ctx.store.publish_workflow(ctx.project_id, workflow, str(args["workflow_plan_id"]))

@@ -453,6 +453,38 @@ def test_direct_acceptance_script_uses_same_column_ownership_rule(store, tmp_pat
     assert accepted.ok, accepted.error
 
 
+def test_advanced_acceptance_requires_separate_report_argument(store, tmp_path):
+    from tests.test_task_entry_admission import software_plan
+
+    project, _, ctx = software_plan(store, tmp_path)
+    current = store.get_workflow(project['id'])
+    base = {'base_revision_id': current['id'], 'base_digest': current['definition_hash']}
+    original = next(col for col in current['definition']['columns']
+                    if col['key'] == 'backend_development')['acceptance_checks'][0]
+    check = copy.deepcopy(original)
+    check['report_path'] = 'reports/backend.json'
+    for label, argv in [('embedded', ['python', 'backend/check.py', '--report=reports/backend.json']),
+                        ('missing', ['python', 'backend/check.py'])]:
+        check['arguments']['argv'] = argv
+        denied = store.registry.dispatch('workflow.acceptance.configure', {
+            **base, 'columns': [{'key': 'backend_development', 'acceptance_checks': [check]}]},
+            replace(ctx, execution_key=f'report-arg-{label}'))
+        assert not denied.ok and 'BehaviorRunnerReportArgumentMissing' in str(denied.error)
+        assert store.get_workflow(project['id'])['id'] == current['id']
+    definition = copy.deepcopy(current['definition'])
+    next(col for col in definition['columns'] if col['key'] == 'backend_development')[
+        'acceptance_checks'] = [check]
+    direct = store.registry.dispatch('workflow.publish', {
+        'workflow_plan_id': current['workflow_plan_id'], 'workflow': definition},
+        replace(ctx, execution_key='report-arg-direct'))
+    assert not direct.ok and 'BehaviorRunnerReportArgumentMissing' in str(direct.error)
+    check['arguments']['argv'] = ['python', 'backend/check.py', '--report', 'reports/backend.json']
+    accepted = store.registry.dispatch('workflow.acceptance.configure', {
+        **base, 'columns': [{'key': 'backend_development', 'acceptance_checks': [check]}]},
+        replace(ctx, execution_key='report-arg-owned'))
+    assert accepted.ok, accepted.error
+
+
 def test_rejects_one_backend_runner_as_distinct_frontend_and_delivery_proof(store, tmp_path):
     from tests.test_task_entry_admission import software_plan
     from app.v1.domain import WorkflowDefinition, WorkflowPlan
@@ -485,7 +517,8 @@ def test_rejects_one_backend_runner_as_distinct_frontend_and_delivery_proof(stor
     definition.column('delivery').acceptance_checks[0].arguments['argv'].append('delivery-test')
     assert not acceptance_diagnostics(definition, method)
     for key in ('backend_development', 'frontend_development', 'delivery'):
-        definition.column(key).acceptance_checks[0].arguments['argv'] = ['python', '-m', 'pytest', 'all_tests.py']
+        check = definition.column(key).acceptance_checks[0]
+        check.arguments['argv'] = ['python', '-m', 'pytest', 'all_tests.py', check.report_path]
         definition.column(key).acceptance_checks[0].scenario_ids = ['one', 'two']
     definition.column('frontend_development').acceptance_checks[0].scenario_ids.reverse()
     assert not acceptance_diagnostics(definition, method)

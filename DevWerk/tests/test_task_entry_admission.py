@@ -21,7 +21,7 @@ def software_plan(store, tmp_path):
     definition = WorkflowDefinition.model_validate(workflow['definition'])
     for key in ('backend_development','frontend_development','system_test','delivery','accept'):
         definition.column(key).acceptance_checks = [AcceptanceCheck(key='verify_fixture',capability='project.command.run',
-            arguments={'argv':[sys.executable,'-c',"from pathlib import Path; assert Path('docs/baseline.md').exists()"]},
+            arguments={'argv':[sys.executable,'-c',"from pathlib import Path; assert Path('docs/baseline.md').exists()", 'fixture-report.json']},
             evidence_kind='behavior',purpose='Test fixture for entry-admission contract, not software acceptance',
             scenario_ids=['entry-fixture'],report_path='fixture-report.json')]
         definition.acceptance_obligations.append(AcceptanceObligation(column=key,check_key='verify_fixture',
