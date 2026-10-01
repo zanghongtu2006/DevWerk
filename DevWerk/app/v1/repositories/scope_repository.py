@@ -114,33 +114,42 @@ class ScopeRepository:
                 raise ScopeConflict('Scope changed; inspect the current Requirement and Workflow revisions before revising')
             self.remember(current)
             binding = self.store.get_project_loop_binding(ctx.project_id, active['id'])
-            if not binding or not binding.get('package_json'):
-                raise ScopeConflict('Scope revision requires the frozen Loop package for this Workflow')
-            old_package = json.loads(binding['package_json'])
-            package = old_package
-            if loop_digest and loop_digest != binding['loop_digest']:
-                package = self.store.get_loop(binding['loop_key'])
-                if package['digest'] != loop_digest:
-                    raise ScopeConflict('The selected Loop digest is no longer available')
-            parameters = canonicalize_contract_value({**package['bundle'].get('defaults', {}), **binding['bindings'], **binding_patch}, package['parameter_schema'])
-            validate_contract(parameters, package['parameter_schema'], label='Revised scope bindings')
-            old_material = _resolve_loop_parameters(old_package['bundle'], binding['bindings'])
-            new_material = _resolve_loop_parameters(package['bundle'], parameters)
-            old_method = WorkflowPlan.model_validate(old_material['workflow_plan']).model_dump(mode='json')
-            old_workflow = WorkflowDefinition.model_validate(old_material['workflow']).model_dump(mode='json')
-            new_method = WorkflowPlan.model_validate(new_material['workflow_plan']).model_dump(mode='json')
-            new_workflow = WorkflowDefinition.model_validate(new_material['workflow']).model_dump(mode='json')
             current_method = self.store.get_workflow_plan(ctx.project_id, active['workflow_plan_id'])['plan']
-            method = WorkflowPlan.model_validate(_apply_delta(old_method, new_method, current_method))
-            workflow = WorkflowDefinition.model_validate(_apply_delta(old_workflow, new_workflow, active['definition']))
+            if binding:
+                if not binding.get('package_json'):
+                    raise ScopeConflict('Scope revision requires the frozen Loop package for this Workflow')
+                old_package = json.loads(binding['package_json'])
+                package = old_package
+                if loop_digest and loop_digest != binding['loop_digest']:
+                    package = self.store.get_loop(binding['loop_key'])
+                    if package['digest'] != loop_digest:
+                        raise ScopeConflict('The selected Loop digest is no longer available')
+                parameters = canonicalize_contract_value({**package['bundle'].get('defaults', {}), **binding['bindings'], **binding_patch}, package['parameter_schema'])
+                validate_contract(parameters, package['parameter_schema'], label='Revised scope bindings')
+                old_material = _resolve_loop_parameters(old_package['bundle'], binding['bindings'])
+                new_material = _resolve_loop_parameters(package['bundle'], parameters)
+                old_method = WorkflowPlan.model_validate(old_material['workflow_plan']).model_dump(mode='json')
+                old_workflow = WorkflowDefinition.model_validate(old_material['workflow']).model_dump(mode='json')
+                new_method = WorkflowPlan.model_validate(new_material['workflow_plan']).model_dump(mode='json')
+                new_workflow = WorkflowDefinition.model_validate(new_material['workflow']).model_dump(mode='json')
+                method = WorkflowPlan.model_validate(_apply_delta(old_method, new_method, current_method))
+                workflow = WorkflowDefinition.model_validate(_apply_delta(old_workflow, new_workflow, active['definition']))
+            else:
+                if binding_patch or loop_digest:
+                    raise ScopeConflict('This Workflow has no Loop binding; revise its Workflow directly')
+                parameters = {}
+                method = WorkflowPlan.model_validate(current_method)
+                workflow = WorkflowDefinition.model_validate(active['definition'])
             plan = self.store.create_workflow_plan(ctx.project_id, method)
             published = self.store.publish_workflow(ctx.project_id, workflow, plan['id'])
-            binding_id = new_id('loopapp')
-            db.execute('''INSERT INTO v1_project_loop_bindings
-                (id,project_id,loop_key,loop_version,loop_digest,bindings_json,workflow_plan_id,workflow_revision_id,created_at,package_json)
-                VALUES(?,?,?,?,?,?,?,?,?,?)''',
-                (binding_id, ctx.project_id, package['loop_key'], package['version'], package['digest'], json.dumps(parameters, ensure_ascii=False),
-                 plan['id'], published['id'], utcnow(), json.dumps(package, ensure_ascii=False)))
+            binding_id = None
+            if binding:
+                binding_id = new_id('loopapp')
+                db.execute('''INSERT INTO v1_project_loop_bindings
+                    (id,project_id,loop_key,loop_version,loop_digest,bindings_json,workflow_plan_id,workflow_revision_id,created_at,package_json)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)''',
+                    (binding_id, ctx.project_id, package['loop_key'], package['version'], package['digest'], json.dumps(parameters, ensure_ascii=False),
+                     plan['id'], published['id'], utcnow(), json.dumps(package, ensure_ascii=False)))
             changed = db.execute('UPDATE v1_requirements SET revision=revision+1,objective=?,status=\'active\',updated_at=? WHERE id=? AND revision=?',
                                  (objective, utcnow(), requirement_id, expected_revision)).rowcount
             if changed != 1:

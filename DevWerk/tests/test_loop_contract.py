@@ -208,7 +208,7 @@ def test_preset_loop_definitions_are_not_stored_in_sqlite(store):
     assert "v1_workcell_handoffs" not in tables
 
 
-def test_workflow_revision_requires_loop_provenance(store, tmp_path):
+def test_workflow_revision_preserves_absent_loop_provenance(store, tmp_path):
     project = store.create_project("legacy workflow", "", str(tmp_path / "legacy"))
     workflow = sequence_workflow()
     plan = store.create_workflow_plan(project["id"], workflow_plan(workflow))
@@ -222,8 +222,9 @@ def test_workflow_revision_requires_loop_provenance(store, tmp_path):
             "INSERT INTO v1_workflow_revisions(id,project_id,revision,definition_json,active,created_at,workflow_id,revision_no,schema_version,definition_hash,workflow_plan_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             ("wfrev_legacy", project["id"], 1, workflow.model_dump_json(), 1, now, "workflow_legacy", 1, workflow.schema_version, "legacy", plan["id"]),
         )
-    with pytest.raises(ValueError, match="filesystem Loop application"):
-        store.publish_workflow(project["id"], workflow, plan["id"])
+    revised = store.publish_workflow(project["id"], workflow, plan["id"])
+    assert revised["source_loop_key"] is None
+    assert revised["workflow_plan_id"] == plan["id"]
 
 
 def test_loop_application_creates_reusable_workflow_without_tasks(store, tmp_path):

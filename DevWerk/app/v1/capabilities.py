@@ -1009,7 +1009,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     add(
         "workflow.plan.save",
         (
-            "Persist a reusable Workflow Plan before publishing a revised Workflow that implements it. "
+            "Persist a reusable Workflow Plan before publishing a Workflow that implements it. "
             "First identify the reusable flow_unit; derive lifecycle Columns from that unit instead of from a "
             "work-item list; choose agent or capability_sequence execution for each Column; then simulate the "
             "lifecycle from entry to terminal with explicit receives, action, produces, completion evidence, and "
@@ -1067,8 +1067,9 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     add(
         "workflow.publish",
         (
-            "Publish a revised declarative Workflow implementing the referenced Workflow Plan. The Project must already "
-            "have an initial Workflow created by loop.apply; this capability cannot create one from scratch. "
+            "Publish a declarative Workflow implementing the referenced Workflow Plan. If the Project has no "
+            "Workflow, this creates its initial revision; otherwise it publishes a new revision. A filesystem "
+            "Loop can be applied first as an optional template, then revised for this Requirement. "
             "Workflow column keys must exactly match the Workflow Plan process-stage keys; work slices remain Tasks. "
             "The done and failed values are terminal targets, never Column definitions. Every Column must provide an "
             "executor and non-empty transitions; every declared outcome must have exactly one transition. "
@@ -1376,10 +1377,10 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     add('requirement.create', 'Record a new delivery objective with an explicit stable scope_key. Existing scopes retain their identity; closed scopes are not revived.',
         {'type': 'object', 'required': ['scope_key', 'objective'], 'properties': {'scope_key': {'type': 'string', 'minLength': 1}, 'objective': {'type': 'string', 'minLength': 1}}, 'additionalProperties': False},
         _requirement_create, side_effect_kind='control', delegable_to_column=False)
-    add('project.scope.inspect', 'Inspect the current Requirement, Workflow revision and frozen Loop bindings before extending delivery.',
+    add('project.scope.inspect', 'Inspect the current Requirement, Workflow revision and optional frozen Loop bindings before extending delivery.',
         {'type': 'object', 'properties': {}, 'additionalProperties': False},
         lambda args, ctx: ctx.store.scopes.inspect(ctx.project_id), side_effect_kind='read', delegable_to_column=False)
-    add('project.scope.revise', 'Atomically extend or revise the current project goal on a user request. Keeps completed Tasks and Worker contexts; publishes new Workflow/binding and Requirement revisions. Never close the Requirement first. This does not create Tasks; save a new TaskPlan against the returned Workflow then materialize it. Optionally select a new Loop digest from loop.inspect.',
+    add('project.scope.revise', 'Atomically extend or revise the current project goal on a user request. Keeps completed Tasks and Worker contexts; publishes new Workflow and Requirement revisions. For a Workflow without a Loop, pass an empty binding_patch. Never close the Requirement first. This does not create Tasks; save a new TaskPlan against the returned Workflow then materialize it. For a Loop-backed Workflow, optionally select a new Loop digest from loop.inspect.',
         {'type': 'object', 'required': ['requirement_id', 'expected_revision', 'expected_workflow_revision_id', 'objective', 'binding_patch', 'reason'],
          'properties': {'requirement_id': {'type': 'string'}, 'expected_revision': {'type': 'integer', 'minimum': 1},
                         'expected_workflow_revision_id': {'type': 'string'}, 'objective': {'type': 'string', 'minLength': 1},

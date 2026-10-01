@@ -226,7 +226,7 @@ def test_global_settings_api_saves_and_requests_managed_restart(tmp_path):
         assert restart.calls == 1
 
 
-def test_loop_api_is_the_only_initial_workflow_creation_path(tmp_path):
+def test_loop_and_direct_api_can_create_initial_workflows(tmp_path):
     with client() as web:
         loops = web.get("/v1/loops")
         assert loops.status_code == 200
@@ -269,12 +269,12 @@ def test_loop_api_is_the_only_initial_workflow_creation_path(tmp_path):
             f"/v1/projects/{fresh['id']}/automation/workflow-plans",
             json={"plan": workflow_plan(definition).model_dump(mode="json")},
         ).json()
-        rejected = web.post(
+        published = web.post(
             f"/v1/projects/{fresh['id']}/automation/workflow-revisions",
             json={"workflow_plan_id": plan["id"], "workflow": definition.model_dump(mode="json")},
         )
-        assert rejected.status_code == 422
-        assert "initial Workflow creation requires loop.apply" in rejected.json()["detail"]
+        assert published.status_code == 201
+        assert published.json()["source_loop_key"] is None
 
 
 def test_declarative_api_workflow_reaches_done_without_llm(tmp_path, monkeypatch):

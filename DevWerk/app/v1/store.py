@@ -1191,14 +1191,6 @@ class V1Store:
         )
 
     def publish_workflow(self, project_id: str, workflow: WorkflowDefinition, workflow_plan_id: str) -> dict[str, Any]:
-        try:
-            active = self.get_workflow(project_id)
-        except KeyError as exc:
-            raise ValueError("initial Workflow creation requires loop.apply") from exc
-        if not all(active.get(field) for field in (
-            "source_loop_key", "source_loop_version", "source_loop_digest"
-        )):
-            raise ValueError("Workflow revisions require an existing filesystem Loop application")
         return self._publish_workflow_revision(project_id, workflow, workflow_plan_id)
 
     def _publish_workflow_revision(
@@ -1228,8 +1220,6 @@ class V1Store:
             previous = db.execute('SELECT active_revision_id FROM v1_workflows WHERE project_id=?', (project_id,)).fetchone()
             workflow_id = identity[0] if identity else new_id("workflow")
             if not identity:
-                if initial_loop is None:
-                    raise ValueError("initial Workflow creation requires a filesystem Loop")
                 db.execute(
                     "INSERT INTO v1_workflows("
                     "id,project_id,name,state_version,source_loop_key,source_loop_version,"
@@ -1238,9 +1228,9 @@ class V1Store:
                         workflow_id,
                         project_id,
                         workflow.name,
-                        str(initial_loop["loop_key"]),
-                        str(initial_loop["version"]),
-                        str(initial_loop["digest"]),
+                        str(initial_loop["loop_key"]) if initial_loop else None,
+                        str(initial_loop["version"]) if initial_loop else None,
+                        str(initial_loop["digest"]) if initial_loop else None,
                         now,
                         now,
                     ),

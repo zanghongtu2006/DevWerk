@@ -466,15 +466,6 @@ class SchemaRepository:
                 "CREATE INDEX IF NOT EXISTS idx_v1_agent_runs_conversation_job "
                 "ON v1_agent_runs(conversation_job_id, created_at)"
             )
-            unprovenanced = db.execute(
-                "SELECT id,project_id FROM v1_workflows "
-                "WHERE source_loop_key IS NULL OR source_loop_version IS NULL OR source_loop_digest IS NULL"
-            ).fetchall()
-            if unprovenanced:
-                raise RuntimeError(
-                    "database contains Workflow identities without filesystem Loop provenance; "
-                    "remove the pre-Loop database before starting DevWerk"
-                )
             db.execute("UPDATE v1_column_runs SET project_id=(SELECT project_id FROM v1_tasks WHERE id=v1_column_runs.task_id) WHERE project_id='' ")
             db.execute("UPDATE v1_agent_messages SET project_id=(SELECT project_id FROM v1_agent_runs WHERE id=v1_agent_messages.agent_run_id) WHERE project_id='' ")
             db.execute("UPDATE v1_tool_invocations SET project_id=(SELECT project_id FROM v1_agent_runs WHERE id=v1_tool_invocations.agent_run_id) WHERE project_id='' ")

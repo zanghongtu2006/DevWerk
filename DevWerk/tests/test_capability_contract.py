@@ -167,19 +167,22 @@ def test_json_references_are_explicit_and_do_not_evaluate_templates():
     assert value == {"copied": "resolved", "literal": "${input.task.value}"}
 
 
-def test_workflow_publish_capability_rejects_initial_creation_without_loop(store, tmp_path):
+def test_workflow_publish_capability_creates_initial_workflow_without_loop(store, tmp_path):
     project = store.create_project("workflow", "", str(tmp_path / "project"))
     registry = build_core_registry()
     context = CapabilityContext(project_id=project["id"], project=project, store=store, start_task=True)
     workflow = sequence_workflow(name="created during dialogue")
     planned = registry.dispatch("workflow.plan.save", {"plan": workflow_plan(workflow).model_dump(mode="json")}, context)
     assert planned.ok
-    with pytest.raises(ValueError, match="initial Workflow creation requires loop.apply"):
-        registry.dispatch(
-            "workflow.publish",
-            {"workflow_plan_id": planned.output["id"], "workflow": workflow.model_dump(mode="json")},
-            context,
-        )
+    published = registry.dispatch(
+        "workflow.publish",
+        {"workflow_plan_id": planned.output["id"], "workflow": workflow.model_dump(mode="json")},
+        context,
+    )
+    assert published.ok
+    assert published.output["workflow_plan_id"] == planned.output["id"]
+    assert published.output["source_loop_key"] is None
+    assert store.get_workflow(project["id"])["id"] == published.output["id"]
 
 
 def test_loop_apply_capability_creates_initial_workflow(store, tmp_path):
@@ -202,6 +205,24 @@ def test_loop_apply_capability_creates_initial_workflow(store, tmp_path):
     assert result.ok
     assert result.output["loop"]["loop_key"] == "software.gitlab_devops"
     assert store.get_workflow(project["id"])["source_loop_key"] == "software.gitlab_devops"
+
+
+def test_loop_template_can_be_replaced_by_a_smaller_workflow_in_same_project(store, tmp_path):
+    project = store.create_project("editable loop", "", str(tmp_path / "editable-loop"))
+    registry = build_core_registry()
+    context = CapabilityContext(project_id=project["id"], project=project, store=store, start_task=True)
+    applied = registry.dispatch("loop.apply", {"loop_key": "software.gitlab_devops",
+        "bindings": {"product_name": "demo", "gitlab_repository": "group/project"}}, context)
+    assert applied.ok, applied.error
+    smaller = sequence_workflow(name="small delivery")
+    planned = registry.dispatch("workflow.plan.save",
+        {"plan": workflow_plan(smaller).model_dump(mode="json")}, context)
+    assert planned.ok, planned.error
+    published = registry.dispatch("workflow.publish", {
+        "workflow_plan_id": planned.output["id"], "workflow": smaller.model_dump(mode="json")}, context)
+    assert published.ok, published.error
+    assert [column["key"] for column in published.output["definition"]["columns"]] == ["execute"]
+    assert published.output["source_loop_key"] == "software.gitlab_devops"
 
 
 def test_mailbox_agent_cannot_apply_loop_or_expand_task_graph(store, tmp_path):

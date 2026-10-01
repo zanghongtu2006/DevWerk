@@ -247,7 +247,7 @@ def conversation_job(project_id: str, job_id: str, request: Request) -> dict[str
 
 @router.post("/projects/{project_id}/automation/workflow-revisions", status_code=201)
 def publish_workflow_revision(project_id: str, payload: WorkflowRevisionPublishRequest, request: Request) -> dict[str, Any]:
-    """Revise an existing Loop-created Workflow; the customer Kanban remains read-only."""
+    """Publish an initial or revised Workflow against a saved Workflow Plan."""
     try:
         store(request).get_project(project_id)
         return store(request).publish_workflow(project_id, payload.workflow, payload.workflow_plan_id)

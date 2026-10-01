@@ -5,7 +5,7 @@ import pytest
 
 from app.v1.capabilities import CapabilityContext
 from app.v1.domain import WorkflowDefinition
-from tests.helpers import task_plan, agent_workflow, publish_planned_workflow
+from tests.helpers import task_plan, agent_workflow, publish_planned_workflow, workflow_plan
 from tests.test_agent_recovery_and_fencing import begin_agent
 from tests.test_loop_contract import novel_task_input
 from tests.test_persistent_agents import assignment
@@ -62,6 +62,39 @@ def save_chapters(ctx, workflow, chapters):
         plan.tasks[0].dependencies = [f'chapter{n-1:02}'] if n-1 in chapters else []
     plan = plans[0].model_copy(update={'tasks': [p.tasks[0] for p in plans]})
     return invoke(ctx, 'task.plan.save', {'plan': plan.model_dump(mode='json')})
+
+
+def test_scope_extension_without_loop_keeps_workflow_and_requirement_history(store, tmp_path):
+    project = store.create_project('Direct workflow', '', str(tmp_path / 'direct-workflow'))
+    ctx, req = turn(store, project)
+    definition = agent_workflow()
+    planned = invoke(ctx, 'workflow.plan.save', {'plan': workflow_plan(definition).model_dump(mode='json')})
+    original = invoke(ctx, 'workflow.publish', {
+        'workflow_plan_id': planned['id'], 'workflow': definition.model_dump(mode='json')})
+    assert store.get_project_loop_binding(project['id'], original['id']) is None
+    concrete = task_plan(original['id'], definition)
+    validated = invoke(ctx, 'task.plan.validate', {'plan': concrete.model_dump(mode='json')})
+    assert validated['valid'], validated['diagnostics']
+    saved = invoke(ctx, 'task.plan.save', {'plan': concrete.model_dump(mode='json')})
+    prior_task = invoke(ctx, 'task.create', {
+        'task_plan_id': saved['id'], 'proposed_task_ref': concrete.tasks[0].proposed_task_ref})
+    assert prior_task['workflow_revision_id'] == original['id']
+
+    ctx, _ = turn(store, project, req)
+    revised = invoke(replace(ctx, start_task=False), 'project.scope.revise', {
+        'requirement_id': req['id'], 'expected_revision': req['revision'],
+        'expected_workflow_revision_id': original['id'],
+        'objective': 'Extend the direct workflow goal', 'binding_patch': {},
+        'reason': 'User requested continuation',
+    })
+    assert revised['requirement']['revision'] == req['revision'] + 1
+    assert revised['workflow_revision_id'] != original['id']
+    assert revised['binding_id'] is None and revised['bindings'] == {}
+    assert store.get_project_loop_binding(project['id'], revised['workflow_revision_id']) is None
+    assert store.get_workflow(project['id'])['definition'] == original['definition']
+    assert store.get_task(prior_task['id'])['workflow_revision_id'] == original['id']
+    assert store.scopes.for_workflow(original['id'])['requirement_revision'] == req['revision']
+    assert store.scopes.for_workflow(revised['workflow_revision_id'])['requirement_revision'] == req['revision'] + 1
 
 
 def test_scope_extension_closed_six_to_twelve_same_conversation_and_frozen_history(store, tmp_path):
