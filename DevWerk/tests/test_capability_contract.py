@@ -39,6 +39,20 @@ def test_registry_dispatches_generic_file_capability_and_tracks_artifact(store, 
     assert (tmp_path / "project" / "any" / "domain.txt").is_file()
 
 
+def test_project_files_list_recurses_for_trailing_double_star(store, tmp_path):
+    project = store.create_project('recursive-list', '', str(tmp_path / 'project'))
+    root = tmp_path / 'project'
+    (root / 'backend' / 'src').mkdir(parents=True)
+    (root / 'backend' / 'pom.xml').write_text('pom', encoding='utf-8')
+    (root / 'backend' / 'src' / 'App.java').write_text('class App {}', encoding='utf-8')
+    (root / 'frontend').mkdir()
+    (root / 'frontend' / 'package.json').write_text('{}', encoding='utf-8')
+    result = store.registry.dispatch('project.files.list', {'pattern': 'backend/**'},
+        CapabilityContext(project['id'], project, store))
+    assert result.ok, result.error
+    assert result.output['paths'] == ['backend/pom.xml', 'backend/src/App.java']
+
+
 def test_column_declared_writable_paths_reject_cross_task_file_mutation(store, tmp_path):
     project = store.create_project("write-boundary", "", str(tmp_path / "project"))
     registry = build_core_registry()

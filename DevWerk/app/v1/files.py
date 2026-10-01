@@ -53,6 +53,8 @@ class ProjectFiles:
 
     def _matched_files(self, pattern: str) -> list[tuple[Path, Path]]:
         normalized = self._normalize_relative(pattern or "**/*", kind="glob")
+        if normalized.endswith('/**'):
+            normalized += '/*'
         matches: list[tuple[Path, Path]] = []
         for textual in sorted(self.root.glob(normalized)):
             if not textual.is_file():
