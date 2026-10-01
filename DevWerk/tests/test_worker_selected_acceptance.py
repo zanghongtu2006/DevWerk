@@ -4,7 +4,8 @@ import pytest
 
 from app.v1.agent import AgentCore
 from app.v1.capabilities import CapabilityContext
-from app.v1.domain import AcceptanceCheck, AgentModelResponse, AgentToolCall, Transition
+from app.v1.domain import AcceptanceCheck, AgentModelResponse, AgentToolCall, ToolResult, Transition
+from app.v1.execution_ledger import ledger_entry
 from app.v1.runtime import WorkflowRuntime, _column_completion_contract
 from app.v1.completion_protocol import parse_completion_submission
 from app.v1.services.completion_admission import CompletionAdmissionService
@@ -17,6 +18,21 @@ def test_behavior_column_rejects_completion_without_a_real_command():
     submission = parse_completion_submission(
         {'outcome': 'success', 'output': {'delivered': True}, 'summary': 'claimed done'}, contract, [])
     decision = CompletionAdmissionService().evaluate(submission, contract, [])
+    assert not decision.accepted
+    assert decision.rejection.code == 'behavior_evidence_required'
+
+
+@pytest.mark.parametrize('argv', [['cmd', '/c', 'del', 'temporary.txt'], ['rm', 'temporary.txt']])
+def test_behavior_column_rejects_cleanup_as_verification(argv):
+    workflow = agent_workflow()
+    contract = _column_completion_contract(workflow, workflow.column('work'), ['work'])
+    ledger = [ledger_entry('agent', 'cleanup', 'project.command.run', 'process',
+                           ToolResult(ok=True, capability='project.command.run', output={'returncode': 0}),
+                           arguments={'argv': argv})]
+    submission = parse_completion_submission(
+        {'outcome': 'success', 'output': {'delivered': True}, 'summary': 'claimed verified'},
+        contract, ledger)
+    decision = CompletionAdmissionService().evaluate(submission, contract, ledger)
     assert not decision.accepted
     assert decision.rejection.code == 'behavior_evidence_required'
 

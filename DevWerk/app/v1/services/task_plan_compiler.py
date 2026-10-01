@@ -103,6 +103,11 @@ def known_nonbehavior_command(argv):
         token in {'&', '&&', '|', '||', ';'} for token in command
     ):
         return 'NonBehaviorCheck: printing text or searching a file cannot execute behavior assertions and write a fresh scenario report'
+    if command and command[0] in {'del', 'erase', 'rm', 'remove-item', 'copy', 'cp', 'move', 'mv',
+                                  'mkdir', 'md', 'rmdir', 'rd', 'touch'} and not any(
+        token in {'&', '&&', '|', '||', ';'} for token in command
+    ):
+        return 'NonBehaviorCheck: changing files is not behavior verification'
     if re.fullmatch(r'if\s+(?:not\s+)?exist\s+(?:"[^"]+"|[^\s&|;<>]+)\s+\(?\s*echo\s+[^&|;<>]+?\)?', ' '.join(command)):
         return 'NonBehaviorCheck: if exist/echo only checks an artifact; configure an entry script that executes assertions and writes a fresh scenario report'
     # Only built-in Maven lifecycle prefixes before test, with simple logging flags.
