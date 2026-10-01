@@ -1,6 +1,6 @@
 # P0：直接执行验收脚本绕过 Column 脚本归属校验
 
-第九次黑盒 Project `prj_4859dd2f5bd74077a313f2b109258fb4` 在授权后创建单 Task，但冻结 Workflow 的 `backend_development`、`frontend_development` 分别执行 `scripts/run-backend-tests.bat`、`scripts/run-frontend-tests.bat`。这两个文件创建 Task 时均不存在；两列可写范围分别为 `backend/**`、`frontend/**`。先前 `workflow.acceptance.runners` 对不完整命令给出错误，模型改用高级配置成功发布，表明脚本所有权校验仍有识别缺口。
+第九次黑盒 Project `prj_4859dd2f5bd74077a313f2b109258fb4` 在授权后创建单 Task，冻结 Workflow 的 `backend_development`、`frontend_development` 分别执行 `scripts/run-backend-tests.bat`、`scripts/run-frontend-tests.bat`。复查授权 Run 的工具记录后确认：这两个文件在发布 Workflow 前已由 Conversation Agent 创建。因此本次实际障碍不是“脚本不存在”，而是后端 Column 无权修正已有脚本，且其验收执行未生成合格的新报告。下面的直接脚本识别缺口是在复查时发现的独立准入缺陷，不应记作本次失败的直接根因。
 
 根因是 `app/v1/capabilities.py::_behavior_runner_script_index` 只识别 `python script.py`、`cmd /c script.bat` 等解释器入口，没有识别 `scripts/verify.bat` 这样的项目相对可执行脚本。共享所有权校验因此跳过它，发布入口一致化也不能阻挡。
 
