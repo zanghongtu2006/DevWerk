@@ -949,8 +949,10 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     add(
         "project.command.run",
         (
-            "Run an argv command without a shell inside the Project base directory. The capability fails unless "
-            "the process exit code is declared successful. When a command generates content that a later exact "
+            "Run a bounded argv command without a shell inside the Project base directory; success requires exit 0. "
+            "Child processes are cleaned up when the call ends, and a foreground service will time out. "
+            "For live HTTP checks, start the service, assert responses, and stop it in one bounded command, "
+            "or use a test runner that exits. When a command generates content that a later exact "
             "file check will consume, it must preserve the contracted bytes, including encoding markers and "
             "newlines; on Windows PowerShell, `Set-Content -Encoding utf8` adds a UTF-8 BOM, so use a BOM-free "
             "writer when the expected content has no BOM."

@@ -24,6 +24,15 @@ from app.v1.domain import (
 from tests.helpers import agent_workflow, create_planned_task, publish_initial_workflow, publish_planned_workflow, sequence_workflow, task_plan, workflow_plan
 
 
+def test_command_tool_advertises_bounded_process_lifecycle(store, tmp_path):
+    project = store.create_project('command contract', '', str(tmp_path / 'project'))
+    registry = build_core_registry()
+    context = CapabilityContext(project_id=project['id'], project=project, store=store)
+    description = registry.schemas(['project.command.run'], context)[0]['function']['description']
+    assert 'Child processes are cleaned up when the call ends' in description
+    assert 'one bounded command' in description
+
+
 def test_registry_dispatches_generic_file_capability_and_tracks_artifact(store, tmp_path):
     project = store.create_project("caps", "", str(tmp_path / "project"))
     registry = build_core_registry()
