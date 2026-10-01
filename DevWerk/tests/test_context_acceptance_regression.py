@@ -239,7 +239,7 @@ def test_partial_acceptance_configure_preserves_graph_and_rejects_stale_base(sto
     assert store.get_workflow(project['id'])['id'] == after['id']
 
 
-def test_acceptance_can_be_configured_one_column_at_a_time_without_weaker_task_admission(store, tmp_path):
+def test_optional_acceptance_checks_can_be_configured_one_column_at_a_time(store, tmp_path):
     from tests.test_task_entry_admission import software_plan
     from app.v1.domain import WorkflowDefinition
 
@@ -259,8 +259,8 @@ def test_acceptance_can_be_configured_one_column_at_a_time_without_weaker_task_a
             'columns': [{'key': key, 'acceptance_checks': checks[key]}],
         }, replace(ctx, execution_key=f'configure-stage-{index}'))
         assert configured.ok, configured.error
-        assert configured.output['ready_for_task_plan'] is (index == len(required) - 1)
-        assert bool(configured.output['remaining_diagnostics']) is (index < len(required) - 1)
+        assert configured.output['ready_for_task_plan'] is True
+        assert configured.output['remaining_diagnostics'] == []
         current = store.get_workflow(project['id'])
         assert current['id'] == configured.output['id']
         obligations = {(item['column'], item['check_key']): item['invalidated_by']
@@ -274,7 +274,7 @@ def test_acceptance_can_be_configured_one_column_at_a_time_without_weaker_task_a
             {'plan': plan.model_dump(mode='json')},
             replace(ctx, execution_key=f'validate-stage-{index}'))
         assert validation.ok, validation.error
-        assert validation.output['valid'] is (index == len(required) - 1)
+        assert validation.output['valid'] is True
 
 
 def test_simple_behavior_runners_freeze_checks_and_derive_obligations(store, tmp_path):
@@ -307,7 +307,7 @@ def test_simple_behavior_runners_freeze_checks_and_derive_obligations(store, tmp
             'runners':[runner(key) for key in batch]},
             replace(ctx, execution_key=f'runner-batch-{index}'))
         assert result.ok, result.error
-        assert result.output['ready_for_task_plan'] is (index == 1)
+        assert result.output['ready_for_task_plan'] is True
         current = store.get_workflow(project['id'])
     definition = WorkflowDefinition.model_validate(current['definition'])
     for key in required:
@@ -526,7 +526,7 @@ def test_rejects_one_backend_runner_as_distinct_frontend_and_delivery_proof(stor
     assert not acceptance_diagnostics(definition, method)
 
 
-def test_task_plan_validation_collects_all_columns_without_writes(store, tmp_path):
+def test_task_plan_validation_accepts_worker_selected_checks_without_writes(store, tmp_path):
     from tests.test_task_entry_admission import software_plan
     from app.v1.domain import WorkflowDefinition
     project, plan, ctx = software_plan(store,tmp_path)
@@ -537,8 +537,8 @@ def test_task_plan_validation_collects_all_columns_without_writes(store, tmp_pat
     revision = store.publish_workflow(project['id'],definition,before['workflow_plan_id'])
     plan.workflow_revision_id = revision['id']
     result = store.registry.dispatch('task.plan.validate',{'plan':plan.model_dump(mode='json')},ctx)
-    assert result.ok and not result.output['valid']
-    assert len(result.output['diagnostics']) >= 5
+    assert result.ok and result.output['valid']
+    assert result.output['diagnostics'] == []
     assert not store.list_task_plans(project['id'])
 
 

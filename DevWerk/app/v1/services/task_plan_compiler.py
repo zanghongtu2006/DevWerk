@@ -33,35 +33,19 @@ def acceptance_diagnostics(definition, method, data=None):
         executor = definition.column(key).executor
         if executor.kind != 'agent' or 'task.feedback.record' not in executor.capabilities:
             issue(column_paths[key]+'/executor/capabilities', f'FeedbackContractMissing: {key} must expose task.feedback.record')
-    covered = set()
-    required = set()
     pointer = method.task_contract.scenario_input_pointer
     if pointer and data is not None:
         values = resolve_input_pointer(data, pointer)
         if not isinstance(values, list) or not values or any(not isinstance(v, str) or not v.strip() for v in values) or len(set(values)) != len(values):
             issue('/input'+pointer, 'ScenarioContractInvalid: expected unique nonempty scenario IDs from the accepted requirement')
-        else:
-            required = set(values)
     for key in method.task_contract.required_behavior_columns:
-        invalidators = ({key} if key in method.task_contract.acceptance_invalidated_by
-                        else set(method.task_contract.acceptance_invalidated_by))
-        obligations = {(item.column,item.check_key) for item in definition.acceptance_obligations
-                       if invalidators.issubset(item.invalidated_by)}
-        column = definition.column(key)
-        checks = [c for c in column.acceptance_checks if c.evidence_kind == 'behavior' and (key,c.key) in obligations]
-        if not checks:
-            issue(column_paths[key]+'/acceptance_checks', f'AcceptanceContractMissing: {key} needs a frozen behavioral command and a workflow.acceptance_obligations reference with invalidated_by={sorted(invalidators)}')
-        if pointer:
-            ids = set()
-            for check in checks:
-                if not check.report_path or not check.scenario_ids:
-                    issue(column_paths[key]+'/acceptance_checks/'+str(column.acceptance_checks.index(check)), 'ScenarioContractMissing: behavior requires scenario_ids and a fresh structured report_path')
-                ids.update(check.scenario_ids)
-            covered.update(ids)
-            if required and any(t.target == 'done' for t in column.transitions) and not required.issubset(ids):
-                issue(column_paths[key]+'/acceptance_checks', 'ScenarioCoverageMissing: terminal acceptance lacks '+', '.join(sorted(required-ids)))
-    if required-covered:
-        issue('/workflow/acceptance_obligations', 'ScenarioCoverageMissing: '+', '.join(sorted(required-covered)))
+        if key not in column_paths:
+            issue('/task_contract/required_behavior_columns', f'UnknownBehaviorColumn: {key}')
+            continue
+        executor = definition.column(key).executor
+        if executor.kind != 'agent' or 'project.command.run' not in executor.capabilities:
+            issue(column_paths[key]+'/executor/capabilities',
+                  f'BehaviorEvidenceCapabilityMissing: {key} must let its Worker run tests or other commands')
     return errors
 
 
@@ -88,8 +72,8 @@ def acceptance_scope_collision_diagnostics(definition, method):
 def known_nonbehavior_command(argv):
     """Reject a few provably non-testing commands, not arbitrary script semantics.
 
-    Runtime still requires fresh assertions and independent review for everything
-    else. This admission check never reinterprets previously frozen definitions.
+    This is only a coarse guard; the Worker and acceptance Column must judge
+    whether a command actually tests the Task. Frozen definitions keep their checks.
     """
     if not argv or not all(isinstance(a,str) for a in argv):
         return None

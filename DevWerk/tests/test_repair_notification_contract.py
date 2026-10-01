@@ -222,7 +222,7 @@ def test_sequence_checks_generate_runtime_evidence_without_agent(store, tmp_path
         assert proof['ok'] == 1 and proof['agent_run_id'] is None
 
 
-def test_software_template_cannot_admit_task_without_instantiated_checks(store, tmp_path):
+def test_software_template_admits_task_before_workers_select_checks(store, tmp_path):
     from tests.test_task_entry_admission import software_plan
     project, plan, ctx = software_plan(store,tmp_path)
     current = store.get_workflow(project['id'])
@@ -233,5 +233,5 @@ def test_software_template_cannot_admit_task_without_instantiated_checks(store, 
         column.acceptance_checks = []
     revision = store.publish_workflow(project['id'],definition,current['workflow_plan_id'])
     plan.workflow_revision_id = revision['id']
-    with pytest.raises(ValueError,match='AcceptanceContractMissing'):
-        store.create_task_plan(project['id'],plan)
+    saved = store.create_task_plan(project['id'],plan)
+    assert saved['workflow_revision_id'] == revision['id']

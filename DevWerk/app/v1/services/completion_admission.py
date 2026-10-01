@@ -158,6 +158,23 @@ class CompletionAdmissionService:
                     f"outcome {submission.outcome!r} requires at least one successful action evidence",
                 )
 
+        if rule.required_capability:
+            from app.v1.services.task_plan_compiler import known_nonbehavior_command
+            valid_command = any(
+                item.get('capability') == rule.required_capability
+                and item.get('ok') and item.get('status') == 'completed'
+                and not known_nonbehavior_command(
+                    ((item.get('facts') or {}).get('arguments') or {}).get('argv', []))
+                for item in referenced
+            )
+        else:
+            valid_command = True
+        if not valid_command:
+            return self._reject(
+                'behavior_evidence_required',
+                f"outcome {submission.outcome!r} requires a successful {rule.required_capability} receipt from this Column",
+            )
+
         return CompletionDecision(accepted=True, submission=submission)
 
     @staticmethod

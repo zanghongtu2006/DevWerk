@@ -504,6 +504,33 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     task_schema = TaskCreate.model_json_schema()
     task_defs = task_schema.pop("$defs", {})
 
+    def receipt_schema(required: list[str], properties: dict[str, Any]) -> dict[str, Any]:
+        return {'type': 'object', 'required': required, 'properties': properties}
+
+    saved_plan_receipt = receipt_schema(['id', 'plan'], {
+        'id': {'type': 'string', 'minLength': 1}, 'plan': {'type': 'object'}})
+    workflow_receipt = receipt_schema(['id', 'workflow_plan_id', 'definition_hash', 'definition'], {
+        'id': {'type': 'string', 'minLength': 1},
+        'workflow_plan_id': {'type': 'string', 'minLength': 1},
+        'definition_hash': {'type': 'string', 'minLength': 1},
+        'definition': {'type': 'object'},
+        'source_loop_key': {'type': ['string', 'null']}})
+    validation_receipt = receipt_schema(['valid', 'diagnostics'], {
+        'valid': {'type': 'boolean'},
+        'diagnostics': {'type': 'array', 'items': {'type': 'object',
+            'required': ['path', 'message'],
+            'properties': {'path': {'type': 'string'}, 'message': {'type': 'string'}}}}})
+    task_receipt = receipt_schema(['id', 'workflow_revision_id', 'status', 'materialization', 'dispatch'], {
+        'id': {'type': 'string', 'minLength': 1},
+        'workflow_revision_id': {'type': 'string', 'minLength': 1},
+        'status': {'type': 'string', 'minLength': 1},
+        'materialization': {'type': 'object',
+            'required': ['created_task_ids', 'reused_task_ids'],
+            'properties': {'created_task_ids': {'type': 'array', 'items': {'type': 'string'}},
+                           'reused_task_ids': {'type': 'array', 'items': {'type': 'string'}}}},
+        'dispatch': {'type': 'object', 'required': ['owner', 'mode'],
+                     'properties': {'owner': {'const': 'runtime'}, 'mode': {'const': 'asynchronous'}}}})
+
     def add(
         capability_id: str,
         description: str,
@@ -1017,6 +1044,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         ),
         {"type": "object", "required": ["plan"], "properties": {"plan": workflow_plan_schema}, "additionalProperties": False, "$defs": workflow_plan_defs},
         _workflow_plan_save,
+        output_schema=saved_plan_receipt,
         side_effect_kind="control",
         delegable_to_column=False,
     )
@@ -1046,6 +1074,9 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         ),
         {"type": "object", "required": ["plan"], "properties": {"plan": task_plan_schema}, "additionalProperties": False, "$defs": task_plan_defs},
         _task_plan_save,
+        output_schema=receipt_schema(['id', 'workflow_revision_id', 'plan'], {
+            **saved_plan_receipt['properties'],
+            'workflow_revision_id': {'type': 'string', 'minLength': 1}}),
         side_effect_kind="control",
         delegable_to_column=False,
     )
@@ -1092,6 +1123,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
             "$defs": workflow_defs,
         },
         lambda args, ctx: _workflow_publish(args, ctx, registry),
+        output_schema=workflow_receipt,
         side_effect_kind="control",
         delegable_to_column=False,
     )
@@ -1111,6 +1143,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         ),
         {**task_schema, "$defs": task_defs},
         lambda args, ctx: _task_create(args, ctx, registry),
+        output_schema=task_receipt,
         side_effect_kind="control",
         delegable_to_column=False,
     )
@@ -1207,11 +1240,12 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     )
     add('task.plan.validate', 'Read-only admission diagnostics for a concrete Task Plan. Returns all independent contract errors, paths and legal columns. Does not persist plans or execute future commands.',
         {'type':'object','required':['plan'],'properties':{'plan':{'type':'object'}},'additionalProperties':False},
-        lambda args, ctx: _task_plan_validate(args, ctx, registry), side_effect_kind='read', delegable_to_column=False)
+        lambda args, ctx: _task_plan_validate(args, ctx, registry), output_schema=validation_receipt,
+        side_effect_kind='read', delegable_to_column=False)
     add('task.plan.contract', 'Read the active Workflow Task input contract, frozen scenario IDs and real entry-evidence candidates before building a Task Plan. Read-only; it does not create or validate a plan.',
         {'type':'object','additionalProperties':False},
         lambda args, ctx: _task_plan_contract(ctx), side_effect_kind='read', delegable_to_column=False)
-    add('workflow.acceptance.configure', 'Advanced raw acceptance editor. For ordinary behavior runners use workflow.acceptance.runners instead. Configure the exact active Workflow revision without resending its graph. base_digest is definition_hash from workflow.inspect or loop.apply. Listed columns replace only their own checks. Omit acceptance_obligations to derive required behavior obligations from the frozen Task Contract and retain untouched columns; explicit obligations replace the full list. Partial revisions are saved, but TaskPlan admission still rejects missing behavior checks or scenario coverage; read ready_for_task_plan and remaining_diagnostics, then configure the next column on the new revision. Each required behavior column needs an executable assertion command, scenario_ids and a fresh devwerk.acceptance-report.v1 report_path. Build/package-only checks are artifacts and cannot replace a behavior check or carry a scenario report. Future entry scripts use launch_validation=deferred. Frozen Tasks retain their old revision.',
+    add('workflow.acceptance.configure', 'Optional advanced editor for fixed Workflow acceptance checks. It is not required before Task creation: Workers can select their own behavior commands during execution. Configure the exact active revision using base_revision_id and base_digest from workflow.inspect. Listed columns replace only their checks; omitted acceptance_obligations are derived for changed behavior checks. Fixed behavior checks require real assertions and fresh reports. Frozen Tasks keep their old revision.',
         {'type':'object','required':['base_revision_id','base_digest','columns'],
          'properties':{'base_revision_id':{'type':'string'},'base_digest':{'type':'string'},
            'columns':{'type':'array','minItems':1,'items':{'type':'object','required':['key','acceptance_checks'],
@@ -1219,7 +1253,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
            'acceptance_obligations':workflow_schema['properties']['acceptance_obligations']},
          'additionalProperties':False,'$defs':{k:workflow_defs[k] for k in ('AcceptanceCheck','AcceptanceObligation')}},
         lambda args, ctx: _workflow_acceptance_configure(args, ctx, registry), side_effect_kind='control', delegable_to_column=False)
-    add('workflow.acceptance.runners', 'Configure simple behavioral test runners on the active Workflow revision. Each argv starts at the Project root and must invoke a dedicated Project-relative Python/Node/PowerShell/shell script, then pass report_path as a separate argument. Maven/npm commands with --report are not report-producing scripts. A missing script must be writable by its Column or reuse a script owned by an earlier Column; an existing Project script is also valid. The Column Worker may create its owned script later; it must execute real assertions and write fresh devwerk.acceptance-report.v1 JSON. Example: argv=["python","backend/acceptance.py","--report","reports/backend.json"], report_path="reports/backend.json". Host derives check fields and invalidation obligations. Submit required columns, then inspect ready_for_task_plan/remaining_diagnostics before saving the TaskPlan.',
+    add('workflow.acceptance.runners', 'Optional fixed behavioral test runners; do not call this merely to admit a Task. Each argv must invoke a dedicated Project-relative test script and pass report_path separately. A missing or existing script must have a responsible Column that can create or repair it under writable_paths; earlier Column ownership may be reused. The Worker executes real assertions and writes a fresh devwerk.acceptance-report.v1 report. Host derives checks and invalidation obligations.',
         {'type':'object','required':['base_revision_id','base_digest','runners'],
          'properties':{'base_revision_id':{'type':'string'},'base_digest':{'type':'string'},
            'runners':{'type':'array','minItems':1,'maxItems':30,'items':{
@@ -1237,7 +1271,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
          'properties':{'task_id':{'type':'string'},'task_plan_id':{'type':'string'}}, 'additionalProperties':False},
         _task_successor, side_effect_kind='control', delegable_to_column=False)
     add('task.feedback.record',
-        'Persist a Task defect for a responsible Column with frozen verification checks. Runtime routes only at a safe Column boundary along declared Workflow edges. This does not send Mailbox instructions or start another Agent.',
+        'Persist a Task defect for a responsible Column. checks reference frozen checks or runtime.behavior for a Workflow Plan required_behavior_column; the latter verifies a fresh successful Worker-selected command after repair. Runtime routes only at a safe Column boundary along declared Workflow edges. This does not send Mailbox instructions or start another Agent.',
         {'type':'object', 'required':['task_id','dedupe_key','responsible_column','description','checks'],
          'properties':{'task_id':{'type':'string'},'dedupe_key':{'type':'string','minLength':1,'maxLength':200},
              'responsible_column':{'type':'string'},'description':{'type':'string','minLength':1,'maxLength':12000},

@@ -22,6 +22,7 @@ class CompletionOutcomeRule:
     target: str
     evidence_requirement: EvidenceRequirement = "required"
     allows_unresolved_failures: bool = False
+    required_capability: str | None = None
 
 
 @dataclass(frozen=True)

@@ -702,6 +702,8 @@ class WorkflowRuntime:
         assert isinstance(column.executor, AgentExecutor)
         project = self.store.get_project(task["project_id"])
         workflow_row = self.store.get_workflow_revision(task["project_id"], task["workflow_revision_id"])
+        method = WorkflowPlan.model_validate(self.store.get_workflow_plan(
+            task["project_id"], workflow_row["workflow_plan_id"])["plan"])
         assignment = self.store.agents.assign(task, run, column)
         session = {"id": assignment["session_id"]}
         agent_input = input_data
@@ -731,8 +733,13 @@ class WorkflowRuntime:
                     **({'feedback_contract':{
                         'responsible_columns':[c.key for c in workflow.columns],
                         'checks':[{'column':c.key,'check_key':check.key,'purpose':check.purpose[:500]}
-                                  for c in workflow.columns for check in c.acceptance_checks],
-                        'instruction':'Before reporting a defect/rework outcome, persist task.feedback.record with a responsible Column and frozen check references. Read existing feedback to avoid duplicates. Runtime handles the declared handoff; do not send instructions through Mailbox or run other Workers.'}}
+                                  for c in workflow.columns for check in c.acceptance_checks] +
+                                 [{'column':key,'check_key':'runtime.behavior',
+                                   'purpose':'Re-run real behavior commands after repair in this Column'}
+                                  for key in method.task_contract.required_behavior_columns
+                                  if not any(check.evidence_kind == 'behavior'
+                                             for check in workflow.column(key).acceptance_checks)],
+                        'instruction':'Before reporting a defect/rework outcome, persist task.feedback.record with a responsible Column and a frozen check or runtime.behavior reference. Read existing feedback to avoid duplicates. Runtime handles the declared handoff; do not send instructions through Mailbox or run other Workers.'}}
                        if 'task.feedback.record' in column.executor.capabilities else {}),
                 },
                 runtime_ledger=runtime_ledger,
@@ -743,7 +750,8 @@ class WorkflowRuntime:
                 execution_control=ExecutionControl(
                     time.monotonic() + self.policy.execution.agent_wall_seconds,
                     validate_owner=lambda: self.store.agents.assert_owner(assignment)),
-                completion_contract=_column_completion_contract(workflow, column),
+                completion_contract=_column_completion_contract(
+                    workflow, column, method.task_contract.required_behavior_columns),
                 wait_config=column.wait_policy.model_dump(mode="json") if column.wait_policy else {},
                 agent_session_id=session["id"] if session else None,
                 assignment=assignment,
@@ -1233,6 +1241,7 @@ def _failure_message(output: dict[str, Any]) -> str:
 def _column_completion_contract(
     workflow: WorkflowDefinition,
     column: ColumnDefinition,
+    required_behavior_columns: list[str] | None = None,
 ) -> CompletionContract:
     rules: dict[str, CompletionOutcomeRule] = {}
     for transition in column.transitions:
@@ -1245,6 +1254,13 @@ def _column_completion_contract(
             ),
             allows_unresolved_failures=(
                 transition.allows_unresolved_failures or terminal_failure
+            ),
+            required_capability=(
+                'project.command.run'
+                if column.key in (required_behavior_columns or [])
+                and not transition.allows_unresolved_failures and not terminal_failure
+                and not any(check.evidence_kind == 'behavior' for check in column.acceptance_checks)
+                else None
             ),
         )
     return CompletionContract(

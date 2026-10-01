@@ -5,6 +5,8 @@ from collections import deque
 
 from app.v1.storage_support import new_id, utcnow
 
+RUNTIME_BEHAVIOR_CHECK = 'runtime.behavior'
+
 
 class TaskFeedbackRepository:
     def __init__(self, store):
@@ -66,6 +68,7 @@ class TaskFeedbackRepository:
             if task['status'] in {'done','failed'}:
                 raise ValueError('Terminal Task is immutable; create task.successor then record feedback on that Task')
             workflow = self.store.workflow_by_id(ctx.project_id, task['workflow_revision_id'])
+            behavior_columns = self._behavior_columns(db, task['workflow_revision_id'])
             responsible = args['responsible_column']
             workflow.column(responsible)
             if task['current_column'] != responsible:
@@ -75,7 +78,8 @@ class TaskFeedbackRepository:
                 raise ValueError('Feedback requires nonempty unique frozen verification checks')
             for check in checks:
                 column = workflow.column(check['column'])
-                if not any(c.key == check['check_key'] for c in column.acceptance_checks):
+                runtime_check = check['check_key'] == RUNTIME_BEHAVIOR_CHECK and column.key in behavior_columns
+                if not runtime_check and not any(c.key == check['check_key'] for c in column.acceptance_checks):
                     raise ValueError('Feedback check must reference a frozen acceptance check')
                 if check['column'] != responsible:
                     self.route(workflow, responsible, check['column'])
@@ -103,14 +107,46 @@ class TaskFeedbackRepository:
         rows = db.execute("SELECT * FROM v1_task_feedback WHERE task_id=? AND state!='resolved' ORDER BY rowid", (predecessor_id,)).fetchall()
         for row in rows:
             workflow.column(row['responsible_column'])
+            revision = db.execute('SELECT workflow_revision_id FROM v1_tasks WHERE id=?', (task_id,)).fetchone()
+            behavior_columns = self._behavior_columns(db, revision[0])
             for check in json.loads(row['checks_json']):
-                if not any(c.key == check['check_key'] for c in workflow.column(check['column']).acceptance_checks):
+                column = workflow.column(check['column'])
+                runtime_check = check['check_key'] == RUNTIME_BEHAVIOR_CHECK and column.key in behavior_columns
+                if not runtime_check and not any(c.key == check['check_key'] for c in column.acceptance_checks):
                     raise ValueError('A successor cannot discard unresolved feedback verification checks')
             db.execute('''INSERT INTO v1_task_feedback
                 (id,project_id,task_id,dedupe_key,responsible_column,description,checks_json,
                  source_run_id,source_job_id,reported_sequence,created_at) VALUES(?,?,?,?,?,?,?,?,?,0,?)''',
                 (new_id('feedback'),row['project_id'],task_id,'inherited:'+row['id'],row['responsible_column'],
                  row['description'],row['checks_json'],row['source_run_id'],row['source_job_id'],utcnow()))
+
+    @staticmethod
+    def _behavior_columns(db, revision_id):
+        row = db.execute('''SELECT p.plan_json FROM v1_workflow_revisions r
+            JOIN v1_workflow_plans p ON p.id=r.workflow_plan_id WHERE r.id=?''', (revision_id,)).fetchone()
+        return set((json.loads(row[0]).get('task_contract') or {}).get('required_behavior_columns') or []) if row else set()
+
+    def record_column_evidence(self, db, task, run_id, attempt_id):
+        """Bind a successful Worker-selected behavior command to this Column visit."""
+        if task['current_column'] not in self._behavior_columns(db, task['workflow_revision_id']):
+            return
+        from app.v1.services.task_plan_compiler import known_nonbehavior_command
+        rows = db.execute('''SELECT i.agent_run_id,i.tool_call_id,i.arguments_json FROM v1_tool_invocations i
+            JOIN v1_agent_runs r ON r.id=i.agent_run_id
+            WHERE r.column_run_id=? AND r.column_attempt_id=?
+              AND i.capability='project.command.run' AND i.ok=1
+            ORDER BY i.rowid DESC''', (run_id, attempt_id)).fetchall()
+        executed = next((row for row in rows if not known_nonbehavior_command(
+            json.loads(row['arguments_json']).get('argv', []))), None)
+        if not executed:
+            return
+        execution_key = f'{run_id}:{RUNTIME_BEHAVIOR_CHECK}'
+        result = {'ok': True, 'capability': 'project.command.run',
+                  'output': {'tool_call_id': executed['tool_call_id'], 'agent_run_id': executed['agent_run_id']}}
+        db.execute('''INSERT OR IGNORE INTO v1_acceptance_results VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
+                   (new_id('verification'),task['id'],task['workflow_revision_id'],run_id,
+                    attempt_id,executed['agent_run_id'],RUNTIME_BEHAVIOR_CHECK,execution_key,1,
+                    json.dumps(result,ensure_ascii=False),utcnow()))
 
     def record_check(self, spec, key, execution_key, result, *, task_owner=None, agent_run_id=None):
         with self.store.tx(immediate=True) as db:
@@ -246,7 +282,8 @@ class TaskFeedbackRepository:
         if terminal == 'failed':
             return next_column, terminal
         feedback = db.execute("SELECT * FROM v1_task_feedback WHERE task_id=? ORDER BY rowid", (task['id'],)).fetchall()
-        if not feedback and not workflow.acceptance_obligations:
+        behavior_columns = self._behavior_columns(db, task['workflow_revision_id'])
+        if not feedback and not workflow.acceptance_obligations and not behavior_columns:
             return next_column, terminal
         run = db.execute('SELECT sequence FROM v1_column_runs WHERE id=?', (run_id,)).fetchone()
         transition = next(t for t in workflow.column(task['current_column']).transitions if t.outcome == outcome)
@@ -290,4 +327,26 @@ class TaskFeedbackRepository:
                     barrier = max(barrier,latest[0] if latest else 0)
                 if not self.verified(db,task,obligation.column,obligation.check_key,after_sequence=barrier,current_run=run_id):
                     raise ValueError(f'Required acceptance evidence missing: {obligation.column}/{obligation.check_key}')
+            invalidated_by = self._invalidators(db, task['workflow_revision_id'])
+            for key in behavior_columns:
+                if any(item.column == key and
+                       workflow.column(key).acceptance_checks and
+                       any(check.key == item.check_key and check.evidence_kind == 'behavior'
+                           for check in workflow.column(key).acceptance_checks)
+                       for item in workflow.acceptance_obligations):
+                    continue  # Frozen command obligations keep their original verification path.
+                invalidators = {key} if key in invalidated_by else invalidated_by
+                barrier = 0
+                for changed in invalidators:
+                    latest = db.execute('SELECT sequence FROM v1_column_runs WHERE task_id=? AND column_key=? ORDER BY sequence DESC LIMIT 1',
+                                        (task['id'],changed)).fetchone()
+                    barrier = max(barrier,latest[0] if latest else 0)
+                if not self.verified(db,task,key,RUNTIME_BEHAVIOR_CHECK,after_sequence=barrier,current_run=run_id):
+                    raise ValueError(f'Required behavior evidence missing: {key}')
         return next_column, terminal
+
+    @staticmethod
+    def _invalidators(db, revision_id):
+        row = db.execute('''SELECT p.plan_json FROM v1_workflow_revisions r
+            JOIN v1_workflow_plans p ON p.id=r.workflow_plan_id WHERE r.id=?''', (revision_id,)).fetchone()
+        return set((json.loads(row[0]).get('task_contract') or {}).get('acceptance_invalidated_by') or []) if row else set()

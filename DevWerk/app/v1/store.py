@@ -1973,6 +1973,8 @@ class V1Store:
             attempt_row = db.execute("SELECT status FROM v1_column_attempts WHERE id=?", (attempt[0],)).fetchone()
             if not run_row or not attempt_row:
                 raise RuntimeError("Column Run state disappeared while finishing")
+            if not error:
+                self.feedback.record_column_evidence(db, task, run_id, attempt[0])
             next_column, terminal = self.feedback.settle(db, task, run_id, outcome, next_column, terminal)
             task_status = terminal or ('failed' if error else 'pending')
             COLUMN_RUN_STATE_MACHINE.require(run_row[0], run_status)

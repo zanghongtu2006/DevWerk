@@ -197,6 +197,8 @@ class ColumnDefinition(BaseModel):
     def validate_execution(self) -> "ColumnDefinition":
         if len({check.key for check in self.acceptance_checks}) != len(self.acceptance_checks):
             raise ValueError('Acceptance check keys must be unique')
+        if any(check.key == 'runtime.behavior' for check in self.acceptance_checks):
+            raise ValueError('runtime.behavior is reserved for Worker-selected command evidence')
         if self.executor is None:
             raise ValueError(f"column {self.key!r} requires an executor")
         if not self.transitions:
@@ -763,12 +765,12 @@ class TaskContract(BaseModel):
     input_schema: dict[str, Any] = Field(default_factory=dict)
     entry_requirements: list[TaskEntryRequirement] = Field(default_factory=list)
     required_behavior_columns: list[str] = Field(default_factory=list, max_length=200,
-        description='Before Task admission, each named Column needs a behavioral command check referenced by workflow.acceptance_obligations.')
+        description='Columns that must produce successful command evidence during execution; no command or script is required before Task admission.')
     acceptance_invalidated_by: list[str] = Field(default_factory=list, max_length=200)
     feedback_columns: list[str] = Field(default_factory=list, max_length=200,
         description='Columns that must expose task.feedback.record for persistent defect handoff.')
     scenario_input_pointer: str | None = Field(default=None, pattern=r'^/',
-        description='Task input JSON pointer listing required scenario IDs. Software delivery requires scenario reports and complete coverage of this frozen list.')
+        description='Task input JSON pointer listing scenario IDs to be checked by the executing and acceptance Columns.')
     identity_pointer: str | None = Field(
         default=None,
         pattern=r"^/.*",
