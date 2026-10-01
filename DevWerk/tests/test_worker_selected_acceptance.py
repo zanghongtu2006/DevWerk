@@ -1,7 +1,10 @@
 import sys
 
+import pytest
+
 from app.v1.agent import AgentCore
-from app.v1.domain import AgentModelResponse, AgentToolCall, Transition
+from app.v1.capabilities import CapabilityContext
+from app.v1.domain import AcceptanceCheck, AgentModelResponse, AgentToolCall, Transition
 from app.v1.runtime import WorkflowRuntime, _column_completion_contract
 from app.v1.completion_protocol import parse_completion_submission
 from app.v1.services.completion_admission import CompletionAdmissionService
@@ -16,6 +19,29 @@ def test_behavior_column_rejects_completion_without_a_real_command():
     decision = CompletionAdmissionService().evaluate(submission, contract, [])
     assert not decision.accepted
     assert decision.rejection.code == 'behavior_evidence_required'
+
+
+def test_fixed_behavior_check_does_not_accept_runtime_behavior_feedback(store, tmp_path):
+    project = store.create_project('fixed-check', '', str(tmp_path / 'project'))
+    workflow = agent_workflow()
+    column = workflow.column('work')
+    column.executor.capabilities.extend(['project.command.run', 'task.feedback.record'])
+    column.acceptance_checks = [AcceptanceCheck(
+        key='fixed', capability='project.command.run',
+        evidence_kind='behavior', purpose='Run the fixed behavior check',
+        arguments={'argv': [sys.executable, '-c', 'print("fixed")']})]
+    method = workflow_plan(workflow)
+    method.task_contract.required_behavior_columns = ['work']
+    saved = store.create_workflow_plan(project['id'], method)
+    store.publish_workflow(project['id'], workflow, saved['id'])
+    task = create_planned_task(store, project['id'], 'fixed check')
+    ctx = CapabilityContext(project_id=project['id'], project=project, store=store)
+    with pytest.raises(ValueError, match='frozen acceptance check'):
+        store.feedback.record(ctx, {
+            'task_id': task['id'], 'dedupe_key': 'wrong-receipt',
+            'responsible_column': 'work', 'description': 'Must use fixed check',
+            'checks': [{'column': 'work', 'check_key': 'runtime.behavior'}],
+        })
 
 
 def test_worker_selected_commands_complete_script_free_workflow(store, tmp_path):

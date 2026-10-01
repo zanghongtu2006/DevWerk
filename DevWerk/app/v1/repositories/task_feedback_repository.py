@@ -78,7 +78,9 @@ class TaskFeedbackRepository:
                 raise ValueError('Feedback requires nonempty unique frozen verification checks')
             for check in checks:
                 column = workflow.column(check['column'])
-                runtime_check = check['check_key'] == RUNTIME_BEHAVIOR_CHECK and column.key in behavior_columns
+                runtime_check = (check['check_key'] == RUNTIME_BEHAVIOR_CHECK
+                                 and column.key in behavior_columns
+                                 and not any(c.evidence_kind == 'behavior' for c in column.acceptance_checks))
                 if not runtime_check and not any(c.key == check['check_key'] for c in column.acceptance_checks):
                     raise ValueError('Feedback check must reference a frozen acceptance check')
                 if check['column'] != responsible:
@@ -111,7 +113,9 @@ class TaskFeedbackRepository:
             behavior_columns = self._behavior_columns(db, revision[0])
             for check in json.loads(row['checks_json']):
                 column = workflow.column(check['column'])
-                runtime_check = check['check_key'] == RUNTIME_BEHAVIOR_CHECK and column.key in behavior_columns
+                runtime_check = (check['check_key'] == RUNTIME_BEHAVIOR_CHECK
+                                 and column.key in behavior_columns
+                                 and not any(c.evidence_kind == 'behavior' for c in column.acceptance_checks))
                 if not runtime_check and not any(c.key == check['check_key'] for c in column.acceptance_checks):
                     raise ValueError('A successor cannot discard unresolved feedback verification checks')
             db.execute('''INSERT INTO v1_task_feedback
@@ -130,6 +134,10 @@ class TaskFeedbackRepository:
         """Bind a successful Worker-selected behavior command to this Column visit."""
         if task['current_column'] not in self._behavior_columns(db, task['workflow_revision_id']):
             return
+        workflow = self.store.workflow_by_id(task['project_id'], task['workflow_revision_id'])
+        if any(check.evidence_kind == 'behavior'
+               for check in workflow.column(task['current_column']).acceptance_checks):
+            return  # Fixed checks retain their original verification receipts.
         from app.v1.services.task_plan_compiler import known_nonbehavior_command
         rows = db.execute('''SELECT i.agent_run_id,i.tool_call_id,i.arguments_json FROM v1_tool_invocations i
             JOIN v1_agent_runs r ON r.id=i.agent_run_id
@@ -329,12 +337,8 @@ class TaskFeedbackRepository:
                     raise ValueError(f'Required acceptance evidence missing: {obligation.column}/{obligation.check_key}')
             invalidated_by = self._invalidators(db, task['workflow_revision_id'])
             for key in behavior_columns:
-                if any(item.column == key and
-                       workflow.column(key).acceptance_checks and
-                       any(check.key == item.check_key and check.evidence_kind == 'behavior'
-                           for check in workflow.column(key).acceptance_checks)
-                       for item in workflow.acceptance_obligations):
-                    continue  # Frozen command obligations keep their original verification path.
+                if any(check.evidence_kind == 'behavior' for check in workflow.column(key).acceptance_checks):
+                    continue  # Frozen checks keep their original verification path.
                 invalidators = {key} if key in invalidated_by else invalidated_by
                 barrier = 0
                 for changed in invalidators:
