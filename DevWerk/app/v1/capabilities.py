@@ -2518,7 +2518,11 @@ def _validate_acceptance_script_owners(definition, ctx):
 def _behavior_runner_script_index(argv):
     if not argv:
         return None
-    executable = argv[0].replace('\\', '/').rsplit('/', 1)[-1].lower()
+    executable_path = argv[0].replace('\\', '/')
+    executable = executable_path.rsplit('/', 1)[-1].lower()
+    if '/' in executable_path and executable.endswith(
+            ('.py', '.js', '.mjs', '.cjs', '.ps1', '.sh', '.cmd', '.bat')):
+        return 0
     if executable in {'python', 'python.exe', 'py', 'py.exe'}:
         index, extensions = 1, ('.py',)
     elif executable in {'node', 'node.exe'}:

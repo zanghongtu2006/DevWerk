@@ -425,6 +425,34 @@ def test_advanced_acceptance_editor_rejects_unowned_script(store, tmp_path):
     assert accepted.ok, accepted.error
 
 
+def test_direct_acceptance_script_uses_same_column_ownership_rule(store, tmp_path):
+    from tests.test_task_entry_admission import software_plan
+
+    project, _, ctx = software_plan(store, tmp_path)
+    current = store.get_workflow(project['id'])
+    base = {'base_revision_id': current['id'], 'base_digest': current['definition_hash']}
+    report = 'reports/backend.json'
+    runner = {'column': 'backend_development',
+              'argv': ['scripts/run-backend-tests.bat', '--report', report],
+              'report_path': report, 'scenario_ids': ['entry-fixture'],
+              'purpose': 'Run backend behavior assertions'}
+    rejected = store.registry.dispatch('workflow.acceptance.runners',
+        {**base, 'runners': [runner]}, replace(ctx, execution_key='direct-unowned-runner'))
+    assert not rejected.ok and 'BehaviorRunnerScriptUnowned' in str(rejected.error)
+    assert store.get_workflow(project['id'])['id'] == current['id']
+    definition = copy.deepcopy(current['definition'])
+    next(col for col in definition['columns'] if col['key'] == 'backend_development')[
+        'acceptance_checks'][0]['arguments']['argv'] = runner['argv']
+    direct = store.registry.dispatch('workflow.publish', {
+        'workflow_plan_id': current['workflow_plan_id'], 'workflow': definition},
+        replace(ctx, execution_key='direct-unowned-publish'))
+    assert not direct.ok and 'BehaviorRunnerScriptUnowned' in str(direct.error)
+    owned = {**runner, 'argv': ['backend/run-backend-tests.bat', '--report', report]}
+    accepted = store.registry.dispatch('workflow.acceptance.runners',
+        {**base, 'runners': [owned]}, replace(ctx, execution_key='direct-owned-runner'))
+    assert accepted.ok, accepted.error
+
+
 def test_rejects_one_backend_runner_as_distinct_frontend_and_delivery_proof(store, tmp_path):
     from tests.test_task_entry_admission import software_plan
     from app.v1.domain import WorkflowDefinition, WorkflowPlan
