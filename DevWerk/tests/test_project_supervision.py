@@ -3,7 +3,8 @@ import pytest
 from app.v1.agent import AgentCore
 from app.v1.capabilities import CapabilityContext
 from app.v1.conversation import ConversationGateway
-from app.v1.domain import AgentModelResponse, AgentToolCall
+from app.v1.domain import AgentModelResponse, AgentToolCall, ToolResult
+from app.v1.execution_ledger import ledger_entry, repeats_failed_operation
 from tests.helpers import agent_workflow, create_planned_task, publish_planned_workflow
 from tests.test_agent_recovery_and_fencing import begin_agent
 from tests.test_conversation_intent_contract import turn
@@ -279,6 +280,21 @@ def test_user_recovery_rejects_resume_boundary_before_it_can_block_retry(store, 
     retried = store.registry.dispatch('task.retry', {'task_id': task['id']}, ctx)
     assert retried.ok, retried.error
     assert store.get_task(task['id'])['status'] == 'pending'
+
+
+def test_successful_continue_authorization_allows_same_retry_arguments():
+    retry_args = {'task_id': 'task-1', 'column_key': 'backend'}
+    denied = ledger_entry('run', 'premature', 'task.retry', 'control',
+        ToolResult(ok=False, capability='task.retry',
+                   error={'type': 'RecoveryRequiresExecutionAuthorization', 'message': 'authorize first'}),
+        arguments=retry_args)
+    inspected = ledger_entry('run', 'inspect', 'task.inspect', 'read',
+        ToolResult(ok=True, capability='task.inspect', output={}), arguments={'task_id': 'task-1'})
+    authorized = ledger_entry('run', 'authorize', 'conversation.execution.authorize', 'session_control',
+        ToolResult(ok=True, capability='conversation.execution.authorize', output={'grant_id': 'grant-1'}),
+        arguments={'request': 'continue'})
+    assert repeats_failed_operation('task.retry', retry_args, [denied, inspected])
+    assert not repeats_failed_operation('task.retry', retry_args, [denied, inspected, authorized])
 
 
 def test_supervision_model_failure_still_notifies_original_task_failure(store, tmp_path):

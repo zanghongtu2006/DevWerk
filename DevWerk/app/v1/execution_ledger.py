@@ -156,7 +156,8 @@ def repeats_failed_operation(
     if latest_failure is None:
         return False
     return not any(
-        item.get("effect_kind") in ACTION_EFFECT_KINDS
+        (item.get("effect_kind") in ACTION_EFFECT_KINDS
+         or item.get("capability") in {"conversation.execution.authorize", "conversation.task.control.authorize"})
         and item.get("ok")
         and item.get("status") == "completed"
         for item in entries[latest_failure + 1 :]
