@@ -171,6 +171,42 @@ def test_repeated_rejected_completion_stalls_without_execution_progress() -> Non
         )
 
 
+def test_exact_retry_resets_completion_rejection_ceiling() -> None:
+    guard = CompletionAttemptGuard()
+    command = {'argv': ['mvn', 'test']}
+    failed = _entry('failed', 'project.command.run', 'process', ok=False, arguments=command)
+    for index in range(4):
+        guard.observe_rejection({'attempt': index}, ValueError('failed command'), [failed],
+                                completion_tool_name='column.complete')
+    repaired = _entry('repaired', 'project.command.run', 'process', ok=True, arguments=command)
+    guard.observe_rejection({'attempt': 4}, ValueError('another issue'), [failed, repaired],
+                            completion_tool_name='column.complete')
+    assert guard.rejections == 1
+
+
+def test_worker_selected_behavior_check_repairs_earlier_command_failure() -> None:
+    failed = _entry('failed', 'project.command.run', 'process', ok=False,
+                    arguments={'argv': ['mvn', 'exec:java']})
+    passed = _entry('passed', 'project.command.run', 'process', ok=True,
+                    arguments={'argv': ['mvn', 'test']})
+    cleanup = _entry('cleanup', 'project.command.run', 'process', ok=True,
+                     arguments={'argv': ['cmd', '/c', 'del', 'temporary.java']})
+    failed_write = _entry('write', 'project.files.write', 'write', ok=False)
+    contract = CompletionContract('column.complete',
+        {'ready': CompletionOutcomeRule(target='next', required_capability='project.command.run')},
+        evidence_collection='runtime')
+
+    def decision(ledger):
+        return CompletionAdmissionService().evaluate(
+            CompletionSubmission('ready', {}, 'verified',
+                                 tuple(item['evidence_id'] for item in ledger)), contract, ledger)
+
+    assert decision([failed, passed]).accepted
+    assert decision([passed, failed]).rejection.code == 'unresolved_execution_failure'
+    assert decision([failed, cleanup]).rejection.code == 'unresolved_execution_failure'
+    assert decision([failed, passed, failed_write]).rejection.code == 'unresolved_execution_failure'
+
+
 def test_runtime_evidence_collection_ignores_model_supplied_evidence_ids() -> None:
     successful = _entry("read", "project.files.read", "read", ok=True)
     contract = CompletionContract(

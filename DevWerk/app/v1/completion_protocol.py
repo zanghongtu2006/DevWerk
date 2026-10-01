@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from app.v1.contracts import canonicalize_contract_value, validate_contract
-from app.v1.execution_ledger import evidence_entries, execution_progress
+from app.v1.execution_ledger import evidence_entries, execution_progress, unresolved_execution_failures
 
 
 EvidenceCollection = Literal["model", "runtime"]
@@ -75,6 +75,7 @@ class CompletionSubmission:
 @dataclass
 class CompletionAttemptGuard:
     last_rejection: tuple[str, str, tuple[str, ...]] | None = None
+    last_unresolved_operations: frozenset[str] = frozenset()
     rejections: int = 0
 
     def observe_rejection(
@@ -85,6 +86,11 @@ class CompletionAttemptGuard:
         *,
         completion_tool_name: str,
     ) -> None:
+        unresolved = frozenset(unresolved_execution_failures(ledger))
+        if self.last_unresolved_operations - unresolved:
+            # An exact successful retry repaired a previously rejected action.
+            # Unrelated successful commands must not reset the loop ceiling.
+            self.rejections = 0
         self.rejections += 1
         if self.rejections >= 5:
             raise CompletionProtocolStalled(
@@ -104,9 +110,12 @@ class CompletionAttemptGuard:
                 "without new execution progress"
             )
         self.last_rejection = fingerprint
+        self.last_unresolved_operations = unresolved
 
     def observe_progress(self) -> None:
         self.last_rejection = None
+        self.last_unresolved_operations = frozenset()
+        self.rejections = 0
 
 
 def parse_completion_submission(

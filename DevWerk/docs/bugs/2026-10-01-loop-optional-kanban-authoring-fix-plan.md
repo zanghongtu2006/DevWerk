@@ -66,3 +66,18 @@ Web 对话触发 Conversation Agent 的正常工具调用；Agent 不调用脚�
 3. 新 Project 黑盒：Web 连续至少五轮讨论 → 授权交付 Vue/Java 登录与防刷 Demo → CA 选择/修改 Loop 或自建合适 Workflow → 产生 Task、Column Runs、单列 Worker → 失败可恢复并推进至最终验收。测试中不通过脚本直接控制 DevWerk；测试方可用内部脚本做启动与观测，但用户路径始终是 Web 对话。记录调用次数、无效写文件数、最终状态和交付物核验结果。
 
 按 A、B、C 的依赖顺序做小步提交，每步跑对应单测，最后才运行完整黑盒。若 B 的 evidence/feedback 设计发现旧契约无法兼容，先在文档中定最小 receipt 结构并审查，不能靠放宽 `done` 准入赶进度。
+
+## 实施与回归记录（2026-10-01）
+
+- `54a5bb7`：先提交本方案；`6873836`：开放无 Loop 初始 Workflow，并使无 Loop 的新用户需求扩展复制新 revision、保留旧 Task 的冻结 revision。Loop 导入后仍可在同一需求中缩减和修订 Workflow。
+- `7cf92c8`：把 `required_behavior_columns` 的命令证据移到 Column 执行期。没有固定检查时，Worker 必须成功调用 `project.command.run` 才能提交非失败完成；Runtime 将该 Column/attempt 的成功调用记录为 `runtime.behavior` 验证回执，最终 `done` 与反馈重验都检查当前有效回执。固定 `acceptance_checks` 保持原路径。关键 Kanban 写操作增加成功回执的输出 schema 校验。
+- `a2a3e85`：Conversation Agent 指引和 Loop 工具结果投影改为“模板可选、规划期不预写未来脚本、先验证 TaskPlan 再创建 Task”。`08c4505`：补充隔离固定检查与 `runtime.behavior` 的回执语义，避免反馈用动态引用替代固定检查。
+- 定向回归 161 项通过；完整 `tests` 目录 511 项通过；回执隔离补丁后的相关回归 63 项通过（均使用 `-W ignore::ResourceWarning`，因为现有 SQLite 资源告警会让退出码失真）。`git diff --check` 无空白错误。
+
+**证据边界：**`runtime.behavior` 确认当前 Column attempt 有成功的命令调用，并排除少数确定不是行为测试的命令；它不静态证明任意命令覆盖了全部需求场景。独立验收仍由验收 Column 按 Task 输入执行，且交付物质量需在真实黑盒完成后检查。不能把上述单测通过表述为 Vue/Java Demo 已交付。隔离端口 8001 的五轮讨论及授权黑盒正在进行，结果另记。
+
+## 黑盒执行期补充方案（2026-10-02）
+
+隔离项目 `prj_0d2e7f5068e14db09c0545bcd017b6ef` 的首列 Worker 已写入后端并成功执行 `mvn test`，但此前对 `column.complete` 的四次拒绝累计在 `CompletionAttemptGuard`；成功重试同一 Maven 操作没有消除拒绝计数。随后提交会触发第五次上限而暂停。另一个探索用的 `mvn exec:java` 参数变体仍有失败记录，虽然其后完整测试成功，当前“所有失败命令必须原样重试成功”规则仍拒绝完成。
+
+最小修改：`completion_protocol.py::CompletionAttemptGuard` 仅在先前未解决的操作被**同一操作的成功回执**消除时重置计数，保留无进展和无关 noop 的防循环上限；`services/completion_admission.py::evaluate` 对无固定检查、要求 Worker 自选 `project.command.run` 的 Column，把晚于失败命令的成功行为验证命令视为本次探索失败已修复，但仍拒绝更晚的失败、非行为命令、其他能力的失败以及固定检查失败。保留完整执行 ledger；完成准入与最终 `runtime.behavior` 仍需真实成功回执。增单元测试覆盖上述四种边界，再恢复该 Task；随后新建 Project 用相同对话案例完整回归。

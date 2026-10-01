@@ -68,6 +68,26 @@ class CompletionAdmissionService:
                         message += f" ({str(error.get('type') or 'CheckFailed')[:80]}: {str(error['message'])[:300]})"
                     return self._reject('acceptance_check_failed', message)
             unresolved = {}
+        elif rule.required_capability == 'project.command.run' and not rule.allows_unresolved_failures:
+            # Worker-selected checks have no frozen command to retry verbatim.
+            # A later successful behavior command can supersede exploratory
+            # command failures, while other failed actions still block success.
+            from app.v1.services.task_plan_compiler import known_nonbehavior_command
+            failed_commands = [item for item in unresolved.values()
+                               if item.get('capability') == 'project.command.run']
+            if failed_commands:
+                last_failure = max(ledger.index(item) for item in failed_commands)
+                repaired = any(
+                    item.get('capability') == 'project.command.run'
+                    and item.get('ok') and item.get('status') == 'completed'
+                    and item.get('evidence_id') in referenced_ids
+                    and not known_nonbehavior_command(
+                        ((item.get('facts') or {}).get('arguments') or {}).get('argv', []))
+                    for item in ledger[last_failure + 1:]
+                )
+                if repaired:
+                    unresolved = {key: item for key, item in unresolved.items()
+                                  if item.get('capability') != 'project.command.run'}
         unresolved_by_evidence = {
             str(item.get("evidence_id")): item
             for item in unresolved.values()
