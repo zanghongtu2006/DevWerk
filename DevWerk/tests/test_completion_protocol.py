@@ -188,6 +188,31 @@ def test_runtime_evidence_collection_ignores_model_supplied_evidence_ids() -> No
     assert submission.evidence_ids == (successful["evidence_id"],)
 
 
+@pytest.mark.parametrize('arguments', [
+    {'outcome': 'ready', 'output': '{}', 'summary': 'verified'},
+    {'outcome': 'ready', 'summary': 'verified'},
+])
+def test_completion_accepts_empty_object_output_from_provider(arguments) -> None:
+    contract = CompletionContract(
+        tool_name='column.complete',
+        outcomes={'ready': CompletionOutcomeRule(target='next', evidence_requirement='optional')},
+        output_schema={'properties': {}},
+        evidence_collection='runtime',
+    )
+    assert parse_completion_submission(arguments, contract, []).output == {}
+
+
+def test_completion_does_not_invent_required_output_fields() -> None:
+    contract = CompletionContract(
+        tool_name='column.complete',
+        outcomes={'ready': CompletionOutcomeRule(target='next', evidence_requirement='optional')},
+        output_schema={'type': 'object', 'required': ['delivered'],
+                       'properties': {'delivered': {'type': 'boolean'}}},
+    )
+    with pytest.raises(ValueError, match='output'):
+        parse_completion_submission({'outcome': 'ready', 'summary': 'verified'}, contract, [])
+
+
 def test_completion_recovers_provider_misplaced_named_parameter_without_inventing_data() -> None:
     contract = CompletionContract(
         tool_name="column.complete",

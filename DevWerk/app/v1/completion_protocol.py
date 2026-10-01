@@ -119,6 +119,20 @@ def parse_completion_submission(
     arguments = dict(arguments)
     if contract.evidence_collection == "runtime":
         arguments.pop("evidence_ids", None)
+    if isinstance(arguments.get("output"), str):
+        try:
+            decoded_output = json.loads(arguments["output"])
+        except (TypeError, ValueError):
+            decoded_output = None
+        if isinstance(decoded_output, dict):
+            arguments["output"] = decoded_output
+    if "output" not in arguments:
+        try:
+            validate_contract({}, schema["properties"]["output"], label="Column output")
+        except ValueError:
+            pass
+        else:
+            arguments["output"] = {}
     normalized = canonicalize_contract_value(arguments, schema)
     validate_contract(normalized, schema, label=contract.tool_name)
     outcome = str(normalized["outcome"])
@@ -169,9 +183,11 @@ def completion_tool_schema(contract: CompletionContract) -> dict[str, Any]:
 
 def completion_arguments_schema(contract: CompletionContract) -> dict[str, Any]:
     required = ["outcome", "output", "summary"]
+    output_schema = dict(contract.output_schema or {})
+    output_schema.setdefault("type", "object")
     properties: dict[str, Any] = {
         "outcome": {"type": "string", "enum": sorted(contract.outcomes)},
-        "output": contract.output_schema or {"type": "object"},
+        "output": output_schema,
         "summary": {"type": "string", "maxLength": 4000},
         "failure_resolutions": {
             "type": "array",
