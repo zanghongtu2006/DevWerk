@@ -257,6 +257,30 @@ def test_supervision_cannot_finish_as_recovered_after_only_queuing_worker_input(
     assert store.get_task(task['id'])['status'] == 'pending'
 
 
+def test_user_recovery_rejects_resume_boundary_before_it_can_block_retry(store, tmp_path):
+    project, task, assignment = blocked_task_with_user_grant(store, tmp_path)
+    job, ctx = turn(store, project, f'Continue the failed Task {task["id"]}')
+    premature = store.registry.dispatch('agent.worker.send', {
+        'worker_id': assignment['agent_instance_id'], 'assignment_id': assignment['id'],
+        'content': 'Inspect the prior failure.'}, ctx)
+    assert not premature.ok
+    assert 'RecoveryRequiresExecutionAuthorization' in str(premature.error)
+    wrong_boundary = store.registry.dispatch('conversation.task.control.authorize', {
+        'action': 'task.resume', 'task_id': task['id']}, ctx)
+    assert not wrong_boundary.ok
+    assert 'RecoveringTaskRequiresRetry' in str(wrong_boundary.error)
+    assert store.intents.contract(job)['phase'] == 'unresolved'
+    with pytest.raises(ValueError, match='RecoveringTaskRequiresRetry'):
+        store.resume_task(task['id'])
+    assert store.get_task(task['id'])['control_state'] == 'paused'
+    authorized = store.registry.dispatch('conversation.execution.authorize', {
+        'request': 'continue', 'requirement_id': store.get_task(task['id'])['requirement_id']}, ctx)
+    assert authorized.ok, authorized.error
+    retried = store.registry.dispatch('task.retry', {'task_id': task['id']}, ctx)
+    assert retried.ok, retried.error
+    assert store.get_task(task['id'])['status'] == 'pending'
+
+
 def test_supervision_model_failure_still_notifies_original_task_failure(store, tmp_path):
     project, _, task = failed_task_with_user_grant(store, tmp_path)
     job, _ = claim_event(store, project)

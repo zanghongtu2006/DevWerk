@@ -559,7 +559,8 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
             'new_scope':{'type':'boolean'}},'additionalProperties':False},
         _authorize_execution, side_effect_kind='session_control', delegable_to_column=False)
     add('conversation.task.control.authorize',
-        'Bind an explicit current user request to pause, resume or cancel one Task. Call alone before the Task control tool.',
+        'Bind an explicit current user request to pause, resume or cancel one Task. Call alone before the Task control tool. '
+        'A recovering Task needs conversation.execution.authorize(request=continue) then task.retry, not task.resume.',
         {'type':'object','required':['action','task_id'],'properties':{
             'action':{'type':'string','enum':['task.pause','task.resume','task.cancel']},
             'task_id':{'type':'string','minLength':1}},'additionalProperties':False},
@@ -2805,6 +2806,11 @@ def _authorize_execution(args, ctx):
 
 
 def _authorize_task_control(args, ctx):
+    if args['action'] == 'task.resume':
+        task = ctx.store.get_project_task(ctx.project_id, args['task_id'])
+        if task['status'] == 'recovering':
+            raise ValueError('RecoveringTaskRequiresRetry: call conversation.execution.authorize '
+                             'with request=continue, then task.retry for the same Task')
     return _resolve_current_turn({
         'act':'control', 'control_capability':args['action'],
         'control_task_id':args['task_id'],

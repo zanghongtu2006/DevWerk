@@ -283,6 +283,9 @@ class ConversationIntentRepository:
         if contract['phase'] == 'targeted_control':
             return None if (capability == contract['control_capability'] and arguments.get('task_id') == contract['control_task_id']) else 'TurnControlScopeMismatch: only the requested Task control is allowed'
         if contract['phase'] != 'execution':
+            if contract['phase'] == 'unresolved' and capability in {'task.retry', 'agent.worker.send'}:
+                return ('RecoveryRequiresExecutionAuthorization: call conversation.execution.authorize '
+                        'with request=continue before Worker input or task.retry')
             return 'TurnUnresolved: call conversation.execution.authorize or conversation.task.control.authorize before business mutations' if contract['phase'] == 'unresolved' else 'ConversationMutationDisabled: continue discussing; no work was authorized'
         with self.store.connect() as db:
             grant = db.execute('SELECT * FROM v1_execution_grants WHERE id=? AND project_id=?',

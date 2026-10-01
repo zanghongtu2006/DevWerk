@@ -469,6 +469,8 @@ class RecoveryManager:
 
     def resume_task(self, task_id: str) -> dict[str, Any]:
         task = self.store.get_task(task_id)
+        if task['status'] == 'recovering':
+            raise ValueError('RecoveringTaskRequiresRetry: use task.retry to queue the interrupted Column')
         if task["status"] in {"done", "failed"}:
             raise ValueError("terminal Tasks are immutable")
         if task.get("control_state") not in {"paused", "pause_requested"}:
