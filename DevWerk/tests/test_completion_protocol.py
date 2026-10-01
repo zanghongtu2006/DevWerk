@@ -11,6 +11,7 @@ from app.v1.completion_protocol import (
     CompletionProtocolStalled,
     CompletionSubmission,
     FailureResolution,
+    completion_tool_schema,
     parse_completion_submission,
 )
 from app.v1.domain import AgentModelResponse, AgentToolCall, ToolResult
@@ -202,9 +203,12 @@ def test_worker_selected_behavior_check_repairs_earlier_command_failure() -> Non
                                  tuple(item['evidence_id'] for item in ledger)), contract, ledger)
 
     assert decision([failed, passed]).accepted
-    assert decision([passed, failed]).rejection.code == 'unresolved_execution_failure'
+    rejected = decision([passed, failed])
+    assert rejected.rejection.code == 'unresolved_execution_failure'
+    assert 'later successful behavior check' in rejected.rejection.message
     assert decision([failed, cleanup]).rejection.code == 'unresolved_execution_failure'
     assert decision([failed, passed, failed_write]).rejection.code == 'unresolved_execution_failure'
+    assert 'later successful behavior command' in completion_tool_schema(contract)['function']['description']
 
 
 def test_runtime_evidence_collection_ignores_model_supplied_evidence_ids() -> None:

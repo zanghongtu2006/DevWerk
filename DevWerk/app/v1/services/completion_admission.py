@@ -144,9 +144,16 @@ class CompletionAdmissionService:
                 or "a failed Column action has not been repaired"
             )
             operation = {"capability": failed.get("capability"), "arguments": (failed.get("facts") or {}).get("arguments") or {}}
+            repair_hint = (
+                "Retry this operation successfully, run a later successful behavior check, "
+                "or submit a declared failure/rework outcome. "
+                if rule.required_capability == 'project.command.run' and not contract.acceptance_checks
+                and failed.get('capability') == 'project.command.run'
+                else "Retry this operation successfully, or submit a declared failure/rework outcome. "
+            )
             return self._reject("unresolved_execution_failure", message +
                                 "; unresolved operation=" + json.dumps(operation, ensure_ascii=False) +
-                                ". Retry this operation successfully, or submit a declared failure/rework outcome. "
+                                ". " + repair_hint +
                                 "Unrelated commands/noops do not repair this failure; Runtime collects receipt IDs automatically.")
 
         if rule.allows_unresolved_failures and not set(remaining_failures).issubset(

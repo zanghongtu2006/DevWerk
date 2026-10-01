@@ -182,8 +182,9 @@ def completion_tool_schema(contract: CompletionContract) -> dict[str, Any]:
             "name": contract.tool_name,
             "description": (
                 "Submit one declared assignment outcome with structured output and auditable evidence. "
-                "Runtime collects evidence automatically. Frozen acceptance checks or successful identical retries "
-                "discharge failures; failure_resolutions is optional and cannot equate unrelated commands."
+                "Runtime collects evidence automatically. Frozen acceptance checks and successful identical retries "
+                "discharge failures. For Worker-selected behavior checks, a later successful behavior command can "
+                "discharge earlier exploratory command failures. Unrelated commands cannot discharge fixed checks."
             ),
             "parameters": completion_arguments_schema(contract),
         },

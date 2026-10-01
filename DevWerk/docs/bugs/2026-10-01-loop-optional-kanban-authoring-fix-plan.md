@@ -81,3 +81,5 @@ Web 对话触发 Conversation Agent 的正常工具调用；Agent 不调用脚�
 隔离项目 `prj_0d2e7f5068e14db09c0545bcd017b6ef` 的首列 Worker 已写入后端并成功执行 `mvn test`，但此前对 `column.complete` 的四次拒绝累计在 `CompletionAttemptGuard`；成功重试同一 Maven 操作没有消除拒绝计数。随后提交会触发第五次上限而暂停。另一个探索用的 `mvn exec:java` 参数变体仍有失败记录，虽然其后完整测试成功，当前“所有失败命令必须原样重试成功”规则仍拒绝完成。
 
 最小修改：`completion_protocol.py::CompletionAttemptGuard` 仅在先前未解决的操作被**同一操作的成功回执**消除时重置计数，保留无进展和无关 noop 的防循环上限；`services/completion_admission.py::evaluate` 对无固定检查、要求 Worker 自选 `project.command.run` 的 Column，把晚于失败命令的成功行为验证命令视为本次探索失败已修复，但仍拒绝更晚的失败、非行为命令、其他能力的失败以及固定检查失败。保留完整执行 ledger；完成准入与最终 `runtime.behavior` 仍需真实成功回执。增单元测试覆盖上述四种边界，再恢复该 Task；随后新建 Project 用相同对话案例完整回归。
+
+后续核对发现 `column.complete` 的公开描述仍只说“相同操作重试可解除失败”，与上述动态规则不一致。应只修正这一处工具描述和相应拒绝提示，让 Worker 知道晚于失败的成功行为检查也可解除探索失败；不能因此放宽固定验收检查或写入新的状态位。
