@@ -2042,14 +2042,18 @@ def _system_command_run(args: dict[str, Any], ctx: CapabilityContext) -> ToolRes
     if exit_code in accepted and not output.get("timed_out") and not output.get("output_truncated"):
         return ToolResult(ok=True, capability="system.command.run", output=output)
     detail = str(output.get("stderr") or output.get("stdout") or "").strip()
-    message = f"command exited with code {exit_code}"
+    message = ("command timed out" if output.get("timed_out") else
+               "command output exceeded limit" if output.get("output_truncated") else
+               f"command exited with code {exit_code}")
     if detail:
         message = f"{message}: {detail}"
     return ToolResult(
         ok=False,
         capability="system.command.run",
         output=output,
-        error={"type": "CommandFailed", "message": message, "exit_code": exit_code},
+        error={"type": "CommandFailed", "message": message, "exit_code": exit_code,
+               "timed_out": bool(output.get("timed_out")),
+               "output_truncated": bool(output.get("output_truncated"))},
     )
 
 
@@ -2190,7 +2194,9 @@ def _command_run(args: dict[str, Any], ctx: CapabilityContext) -> ToolResult:
     if exit_code in accepted and not output.get("timed_out") and not output.get("output_truncated"):
         return ToolResult(ok=True, capability="project.command.run", output=output)
     detail = str(output.get("stderr") or output.get("stdout") or "").strip()
-    message = f"command exited with code {exit_code}"
+    message = ("command timed out" if output.get("timed_out") else
+               "command output exceeded limit" if output.get("output_truncated") else
+               f"command exited with code {exit_code}")
     if detail:
         message = f"{message}: {detail}"
     return ToolResult(
@@ -2201,6 +2207,8 @@ def _command_run(args: dict[str, Any], ctx: CapabilityContext) -> ToolResult:
             "type": "CommandFailed",
             "message": message,
             "exit_code": exit_code,
+            "timed_out": bool(output.get("timed_out")),
+            "output_truncated": bool(output.get("output_truncated")),
         },
     )
 

@@ -7,11 +7,14 @@ import pytest
 
 from app.v1.capabilities import (
     CapabilityContext,
+    _command_run,
+    _system_command_run,
     build_core_registry,
     resolve_references,
     validate_task_capability_bindings,
     validate_workflow_capabilities,
 )
+from app.v1.files import ProjectFiles, SystemFiles
 from app.v1.contracts import ContractError
 from app.v1.domain import (
     CapabilityStep,
@@ -119,6 +122,26 @@ def test_command_capability_keeps_runtime_process_exit_semantics(store, tmp_path
     assert failed.output["exit_code"] == 7
     assert not accepted.ok
     assert accepted.output["exit_code"] == 7
+
+
+@pytest.mark.parametrize('command,files', [(_command_run, ProjectFiles),
+                                          (_system_command_run, SystemFiles)])
+@pytest.mark.parametrize('failure_flag,expected', [('timed_out', 'command timed out'),
+                                                   ('output_truncated', 'command output exceeded limit')])
+def test_command_failure_receipt_names_timeout_or_truncation(
+        store, tmp_path, monkeypatch, command, files, failure_flag, expected):
+    project = store.create_project('command-receipt', '', str(tmp_path / 'project'))
+    context = CapabilityContext(project_id=project['id'], project=project, store=store)
+    output = {'exit_code': 0, 'stdout': '', 'stderr': '',
+              'timed_out': failure_flag == 'timed_out',
+              'output_truncated': failure_flag == 'output_truncated'}
+    monkeypatch.setattr(files, 'run', lambda self, *args, **kwargs: output)
+    result = command({'argv': ['example']}, context)
+    assert not result.ok
+    assert result.error['type'] == 'CommandFailed'
+    assert result.error['message'] == expected
+    assert result.error['exit_code'] == 0
+    assert result.error[failure_flag] is True
 
 
 def test_json_references_are_explicit_and_do_not_evaluate_templates():
