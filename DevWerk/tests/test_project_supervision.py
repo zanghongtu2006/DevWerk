@@ -228,6 +228,35 @@ def test_supervision_hands_diagnosis_to_blocked_worker_then_stops_after_retry(st
     assert queued[0]['assignment_id'] == fresh['id']
 
 
+def test_supervision_cannot_finish_as_recovered_after_only_queuing_worker_input(store, tmp_path):
+    project, task, assignment = blocked_task_with_user_grant(store, tmp_path)
+    job, mailbox = claim_event(store, project)
+    assert store.bind_supervision_job(job['id'], mailbox)
+    run = begin_agent(store, project, kind='conversation', conversation_job_id=job['id'])
+    ctx = CapabilityContext(project['id'], project, store, agent_run_id=run['id'],
+                            agent_instance_id=store.agents.main(project['id'])['id'])
+    sent = store.registry.dispatch('agent.worker.send', {
+        'worker_id': assignment['agent_instance_id'], 'assignment_id': assignment['id'],
+        'content': 'Inspect the runtime failure before continuing.'}, ctx)
+    assert sent.ok, sent.error
+    store.record_tool_invocation(agent_run_id=run['id'], tool_call_id='queued-input',
+        capability='agent.worker.send', arguments={}, result=sent.model_dump(mode='json'), ok=True)
+    premature = store.registry.dispatch('conversation.reply', {
+        'mode': 'work_result', 'tool_call_ids': ['queued-input']}, ctx)
+    assert not premature.ok
+    assert 'SupervisionRecoveryNotQueued' in str(premature.error)
+    assert store.get_task(task['id'])['status'] == 'recovering'
+    retried = store.registry.dispatch('task.retry', {'task_id': task['id']}, ctx)
+    assert retried.ok, retried.error
+    store.record_tool_invocation(agent_run_id=run['id'], tool_call_id='queued-retry',
+        capability='task.retry', arguments={'task_id': task['id']},
+        result=retried.model_dump(mode='json'), ok=True)
+    finished = store.registry.dispatch('conversation.reply', {
+        'mode': 'work_result', 'tool_call_ids': ['queued-retry']}, ctx)
+    assert finished.ok, finished.error
+    assert store.get_task(task['id'])['status'] == 'pending'
+
+
 def test_supervision_model_failure_still_notifies_original_task_failure(store, tmp_path):
     project, _, task = failed_task_with_user_grant(store, tmp_path)
     job, _ = claim_event(store, project)

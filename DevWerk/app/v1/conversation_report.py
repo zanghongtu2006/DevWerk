@@ -64,6 +64,15 @@ def render_report(store, project_id, run_id, text, *, execution_control=None):
             raise ValueError('The turn boundary is ALREADY COMMITTED. Omit turn_resolution entirely from the final reply; '
                              'return mode, message, task_ids, tool_call_ids; optionally draft_update for discussion data. For discussion use {"mode":"discussion","message":"your answer"}.')
     report = ConversationReport.model_validate_json(text)
+    contract = store.intents.contract(job) if job else {}
+    if report.mode == 'work_result' and contract.get('phase') == 'supervision':
+        task = store.get_project_task(project_id, contract['supervised_task_id'])
+        if task['status'] in {'recovering', 'failed'}:
+            recovery = 'task.retry' if task['status'] == 'recovering' else 'task.reopen'
+            raise ValueError(
+                f'SupervisionRecoveryNotQueued: Task is still {task["status"]}; '
+                f'agent.worker.send only queues input. Call {recovery} for the same Task '
+                'or report mode=blocked with a concrete reason.')
     invocations = {str(i['tool_call_id']): i for i in store.tool_invocations(project_id, run_id, hydrate_payloads=True)}
     selected = []
     for identity in dict.fromkeys(report.tool_call_ids):
