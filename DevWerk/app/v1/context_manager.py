@@ -200,7 +200,7 @@ def project_result(content, max_bytes):
     if planning is not None:
         planning['projection'] = {'truncated':True,'source_bytes':len(content.encode('utf8')),
             'sha256':digest(original),'reference':reference,'retrieve':'agent.result.read',
-            'note':'Complete planning contract fields; omitted prose and graph instructions remain in the archived result. Use workflow.acceptance.runners for ordinary behavioral checks.'}
+            'note':'Complete planning contract fields; omitted prose and graph instructions remain in the archived result. Fixed acceptance runners are optional.'}
         if len(packed(planning).encode('utf8')) <= max_bytes:
             return packed(planning)
     for limit in (2400, 1200, 600, 200, 40):
@@ -236,19 +236,15 @@ def planning_projection(result):
         view['task_contract'] = method.get('task_contract',{})
         view['columns'] = [{'key':c['key'],'writable_paths':c.get('metadata',{}).get('writable_paths',[])} for c in workflow.get('columns',[])]
         view['assets'] = [a['path'] for a in output.get('assets',[])]
-        if view['task_contract'].get('scenario_input_pointer'):
-            view['behavior_report_contract'] = {
-                'check_fields':['scenario_ids','report_path','evidence_kind=behavior','purpose','arguments.argv'],
-                'report':{'schema_version':'devwerk.acceptance-report.v1','scenarios':[{'id':'required ID','status':'passed',
-                    'assertions':[{'expected':'expected value','actual':'observed value'}],
-                    'test_source':{'path':'project-relative executed test source','sha256':'source SHA256'}}]},
-                'rules':'Freeze an entry script that runs real assertions AND writes a fresh report on every execution. Ordinary mvn compile, npm build and if-exist/echo do not supply behavior reports; keep builds as additional artifact checks. Future entry scripts and report paths must be writable by the responsible column, using launch_validation=deferred. Preserve frozen scenario coverage; terminal acceptance covers all IDs. Use required_behavior_columns and acceptance_invalidated_by when declaring obligations.'}
+        if view['task_contract'].get('required_behavior_columns'):
+            view['behavior_evidence_contract'] = {
+                'rules':'No test script is needed before Task admission. Each named Column Worker selects and runs real commands during execution; Runtime requires successful command evidence. Keep scenario IDs in the Task input and verify them independently at acceptance. Fixed workflow.acceptance.runners remain optional.'}
     elif capability == 'loop.apply':
         workflow = output.get('workflow') or {}
         method = output.get('workflow_plan') or {}
         view = {'workflow':{k:workflow[k] for k in ('id','definition_hash','workflow_plan_id') if k in workflow},
                 'workflow_plan':{'id':method.get('id'),'task_contract':method.get('plan',{}).get('task_contract',{})},
-                'next':'Configure behavioral checks with workflow.acceptance.runners; then validate the concrete plan with task.plan.validate.'}
+                'next':'Revise this template when needed, then use task.plan.contract and task.plan.validate. Fixed acceptance runners are optional.'}
     elif capability == 'workflow.inspect':
         definition = output.get('definition') or {}
         view = {k:output[k] for k in ('id','definition_hash','workflow_plan_id','source_loop_key','source_loop_version','source_loop_digest') if k in output}
