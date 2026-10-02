@@ -109,3 +109,9 @@
 最小修复：在现有 Worker 自选验证命令识别器中纳入可执行交付的 `build/compile/package` 目标；对 Windows `cmd /c` 的 `&&` 串行命令，仅识别最后一个实际验证命令，拒绝含 `||` 或后续掩盖退出码的命令。保留 `npm install`、`npm --version`、清理命令等非验证命令不能清除失败的规则。单测覆盖失败安装→成功 `pnpm run build`→完成，以及安装/版本查询不能清除失败；修后用新库新 Project 重测，不恢复本项目。
 
 该命令识别补丁的 Completion/Worker/Context 相关回归 89 项通过，`git diff --check` 通过。
+
+## 最终全新 Project 验收
+
+隔离库 `data/evals/2026-10-02-final-blackbox-v3/devwerk.db` 的 Project `prj_7e04aed8f5d24669a1b816837bf6fee7` 重走五轮自然语言讨论，第六轮明确授权。五轮讨论期间没有 Task；授权轮通过内部 `workflow.plan.save`、`workflow.publish`、`task.plan.save`、`task.create` 建立恰好 `backend → frontend → review → done` 的串行 Workflow 和 Task `tsk_abafc94472c8465094f895d735ca23fb`。三个 Column 都是单 Agent。Task 经 backend、frontend、review，review 对 backend 记录一项反馈并按 Workflow 回流，再经 backend、frontend、review；六次 Column Run 均 succeeded，反馈 resolved，Task 终态 `done`。运行状态只在至少五分钟间隔读取。
+
+独立交付验收：在交付目录重新运行 `mvn -q test` 成功；项目已安装的 Vite 入口 `node node_modules/vite/bin/vite.js build` 成功生成 `dist`。使用独立端口 8082 与全新 H2 测试库请求真实 `/api/login`，依次得到 `200, 401, 401, 401, 401, 429, 429`，验证成功登录、前四次失败、第五码锁定及锁定期间仍 429。Java 服务已停止。源码的应用 Controller 只声明 `POST /api/login`；根目录有 README 运行说明。宿主机全局 `npm` 命令因缺失 `npm-cli.js` 无法启动，`pnpm` 包管理器检查也受宿主环境影响；这不影响项目 Vite 入口的实际生产构建，且与 DevWerk Workflow 完成协议无关。
