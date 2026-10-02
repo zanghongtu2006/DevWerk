@@ -43,3 +43,5 @@
 项目一在新协议下恢复后，验收 Worker 成功提交，但最终 `done` 被 `Required behavior evidence missing: backend_implementation` 拒绝。后端 Column Run `run_62de721c13f54f38b295bc0d973e0b61` 共有五个 Attempt；第 4 个 Attempt 成功执行 `mvn test`，第 5 个 Attempt 仅提交 `column.complete`。完成准入从整个 Column Run 的 ledger 看到成功命令，`TaskFeedbackRepository.record_column_evidence()` 却只查最后 Attempt，所以没写入后端 `runtime.behavior`。同一事实在两个准入层使用了不同生命周期边界，属于 P0 假阴性。
 
 最小修复：`record_column_evidence` 以 Column Run 为检索范围，取最后一个真正的成功行为命令；若其后有成功的 `project.files.write`，证据作废，要求再测试。回执仍绑定当前完成 Attempt，但 output 保留实际 Agent Run/Tool Call 来源，避免伪造来源。`settle` 在终态检查前对已有成功且缺回执的行为列按同一规则补记，以恢复受此缺陷影响的历史 Task；显式固定检查完全不走补记。单测覆盖跨 Attempt 成功、后续源码写入使证据失效、终态补记与固定检查隔离，再恢复原 Task。
+
+跨 Attempt 修复的完整回归为 523 通过、1 失败。失败用例 `test_different_successful_operation_does_not_recover_failed_column_action` 指出：无固定检查时，泛化为“任意后续成功命令”会错误地把 `python -c print('different operation')` 视为修复。后续补丁只收紧**自动清除旧失败**的判定：成功命令必须是从 argv 可识别的测试/验证入口（如 Maven test、pytest、test/verify/acceptance 脚本），且晚于最后失败；普通打印、noop、清理仍不算。该规则不改变 Worker 对任意项目命令的执行权限，也不改变首次成功证据或 Workflow/Task 作者能力。原项目的 `acceptance-test.ps1` 和后端 `mvn test` 均在可识别范围内。

@@ -3,12 +3,53 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 import json
+import ntpath
+import re
+import shlex
 
 from app.v1.completion_protocol import CompletionContract, CompletionSubmission
 from app.v1.execution_ledger import (
     evidence_entries,
     unresolved_execution_failures,
 )
+
+
+def _recognizable_verification_command(argv: list[str]) -> bool:
+    """Only an identifiable test entrypoint may automatically supersede failures."""
+    from app.v1.services.task_plan_compiler import known_nonbehavior_command
+
+    if known_nonbehavior_command(argv) or not argv or not all(isinstance(arg, str) for arg in argv):
+        return False
+    tokens = list(argv)
+    executable = ntpath.basename(tokens[0]).lower()
+    if executable in {'cmd', 'cmd.exe'} and len(tokens) > 2 and tokens[1].lower() == '/c':
+        tokens = tokens[2:]
+        if len(tokens) == 1:
+            try:
+                tokens = shlex.split(tokens[0], posix=False)
+            except ValueError:
+                return False
+        executable = ntpath.basename(tokens[0]).lower() if tokens else ''
+    lower = [arg.lower() for arg in tokens]
+    if executable in {'mvn', 'mvn.cmd', 'mvnw', 'mvnw.cmd', 'gradle', 'gradlew', 'gradlew.bat'}:
+        return any(arg in {'test', 'verify', 'integration-test', 'check', 'surefire:test',
+                           'failsafe:integration-test', 'failsafe:verify'} for arg in lower[1:])
+    if executable in {'pytest', 'pytest.exe', 'go', 'cargo', 'dotnet', 'npm', 'npm.cmd',
+                      'pnpm', 'pnpm.cmd', 'yarn', 'yarn.cmd'}:
+        return any(arg in {'test', 'verify', 'check'} for arg in lower[1:]) or executable.startswith('pytest')
+    if executable in {'python', 'python.exe', 'py', 'py.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe'}:
+        if '-m' in lower:
+            index = lower.index('-m')
+            if index + 1 < len(lower) and lower[index + 1] in {'pytest', 'unittest'}:
+                return True
+        if '-file' in lower:
+            index = lower.index('-file')
+            script = lower[index + 1] if index + 1 < len(lower) else ''
+        else:
+            script = next((arg for arg in lower[1:] if arg.endswith(('.py', '.ps1', '.sh', '.bat', '.cmd'))), '')
+        return bool(re.search(r'(^|[._-])(test|tests|verify|check|acceptance)([._-]|$)',
+                              ntpath.basename(script)))
+    return bool(re.search(r'(^|[._-])(test|tests|verify|check|acceptance)([._-]|$)', executable))
 
 
 @dataclass(frozen=True)
@@ -72,7 +113,6 @@ class CompletionAdmissionService:
             # Worker-selected checks have no frozen command to retry verbatim.
             # A later successful behavior command can supersede exploratory
             # command failures, while other failed actions still block success.
-            from app.v1.services.task_plan_compiler import known_nonbehavior_command
             failed_commands = [item for item in unresolved.values()
                                if item.get('capability') == 'project.command.run']
             if failed_commands:
@@ -81,7 +121,7 @@ class CompletionAdmissionService:
                     item.get('capability') == 'project.command.run'
                     and item.get('ok') and item.get('status') == 'completed'
                     and item.get('evidence_id') in referenced_ids
-                    and not known_nonbehavior_command(
+                    and _recognizable_verification_command(
                         ((item.get('facts') or {}).get('arguments') or {}).get('argv', []))
                     for item in ledger[last_failure + 1:]
                 )

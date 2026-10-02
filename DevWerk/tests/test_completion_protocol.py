@@ -16,7 +16,7 @@ from app.v1.completion_protocol import (
 )
 from app.v1.domain import AgentModelResponse, AgentToolCall, ToolResult
 from app.v1.execution_ledger import ledger_entry
-from app.v1.services.completion_admission import CompletionAdmissionService
+from app.v1.services.completion_admission import CompletionAdmissionService, _recognizable_verification_command
 from app.v1.tool_protocol import parse_await_submission
 
 
@@ -208,7 +208,7 @@ def test_worker_selected_behavior_check_repairs_earlier_command_failure() -> Non
     assert 'later successful behavior check' in rejected.rejection.message
     assert decision([failed, cleanup]).rejection.code == 'unresolved_execution_failure'
     assert decision([failed, passed, failed_write]).rejection.code == 'unresolved_execution_failure'
-    assert 'later successful behavior command' in completion_tool_schema(contract)['function']['description']
+    assert 'later successful identifiable test/verification command' in completion_tool_schema(contract)['function']['description']
 
 
 def test_unfrozen_acceptance_column_can_complete_after_later_successful_behavior_check() -> None:
@@ -233,6 +233,17 @@ def test_unfrozen_acceptance_column_can_complete_after_later_successful_behavior
     assert decision([passed, failed]).rejection.code == 'unresolved_execution_failure'
     assert decision([failed, cleanup]).rejection.code == 'unresolved_execution_failure'
     assert decision([failed, passed], frozen=True).rejection.code == 'acceptance_check_failed'
+
+
+@pytest.mark.parametrize(('argv', 'expected'), [
+    (['mvn', '-f', 'backend/pom.xml', 'test', '-q'], True),
+    (['powershell', '-ExecutionPolicy', 'Bypass', '-File', 'acceptance-test.ps1'], True),
+    (['cmd', '/c', 'python frontend/verify_acceptance.py'], True),
+    (['python', '-c', "print('different operation')"], False),
+    (['cmd', '/c', 'del', 'temporary.java'], False),
+])
+def test_only_identifiable_verification_commands_supersede_failures(argv, expected) -> None:
+    assert _recognizable_verification_command(argv) is expected
 
 
 def test_runtime_evidence_collection_ignores_model_supplied_evidence_ids() -> None:
