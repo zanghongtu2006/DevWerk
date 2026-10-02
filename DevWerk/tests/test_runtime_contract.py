@@ -161,6 +161,7 @@ def test_runtime_separates_accepted_working_and_reference_artifact_provenance(st
     assert [item["path"] for item in context["reference_artifacts"]] == ["stale.md"]
     assert "current_goal" not in context
     assert "project" not in context
+    assert "authorized_scope" not in context
     assert set(context["task"]) == {"id", "input"}
     assert context["task"]["input"] == {}
     assert {

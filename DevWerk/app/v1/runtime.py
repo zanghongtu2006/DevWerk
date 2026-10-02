@@ -61,7 +61,11 @@ _CONTEXT_CONSUMPTION_CONTRACT = (
     "project.loop.assets and preloaded content directly; do not reread a manifest path "
     "unless it is missing, known to have changed, or independent verification is required. "
     "Loop asset paths are not Project filesystem paths. On a Session resume, use the logical "
-    "checkpoint and directed Handoffs, then fetch only specific missing or changed files."
+    "checkpoint and directed Handoffs, then fetch only specific missing or changed files. "
+    "When authorized_scope is present, user_request is the user request that authorized "
+    "this Task; original_user_request preserves the initial grant request when different. "
+    "Check the deliverable against its explicit exclusions as well as the Task Plan; "
+    "do not treat an omitted exclusion in the Plan as permission to add a feature."
 )
 
 
@@ -277,6 +281,30 @@ class WorkflowRuntime:
             "task_plan_hash": task_plan_row["plan_hash"],
             "column": column_plan,
         }
+        for evidence_id in planned_task.get("entry_evidence", {}).values():
+            if not isinstance(evidence_id, str):
+                continue
+            with self.store.connect() as db:
+                grant = db.execute(
+                    "SELECT g.id, j.message FROM v1_execution_grants g "
+                    "JOIN v1_conversation_jobs j ON j.id=g.source_job_id "
+                    "WHERE g.id=? AND g.project_id=?",
+                    (evidence_id, task["project_id"]),
+                ).fetchone()
+                latest_request = db.execute(
+                    "SELECT message FROM v1_conversation_jobs WHERE project_id=? "
+                    "AND execution_grant_id=? AND trigger_kind='user' AND created_at<=? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (task["project_id"], evidence_id, task["created_at"]),
+                ).fetchone() if grant else None
+            if grant:
+                data["authorized_scope"] = {
+                    "grant_id": grant["id"],
+                    "user_request": latest_request["message"] if latest_request else grant["message"],
+                }
+                if latest_request and latest_request["message"] != grant["message"]:
+                    data["authorized_scope"]["original_user_request"] = grant["message"]
+                break
         if selection.include_current_goal:
             data["current_goal"] = planned_task
         data["dependencies"] = self.store.task_dependency_context(

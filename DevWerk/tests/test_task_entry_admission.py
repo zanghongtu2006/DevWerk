@@ -10,7 +10,7 @@ from tests.test_conversation_intent_contract import turn, resolve
 
 def software_plan(store, tmp_path):
     project = store.create_project('software entry', '', str(tmp_path/'project'))
-    job, ctx = turn(store, project, '按方案开始开发')
+    job, ctx = turn(store, project, '按方案开始开发；不要增加登出功能。')
     resolution = resolve(ctx, job, act='execute', execution_request='begin', scope_summary='local login demo',
         user_evidence=[{'message_id':job['user_message_id'],'quote':job['message']}])
     assert resolution.ok, resolution.error
@@ -59,6 +59,10 @@ def test_plan_contract_exposes_only_real_entry_evidence(store, tmp_path):
         'requirements_path', 'requirements_confirmed', 'acceptance_scenarios'}
     assert guide['entry_evidence']['confirmed_scope']['candidate_ids'] == [
         plan.tasks[0].entry_evidence['confirmed_scope']]
+    assert guide['authorized_scope'][0] == {
+        'grant_id': plan.tasks[0].entry_evidence['confirmed_scope'],
+        'user_request': '按方案开始开发；不要增加登出功能。',
+    }
     assert guide['entry_evidence']['requirements_file']['candidates'] == [{
         'execution_key': plan.tasks[0].entry_evidence['requirements_file'],
         'path': 'docs/baseline.md',
@@ -79,6 +83,58 @@ def test_plan_contract_exposes_only_real_entry_evidence(store, tmp_path):
     (tmp_path/'project'/'docs'/'baseline.md').write_text('changed', encoding='utf-8')
     stale = store.registry.dispatch('task.plan.contract', {}, replace(ctx, execution_key='read-stale-contract'))
     assert stale.ok and stale.output['entry_evidence']['requirements_file']['candidates'] == []
+
+
+def test_each_column_receives_original_authorized_scope_even_when_plan_omits_exclusion(store, tmp_path):
+    from app.v1.runtime import WorkflowRuntime
+
+    project, plan, _ = software_plan(store, tmp_path)
+    assert plan.tasks[0].readiness.non_scope == []
+    saved = store.create_task_plan(project['id'], plan)
+    task = store.create_task(project['id'], task_plan_id=saved['id'], proposed_task_ref='primary')
+    workflow = store.workflow_by_id(project['id'], task['workflow_revision_id'])
+    runtime = WorkflowRuntime(store, store.registry, 'scope-worker')
+
+    for key in ('backend_development', 'frontend_development', 'accept'):
+        column = workflow.column(key)
+        context = runtime._input_for(task, workflow, column)
+        assert context['authorized_scope'] == {
+            'grant_id': plan.tasks[0].entry_evidence['confirmed_scope'],
+            'user_request': '按方案开始开发；不要增加登出功能。',
+        }
+        assert 'explicit exclusions' in context['context_manifest']['consumption_contract']
+
+
+def test_repair_task_receives_current_request_and_initial_grant_request(store, tmp_path):
+    from app.v1.runtime import WorkflowRuntime
+
+    project, plan, ctx = software_plan(store, tmp_path)
+    prior_job = store.intents.job_for_run(ctx.agent_run_id, project['id'])
+    store.finish_conversation_job(prior_job['id'], None, ctx.agent_run_id, {})
+    followup, followup_ctx = turn(store, project, '修复交付：仍然不要增加登出功能。')
+    authorized = store.registry.dispatch('conversation.execution.authorize',
+        {'request': 'continue'}, followup_ctx)
+    assert authorized.ok, authorized.error
+    assert authorized.output['turn_contract']['execution_grant_id'] == (
+        plan.tasks[0].entry_evidence['confirmed_scope'])
+    guide = store.registry.dispatch('task.plan.contract', {}, followup_ctx)
+    assert guide.ok, guide.error
+    assert guide.output['authorized_scope'][0] == {
+        'grant_id': plan.tasks[0].entry_evidence['confirmed_scope'],
+        'user_request': followup['message'],
+        'original_user_request': '按方案开始开发；不要增加登出功能。',
+    }
+
+    saved = store.create_task_plan(project['id'], plan)
+    task = store.create_task(project['id'], task_plan_id=saved['id'], proposed_task_ref='primary')
+    workflow = store.workflow_by_id(project['id'], task['workflow_revision_id'])
+    context = WorkflowRuntime(store, store.registry, 'scope-worker')._input_for(
+        task, workflow, workflow.column('accept'))
+    assert context['authorized_scope'] == {
+        'grant_id': plan.tasks[0].entry_evidence['confirmed_scope'],
+        'user_request': followup['message'],
+        'original_user_request': '按方案开始开发；不要增加登出功能。',
+    }
 
 
 def test_unsaved_plan_is_not_misdiagnosed_as_requirement_conflict(store, tmp_path):

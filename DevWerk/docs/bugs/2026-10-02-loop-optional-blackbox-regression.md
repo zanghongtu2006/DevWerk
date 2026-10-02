@@ -45,3 +45,19 @@
 最小修复：`record_column_evidence` 以 Column Run 为检索范围，取最后一个真正的成功行为命令；若其后有成功的 `project.files.write`，证据作废，要求再测试。回执仍绑定当前完成 Attempt，但 output 保留实际 Agent Run/Tool Call 来源，避免伪造来源。`settle` 在终态检查前对已有成功且缺回执的行为列按同一规则补记，以恢复受此缺陷影响的历史 Task；显式固定检查完全不走补记。单测覆盖跨 Attempt 成功、后续源码写入使证据失效、终态补记与固定检查隔离，再恢复原 Task。
 
 跨 Attempt 修复的完整回归为 523 通过、1 失败。失败用例 `test_different_successful_operation_does_not_recover_failed_column_action` 指出：无固定检查时，泛化为“任意后续成功命令”会错误地把 `python -c print('different operation')` 视为修复。后续补丁只收紧**自动清除旧失败**的判定：成功命令必须是从 argv 可识别的测试/验证入口（如 Maven test、pytest、test/verify/acceptance 脚本），且晚于最后失败；普通打印、noop、清理仍不算。该规则不改变 Worker 对任意项目命令的执行权限，也不改变首次成功证据或 Workflow/Task 作者能力。原项目的 `acceptance-test.ps1` 和后端 `mvn test` 均在可识别范围内。
+
+## 项目一终态复核：授权约束在规划交接中丢失
+
+项目一 Task `tsk_88749529a9f24c568243c52a5029a50a` 已经沿四个 Column 到达 `done`，说明 Workflow/Task 创建与调度链条可运行；但交付不符合用户确认的范围。第六轮用户明确说不要 logout 或其它端点，第七轮授权又重复说不要 logout。实际后端 `AuthController` 提供了 `POST /api/auth/logout`，Vue 也调用它并显示登出按钮。验收报告只测了正向的 login/me 与限流，共 8 项，没有检查额外端点或额外 UI。
+
+证据链：授权 Grant `grant_34ec37dc30a540948439206e49e4f555` 的 `scope_summary` 只写“两条端点”，没有保留原授权消息的排除语句；Task Plan 的 `readiness.non_scope=[]`，验收标准也没有排除项；后续前端、集成、验收 Column 输入都没有出现 logout 字样。故这是交接上下文缺失与验收范围遗漏，不能把 `done` 等同于符合目标。
+
+最小修复设计：
+
+1. 执行 Grant 已有不可变 `source_job_id`，原始授权用户消息也已保存在对应 Conversation Job；无需新增快照字段或表列。`task.plan.contract` 读取并展示当前 Grant 的原文，提醒 Agent 将明确排除项写入现有 `readiness.non_scope` 与验收标准。
+2. 在 `runtime.py::WorkflowRuntime._input_for`，对引用该 Grant 的 Task，从已有记录读取**创建该 Task 前最新一次使用同一 Grant 的用户请求**作为 `authorized_scope.user_request`；若与最初授权不同，同时附上 `original_user_request`。送入每个 Column，独立于可选择省略的 Goal/Task Context；Worker 提示要求按原始授权检查交付，发现与 Task Plan 冲突时不能默默采纳缩水后的 Plan。无 Grant 的原有 Task 保持原输入。历史 Grant 无需迁移。这也覆盖后续用户授权继续或修复同一 Requirement 的情况。
+3. 单测检验 Grant 原文不可被摘要取代、每个 Column 看到相同原文、无 Grant 的 Context 不变。随后从 Web 对话让 Conversation Agent 对此已完成但越界的 Task 创建明确的修复 Task，验证 Kanban 再次推进并验收；另一个 Loop 项目在隔离服务里继续恢复，最终对两条路径做终态复核。
+
+修复 Task 黑盒进展：Conversation Agent 通过现有工具创建 `tsk_1c7cb102c72040b89203be82be6531f0`，`repair_of_task_id` 正确指向原 `done` Task；该 Plan 的 `non_scope` 和验收标准也明确排除 logout。Task 在 `pending/backend_implementation`、`scheduling.state=admitted`、无依赖和失败码的状态停留约七分钟。Conversation Agent 随后错误地把正常的 `pending` 当作已确认故障，先尝试 `task.retry`/`task.resume`，再自行 `task.cancel`，使修复 Task 进入 `failed`，之后又反复尝试创建新 Plan。离线复制同一数据库，将该 Task 恢复为 `pending` 后，`SchedulerService._dispatch_eligible()` 返回 true，`runnable_task_ids()` 返回它；隔离服务 `/v1/health` 的 Supervisor 线程存活且 tick 无异常。仍需查明进程内为何未领取 Task，不能仅凭健康接口推断它正常调度。
+
+全量单测 529 通过、2 个 `ResourceWarning: unclosed database` 收集期错误；两个受影响用例分别单独重跑均通过，暂无证据指向本补丁的功能失败。相关目标测试 68 通过，新增 continuation 原文测试另行通过。

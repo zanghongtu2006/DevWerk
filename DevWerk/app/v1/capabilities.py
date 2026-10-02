@@ -1069,7 +1069,9 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
             "the existing Project predecessor. Never repeat an already materialized work item merely to make a new "
             "plan start at the configured first value. Saving the plan creates no Tasks. "
             "This is a mutating capability, never a schema probe: do not submit placeholder, test, TODO, or partial "
-            "plans. Read task.plan.contract first for the current frozen input and evidence candidates, then "
+            "plans. Preserve explicit exclusions from the authorizing user request in readiness.non_scope "
+            "and the acceptance criteria; a positive feature list does not override those exclusions. "
+            "Read task.plan.contract first for the current frozen input and evidence candidates, then "
             "task.plan.validate before saving. If validation rejects a call before persistence, correct and "
             "resubmit the same complete user-owned plan. A queue readiness decision is automatically admitted "
             "when dependencies and WIP constraints allow."
@@ -1244,7 +1246,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         {'type':'object','required':['plan'],'properties':{'plan':{'type':'object'}},'additionalProperties':False},
         lambda args, ctx: _task_plan_validate(args, ctx, registry), output_schema=validation_receipt,
         side_effect_kind='read', delegable_to_column=False)
-    add('task.plan.contract', 'Read the active Workflow Task input contract, frozen scenario IDs and real entry-evidence candidates before building a Task Plan. Read-only; it does not create or validate a plan.',
+    add('task.plan.contract', 'Read the active Workflow Task input contract, authorizing user request, frozen scenario IDs and real entry-evidence candidates before building a Task Plan. Read-only; it does not create or validate a plan.',
         {'type':'object','additionalProperties':False},
         lambda args, ctx: _task_plan_contract(ctx), side_effect_kind='read', delegable_to_column=False)
     add('workflow.acceptance.configure', 'Optional advanced editor for fixed Workflow acceptance checks. It is not required before Task creation: Workers can select their own behavior commands during execution. Configure the exact active revision using base_revision_id and base_digest from workflow.inspect. Listed columns replace only their checks; omitted acceptance_obligations are derived for changed behavior checks. Fixed behavior checks require real assertions and fresh reports. Frozen Tasks keep their old revision.',
@@ -2396,8 +2398,10 @@ def _task_plan_contract(ctx):
     evidence = {}
     with ctx.store.connect() as db:
         grants = [dict(row) for row in db.execute(
-            "SELECT id,created_at FROM v1_execution_grants WHERE project_id=? AND requirement_id=? "
-            "AND requirement_revision=? AND state='active' ORDER BY created_at DESC LIMIT 5",
+            "SELECT g.id,g.created_at,j.message AS user_request FROM v1_execution_grants g "
+            "JOIN v1_conversation_jobs j ON j.id=g.source_job_id "
+            "WHERE g.project_id=? AND g.requirement_id=? "
+            "AND g.requirement_revision=? AND g.state='active' ORDER BY g.created_at DESC LIMIT 5",
             (ctx.project_id, scope.get('requirement_id'), scope.get('requirement_revision')))]
         for rule in contract.entry_requirements:
             if rule.kind == 'accepted_scope_snapshot':
@@ -2429,6 +2433,15 @@ def _task_plan_contract(ctx):
                     break
             evidence[rule.key] = {'kind': rule.kind, 'input_pointer': rule.input_pointer,
                                   'candidates': candidates}
+    active_job = ctx.store.intents.job_for_run(ctx.agent_run_id, ctx.project_id) if ctx.agent_run_id else None
+    authorized_scope = []
+    for grant in grants:
+        current_request = (active_job['message'] if active_job and
+                           active_job.get('execution_grant_id') == grant['id'] else grant['user_request'])
+        item = {'grant_id': grant['id'], 'user_request': current_request}
+        if current_request != grant['user_request']:
+            item['original_user_request'] = grant['user_request']
+        authorized_scope.append(item)
     return {
         'workflow_revision_id': workflow['id'],
         'flow_unit': method.flow_unit,
@@ -2441,6 +2454,7 @@ def _task_plan_contract(ctx):
         'identity_pointer': contract.identity_pointer,
         'frozen_scenario_ids': scenario_ids[:100],
         'entry_evidence': evidence,
+        'authorized_scope': authorized_scope,
         'next_action': 'Pair each file receipt with its execution_grant_id as confirmed_scope; submit actual input and matching evidence through task.plan.validate before task.plan.save.',
     }
 
