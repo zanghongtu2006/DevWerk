@@ -239,6 +239,14 @@ def test_each_completed_column_makes_the_next_column_runnable(store, tmp_path):
     assert after_prepare["current_column"] == "deliver"
     assert task["id"] in store.runnable_task_ids()
 
+    # A blocked second Column defaults to retrying itself, not the Workflow entry.
+    with store.tx(immediate=True) as db:
+        db.execute("UPDATE v1_tasks SET status='recovering',control_state='paused',"
+                   "failure_code='simulated_failure' WHERE id=?", (task['id'],))
+    retried = store.retry_task(task['id'])
+    assert retried['status'] == 'pending'
+    assert retried['current_column'] == 'deliver'
+
     runtime.step(task["id"])
     finished = store.get_task(task["id"])
     assert finished["status"] == "done"

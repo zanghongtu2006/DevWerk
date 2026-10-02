@@ -72,4 +72,10 @@
 
 本地对同一 Task、同一前端 Column 用新预载规则重新构造输入，JSON 长度从约 230 KB 降到约 56 KB；预载文件为 `frontend/index.html`、`package.json`、`pnpm-lock.yaml`、Vue 源码和 Vite 配置，不再含 `dist` 或 `node_modules`。相关文件/上下文测试 4 通过。隔离服务已加载补丁，并从 Web 对话请求重试原 `recovering/paused` Task，终态待验证。
 
+另一个独立的重试边界问题在此过程中暴露：前端 ContextExhausted 的监督唤醒调用 `task.retry(task_id)`，未带 `column_key`；`RecoveryManager.retry_task()` 默认把目标设为 `workflow.entry`，于是已经成功的后端列被重跑。此不是前端模型上下文修复所需，也增加了工具/模型成本。最小改动是**非终态 Task 的默认 retry 目标改为当前 Column**；确需从 Workflow 入口重跑仍可显式提供 `column_key=workflow.entry`。在现有两列 Runtime 测试中模拟第二列恢复，断言默认 retry 留在第二列并且第一列不重跑。`task.reopen` 的终态后重新进入流程语义不改。
+
+重试默认目标补丁完成；Runtime、文件、监督相关回归 42 通过。此补丁尚未加载到正在执行黑盒的隔离进程，但该黑盒的下一次恢复请求已显式给出目标 Column，因此不会依赖默认值。
+
+隔离服务重启时监督唤醒已把后端列重新启动，启动策略又暂停了该进行中的 Assignment；这次中断是测试进程重启时机造成，不能归因于上下文补丁。随后用户模拟的“重试前端”对话被 Conversation Agent 错判为讨论，只检查 Task 并回复，未执行恢复；该轮没有任何 Task 状态变更。下一轮需显式恢复原 Task，再验证前端是否成功。环境操作以后须先确认无运行中的 Column 再重启，避免人为制造新中断。
+
 全量单测 529 通过、2 个 `ResourceWarning: unclosed database` 收集期错误；两个受影响用例分别单独重跑均通过，暂无证据指向本补丁的功能失败。相关目标测试 68 通过，新增 continuation 原文测试另行通过。

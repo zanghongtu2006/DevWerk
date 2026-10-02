@@ -156,7 +156,7 @@ class RecoveryManager:
             )
         TASK_STATE_MACHINE.require(task["status"], TaskStatus.PENDING)
         workflow = self.store.workflow_by_id(task["project_id"], task["workflow_revision_id"])
-        target = column_key or workflow.entry
+        target = column_key or task["current_column"]
         if workflow.terminal_kind(target):
             raise ValueError("retry target must be a non-terminal Column")
         workflow.column(target)
