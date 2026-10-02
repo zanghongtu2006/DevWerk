@@ -60,6 +60,49 @@ def test_fixed_behavior_check_does_not_accept_runtime_behavior_feedback(store, t
         })
 
 
+@pytest.mark.parametrize('write_after_command', [False, True])
+def test_behavior_receipt_spans_attempts_but_not_later_file_writes(store, tmp_path, write_after_command):
+    from tests.test_agent_recovery_and_fencing import begin_agent
+
+    project = store.create_project('resumed behavior', '', str(tmp_path / 'project'))
+    workflow = agent_workflow()
+    workflow.column('work').executor.capabilities.append('project.command.run')
+    method = workflow_plan(workflow)
+    method.task_contract.required_behavior_columns = ['work']
+    saved = store.create_workflow_plan(project['id'], method)
+    store.publish_workflow(project['id'], workflow, saved['id'])
+    task = create_planned_task(store, project['id'], 'resumed work')
+    owned = store.claim_task(task['id'], 'test-worker')
+    run = store.begin_run(owned, {})
+    prior = begin_agent(store, project, kind='column', task_id=task['id'],
+                        column_run_id=run['id'], column_attempt_id=run['attempt_id'])
+    success = ToolResult(ok=True, capability='project.command.run', output={'exit_code': 0})
+    store.record_tool_invocation(agent_run_id=prior['id'], tool_call_id='verified',
+        capability='project.command.run', arguments={'argv': ['mvn', 'test']},
+        result=success.model_dump(mode='json'), ok=True)
+    if write_after_command:
+        written = ToolResult(ok=True, capability='project.files.write', output={'path': 'src/Changed.java'})
+        store.record_tool_invocation(agent_run_id=prior['id'], tool_call_id='changed',
+            capability='project.files.write', arguments={'path': 'src/Changed.java', 'content': 'changed'},
+            result=written.model_dump(mode='json'), ok=True)
+    resumed_attempt = 'resumed-attempt'
+    with store.tx(immediate=True) as db:
+        db.execute('''INSERT INTO v1_column_attempts
+            (id,project_id,task_id,column_run_id,attempt_no,status,input_json,
+             runtime_policy_revision,runtime_policy_hash,started_at,created_at)
+            SELECT ?,project_id,task_id,column_run_id,attempt_no+1,'running',input_json,
+                   runtime_policy_revision,runtime_policy_hash,started_at,created_at
+            FROM v1_column_attempts WHERE id=?''', (resumed_attempt, run['attempt_id']))
+        store.feedback.record_column_evidence(db, owned, run['id'], resumed_attempt)
+        receipt = db.execute('''SELECT column_attempt_id,result_json FROM v1_acceptance_results
+            WHERE task_id=? AND check_key='runtime.behavior' ''', (task['id'],)).fetchone()
+    if write_after_command:
+        assert receipt is None
+    else:
+        assert receipt['column_attempt_id'] == resumed_attempt
+        assert prior['id'] in receipt['result_json']
+
+
 def test_worker_selected_commands_complete_script_free_workflow(store, tmp_path):
     project = store.create_project('script-free', '', str(tmp_path / 'project'))
     workflow = agent_workflow()
@@ -92,6 +135,9 @@ def test_worker_selected_commands_complete_script_free_workflow(store, tmp_path)
     runtime = WorkflowRuntime(store, store.registry, 'test-worker',
                               AgentCore(store, store.registry, lambda *_a, **_kw: next(replies)))
     runtime.step(task['id'])
+    with store.tx(immediate=True) as db:
+        assert db.execute("SELECT count(*) FROM v1_acceptance_results WHERE task_id=?", (task['id'],)).fetchone()[0] == 1
+        db.execute("DELETE FROM v1_acceptance_results WHERE task_id=?", (task['id'],))
     runtime.step(task['id'])
     assert store.get_task(task['id'])['status'] == 'done'
     with store.connect() as db:

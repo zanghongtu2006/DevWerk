@@ -132,18 +132,22 @@ class TaskFeedbackRepository:
 
     def record_column_evidence(self, db, task, run_id, attempt_id):
         """Bind a successful Worker-selected behavior command to this Column visit."""
-        if task['current_column'] not in self._behavior_columns(db, task['workflow_revision_id']):
+        run = db.execute('SELECT task_id,column_key FROM v1_column_runs WHERE id=?', (run_id,)).fetchone()
+        if not run or run['task_id'] != task['id'] or run['column_key'] not in self._behavior_columns(db, task['workflow_revision_id']):
             return
         workflow = self.store.workflow_by_id(task['project_id'], task['workflow_revision_id'])
         if any(check.evidence_kind == 'behavior'
-               for check in workflow.column(task['current_column']).acceptance_checks):
+               for check in workflow.column(run['column_key']).acceptance_checks):
             return  # Fixed checks retain their original verification receipts.
         from app.v1.services.task_plan_compiler import known_nonbehavior_command
+        last_write = db.execute('''SELECT COALESCE(MAX(i.rowid),0) FROM v1_tool_invocations i
+            JOIN v1_agent_runs r ON r.id=i.agent_run_id
+            WHERE r.column_run_id=? AND i.capability='project.files.write' AND i.ok=1''', (run_id,)).fetchone()[0]
         rows = db.execute('''SELECT i.agent_run_id,i.tool_call_id,i.arguments_json FROM v1_tool_invocations i
             JOIN v1_agent_runs r ON r.id=i.agent_run_id
-            WHERE r.column_run_id=? AND r.column_attempt_id=?
-              AND i.capability='project.command.run' AND i.ok=1
-            ORDER BY i.rowid DESC''', (run_id, attempt_id)).fetchall()
+            WHERE r.column_run_id=? AND i.capability='project.command.run' AND i.ok=1
+              AND i.rowid>?
+            ORDER BY i.rowid DESC''', (run_id, last_write)).fetchall()
         executed = next((row for row in rows if not known_nonbehavior_command(
             json.loads(row['arguments_json']).get('argv', []))), None)
         if not executed:
@@ -328,6 +332,19 @@ class TaskFeedbackRepository:
             self.store._event(db,task['project_id'],task['id'],run_id,'task.feedback_routed',{'feedback_id':item['id'],'next':routed})
             return routed, None
         if terminal == 'done':
+            # Older interrupted Attempts can contain the passing command while
+            # the final Attempt only submits completion. Rebuild a missing
+            # visit receipt before enforcing terminal behavior obligations.
+            for key in behavior_columns:
+                latest = db.execute('''SELECT id,status FROM v1_column_runs
+                    WHERE task_id=? AND column_key=? ORDER BY sequence DESC LIMIT 1''',
+                    (task['id'], key)).fetchone()
+                if latest and latest['status'] == 'succeeded':
+                    attempt = db.execute('''SELECT id FROM v1_column_attempts
+                        WHERE column_run_id=? ORDER BY attempt_no DESC LIMIT 1''',
+                        (latest['id'],)).fetchone()
+                    if attempt:
+                        self.record_column_evidence(db, task, latest['id'], attempt['id'])
             for obligation in workflow.acceptance_obligations:
                 barrier = 0
                 for key in obligation.invalidated_by:
