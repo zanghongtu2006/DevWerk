@@ -103,6 +103,53 @@ def test_behavior_receipt_spans_attempts_but_not_later_source_writes(store, tmp_
         assert prior['id'] in receipt['result_json']
 
 
+@pytest.mark.parametrize('later_source_write', [False, True])
+def test_interrupted_visit_only_invalidates_prior_behavior_after_a_successful_effect(
+    store, tmp_path, later_source_write,
+):
+    from tests.test_agent_recovery_and_fencing import begin_agent
+    from app.v1.storage_support import utcnow
+
+    project = store.create_project('interrupted behavior visit', '', str(tmp_path / 'project'))
+    workflow = agent_workflow()
+    workflow.column('work').executor.capabilities.append('project.command.run')
+    method = workflow_plan(workflow)
+    method.task_contract.required_behavior_columns = ['work']
+    saved = store.create_workflow_plan(project['id'], method)
+    store.publish_workflow(project['id'], workflow, saved['id'])
+    task = create_planned_task(store, project['id'], 'verify before interruption')
+    owned = store.claim_task(task['id'], 'test-worker')
+    completed = store.begin_run(owned, {})
+    verifier = begin_agent(store, project, kind='column', task_id=task['id'],
+                           column_run_id=completed['id'], column_attempt_id=completed['attempt_id'])
+    success = ToolResult(ok=True, capability='project.command.run', output={'exit_code': 0})
+    store.record_tool_invocation(agent_run_id=verifier['id'], tool_call_id='verified',
+        capability='project.command.run', arguments={'argv': ['mvn', 'test']},
+        result=success.model_dump(mode='json'), ok=True)
+    interrupted_id = 'run_later_interrupted'
+    with store.tx(immediate=True) as db:
+        db.execute("UPDATE v1_column_runs SET status='succeeded' WHERE id=?", (completed['id'],))
+        store.feedback.record_column_evidence(db, owned, completed['id'], completed['attempt_id'])
+        db.execute('''INSERT INTO v1_column_runs
+            (id,project_id,task_id,column_key,sequence,status,attempt,input_json,created_at)
+            VALUES(?,?,?,?,2,'interrupted',1,'{}',?)''',
+            (interrupted_id, project['id'], task['id'], 'work', utcnow()))
+    if later_source_write:
+        interrupted_agent = begin_agent(store, project, kind='column', task_id=task['id'],
+                                        column_run_id=interrupted_id)
+        written = ToolResult(ok=True, capability='project.files.write', output={'path': 'src/Changed.java'})
+        store.record_tool_invocation(agent_run_id=interrupted_agent['id'], tool_call_id='changed',
+            capability='project.files.write', arguments={'path': 'src/Changed.java', 'content': 'changed'},
+            result=written.model_dump(mode='json'), ok=True)
+    with store.tx(immediate=True) as db:
+        if later_source_write:
+            with pytest.raises(ValueError, match='Required behavior evidence missing'):
+                store.feedback.settle(db, owned, completed['id'], 'success', 'done', 'done')
+        else:
+            assert store.feedback.settle(db, owned, completed['id'], 'success', 'done', 'done') == (
+                'done', 'done')
+
+
 def test_worker_selected_commands_complete_script_free_workflow(store, tmp_path):
     project = store.create_project('script-free', '', str(tmp_path / 'project'))
     workflow = agent_workflow()

@@ -135,6 +135,22 @@ class TaskFeedbackRepository:
             JOIN v1_workflow_plans p ON p.id=r.workflow_plan_id WHERE r.id=?''', (revision_id,)).fetchone()
         return set((json.loads(row[0]).get('task_contract') or {}).get('required_behavior_columns') or []) if row else set()
 
+    @staticmethod
+    def _latest_impact_run(db, task_id, column, current_run=None):
+        runs = db.execute('''SELECT id,sequence,status FROM v1_column_runs
+            WHERE task_id=? AND column_key=? ORDER BY sequence DESC''', (task_id, column)).fetchall()
+        for run in runs:
+            if run['status'] == 'succeeded' or run['id'] == current_run:
+                return run
+            effects = db.execute('''SELECT i.capability,i.arguments_json FROM v1_tool_invocations i
+                JOIN v1_agent_runs r ON r.id=i.agent_run_id WHERE r.column_run_id=?
+                AND i.ok=1 AND i.capability IN ('project.files.write','project.command.run')''',
+                (run['id'],)).fetchall()
+            if any(effect['capability'] == 'project.command.run' or _behavior_affecting_write(
+                json.loads(effect['arguments_json'])) for effect in effects):
+                return run
+        return None
+
     def record_column_evidence(self, db, task, run_id, attempt_id):
         """Bind a successful Worker-selected behavior command to this Column visit."""
         run = db.execute('SELECT task_id,column_key FROM v1_column_runs WHERE id=?', (run_id,)).fetchone()
@@ -270,10 +286,9 @@ class TaskFeedbackRepository:
                 for row in rows]
 
     def verified(self, db, task, column, key, *, after_sequence=0, current_run=None, after_check_rowid=0):
-        # The latest visit invalidates all receipts from previous visits, even if
-        # the old run succeeded. A pending/failed latest visit is not evidence.
-        latest = db.execute('SELECT id,sequence,status FROM v1_column_runs WHERE task_id=? AND column_key=? ORDER BY sequence DESC LIMIT 1',
-                            (task['id'],column)).fetchone()
+        # A later visit without a successful effect does not invalidate an
+        # earlier verified result. A visit that changed files still does.
+        latest = self._latest_impact_run(db, task['id'], column, current_run)
         if not latest or latest['sequence'] < after_sequence or (latest['status'] != 'succeeded' and latest['id'] != current_run):
             return None
         row = db.execute('''SELECT rowid AS check_rowid,* FROM v1_acceptance_results WHERE task_id=? AND workflow_revision_id=?
@@ -344,9 +359,7 @@ class TaskFeedbackRepository:
             # the final Attempt only submits completion. Rebuild a missing
             # visit receipt before enforcing terminal behavior obligations.
             for key in behavior_columns:
-                latest = db.execute('''SELECT id,status FROM v1_column_runs
-                    WHERE task_id=? AND column_key=? ORDER BY sequence DESC LIMIT 1''',
-                    (task['id'], key)).fetchone()
+                latest = self._latest_impact_run(db, task['id'], key)
                 if latest and latest['status'] == 'succeeded':
                     attempt = db.execute('''SELECT id FROM v1_column_attempts
                         WHERE column_run_id=? ORDER BY attempt_no DESC LIMIT 1''',
@@ -356,8 +369,8 @@ class TaskFeedbackRepository:
             for obligation in workflow.acceptance_obligations:
                 barrier = 0
                 for key in obligation.invalidated_by:
-                    latest = db.execute('SELECT sequence FROM v1_column_runs WHERE task_id=? AND column_key=? ORDER BY sequence DESC LIMIT 1', (task['id'],key)).fetchone()
-                    barrier = max(barrier,latest[0] if latest else 0)
+                    latest = self._latest_impact_run(db, task['id'], key, run_id)
+                    barrier = max(barrier,latest['sequence'] if latest else 0)
                 if not self.verified(db,task,obligation.column,obligation.check_key,after_sequence=barrier,current_run=run_id):
                     raise ValueError(f'Required acceptance evidence missing: {obligation.column}/{obligation.check_key}')
             invalidated_by = self._invalidators(db, task['workflow_revision_id'])
@@ -367,9 +380,8 @@ class TaskFeedbackRepository:
                 invalidators = {key} if key in invalidated_by else invalidated_by
                 barrier = 0
                 for changed in invalidators:
-                    latest = db.execute('SELECT sequence FROM v1_column_runs WHERE task_id=? AND column_key=? ORDER BY sequence DESC LIMIT 1',
-                                        (task['id'],changed)).fetchone()
-                    barrier = max(barrier,latest[0] if latest else 0)
+                    latest = self._latest_impact_run(db, task['id'], changed, run_id)
+                    barrier = max(barrier,latest['sequence'] if latest else 0)
                 if not self.verified(db,task,key,RUNTIME_BEHAVIOR_CHECK,after_sequence=barrier,current_run=run_id):
                     raise ValueError(f'Required behavior evidence missing: {key}')
         return next_column, terminal

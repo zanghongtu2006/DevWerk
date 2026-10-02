@@ -84,4 +84,10 @@
 
 补丁的 Worker 选定验收回归 9 通过。对当前隔离数据库制作只读逻辑副本后，以真实集成 Run/Attempt 运行新 `record_column_evidence()`，成功补记 `runtime.behavior` 回执；无须重跑已经通过的集成测试。确认无运行中 Task/Conversation Job 后，才能重启隔离服务并恢复原 Task 的验收列。
 
+恢复原验收列后又暴露 `Required behavior evidence missing: backend_implementation`。后端此前成功 Run 已有真实 `mvn test -q` 回执；但前端溢出后的监督唤醒曾无参数 `task.retry`，错误回到后端。该多余后端 Run 只尝试了三次失败的 Maven 命令，未写入任何文件，随后因测试服务重启而 `interrupted`。`TaskFeedbackRepository.verified()` 固定选同名 Column **最后一次访问**，即这个无产出的中断 Run，因而屏蔽先前成功 Run 的有效回执；`settle()` 的失效序号也把这次访问计入。重试默认目标补丁可防未来多余回流，但历史 Task 仍需正确识别无效访问。
+
+最小修复：在 `task_feedback_repository.py` 共用一个“最近有影响的 Column Run”判定：`succeeded` Run 或有成功、可能改变行为的写入的未完成 Run 是影响点；只有失败命令/只读操作、没有成功写入的 `interrupted/failed` Run 不作证据失效点。`verified()`、终态补记与 invalidation barrier 使用同一规则；若中断 Run 确实改过源码，仍拒绝旧回执。测试覆盖成功验证→无写入中断访问→保留旧回执，以及成功验证→中断访问写源码→拒绝旧回执。修好后从原验收列继续，不改 Task Plan 或绕过证据门槛。
+
+该证据判定补丁已通过 70 项相关回归测试。对隔离数据库副本按实际后端、集成和验收 Run 重算，后端与集成均找到真实测试回执，终态判定返回 `done/done`；下一步在隔离服务加载补丁并恢复原 Task 验证实际流程。
+
 全量单测 529 通过、2 个 `ResourceWarning: unclosed database` 收集期错误；两个受影响用例分别单独重跑均通过，暂无证据指向本补丁的功能失败。相关目标测试 68 通过，新增 continuation 原文测试另行通过。
