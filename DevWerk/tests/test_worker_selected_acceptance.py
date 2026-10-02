@@ -60,8 +60,8 @@ def test_fixed_behavior_check_does_not_accept_runtime_behavior_feedback(store, t
         })
 
 
-@pytest.mark.parametrize('write_after_command', [False, True])
-def test_behavior_receipt_spans_attempts_but_not_later_file_writes(store, tmp_path, write_after_command):
+@pytest.mark.parametrize('write_path', [None, 'src/Changed.java', 'integration/VERIFICATION_REPORT.md'])
+def test_behavior_receipt_spans_attempts_but_not_later_source_writes(store, tmp_path, write_path):
     from tests.test_agent_recovery_and_fencing import begin_agent
 
     project = store.create_project('resumed behavior', '', str(tmp_path / 'project'))
@@ -80,10 +80,10 @@ def test_behavior_receipt_spans_attempts_but_not_later_file_writes(store, tmp_pa
     store.record_tool_invocation(agent_run_id=prior['id'], tool_call_id='verified',
         capability='project.command.run', arguments={'argv': ['mvn', 'test']},
         result=success.model_dump(mode='json'), ok=True)
-    if write_after_command:
-        written = ToolResult(ok=True, capability='project.files.write', output={'path': 'src/Changed.java'})
+    if write_path:
+        written = ToolResult(ok=True, capability='project.files.write', output={'path': write_path})
         store.record_tool_invocation(agent_run_id=prior['id'], tool_call_id='changed',
-            capability='project.files.write', arguments={'path': 'src/Changed.java', 'content': 'changed'},
+            capability='project.files.write', arguments={'path': write_path, 'content': 'changed'},
             result=written.model_dump(mode='json'), ok=True)
     resumed_attempt = 'resumed-attempt'
     with store.tx(immediate=True) as db:
@@ -96,7 +96,7 @@ def test_behavior_receipt_spans_attempts_but_not_later_file_writes(store, tmp_pa
         store.feedback.record_column_evidence(db, owned, run['id'], resumed_attempt)
         receipt = db.execute('''SELECT column_attempt_id,result_json FROM v1_acceptance_results
             WHERE task_id=? AND check_key='runtime.behavior' ''', (task['id'],)).fetchone()
-    if write_after_command:
+    if write_path == 'src/Changed.java':
         assert receipt is None
     else:
         assert receipt['column_attempt_id'] == resumed_attempt

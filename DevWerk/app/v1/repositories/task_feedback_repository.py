@@ -8,6 +8,11 @@ from app.v1.storage_support import new_id, utcnow
 RUNTIME_BEHAVIOR_CHECK = 'runtime.behavior'
 
 
+def _behavior_affecting_write(arguments):
+    path = str(arguments.get('path') or '').replace('\\', '/').rsplit('/', 1)[-1].lower()
+    return not (path.endswith('.md') and 'report' in path)
+
+
 class TaskFeedbackRepository:
     def __init__(self, store):
         self.store = store
@@ -140,9 +145,12 @@ class TaskFeedbackRepository:
                for check in workflow.column(run['column_key']).acceptance_checks):
             return  # Fixed checks retain their original verification receipts.
         from app.v1.services.task_plan_compiler import known_nonbehavior_command
-        last_write = db.execute('''SELECT COALESCE(MAX(i.rowid),0) FROM v1_tool_invocations i
+        writes = db.execute('''SELECT i.rowid AS invocation_rowid,i.arguments_json FROM v1_tool_invocations i
             JOIN v1_agent_runs r ON r.id=i.agent_run_id
-            WHERE r.column_run_id=? AND i.capability='project.files.write' AND i.ok=1''', (run_id,)).fetchone()[0]
+            WHERE r.column_run_id=? AND i.capability='project.files.write' AND i.ok=1
+            ORDER BY i.rowid DESC''', (run_id,)).fetchall()
+        last_write = next((row['invocation_rowid'] for row in writes if _behavior_affecting_write(
+            json.loads(row['arguments_json']))), 0)
         rows = db.execute('''SELECT i.agent_run_id,i.tool_call_id,i.arguments_json FROM v1_tool_invocations i
             JOIN v1_agent_runs r ON r.id=i.agent_run_id
             WHERE r.column_run_id=? AND i.capability='project.command.run' AND i.ok=1

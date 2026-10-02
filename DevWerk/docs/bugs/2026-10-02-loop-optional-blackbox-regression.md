@@ -78,4 +78,10 @@
 
 隔离服务重启时监督唤醒已把后端列重新启动，启动策略又暂停了该进行中的 Assignment；这次中断是测试进程重启时机造成，不能归因于上下文补丁。随后用户模拟的“重试前端”对话被 Conversation Agent 错判为讨论，只检查 Task 并回复，未执行恢复；该轮没有任何 Task 状态变更。下一轮需显式恢复原 Task，再验证前端是否成功。环境操作以后须先确认无运行中的 Column 再重启，避免人为制造新中断。
 
+显式指定 `frontend_implementation` 的恢复轮随后成功；前端与集成列均完成，源码已无 logout。最终 `acceptance_testing` 的 Task 终态检查却报 `Required behavior evidence missing: integration_review`。集成 Worker 实际执行成功 `mvn test -Dtest=LoginIntegrationTest -q`、`mvn test -q` 和 `npm run build`，之后写入 `integration/VERIFICATION_REPORT.md` 再调用 `column.complete`。`TaskFeedbackRepository.record_column_evidence()` 以**最后任意一次** `project.files.write` 为行为证据失效点，因此把“测试后写验收报告”错误当作“测试后改源码”，丢掉三个成功命令的回执；`settle()` 复核时同样无法补记。
+
+最小修复：`record_column_evidence` 只把可能改变行为的后续写入当作失效点。明确的验证报告（文件名含 `report` 且后缀为 `.md`）不使先前命令失效；未知路径和源码/配置写入仍保守地要求重新验证。单测覆盖“测试→报告→完成可保留证据”与既有“测试→源码更改必须重验”；再恢复同一 Task 的验收列。此处不修改 Workflow Contract、不伪造测试回执，也不把所有文档写入一概视为安全。
+
+补丁的 Worker 选定验收回归 9 通过。对当前隔离数据库制作只读逻辑副本后，以真实集成 Run/Attempt 运行新 `record_column_evidence()`，成功补记 `runtime.behavior` 回执；无须重跑已经通过的集成测试。确认无运行中 Task/Conversation Job 后，才能重启隔离服务并恢复原 Task 的验收列。
+
 全量单测 529 通过、2 个 `ResourceWarning: unclosed database` 收集期错误；两个受影响用例分别单独重跑均通过，暂无证据指向本补丁的功能失败。相关目标测试 68 通过，新增 continuation 原文测试另行通过。
