@@ -67,10 +67,11 @@ def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text
         if calls <= 2:
             assert state['active_workflow'] is None
         exposed = {item["function"]["name"] for item in tools}
-        assert "loop.apply" in exposed
-        assert "workflow.plan.save" in exposed
-        assert "task.plan.save" in exposed
-        assert "task.create" in exposed
+        if calls <= 4:
+            assert "loop.apply" in exposed
+            assert "workflow.plan.save" in exposed
+            assert "task.plan.save" in exposed
+            assert "task.create" in exposed
         if calls == 1:
             return AgentModelResponse(tool_calls=[AgentToolCall(id="loops", name="loop.list", arguments={"query": "GitLab software delivery"})])
         if calls == 2:
@@ -113,7 +114,20 @@ def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text
                 name="task.create",
                 arguments={"task_plan_id": planned["id"], "proposed_task_ref": "primary"},
             )])
-        return AgentModelResponse(text=json.dumps({'mode': 'work_result', 'tool_call_ids': ['apply', 'task-plan', 'task']}))
+        assert exposed == {'conversation.reply'}
+        assert _kwargs['required_tool_name'] == 'conversation.reply'
+        if calls == 5:
+            # A Provider that ignores its required tool selection still cannot
+            # cancel queued work while the planning lease is held.
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id='premature-cancel', name='task.cancel',
+                arguments={'task_id': store.list_tasks(project['id'])[0]['id'],
+                           'reason': 'pending has not started yet'},
+            )])
+        return AgentModelResponse(tool_calls=[AgentToolCall(
+            id='reply', name='conversation.reply',
+            arguments={'mode': 'work_result', 'tool_call_ids': ['apply', 'task-plan', 'task']},
+        )])
 
     wakes: list[bool] = []
     registry = build_core_registry()
@@ -125,6 +139,12 @@ def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text
     assert "Deliver the managed product：待执行" in job["result"]["reply"]
     assert len(job["result"]["task_ids"]) == 1
     assert wakes == [True]
+    assert store.get_task(job['result']['task_ids'][0])['status'] == 'pending'
+    receipts = {item['tool_call_id']: item for item in store.tool_invocations(
+        project['id'], job['agent_run_id'], hydrate_payloads=True)}
+    assert not receipts['premature-cancel']['ok']
+    assert receipts['premature-cancel']['result']['error']['type'] == 'ConversationTurnProtocolError'
+    assert store.claim_task(job['result']['task_ids'][0], 'runtime-after-reply') is not None
 
 
 def test_conversation_with_loop_workflow_can_revise_but_cannot_reapply_loop(store, tmp_path):

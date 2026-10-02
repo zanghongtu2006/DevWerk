@@ -45,6 +45,9 @@ class ProviderTurnRequester:
         # one-shot authorization tools after this Job has committed its boundary.
         # Dispatch still enforces the durable grant for every business effect.
         tools = self._visible_tools(tools)
+        if self.spec.kind == 'conversation' and required_tool_name == 'conversation.reply':
+            tools = [tool for tool in tools
+                     if tool.get('function', {}).get('name') == 'conversation.reply']
         if self.context is None:
             self.context = ContextManager(self.store, self.spec, self.run_id, self.model_complete)
         working_messages = messages

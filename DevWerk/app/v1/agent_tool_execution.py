@@ -22,6 +22,11 @@ from app.v1.services.completion_admission import CompletionAdmissionService
 from app.v1.tool_protocol import column_tool_batch_error, parse_await_submission
 
 
+QUEUED_TASK_CAPABILITIES = frozenset({
+    'task.create', 'task.successor', 'task.retry', 'task.reopen', 'task.rerun', 'task.resume',
+})
+
+
 @dataclass(frozen=True)
 class ToolBatchResult:
     completion: dict[str, Any] | None
@@ -94,6 +99,15 @@ class AgentToolBatchExecutor:
             call.name in exclusive for call in tool_calls
         ):
             protocol_error = 'Submit an execution/control authorization or conversation.reply alone; read its receipt before choosing the next action. This batch had no effects.'
+        if self.spec.kind == 'conversation' and len(tool_calls) > 1 and any(
+            call.name in QUEUED_TASK_CAPABILITIES for call in tool_calls
+        ):
+            protocol_error = 'Queue one Task action alone, then finish this turn with conversation.reply so Workers can start.'
+        if self.spec.kind == 'conversation' and any(
+            entry['ok'] and entry['capability'] in QUEUED_TASK_CAPABILITIES
+            for entry in self.logical_ledger
+        ) and any(call.name != 'conversation.reply' for call in tool_calls):
+            protocol_error = 'Task work is queued. Call conversation.reply alone now to release the Project planning lease.'
         if protocol_error is not None:
             self.completion_guard.observe_rejection(
                 {

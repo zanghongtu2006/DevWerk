@@ -60,4 +60,10 @@
 
 修复 Task 黑盒进展：Conversation Agent 通过现有工具创建 `tsk_1c7cb102c72040b89203be82be6531f0`，`repair_of_task_id` 正确指向原 `done` Task；该 Plan 的 `non_scope` 和验收标准也明确排除 logout。Task 在 `pending/backend_implementation`、`scheduling.state=admitted`、无依赖和失败码的状态停留约七分钟。Conversation Agent 随后错误地把正常的 `pending` 当作已确认故障，先尝试 `task.retry`/`task.resume`，再自行 `task.cancel`，使修复 Task 进入 `failed`，之后又反复尝试创建新 Plan。离线复制同一数据库，将该 Task 恢复为 `pending` 后，`SchedulerService._dispatch_eligible()` 返回 true，`runnable_task_ids()` 返回它；隔离服务 `/v1/health` 的 Supervisor 线程存活且 tick 无异常。仍需查明进程内为何未领取 Task，不能仅凭健康接口推断它正常调度。
 
+**根因补证**：`SchedulerService.claim_task()` 在 Conversation Agent 持有 Project 规划租约时明确拒绝 Worker 领取 Task；`conversation.py::_process` 也已把“排队后立即 `conversation.reply` 结束本轮，Worker 在租约释放后启动”写进 Agent 的权威上下文。该 Agent 创建 Task 后继续轮询，自己延长租约，因而制造了七分钟 `pending`，随后错误取消。Supervisor 与准入条件并未坏，进程内调度受规划租约阻挡是设计行为；真正缺陷是“排队后的本轮结束”仅靠自然语言约束，未在工具协议上落实。
+
+针对这一缺陷的小范围修复：在 `agent_runner.py` 发现 Conversation Agent 成功调用排队类工具（`task.create`、`task.successor`、`task.retry`、`task.reopen`、`task.rerun`、`task.resume`）后，将下个模型请求限定为 `conversation.reply`；`agent_provider.py` 只暴露该回复工具；`agent_tool_execution.py` 拒绝同轮追加的其它工具调用。被拒绝的排队操作不触发强制结束，已有监督唤醒的自动回复保持原样。回归测试确认 Task 创建后不会继续轮询/取消、正常回复释放租约，随后 Supervisor 可领取 Task；测试覆盖 Provider 不遵守工具选择的兜底拒绝。无需修改 Scheduler 或 Worker 生命周期。
+
+协议回归 77 通过。旧测试轮最后因持续规划、反复提交无效修复 Plan 耗尽 Agent 调用预算而失败；它留下的修复 Task 已是 `pending/paused`。隔离服务加载新协议后，通过新的 Web 对话明确请求恢复**同一** Task，观察其结束本轮并释放租约后由 Supervisor 领取；不以再创建 Task 掩盖这次失败。
+
 全量单测 529 通过、2 个 `ResourceWarning: unclosed database` 收集期错误；两个受影响用例分别单独重跑均通过，暂无证据指向本补丁的功能失败。相关目标测试 68 通过，新增 continuation 原文测试另行通过。

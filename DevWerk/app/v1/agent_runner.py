@@ -14,7 +14,7 @@ from app.v1.agent_models import AgentRunResult, AgentRunSpec, ModelComplete
 from app.v1.agent_prompt import assistant_message, run_checkpoint, stable_json
 from app.v1.agent_provider import ProviderTurnRequester
 from app.v1.agent_run_preparation import AgentRunPreparer
-from app.v1.agent_tool_execution import AgentToolBatchExecutor
+from app.v1.agent_tool_execution import AgentToolBatchExecutor, QUEUED_TASK_CAPABILITIES
 from app.v1.capabilities import CapabilityRegistry
 from app.v1.policy import PlatformPolicySnapshot, V1RuntimePolicy
 
@@ -77,7 +77,10 @@ class AgentExecutionRunner:
             iteration = 0
             report_rejections = 0
             empty_responses = 0
-            force_reply_tool = False
+            force_reply_tool = spec.kind == 'conversation' and any(
+                entry['ok'] and entry['capability'] in QUEUED_TASK_CAPABILITIES
+                for entry in prepared.logical_ledger
+            )
             scope_id = spec.column_run_id or spec.conversation_job_id or run["id"]
             adopt_legacy_intents(self.store, self.registry, spec, run['id'])
             pending = self.store.agents.pending_operations(spec.project["id"], scope_id)
@@ -173,6 +176,11 @@ class AgentExecutionRunner:
                             run["id"], response.text, batch.wait_request,
                             iteration, calls_used,
                         )
+                    if spec.kind == 'conversation' and any(
+                        entry['ok'] and entry['capability'] in QUEUED_TASK_CAPABILITIES
+                        for entry in batch.ledger_entries
+                    ):
+                        force_reply_tool = True
                     if spec.supervision_turn:
                         recovery = next((entry for entry in batch.ledger_entries
                             if entry['ok'] and entry['capability'] in {'task.retry','task.reopen'}), None)
