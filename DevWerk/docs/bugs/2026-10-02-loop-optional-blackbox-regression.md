@@ -101,3 +101,11 @@
 最小修复方案：仅在 Conversation Agent 的现有规划权威提示中明确：若用户确认精确的 Column 顺序和数量，发布的 Workflow 必须一致，`done/failed` 是终态而非执行列；代码、报告、运行说明分配给已批准的列，不能增设交付列。仅在 Worker 的现有上下文契约中明确：当前 Column 只按自己的职责和退出证据判断完成，不因后续 Column 尚未创建的产物判失败；真正当前列缺陷按已有反馈路由处理。架构、工具、Mailbox 和 Workflow Schema 均不变。改后在全新隔离数据库/Project 重放五轮讨论与授权，并以 Task 终态和真实构建/行为验收结果判定。
 
 这两处指令修复后，Conversation/Runtime/Context 相关回归 110 项通过；`git diff --check` 通过。该回归仅验证协议未破坏，是否消除本次规划偏差仍以全新 Project 黑盒为准。
+
+全新隔离库的 Project `prj_ba1f10f624f0480aa8ea55e58b6dd0bf` 再次完成五轮讨论，第六轮调用内部 `workflow.publish`、`task.plan.save`、`task.create`；Workflow 恰好是 `backend → frontend → review → done`，每列一个 Agent。backend 成功，但 frontend 在完成前因 `CompletionProtocolStalled` 暂停，未进入 review；按用户要求不恢复这个 Project。
+
+根因不是 Vue 构建失败：frontend 曾以 `cmd /c ... && pnpm run build` 获得退出码 0，并产出 `frontend/dist`。它此前做了多次失败的 npm 探索命令；`completion_admission._recognizable_verification_command()` 只识别 `test/verify/check`，不把构建命令识别为行为验证，而且对 `cmd /c cd ... && pnpm run build` 把 `cd` 误当执行程序。因此后续真实构建成功无法清除旧失败，五次 `column.complete` 均被拒。Runtime 已自动收集回执 ID，问题在命令识别，不在证据提交。
+
+最小修复：在现有 Worker 自选验证命令识别器中纳入可执行交付的 `build/compile/package` 目标；对 Windows `cmd /c` 的 `&&` 串行命令，仅识别最后一个实际验证命令，拒绝含 `||` 或后续掩盖退出码的命令。保留 `npm install`、`npm --version`、清理命令等非验证命令不能清除失败的规则。单测覆盖失败安装→成功 `pnpm run build`→完成，以及安装/版本查询不能清除失败；修后用新库新 Project 重测，不恢复本项目。
+
+该命令识别补丁的 Completion/Worker/Context 相关回归 89 项通过，`git diff --check` 通过。

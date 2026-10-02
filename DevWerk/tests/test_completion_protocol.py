@@ -208,7 +208,21 @@ def test_worker_selected_behavior_check_repairs_earlier_command_failure() -> Non
     assert 'later successful behavior check' in rejected.rejection.message
     assert decision([failed, cleanup]).rejection.code == 'unresolved_execution_failure'
     assert decision([failed, passed, failed_write]).rejection.code == 'unresolved_execution_failure'
-    assert 'later successful identifiable test/verification command' in completion_tool_schema(contract)['function']['description']
+    assert 'later successful identifiable build/test/verification command' in completion_tool_schema(contract)['function']['description']
+
+
+def test_successful_frontend_build_supersedes_failed_install_without_model_evidence_ids() -> None:
+    failed = _entry('failed-install', 'project.command.run', 'process', ok=False,
+                    arguments={'argv': ['npm', 'install']})
+    built = _entry('built', 'project.command.run', 'process', ok=True,
+                   arguments={'argv': ['cmd', '/c', 'cd /d frontend && pnpm run build']})
+    contract = CompletionContract('column.complete',
+        {'frontend_done': CompletionOutcomeRule(target='next', required_capability='project.command.run')},
+        evidence_collection='runtime')
+    submission = parse_completion_submission(
+        {'outcome': 'frontend_done', 'output': {}, 'summary': 'build passed'}, contract, [failed, built])
+
+    assert CompletionAdmissionService().evaluate(submission, contract, [failed, built]).accepted
 
 
 def test_unfrozen_acceptance_column_can_complete_after_later_successful_behavior_check() -> None:
@@ -237,6 +251,11 @@ def test_unfrozen_acceptance_column_can_complete_after_later_successful_behavior
 
 @pytest.mark.parametrize(('argv', 'expected'), [
     (['mvn', '-f', 'backend/pom.xml', 'test', '-q'], True),
+    (['npm', 'run', 'build'], True),
+    (['cmd', '/c', 'cd /d frontend && pnpm run build'], True),
+    (['cmd', '/c', 'cd /d frontend && pnpm run build && exit /b 0'], False),
+    (['npm', 'install'], False),
+    (['npm', '--version'], False),
     (['powershell', '-ExecutionPolicy', 'Bypass', '-File', 'acceptance-test.ps1'], True),
     (['cmd', '/c', 'python frontend/verify_acceptance.py'], True),
     (['python', '-c', "print('different operation')"], False),

@@ -23,20 +23,21 @@ def _recognizable_verification_command(argv: list[str]) -> bool:
     tokens = list(argv)
     executable = ntpath.basename(tokens[0]).lower()
     if executable in {'cmd', 'cmd.exe'} and len(tokens) > 2 and tokens[1].lower() == '/c':
-        tokens = tokens[2:]
-        if len(tokens) == 1:
-            try:
-                tokens = shlex.split(tokens[0], posix=False)
-            except ValueError:
-                return False
-        executable = ntpath.basename(tokens[0]).lower() if tokens else ''
+        command = ' '.join(tokens[2:]).strip().strip('"')
+        if '||' in command or re.search(r'(?<!&)&(?!&)', command):
+            return False
+        try:
+            tokens = shlex.split(command.split('&&')[-1].strip(), posix=False)
+        except ValueError:
+            return False
+        executable = ntpath.basename(tokens[0].strip('"')).lower() if tokens else ''
     lower = [arg.lower() for arg in tokens]
     if executable in {'mvn', 'mvn.cmd', 'mvnw', 'mvnw.cmd', 'gradle', 'gradlew', 'gradlew.bat'}:
-        return any(arg in {'test', 'verify', 'integration-test', 'check', 'surefire:test',
+        return any(arg in {'test', 'verify', 'integration-test', 'check', 'build', 'compile', 'package', 'surefire:test',
                            'failsafe:integration-test', 'failsafe:verify'} for arg in lower[1:])
     if executable in {'pytest', 'pytest.exe', 'go', 'cargo', 'dotnet', 'npm', 'npm.cmd',
                       'pnpm', 'pnpm.cmd', 'yarn', 'yarn.cmd'}:
-        return any(arg in {'test', 'verify', 'check'} for arg in lower[1:]) or executable.startswith('pytest')
+        return any(arg in {'test', 'verify', 'check', 'build', 'compile', 'package'} for arg in lower[1:]) or executable.startswith('pytest')
     if executable in {'python', 'python.exe', 'py', 'py.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe'}:
         if '-m' in lower:
             index = lower.index('-m')
