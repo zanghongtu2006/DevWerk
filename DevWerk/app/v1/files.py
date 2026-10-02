@@ -223,6 +223,7 @@ class ProjectFiles:
         *,
         limit: int | None = None,
         exclude_paths: set[str] | None = None,
+        exclude_directories: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         remaining = max_total_chars
@@ -231,6 +232,10 @@ class ProjectFiles:
         for path, relative in self._matched_files(pattern):
             relative_path = relative.as_posix()
             if relative_path in excluded:
+                continue
+            if exclude_directories and any(
+                part in exclude_directories for part in relative.parts[:-1]
+            ):
                 continue
             if remaining is not None and remaining <= 0:
                 break

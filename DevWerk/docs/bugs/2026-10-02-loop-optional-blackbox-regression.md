@@ -66,4 +66,10 @@
 
 协议回归 77 通过。旧测试轮最后因持续规划、反复提交无效修复 Plan 耗尽 Agent 调用预算而失败；它留下的修复 Task 已是 `pending/paused`。隔离服务加载新协议后，通过新的 Web 对话明确请求恢复**同一** Task，观察其结束本轮并释放租约后由 Supervisor 领取；不以再创建 Task 掩盖这次失败。
 
+恢复请求随后成功，Conversation Agent 结束本轮，Supervisor 领取同一 Task；`backend_implementation` 成功。`frontend_implementation` 在生成模型输入前报 `ContextExhausted(required_context_overflow)`，Task 转为 `recovering/paused`。该 Column 的冻结输入约 230 KB，其中 `reference_artifacts` 约 214 KB；自动预载的第一个文件 `frontend/dist/assets/index-*.js` 就有 121 KB，后面还包括 `frontend/node_modules` 中的包源码、`.map`、安装元数据。`ContextSelection.artifact_globs` 为 `frontend/**/*` 时，`ProjectFiles.existing_texts` 只按 glob 和字符数取文件，不区分项目源文件与生成物；最多 200,000 字符的预载在这个模型下估计为 152,147 tokens，超过 129,025 的输入预算。此溢出和 Task 逻辑无关，属于 P0 上下文装载缺陷。
+
+最小修复：仅在 Runtime 的**自动参考文件预载**中排除常见依赖/构建目录（`node_modules`、`dist`、`target`、`build`、`.venv`、`venv`、`.next`、`.cache`、`coverage`）；`project.files.read/list/search` 保持原能力，Worker 需要时仍可按路径读取。实现为 `ProjectFiles.existing_texts` 的可选排除目录参数，由 `WorkflowRuntime._input_for` 传入，不改变显式注册的 accepted/working Artifact 或现有 ContextSelection 契约。测试验证 `frontend/**/*` 预载只带源码、普通文件接口仍可读生成物，并恢复同一 Task 重验。
+
+本地对同一 Task、同一前端 Column 用新预载规则重新构造输入，JSON 长度从约 230 KB 降到约 56 KB；预载文件为 `frontend/index.html`、`package.json`、`pnpm-lock.yaml`、Vue 源码和 Vite 配置，不再含 `dist` 或 `node_modules`。相关文件/上下文测试 4 通过。隔离服务已加载补丁，并从 Web 对话请求重试原 `recovering/paused` Task，终态待验证。
+
 全量单测 529 通过、2 个 `ResourceWarning: unclosed database` 收集期错误；两个受影响用例分别单独重跑均通过，暂无证据指向本补丁的功能失败。相关目标测试 68 通过，新增 continuation 原文测试另行通过。

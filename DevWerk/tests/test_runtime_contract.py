@@ -83,6 +83,28 @@ def test_runtime_artifact_context_is_bounded_and_deduplicated_across_globs(store
     assert all(item["sha256"] for item in manifest["preloaded_project_artifacts"])
 
 
+def test_runtime_reference_context_excludes_generated_frontend_dependencies(store, tmp_path):
+    from app.v1.files import ProjectFiles
+
+    project = store.create_project('frontend source context', '', str(tmp_path / 'project'))
+    workflow = sequence_workflow()
+    workflow.columns[0].context.artifact_globs = ['frontend/**/*']
+    publish_planned_workflow(store, project['id'], workflow)
+    task = create_planned_task(store, project['id'], 'frontend')
+    files = ProjectFiles(project['base_dir'])
+    files.write_text('frontend/dist/assets/bundle.js', 'generated' * 10000)
+    files.write_text('frontend/node_modules/pkg/index.js', 'dependency' * 10000)
+    files.write_text('frontend/src/App.vue', '<template>login</template>')
+
+    context = WorkflowRuntime(store, build_core_registry(), 'context-worker')._input_for(
+        task, workflow, workflow.columns[0])
+
+    assert [item['path'] for item in context['reference_artifacts']] == [
+        'frontend/src/App.vue']
+    assert files.read_text('frontend/dist/assets/bundle.js').startswith('generated')
+    assert 'frontend/node_modules/pkg/index.js' in files.list_paths('frontend/**/*')
+
+
 def test_runtime_separates_accepted_working_and_reference_artifact_provenance(store, tmp_path):
     project = store.create_project("provenance", "future project goal", str(tmp_path / "project"))
     workflow = sequence_workflow()

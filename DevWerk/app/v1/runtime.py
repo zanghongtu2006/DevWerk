@@ -450,6 +450,10 @@ class WorkflowRuntime:
                     remaining_chars,
                     limit=remaining_files,
                     exclude_paths=seen_paths,
+                    exclude_directories={
+                        'node_modules', 'dist', 'target', 'build', '.venv', 'venv',
+                        '.next', '.cache', 'coverage',
+                    },
                 )
                 for item in selected:
                     artifact_channels["reference_artifacts"].append({
