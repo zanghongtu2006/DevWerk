@@ -65,7 +65,9 @@ _CONTEXT_CONSUMPTION_CONTRACT = (
     "When authorized_scope is present, user_request is the user request that authorized "
     "this Task; original_user_request preserves the initial grant request when different. "
     "Check the deliverable against its explicit exclusions as well as the Task Plan; "
-    "do not treat an omitted exclusion in the Plan as permission to add a feature."
+    "do not treat an omitted exclusion in the Plan as permission to add a feature. "
+    "Judge completion against this Column's responsibility and exit evidence. Do not fail "
+    "this Column because a later Column has not yet produced its assigned artifact."
 )
 
 

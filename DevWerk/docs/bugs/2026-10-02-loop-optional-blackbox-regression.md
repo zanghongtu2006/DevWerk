@@ -91,3 +91,13 @@
 该证据判定补丁已通过 70 项相关回归测试。对隔离数据库副本按实际后端、集成和验收 Run 重算，后端与集成均找到真实测试回执，终态判定返回 `done/done`；下一步在隔离服务加载补丁并恢复原 Task 验证实际流程。
 
 全量单测 529 通过、2 个 `ResourceWarning: unclosed database` 收集期错误；两个受影响用例分别单独重跑均通过，暂无证据指向本补丁的功能失败。相关目标测试 68 通过，新增 continuation 原文测试另行通过。
+
+## 目标收敛后的全新 Project 回归
+
+根据用户限定，只以新 Project 验证“至少五轮自然语言讨论后，Conversation Agent 用内部工具创建 Workflow/Task，Workflow 驱动 Task 到完成，交付符合约定并可编译”。历史 Project 不再恢复。新 Project `prj_04b4c6994e934e82aac24e863159b856` 先进行五轮需求、API、列责任讨论，第六轮才授权执行。前五轮没有 Task；授权轮通过 `conversation.execution.authorize`、`workflow.plan.save`、`workflow.publish`、`task.plan.save`、`task.create` 成功创建 `tsk_e305cfa75cca4a7d9e242a10417b1721`，Worker 接管并完成 backend、frontend，随后进入 review。状态观察间隔至少五分钟。
+
+本次失败：用户明确确认 `backend → frontend → review → done`，并说不要额外的列；Conversation Agent 却发布了额外的 `delivery` Agent 列，分配 README 编写给它。review Worker 将尚未由后续 delivery 创建的 README 记作 `missing_readme`，最终把 Task 转为 `failed`；因此既违背已确认的列结构，也使 Workflow 在交付前停止。review 输出中 Maven 编译/测试、Vue 构建及登录/限流场景均标为通过，但因 README 失败不能算通过验收。该 Project 按用户要求丢弃，不重试。
+
+最小修复方案：仅在 Conversation Agent 的现有规划权威提示中明确：若用户确认精确的 Column 顺序和数量，发布的 Workflow 必须一致，`done/failed` 是终态而非执行列；代码、报告、运行说明分配给已批准的列，不能增设交付列。仅在 Worker 的现有上下文契约中明确：当前 Column 只按自己的职责和退出证据判断完成，不因后续 Column 尚未创建的产物判失败；真正当前列缺陷按已有反馈路由处理。架构、工具、Mailbox 和 Workflow Schema 均不变。改后在全新隔离数据库/Project 重放五轮讨论与授权，并以 Task 终态和真实构建/行为验收结果判定。
+
+这两处指令修复后，Conversation/Runtime/Context 相关回归 110 项通过；`git diff --check` 通过。该回归仅验证协议未破坏，是否消除本次规划偏差仍以全新 Project 黑盒为准。
