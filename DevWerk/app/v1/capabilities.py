@@ -1188,7 +1188,9 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     )
     add(
         "task.retry",
-        "Retry a non-terminal Task on its pinned Workflow revision. Terminal Tasks remain immutable.",
+        "Retry a non-terminal Task on its pinned Workflow revision. For a paused uncertain command, "
+        "retry records its missing exit result as failed without rerunning it; inspect partial workspace effects "
+        "before issuing a new command. Other uncertain effects remain blocked. Terminal Tasks remain immutable.",
         {
             "type": "object",
             "required": ["task_id"],

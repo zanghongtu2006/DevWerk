@@ -165,6 +165,7 @@ class RecoveryManager:
         now = utcnow()
         context = {} if clear_context else task["context"]
         with self.store.tx(immediate=True) as db:
+            reconciled = self._reconcile_interrupted_command_receipts(db, task, target, now)
             if (task["status"] == "recovering"
                     and task.get("failure_code") == "execution_budget_exceeded"
                     and target == task["current_column"]):
@@ -192,10 +193,58 @@ class RecoveryManager:
             ).rowcount
             if changed != 1:
                 raise RuntimeError("Task changed while retrying")
-            data = {"target": target, "clear_context": clear_context}
+            data = {"target": target, "clear_context": clear_context,
+                    "interrupted_command_receipts": reconciled}
             self.store._event(db, task["project_id"], task_id, None, "task.retry_requested", data)
             self.store._mailbox(db, task["project_id"], "task.retry_requested", task_id, None, data)
         return self.store.get_task(task_id)
+
+    @staticmethod
+    def _reconcile_interrupted_command_receipts(db, task, target, now):
+        if not (task["status"] == "recovering" and task.get("control_state") == "paused"
+                and task.get("failure_code") == "effect_outcome_unknown"):
+            return []
+        if target != task["current_column"]:
+            raise ValueError("Uncertain effect must be reconciled in its current Column before changing retry target")
+        run = db.execute(
+            "SELECT id,status FROM v1_column_runs WHERE task_id=? AND column_key=? "
+            "ORDER BY sequence DESC LIMIT 1", (task["id"], target),
+        ).fetchone()
+        if not run or run["status"] != "interrupted":
+            raise ValueError("Uncertain effect has no interrupted Column Run to reconcile")
+        receipts = db.execute(
+            "SELECT e.execution_key,e.capability,o.result_json,o.completion_json,a.status AS agent_status "
+            "FROM v1_execution_receipts e "
+            "JOIN v1_agent_operations o ON o.id=e.execution_key AND o.project_id=e.project_id "
+            "JOIN v1_agent_runs a ON a.id=o.source_run_id AND a.project_id=e.project_id "
+            "WHERE e.project_id=? AND a.task_id=? AND o.scope_id=? AND e.status='started' "
+            "ORDER BY e.started_at", (task["project_id"], task["id"], run["id"]),
+        ).fetchall()
+        if not receipts:
+            raise ValueError("Uncertain effect has no interrupted command receipt to reconcile")
+        acceptance = db.execute(
+            "SELECT e.execution_key FROM v1_execution_receipts e JOIN v1_agent_runs a "
+            "ON a.project_id=e.project_id AND e.execution_key GLOB (a.id || ':acceptance-*') "
+            "WHERE e.project_id=? AND a.column_run_id=? AND e.status IN ('started','awaiting') LIMIT 1",
+            (task["project_id"], run["id"]),
+        ).fetchone()
+        if acceptance:
+            raise ValueError(f"Unreconciled acceptance effect requires inspection: {acceptance['execution_key']}")
+        for receipt in receipts:
+            if (receipt["capability"] != "project.command.run" or receipt["agent_status"] != "failed"
+                    or receipt["result_json"] is not None or receipt["completion_json"] is not None):
+                raise ValueError(f"Unreconciled side effect requires inspection: {receipt['execution_key']}")
+        reason = ("Interrupted command has no committed exit result; workspace effects may be partial. "
+                  "Inspect existing artifacts before running a new command")
+        for receipt in receipts:
+            changed = db.execute(
+                "UPDATE v1_execution_receipts SET status='failed',error=?,finished_at=? "
+                "WHERE project_id=? AND execution_key=? AND status='started'",
+                (reason, now, task["project_id"], receipt["execution_key"]),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("Interrupted command receipt changed while retrying")
+        return [receipt["execution_key"] for receipt in receipts]
 
     def resolve_await_failure(
         self,

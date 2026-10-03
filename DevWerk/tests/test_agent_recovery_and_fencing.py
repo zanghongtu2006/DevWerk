@@ -55,6 +55,51 @@ def test_legacy_unanswered_intent_is_adopted_or_blocked_without_duplicate_effect
             assert db.execute("SELECT COUNT(*) FROM v1_execution_receipts WHERE capability='project.command.run'").fetchone()[0] == 1
 
 
+@pytest.mark.parametrize('capability', ['project.command.run', 'project.files.write'])
+def test_retry_reconciles_only_interrupted_command_without_reexecuting(store, tmp_path, capability):
+    project = store.create_project('interrupted command', '', str(tmp_path / 'project'))
+    wf = agent_workflow()
+    wf.column('work').executor.capabilities.append('project.command.run')
+    publish_planned_workflow(store, project['id'], wf)
+    task = create_planned_task(store, project['id'], 'interrupted command')
+    task = store.claim_task(task['id'], 'old-worker')
+    run = store.begin_run(task, {})
+    old = begin_agent(store, project, kind='column', task_id=task['id'], column_run_id=run['id'])
+    args = (command("with open('once.txt','a') as f: f.write('x')")
+            if capability == 'project.command.run' else {'path': 'once.txt', 'content': 'x'})
+    key = store.agents.prepare_operations(project['id'], run['id'], old['id'], 1,
+        [AgentToolCall(id='old-call', name=capability, arguments=args)])[0]
+    store.start_execution_receipt(project['id'], key, capability, args)
+    store.finish_agent_run(old['id'], 'failed', '', 'lost command exit', 1, 1)
+    with store.tx(immediate=True) as db:
+        db.execute("UPDATE v1_column_runs SET status='interrupted' WHERE id=?", (run['id'],))
+        db.execute("UPDATE v1_tasks SET status='recovering',control_state='paused',"
+                   "failure_code='effect_outcome_unknown',lease_owner=NULL,lease_until=NULL WHERE id=?", (task['id'],))
+    if capability == 'project.files.write':
+        with pytest.raises(ValueError, match='Unreconciled side effect'):
+            store.retry_task(task['id'])
+        assert store.get_task(task['id'])['status'] == 'recovering'
+        expected_status = 'started'
+    else:
+        retried = store.retry_task(task['id'])
+        assert retried['status'] == 'pending'
+        assert retried['control_state'] == 'active'
+        expected_status = 'failed'
+        result = store.registry.dispatch(capability, args,
+            CapabilityContext(project['id'], project, store, execution_key=key))
+        assert not result.ok and result.error['type'] == 'PriorExecutionFailed'
+        assert 'partial' in result.error['message']
+        assert store.agents.operation(key)['result_json'] is None
+        with store.connect() as db:
+            event = db.execute("SELECT data_json FROM v1_events WHERE task_id=? AND type='task.retry_requested' "
+                               "ORDER BY id DESC LIMIT 1", (task['id'],)).fetchone()
+        assert key in json.loads(event[0])['interrupted_command_receipts']
+    with store.connect() as db:
+        receipt = db.execute('SELECT status FROM v1_execution_receipts WHERE execution_key=?', (key,)).fetchone()
+    assert receipt['status'] == expected_status
+    assert not (tmp_path / 'project/once.txt').exists()
+
+
 def test_control_transaction_serializes_takeover_and_rejects_late_old_owner(store, tmp_path):
     project = store.create_project('original', '', str(tmp_path / 'project'))
     queued = store.create_conversation_job(project['id'], 'control', True)
