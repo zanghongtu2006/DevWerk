@@ -398,6 +398,38 @@ def test_command_timeout_kills_descendant_after_parent_exit(tmp_path):
 def test_wait_runtime_failure_preserves_handle_and_is_bounded(store, tmp_path, monkeypatch):
     project = store.create_project("poll retry", "", str(tmp_path / "project"))
     runtime, task, handle = _waiting_poll_task(store, project, {"status": "succeeded", "output": {"ready": True}})
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows inherited pipe handles')
+def test_finished_launcher_does_not_wait_for_background_child_pipe(tmp_path):
+    child = "import time; from pathlib import Path; time.sleep(2); Path('late.txt').write_text('orphan')"
+    parent = ("import subprocess,sys; "
+              f"subprocess.Popen([sys.executable,'-c',{child!r}],stdout=sys.stdout,stderr=sys.stderr); "
+              "print('launcher finished',flush=True); sys.exit(7)")
+    started = time.monotonic()
+    result = run_command([sys.executable, '-c', parent], tmp_path,
+                         ExecutionLimits(command_timeout_seconds=5))
+    assert time.monotonic() - started < 2
+    assert result['exit_code'] == 7 and not result['timed_out']
+    assert 'launcher finished' in result['stdout']
+    time.sleep(2.1)
+    assert not (tmp_path / 'late.txt').exists()
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows Start-Process pipe inheritance')
+def test_powershell_script_exit_is_not_background_service_timeout(tmp_path):
+    script = tmp_path / 'integration.ps1'
+    script.write_text("Start-Process -FilePath 'powershell.exe' "
+                      "-ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 8' "
+                      "-NoNewWindow -PassThru | Out-Null\n"
+                      "Write-Output 'script complete'\nexit 7\n", encoding='utf-8')
+    started = time.monotonic()
+    result = run_command(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+                          '-File', str(script)], tmp_path,
+                         ExecutionLimits(command_timeout_seconds=4))
+    assert time.monotonic() - started < 4
+    assert result['exit_code'] == 7 and not result['timed_out']
+    assert 'script complete' in result['stdout']
+
+
     store.policy = store.policy.model_copy(update={"execution": ExecutionLimits(max_recovery_attempts=1)})
     original = store.registry.dispatch
     def disconnect(capability, *a, **kw):

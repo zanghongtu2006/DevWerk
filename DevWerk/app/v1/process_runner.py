@@ -73,7 +73,7 @@ def run_command(argv: list[str], cwd: Path, limits: ExecutionLimits,
     deadline = time.monotonic() + limits.command_timeout_seconds
     timed_out = False
     try:
-        while process.poll() is None or any(reader.is_alive() for reader in readers):
+        while process.poll() is None:
             if check:
                 check()
             timed_out = time.monotonic() >= deadline
@@ -82,6 +82,13 @@ def run_command(argv: list[str], cwd: Path, limits: ExecutionLimits,
                 break
             time.sleep(0.05)
         process.wait(timeout=10)
+        # A finished launcher can leave descendants holding its output pipes.
+        # Let its own output drain briefly, then reap those descendants rather
+        # than waiting for the full command timeout after the launcher exited.
+        for reader in readers:
+            reader.join(timeout=0.5)
+        if any(reader.is_alive() for reader in readers):
+            stop_tree()
         if check:
             check()
     except BaseException:

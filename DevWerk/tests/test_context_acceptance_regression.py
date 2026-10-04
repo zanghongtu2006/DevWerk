@@ -736,6 +736,9 @@ def test_archive_unicode_pages_are_contiguous_and_project_scoped(store, tmp_path
         projected_text += visible['content']
         offset = visible['next_offset']
     assert projected_text == source
+    missing = _agent_result_read({'agent_run_id':run['id'],'tool_call_id':'unknown'},ctx)
+    assert not missing['found'] and missing['next_offset'] is None
+    assert {'tool_call_id':'large','capability':'project.command.run'} in missing['available']
     other = store.create_project('other','',str(tmp_path/'other'))
     with pytest.raises(ValueError,match='outside'):
         _agent_result_read({'agent_run_id':run['id'],'tool_call_id':'large'},CapabilityContext(other['id'],other,store))

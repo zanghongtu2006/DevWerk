@@ -1385,7 +1385,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     add('agent.worker.lifecycle', 'Suspend, resume or retire an idle Worker. Retirement preserves its context and cannot be reversed.',
         {'type': 'object', 'required': ['worker_id', 'state'], 'properties': {'worker_id': {'type': 'string'}, 'state': {'enum': ['available', 'suspended', 'retired']}}, 'additionalProperties': False},
         lambda args, ctx: ctx.store.agents.set_lifecycle(ctx.project_id, args['worker_id'], args['state']), side_effect_kind='control', delegable_to_column=False)
-    add('agent.result.read', 'Read a bounded slice of an archived tool result by source run and tool-call ID. Use next_offset to continue; summaries are not execution evidence.',
+    add('agent.result.read', 'Read a bounded slice of an archived tool result by exact source run and tool-call ID from an evidence index. If that call ID is absent, the result lists recent valid IDs for that run. Use next_offset to continue; summaries are not execution evidence. For current Task status use task.inspect.',
         {'type':'object','required':['agent_run_id','tool_call_id'], 'properties':{
             'agent_run_id':{'type':'string'},'tool_call_id':{'type':'string'},
             'field':{'type':'string','enum':['result','stdout','stderr']},
@@ -2725,11 +2725,19 @@ def _agent_result_read(args, ctx):
     with ctx.store.connect() as db:
         row = db.execute('''SELECT t.result_json FROM v1_tool_invocations t
             JOIN v1_agent_runs r ON r.id=t.agent_run_id
+        source = db.execute('SELECT agent_instance_id FROM v1_agent_runs WHERE id=? AND project_id=?',
+                            (args['agent_run_id'], ctx.project_id)).fetchone()
+        if not source or (ctx.column_run_id and source['agent_instance_id'] != ctx.agent_instance_id):
+            raise ValueError('Tool result is absent or outside this Agent scope')
             WHERE t.project_id=? AND t.agent_run_id=? AND t.tool_call_id=?
             AND (? IS NULL OR r.agent_instance_id=?) ORDER BY t.id DESC LIMIT 1''',
             (ctx.project_id,args['agent_run_id'],args['tool_call_id'],ctx.column_run_id,ctx.agent_instance_id)).fetchone()
-    if not row:
-        raise ValueError('Tool result is absent or outside this Agent scope')
+        if not row:
+            available = [dict(item) for item in db.execute('''SELECT tool_call_id,capability
+                FROM v1_tool_invocations WHERE project_id=? AND agent_run_id=?
+                ORDER BY id DESC LIMIT 8''', (ctx.project_id, args['agent_run_id']))]
+            return {'agent_run_id': args['agent_run_id'], 'tool_call_id': args['tool_call_id'],
+                    'found': False, 'available': available, 'content': '', 'next_offset': None}
     content = row['result_json']
     if args.get('field','result') != 'result':
         content = str((json.loads(content).get('output') or {}).get(args['field'],'') or '')
