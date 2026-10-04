@@ -11,7 +11,7 @@ from tests.test_loop_contract import novel_task_input
 from tests.test_persistent_agents import assignment
 
 
-def turn(store, project, requirement=None, request=None):
+def turn(store, project, requirement=None, request=None, focus=None):
     with store.connect() as db:
         prior = db.execute("SELECT id,agent_run_id FROM v1_conversation_jobs WHERE project_id=? AND status='running'", (project['id'],)).fetchall()
     for row in prior:
@@ -27,6 +27,7 @@ def turn(store, project, requirement=None, request=None):
         'act':'execute', 'execution_request':request or ('extend' if requirement else 'begin'),
         'requirement_id':requirement['id'] if requirement else None,
         'scope_summary':job['message'], 'user_evidence':[{'message_id':job['user_message_id'],'quote':job['message']}],
+        **({'focus': focus} if focus else {}),
     }, ctx)
     assert result.ok, result.error
     req = result.output['requirement']
@@ -95,6 +96,61 @@ def test_scope_extension_without_loop_keeps_workflow_and_requirement_history(sto
     assert store.get_task(prior_task['id'])['workflow_revision_id'] == original['id']
     assert store.scopes.for_workflow(original['id'])['requirement_revision'] == req['revision']
     assert store.scopes.for_workflow(revised['workflow_revision_id'])['requirement_revision'] == req['revision'] + 1
+
+
+@pytest.mark.parametrize('prior_status', ['done', 'pending'])
+def test_new_requirement_can_take_over_only_after_previous_tasks_finish(store, tmp_path, prior_status):
+    project = store.create_project('Workflow handover', '', str(tmp_path / prior_status))
+    ctx, old_req = turn(store, project)
+    definition = agent_workflow()
+    planned = invoke(ctx, 'workflow.plan.save', {'plan': workflow_plan(definition).model_dump(mode='json')})
+    original = invoke(ctx, 'workflow.publish', {
+        'workflow_plan_id': planned['id'], 'workflow': definition.model_dump(mode='json')})
+    old_plan = task_plan(original['id'], definition)
+    saved = invoke(ctx, 'task.plan.save', {'plan': old_plan.model_dump(mode='json')})
+    old_task = invoke(ctx, 'task.create', {
+        'task_plan_id': saved['id'], 'proposed_task_ref': old_plan.tasks[0].proposed_task_ref})
+    if prior_status == 'done':
+        with store.tx(immediate=True) as db:
+            db.execute("UPDATE v1_tasks SET status='done' WHERE id=?", (old_task['id'],))
+
+    _, new_req = turn(store, project, request='begin', focus='new_scope')
+    assert new_req['id'] != old_req['id']
+    ctx, _ = turn(store, project, new_req, request='extend')
+    assert store.intents.job_for_run(ctx.agent_run_id, project['id'])['requirement_id'] == new_req['id']
+    args = {'requirement_id': new_req['id'], 'expected_revision': new_req['revision'],
+            'expected_workflow_revision_id': original['id'], 'objective': 'Redesign and deliver again',
+            'binding_patch': {}, 'reason': 'User requested a new delivery in this project'}
+    if prior_status == 'pending':
+        rejected = store.registry.dispatch('project.scope.revise', args, ctx)
+        assert not rejected.ok and rejected.error['code'] == 'scope_revision_conflict'
+        assert store.get_workflow(project['id'])['id'] == original['id']
+        assert store.agents.get_requirement(project['id'], new_req['id'])['revision'] == 1
+        return
+
+    revised = invoke(ctx, 'project.scope.revise', args)
+    assert revised['requirement']['id'] == new_req['id']
+    assert revised['workflow_revision_id'] != original['id']
+    assert store.scopes.for_workflow(original['id'])['requirement_id'] == old_req['id']
+    assert store.get_task(old_task['id'])['workflow_revision_id'] == original['id']
+    assert store.get_task(old_task['id'])['requirement_id'] == old_req['id']
+    redesigned = agent_workflow(instruction='Deliver the redesigned project goal.')
+    workflow_plan_saved = invoke(replace(ctx, execution_key='handover:workflow-plan-save'), 'workflow.plan.save', {
+        'plan': workflow_plan(redesigned).model_dump(mode='json')})
+    with store.connect() as db:
+        saved_owner = db.execute('SELECT requirement_id FROM v1_workflow_plans WHERE id=?',
+                                 (workflow_plan_saved['id'],)).fetchone()[0]
+    assert saved_owner == old_req['id']
+    published = invoke(ctx, 'workflow.publish', {
+        'workflow_plan_id': workflow_plan_saved['id'], 'workflow': redesigned.model_dump(mode='json')})
+    assert published['id'] != revised['workflow_revision_id']
+    assert store.scopes.for_workflow(published['id'])['requirement_id'] == new_req['id']
+    new_plan = task_plan(published['id'], redesigned, task_ref='new-delivery')
+    saved_new = invoke(ctx, 'task.plan.save', {'plan': new_plan.model_dump(mode='json')})
+    new_task = invoke(ctx, 'task.create', {
+        'task_plan_id': saved_new['id'], 'proposed_task_ref': 'new-delivery'})
+    assert new_task['workflow_revision_id'] == published['id']
+    assert new_task['requirement_id'] == new_req['id']
 
 
 def test_scope_extension_closed_six_to_twelve_same_conversation_and_frozen_history(store, tmp_path):

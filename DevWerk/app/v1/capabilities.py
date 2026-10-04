@@ -1420,7 +1420,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     add('project.scope.inspect', 'Inspect the current Requirement, Workflow revision and optional frozen Loop bindings before extending delivery.',
         {'type': 'object', 'properties': {}, 'additionalProperties': False},
         lambda args, ctx: ctx.store.scopes.inspect(ctx.project_id), side_effect_kind='read', delegable_to_column=False)
-    add('project.scope.revise', 'Atomically extend or revise the current project goal on a user request. Keeps completed Tasks and Worker contexts; publishes new Workflow and Requirement revisions. For a Workflow without a Loop, pass an empty binding_patch. Never close the Requirement first. This does not create Tasks; save a new TaskPlan against the returned Workflow then materialize it. For a Loop-backed Workflow, optionally select a new Loop digest from loop.inspect.',
+    add('project.scope.revise', 'Atomically extend or revise the authorized Requirement on a user request. If the current Workflow belongs to another Requirement, its Tasks must all be done or failed before this Requirement can take over in a new Workflow revision. Historical Tasks and Worker contexts stay intact. For a Workflow without a Loop, pass an empty binding_patch. Do not close the Requirement first. This does not create Tasks; save a new TaskPlan against the returned Workflow then materialize it. For a Loop-backed Workflow, optionally select a new Loop digest from loop.inspect.',
         {'type': 'object', 'required': ['requirement_id', 'expected_revision', 'expected_workflow_revision_id', 'objective', 'binding_patch', 'reason'],
          'properties': {'requirement_id': {'type': 'string'}, 'expected_revision': {'type': 'integer', 'minimum': 1},
                         'expected_workflow_revision_id': {'type': 'string'}, 'objective': {'type': 'string', 'minLength': 1},
@@ -2669,6 +2669,13 @@ def _bind_requirement(ctx, table, identity):
                     if table == 'v1_task_plans' else ' Use a saved ID returned by the corresponding planning tool.')
             raise ValueError(f'{label}NotFound: no saved {label} {identity!r} in this Project.'+hint)
         if row['requirement_id'] not in (None, ctx.requirement_id):
+            if table == 'v1_workflow_plans':
+                active = ctx.store.get_workflow(ctx.project_id)
+                scope = ctx.store.scopes.for_workflow(active['id'])
+                if (active['workflow_plan_id'] == identity and scope and
+                        (scope['requirement_id'], scope['requirement_revision']) ==
+                        (ctx.requirement_id, ctx.requirement_revision)):
+                    return  # Reuse the current immutable method after a scope handover.
             raise ValueError('Work belongs to a different Requirement')
         if table != 'v1_workflow_plans':
             version = ctx.requirement_revision or ctx.store.agents.get_requirement(ctx.project_id, ctx.requirement_id)['revision']

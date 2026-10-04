@@ -107,7 +107,11 @@ class ScopeRepository:
             active = self.store.get_workflow(ctx.project_id)
             owner = self.for_workflow(active['id'])
             if owner and owner['requirement_id'] not in (None, requirement_id):
-                raise ScopeConflict('The active Workflow belongs to a different Requirement')
+                unfinished = db.execute("""SELECT 1 FROM v1_tasks
+                    WHERE project_id=? AND requirement_id=? AND status NOT IN ('done','failed') LIMIT 1""",
+                    (ctx.project_id, owner['requirement_id'])).fetchone()
+                if unfinished:
+                    raise ScopeConflict('Finish the previous Requirement Tasks before revising its Workflow for another Requirement')
             if db.execute("SELECT 1 FROM v1_tasks WHERE project_id=? AND failure_code='effect_outcome_unknown'", (ctx.project_id,)).fetchone():
                 raise ScopeConflict('Reconcile the unknown Task effect before revising project scope')
             if current['revision'] != expected_revision or active['id'] != expected_workflow_revision_id:
