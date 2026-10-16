@@ -6,9 +6,9 @@ import pytest
 from app.v1.capabilities import CapabilityContext
 from app.v1.domain import WorkflowDefinition
 from tests.helpers import task_plan, agent_workflow, publish_planned_workflow, workflow_plan
-from tests.test_agent_recovery_and_fencing import begin_agent
+from tests.test_p0_assignment_regressions import begin_agent
 from tests.test_loop_contract import novel_task_input
-from tests.test_persistent_agents import assignment
+from tests.test_p0_assignment_regressions import assignment
 
 
 def turn(store, project, requirement=None, request=None, focus=None):

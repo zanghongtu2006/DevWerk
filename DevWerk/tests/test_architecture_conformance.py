@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -13,14 +14,13 @@ from app.v1.domain import (
     AgentModelResponse,
     AgentToolCall,
     ColumnDefinition,
-    Transition,
     PollWaitPolicy,
+    Transition,
     WorkflowDefinition,
 )
 from app.v1.files import ProjectFiles
 from app.v1.runtime import WorkflowRuntime
 from tests.helpers import create_planned_task, publish_planned_workflow, readiness
-
 
 def test_readiness_is_a_required_dispatch_fact(store, tmp_path):
     project = store.create_project("readiness", "", str(tmp_path / "project"))
@@ -133,3 +133,89 @@ def test_agent_payload_is_persisted_without_hidden_projection(store, tmp_path):
     with store.connect() as db:
         stored_size = db.execute("SELECT length(content) FROM v1_agent_messages WHERE agent_run_id=?", (run["id"],)).fetchone()[0]
     assert stored_size == 200_000
+
+
+# ---------------------------------------------------------------------------
+# Release assets
+# ---------------------------------------------------------------------------
+
+APP_ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = APP_ROOT.parent
+
+
+def test_release_launchers_are_checked_in_assets() -> None:
+    for name in (
+        "install.sh",
+        "startup.sh",
+        "shutdown.sh",
+        "install.bat",
+        "startup.bat",
+        "shutdown.bat",
+        "Dockerfile",
+        ".dockerignore",
+    ):
+        path = APP_ROOT / name
+        assert path.is_file(), name
+        assert path.read_text(encoding="utf-8").strip(), name
+
+    for obsolete in ("start.sh", "start.bat", "docker-start.sh"):
+        assert not (APP_ROOT / obsolete).exists(), obsolete
+
+    assert not (REPOSITORY_ROOT / "packaging" / "Dockerfile").exists()
+    assert not (REPOSITORY_ROOT / ".dockerignore").exists()
+
+    attributes = (REPOSITORY_ROOT / ".gitattributes").read_text(encoding="utf-8")
+    assert "DevWerk/*.sh text eol=lf" in attributes
+    assert "DevWerk/Dockerfile text eol=lf" in attributes
+
+
+def test_startup_launchers_bound_graceful_shutdown() -> None:
+    windows = (APP_ROOT / "startup.bat").read_text(encoding="utf-8")
+    shell = (APP_ROOT / "startup.sh").read_text(encoding="utf-8")
+    environment = (APP_ROOT / ".env.example").read_text(encoding="utf-8")
+
+    assert "GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS=5" in environment
+    assert 'GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS=5' in windows
+    assert "--timeout-graceful-shutdown %GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS%" in windows
+    assert 'GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS="${GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS:-5}"' in shell
+    assert '--timeout-graceful-shutdown "$GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS"' in shell
+
+
+def test_release_packagers_copy_launchers_without_generating_them() -> None:
+    shell_packager = (REPOSITORY_ROOT / "scripts" / "package-devwerk.sh").read_text(
+        encoding="utf-8"
+    )
+    powershell_packager = (
+        REPOSITORY_ROOT / "scripts" / "package-devwerk.ps1"
+    ).read_text(encoding="utf-8")
+
+    assert 'cat > "$STAGE/install.sh"' not in shell_packager
+    assert 'cat > "$STAGE/startup.sh"' not in shell_packager
+    assert 'Join-Path $Stage "install.sh"' not in powershell_packager
+    assert 'Join-Path $Stage "startup.sh"' not in powershell_packager
+    assert "--exclude='.venv'" in shell_packager
+    assert "--exclude='venv'" in shell_packager
+    assert 'PYTHON=python3' in shell_packager
+    assert 'PYTHON=python' in shell_packager
+    assert '"venv"' in powershell_packager
+
+
+def test_docker_builds_only_from_the_application_directory() -> None:
+    workflow = (
+        REPOSITORY_ROOT / ".github" / "workflows" / "release.yml"
+    ).read_text(encoding="utf-8")
+    shell_builder = (REPOSITORY_ROOT / "scripts" / "build-docker.sh").read_text(
+        encoding="utf-8"
+    )
+    powershell_builder = (
+        REPOSITORY_ROOT / "scripts" / "build-docker.ps1"
+    ).read_text(encoding="utf-8")
+    dockerfile = (APP_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "context: ./DevWerk" in workflow
+    assert "file: ./DevWerk/Dockerfile" in workflow
+    assert 'DOCKERFILE="$APP/Dockerfile"' in shell_builder
+    assert 'docker build -f "$DOCKERFILE" -t "$IMAGE" "$APP"' in shell_builder
+    assert '$Dockerfile = Join-Path $App "Dockerfile"' in powershell_builder
+    assert "ENTRYPOINT [\"/opt/devwerk/startup.sh\", \"production\"]" in dockerfile
+    assert "COPY . ./" in dockerfile

@@ -3,9 +3,14 @@ from dataclasses import replace
 
 import pytest
 
+from app.v1.agent import AgentCore, AgentRunSpec
 from app.v1.capabilities import CapabilityContext
-from tests.test_agent_recovery_and_fencing import begin_agent
-
+from app.v1.conversation import _has_durable_governance_progress
+from app.v1.conversation_failure import failure_summary
+from app.v1.domain import AgentModelResponse, AgentToolCall
+from app.v1.runtime import WorkflowRuntime
+from tests.helpers import create_planned_task, publish_planned_workflow, sequence_workflow
+from tests.test_p0_assignment_regressions import begin_agent
 
 def turn(store, project, message, start_task=True):
     queued = store.create_conversation_job(project['id'], message, start_task)
@@ -440,3 +445,358 @@ def test_legacy_draft_records_and_unique_job_snapshot_schema_migrate(store, tmp_
     assert store.intents.update_draft(ctx,args) == state
     updated = store.intents.update_draft(ctx,{'based_on_intent_revision':state['revision'],'proposal':'新方案'})
     assert updated['revision'] == state['revision']+1
+
+
+# ---------------------------------------------------------------------------
+# Partial-effect recovery
+# ---------------------------------------------------------------------------
+
+def test_mixed_resolution_and_mutation_batch_has_no_business_effects(store, tmp_path):
+    project = store.create_project('mixed batch', '', str(tmp_path/'project'))
+    queued = store.create_conversation_job(project['id'], '开始写文件', True)
+    job = store.claim_conversation_job(queued['id'], 'test')
+    calls = 0
+    def model(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return AgentModelResponse(tool_calls=[
+                AgentToolCall(id='resolve',name='conversation.turn.resolve',arguments={
+                    'source_message_id':job['user_message_id'],'based_on_intent_revision':0,
+                    'act':'execute','execution_request':'begin','scope_summary':'write file',
+                    'user_evidence':[{'message_id':job['user_message_id'],'quote':job['message']}]}),
+                AgentToolCall(id='write',name='project.files.write',arguments={'path':'bad.txt','content':'bad'}),
+            ])
+        return AgentModelResponse(text=json.dumps({'mode':'discussion','message':'需要单独提交回合边界。'}))
+    result = AgentCore(store, store.registry, model).run(AgentRunSpec(kind='conversation',project=project,
+        instruction='',instruction_revision=1,context={},conversation_job_id=job['id'],
+        agent_instance_id=store.conversation_agent(project['id'])['logical_id'],
+        capability_ids=['conversation.turn.resolve','project.files.write'],require_conversation_report=True))
+    invocations = store.tool_invocations(project['id'],result.agent_run_id,hydrate_payloads=True)
+    assert len(invocations) == 2 and not any(i['ok'] for i in invocations)
+    assert all(i['result']['error']['type'] == 'ConversationTurnProtocolError' for i in invocations)
+    assert not (tmp_path/'project'/'bad.txt').exists()
+    assert not store.agents.list_requirements(project['id'])
+
+
+def test_plain_discussion_cannot_hide_successful_effect_receipt(store, tmp_path):
+    from app.v1.conversation_report import render_report
+    project = store.create_project('legacy recovery receipt', '', str(tmp_path/'project'))
+    job, ctx = turn(store, project, '讨论')
+    assert resolve(ctx, job).ok
+    store.record_tool_invocation(agent_run_id=ctx.agent_run_id,tool_call_id='legacy-write',
+        capability='project.files.write',arguments={'path':'legacy.txt','content':'x'},
+        result={'ok':True,'capability':'project.files.write','output':{}},ok=True)
+    with pytest.raises(ValueError):
+        render_report(store,project['id'],ctx.agent_run_id,'只是讨论，不需要检查执行结果。')
+
+
+def test_partial_failure_reports_saved_work_and_actual_started_count(store, tmp_path):
+    project = store.create_project('partial effects', '', str(tmp_path/'project'))
+    publish_planned_workflow(store,project['id'],sequence_workflow())
+    task = create_planned_task(store,project['id'],'first')
+    WorkflowRuntime(store,store.registry,'test-worker').step(task['id'])
+    def entry(capability,ok=True,output=None,error=None):
+        return {'capability':capability,'ok':ok,'facts':{'result':{'output':output,'error':{'message':error}}}}
+    ledger = [entry('loop.apply'),entry('task.plan.save'),
+        entry('task.create',output={'materialization':{'created_task_ids':[task['id']],'reused_task_ids':[]}}),
+        entry('task.create',output={'materialization':{'created_task_ids':[],'reused_task_ids':[task['id']]}}),
+        entry('task.plan.save',False,error='ExactInputTargetType: /requirements_confirmed is boolean')]
+    reply = failure_summary(store,project['id'],ledger,'ConversationProtocolStalled')
+    assert '新建 1 个任务，其中 1 个已启动' in reply
+    assert '工作流已保存' in reply and '任务计划已保存' in reply
+    assert 'ExactInputTargetType' in reply and '重复失败调用已停止' in reply
+    assert '复用 1' not in reply
+
+
+def test_failed_final_reply_reports_queued_worker_input_as_partial_effect(store, tmp_path):
+    project = store.create_project('worker input receipt', '', str(tmp_path/'project'))
+    ledger = [
+        {'capability': 'agent.worker.send', 'ok': True, 'status': 'completed',
+         'effect_kind': 'control', 'facts': {'result': {'output': {'id': 'winput_1'}}}},
+        {'capability': 'conversation.reply', 'ok': False, 'status': 'failed',
+         'effect_kind': 'session_control', 'facts': {'result': {'error': {
+             'message': 'The report references a tool call absent from this turn'}}}},
+    ]
+    assert _has_durable_governance_progress(ledger)
+    reply = failure_summary(store, project['id'], ledger, 'ConversationProtocolStalled')
+    assert '已向 Worker 排队 1 条输入' in reply
+    assert '是否消费需另查' in reply
+    assert 'tool call absent' in reply
+
+
+def test_validation_failure_summary_keeps_paths_and_business_reason_without_debug_payload(store, tmp_path):
+    project = store.create_project('validation failure', '', str(tmp_path/'project'))
+    detail = ('2 validation errors for WorkflowDefinition\n'
+              'columns.6.acceptance_checks.0\n'
+              "  Value error, A scenario report requires a behavioral command [type=value_error, input_value={'arguments': {'secret': 'not-for-ui'}}, input_type=dict]\n"
+              '    For further information visit https://errors.pydantic.dev/2.13/v/value_error\n'
+              'columns.6.acceptance_checks.1\n'
+              '  Value error, A scenario report requires a behavioral command [type=value_error, input_value={}, input_type=dict]')
+    ledger = [{'capability': 'workflow.acceptance.configure', 'ok': False,
+               'facts': {'result': {'error': {'message': detail}}}}]
+    reply = failure_summary(store, project['id'], ledger, 'ConversationProtocolStalled')
+    assert 'columns.6.acceptance_checks.0: A scenario report requires a behavioral command' in reply
+    assert 'columns.6.acceptance_checks.1' in reply
+    assert 'not-for-ui' not in reply and 'pydantic.dev' not in reply
+
+
+def test_contract_failure_summary_omits_serialized_plan_arguments(store, tmp_path):
+    project = store.create_project('contract failure', '', str(tmp_path/'project'))
+    detail = "task.plan.save input rejected value at plan: '{\"secret\": \"not-for-ui\"}'"
+    ledger = [{'capability': 'task.plan.save', 'ok': False,
+               'facts': {'result': {'error': {'message': detail}}}}]
+    reply = failure_summary(store, project['id'], ledger, 'ConversationProtocolStalled')
+    assert 'task.plan.save input rejected value at plan' in reply
+    assert 'JSON 字符串' in reply
+    assert 'not-for-ui' not in reply
+
+
+# ---------------------------------------------------------------------------
+# Conversation reply tool
+# ---------------------------------------------------------------------------
+
+def test_reply_tool_finishes_same_run_with_real_task_state(store, tmp_path):
+    project = store.create_project('reply tool', '', str(tmp_path/'project'))
+    publish_planned_workflow(store,project['id'],sequence_workflow())
+    task = create_planned_task(store,project['id'],'Actual task')
+    queued = store.create_conversation_job(project['id'],'当前进度？',True)
+    job = store.claim_conversation_job(queued['id'],'test')
+    calls = 0
+    def model(messages, tools, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            assert kwargs['required_tool_name'] is None
+            return AgentModelResponse(tool_calls=[AgentToolCall(id='resolve',name='conversation.turn.resolve',arguments={
+                'source_message_id':job['user_message_id'],'based_on_intent_revision':0,'act':'status'})])
+        return AgentModelResponse(tool_calls=[AgentToolCall(id='reply',name='conversation.reply',arguments={
+            'mode':'work_result','task_ids':[task['id']],
+            'message':'I will review the result after the queued Task runs.'})])
+    result = AgentCore(store,store.registry,model).run(AgentRunSpec(kind='conversation',project=project,
+        instruction='',instruction_revision=1,context={},conversation_job_id=job['id'],
+        agent_instance_id=store.conversation_agent(project['id'])['logical_id'],
+        capability_ids=['conversation.turn.resolve'],require_conversation_report=True))
+    assert 'Actual task：待执行' in result.text
+    assert 'Agent 说明（未作为完成依据）' in result.text
+    assert 'Actual task：待执行' in result.text.splitlines()[0]
+    assert 'review the result' in result.text
+    assert calls == 2
+    assert len(store.agent_runs(project_id=project['id'])) == 1
+    assert result.completion['conversation_report']['tasks'][0]['id'] == task['id']
+
+
+def test_persistent_session_preserves_prior_tool_trace_across_resolution(store, tmp_path):
+    from app.v1.agent_provider import ProviderTurnRequester
+    project = store.create_project('phase context', '', str(tmp_path/'project'))
+    job, ctx = turn(store,project,'开始实施')
+    payload = {'authoritative_current_request':{'message_id':job['user_message_id'],'content':job['message']},
+        'authoritative_project_state':{}}
+    messages = [{'role':'system','content':'same identity'},
+        {'role':'tool','tool_call_id':'old','content':'OLD_TOOL_TRACE'},
+        {'role':'user','content':json.dumps(payload)}]
+    captured = []
+    def model(messages, tools, **kwargs):
+        captured.append(messages)
+        return AgentModelResponse(text='{}')
+    spec = AgentRunSpec(kind='conversation',project=project,instruction='',instruction_revision=1,
+        context={},capability_ids=[],conversation_job_id=job['id'])
+    provider = ProviderTurnRequester(store=store,model_complete=model,spec=spec,run_id=ctx.agent_run_id)
+    tools = store.registry.schemas(['conversation.turn.resolve','project.files.read'],ctx)
+    provider.request(messages,tools,iteration=1,require_tool=False,required_tool_name=None)
+    assert 'OLD_TOOL_TRACE' in str(captured[-1])
+    assert captured[-1][0] == messages[0]
+    assert resolve(ctx,job,act='execute',execution_request='begin',scope_summary='demo',
+        user_evidence=[{'message_id':job['user_message_id']}]).ok
+    provider.request(messages,tools,iteration=2,require_tool=False,required_tool_name=None)
+    assert 'OLD_TOOL_TRACE' in str(captured[-1])
+
+
+def test_reply_cannot_cite_invented_task(store, tmp_path):
+    project = store.create_project('reply provenance', '', str(tmp_path/'project'))
+    job, ctx = turn(store,project,'进度？')
+    assert resolve(ctx,job,act='status').ok
+    reply = store.registry.dispatch('conversation.reply',{'mode':'work_result','task_ids':['tsk_invented']},ctx)
+    assert not reply.ok
+    assert not store.list_tasks(project['id'])
+
+
+def test_execution_reply_cannot_use_old_task_status_without_current_effect(store, tmp_path):
+    import json
+
+    from app.v1.conversation_report import render_report
+
+    project = store.create_project('execution report admission', '', str(tmp_path/'project'))
+    first, first_ctx = turn(store, project, '开始交付')
+    assert resolve(first_ctx, first, act='execute', execution_request='begin',
+                   scope_summary='demo', user_evidence=[{
+                       'message_id': first['user_message_id'], 'quote': first['message']}]).ok
+    store.finish_conversation_job(first['id'], None, first_ctx.agent_run_id, {})
+    publish_planned_workflow(store, project['id'], sequence_workflow())
+    task = create_planned_task(store, project['id'], 'Existing task')
+
+    job, ctx = turn(store, project, '继续执行当前交付')
+    assert resolve(ctx, job, act='execute', execution_request='continue',
+                   user_evidence=[{'message_id': job['user_message_id'], 'quote': job['message']}]).ok
+    with pytest.raises(ValueError, match='successful write, process or control receipt'):
+        render_report(store, project['id'], ctx.agent_run_id,
+                      json.dumps({'mode': 'work_result', 'task_ids': [task['id']]}))
+
+    written = store.registry.dispatch('project.files.write',
+        {'path': 'current-work.txt', 'content': 'real effect'}, ctx)
+    assert written.ok, written.error
+    store.record_tool_invocation(agent_run_id=ctx.agent_run_id, tool_call_id='current-write',
+        capability='project.files.write', arguments={'path': 'current-work.txt'},
+        result=written.model_dump(mode='json'), ok=True)
+    rendered, _ = render_report(store, project['id'], ctx.agent_run_id,
+        json.dumps({'mode': 'work_result', 'task_ids': [task['id']],
+                    'tool_call_ids': ['current-write']}))
+    assert '项目文件已写入' in rendered
+
+
+def test_execution_reply_cannot_present_old_done_task_as_new_work(store, tmp_path):
+    from app.v1.conversation_report import render_report
+
+    project = store.create_project('terminal provenance', '', str(tmp_path/'project'))
+    first, first_ctx = turn(store, project, '开始交付')
+    assert resolve(first_ctx, first, act='execute', execution_request='begin',
+                   scope_summary='original', user_evidence=[{'message_id': first['user_message_id']}]).ok
+    store.finish_conversation_job(first['id'], None, first_ctx.agent_run_id, {})
+    publish_planned_workflow(store, project['id'], sequence_workflow())
+    task = create_planned_task(store, project['id'], 'Old delivery')
+    with store.tx(immediate=True) as db:
+        db.execute("UPDATE v1_tasks SET status='done' WHERE id=?", (task['id'],))
+
+    job, ctx = turn(store, project, '为已交付项目建立修复任务')
+    assert resolve(ctx, job, act='execute', execution_request='begin', focus='new_scope',
+                   scope_summary='separate repair', user_evidence=[{'message_id': job['user_message_id']}]).ok
+    store.record_tool_invocation(agent_run_id=ctx.agent_run_id, tool_call_id='scope-created',
+        capability='requirement.create', arguments={}, result={'ok': True, 'output': {'id': 'new-scope'}}, ok=True)
+    with pytest.raises(ValueError, match='HistoricalTerminalTaskNotCurrentWork'):
+        render_report(store, project['id'], ctx.agent_run_id,
+            json.dumps({'mode': 'work_result', 'task_ids': [task['id']]}))
+
+    rendered, _ = render_report(store, project['id'], ctx.agent_run_id,
+        json.dumps({'mode': 'work_result', 'tool_call_ids': ['scope-created']}))
+    assert '需求已建立' in rendered and 'Old delivery' not in rendered
+
+
+def test_execution_reply_reports_partial_workflow_configuration_as_incomplete(store, tmp_path):
+    from app.v1.conversation_report import render_report
+
+    project = store.create_project('partial workflow reply', '', str(tmp_path/'project'))
+    job, ctx = turn(store, project, '配置工作流验收')
+    assert resolve(ctx, job, act='execute', execution_request='begin', scope_summary='demo',
+                   user_evidence=[{'message_id': job['user_message_id']}]).ok
+    store.record_tool_invocation(agent_run_id=ctx.agent_run_id, tool_call_id='partial-check',
+        capability='workflow.acceptance.configure', arguments={}, ok=True,
+        result={'ok': True, 'capability': 'workflow.acceptance.configure',
+                'output': {'ready_for_task_plan': False, 'remaining_diagnostic_count': 4}})
+    rendered, _ = render_report(store, project['id'], ctx.agent_run_id,
+        json.dumps({'mode': 'work_result', 'tool_call_ids': ['partial-check']}))
+    assert 'Task 计划准入仍缺 4 项' in rendered
+
+
+def test_reply_and_mutation_batch_is_rejected_before_any_effect(store, tmp_path):
+    project = store.create_project('reply batch', '', str(tmp_path/'project'))
+    queued = store.create_conversation_job(project['id'], '开始写文件', True)
+    job = store.claim_conversation_job(queued['id'], 'test')
+    calls = 0
+    def model(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return AgentModelResponse(tool_calls=[AgentToolCall(id='resolve', name='conversation.turn.resolve', arguments={
+                'source_message_id':job['user_message_id'],'based_on_intent_revision':0,
+                'act':'execute','execution_request':'begin','scope_summary':'write file',
+                'user_evidence':[{'message_id':job['user_message_id']}]} )])
+        if calls == 2:
+            return AgentModelResponse(tool_calls=[
+                AgentToolCall(id='reply',name='conversation.reply',arguments={'mode':'blocked','message':'Finish'}),
+                AgentToolCall(id='write',name='project.files.write',arguments={'path':'bad.txt','content':'bad'})])
+        return AgentModelResponse(tool_calls=[AgentToolCall(id='finish',name='conversation.reply',arguments={
+            'mode':'blocked','tool_call_ids':['write']})])
+    result = AgentCore(store,store.registry,model).run(AgentRunSpec(kind='conversation',project=project,
+        instruction='',instruction_revision=1,context={},conversation_job_id=job['id'],
+        agent_instance_id=store.conversation_agent(project['id'])['logical_id'],
+        capability_ids=['conversation.turn.resolve','project.files.write'],require_conversation_report=True))
+    receipts = store.tool_invocations(project['id'],result.agent_run_id,hydrate_payloads=True)
+    mixed = [i for i in receipts if i['tool_call_id'] in {'reply','write'}]
+    assert len(mixed) == 2 and not any(i['ok'] for i in mixed)
+    assert all(i['result']['error']['type'] == 'ConversationTurnProtocolError' for i in mixed)
+    assert not (tmp_path/'project'/'bad.txt').exists()
+    assert result.completion['conversation_report']['report']['mode'] == 'blocked'
+
+
+def test_reply_receipt_recovery_renders_current_task_without_column_completion(store, tmp_path, monkeypatch):
+    project = store.create_project('reply recovery', '', str(tmp_path/'project'))
+    publish_planned_workflow(store,project['id'],sequence_workflow())
+    task = create_planned_task(store,project['id'],'Recoverable report')
+    queued = store.create_conversation_job(project['id'],'进度？',True)
+    job = store.claim_conversation_job(queued['id'],'test')
+    responses = iter([
+        AgentModelResponse(tool_calls=[AgentToolCall(id='resolve',name='conversation.turn.resolve',arguments={
+            'source_message_id':job['user_message_id'],'based_on_intent_revision':0,'act':'status'})]),
+        AgentModelResponse(tool_calls=[AgentToolCall(id='reply',name='conversation.reply',arguments={
+            'mode':'work_result','task_ids':[task['id']]})]),
+    ])
+    spec = AgentRunSpec(kind='conversation',project=project,instruction='',instruction_revision=1,context={},
+        conversation_job_id=job['id'],agent_instance_id=store.conversation_agent(project['id'])['logical_id'],
+        capability_ids=['conversation.turn.resolve'],require_conversation_report=True)
+    finish = store.finish_agent_run
+    crashed = False
+    def interrupt_finish(run_id, status, *args, **kwargs):
+        nonlocal crashed
+        if status == 'succeeded' and not crashed:
+            crashed = True
+            raise RuntimeError('injected interruption after reply receipt')
+        return finish(run_id,status,*args,**kwargs)
+    monkeypatch.setattr(store,'finish_agent_run',interrupt_finish)
+    core = AgentCore(store,store.registry,lambda *a,**kw: next(responses))
+    with pytest.raises(RuntimeError, match='injected interruption'):
+        core.run(spec)
+    store.pause_task(task['id'])
+    recovered = core.run(spec)
+    assert recovered.status == 'succeeded', recovered.error
+    assert 'Recoverable report：已暂停' in recovered.text
+    with store.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM v1_agent_operations WHERE capability='conversation.reply'").fetchone()[0] == 1
+
+
+def test_empty_discussion_response_recovers_with_reply_tool(store, tmp_path):
+    project = store.create_project('empty reply', '', str(tmp_path/'project'))
+    queued = store.create_conversation_job(project['id'],'只讨论',False)
+    job = store.claim_conversation_job(queued['id'],'test')
+    calls = 0
+    def model(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return AgentModelResponse(tool_calls=[AgentToolCall(id='resolve',name='conversation.turn.resolve',arguments={
+                'source_message_id':job['user_message_id'],'based_on_intent_revision':0,'act':'discuss'})])
+        if calls == 2:
+            return AgentModelResponse()
+        assert kwargs['required_tool_name'] == 'conversation.reply'
+        return AgentModelResponse(tool_calls=[AgentToolCall(id='reply',name='conversation.reply',arguments={
+            'mode':'discussion','message':'先讨论需求与验收。'})])
+    spec = AgentRunSpec(kind='conversation',project=project,instruction='',instruction_revision=1,context={},
+        conversation_job_id=job['id'],agent_instance_id=store.conversation_agent(project['id'])['logical_id'],
+        capability_ids=['conversation.turn.resolve'],require_conversation_report=True)
+    result = AgentCore(store,store.registry,model).run(spec)
+    assert result.status == 'succeeded', result.error
+    assert result.text == '先讨论需求与验收。'
+    assert calls == 3
+    assert not store.agents.list_requirements(project['id'])
+
+
+def test_persistent_empty_response_stops_after_three_attempts(store, tmp_path):
+    project = store.create_project('bounded empty', '', str(tmp_path/'project'))
+    calls = 0
+    def model(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return AgentModelResponse()
+    with pytest.raises(RuntimeError, match='neither tools nor final text'):
+        AgentCore(store,store.registry,model).run(AgentRunSpec(kind='conversation',project=project,
+            instruction='',instruction_revision=1,context={},capability_ids=[],require_conversation_report=True))
+    assert calls == 3

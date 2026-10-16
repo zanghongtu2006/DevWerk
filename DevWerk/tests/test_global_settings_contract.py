@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import logging
+import time
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +16,7 @@ from app.core.global_settings import (
     restart_required_changes,
     save_global_settings,
 )
+from app.core.logging import _daily_archive_name, configure_logging
 from app.core.restart import ManagedRestart
 from app.v1.capabilities import CapabilityContext, _task_resume
 from app.v1.domain import TaskPlan
@@ -21,7 +26,6 @@ from tests.helpers import (
     sequence_workflow,
     task_plan,
 )
-
 
 def test_global_settings_default_disables_previous_task_auto_resume(tmp_path):
     path = tmp_path / "global-settings.yaml"
@@ -277,3 +281,79 @@ def test_startup_releases_legacy_hold_from_dependency_queued_task(store, tmp_pat
     migrated = store.get_task(downstream_task["id"])
     assert migrated["control_state"] == "active"
     assert migrated["supervision_action"] is None
+
+
+# ---------------------------------------------------------------------------
+# Runtime logging
+# ---------------------------------------------------------------------------
+
+def test_daily_log_archive_has_one_human_readable_name():
+    archived = _daily_archive_name(str(Path("data/logs/devwerk.log.2026-08-14")))
+
+    assert Path(archived).name == "devwerk.20260814.log"
+
+
+def test_logging_rejects_additional_business_log_names(tmp_path):
+    log_dir = tmp_path / "logs"
+    config = SimpleNamespace(
+        log_level="info",
+        log_format="%(message)s",
+        log_file_enabled=True,
+        log_dir=str(log_dir),
+        log_file_name="startup.stdout.log",
+        log_retention_days=30,
+    )
+
+    with pytest.raises(ValueError, match="must be devwerk.log"):
+        configure_logging(config)
+
+    assert not log_dir.exists() or list(log_dir.iterdir()) == []
+
+
+def test_current_business_log_is_devwerk_log(tmp_path):
+    log_dir = tmp_path / "logs"
+    config = SimpleNamespace(
+        log_level="info",
+        log_format="%(message)s",
+        log_file_enabled=True,
+        log_dir=str(log_dir),
+        log_file_name="devwerk.log",
+        log_retention_days=30,
+    )
+
+    configure_logging(config)
+    logging.getLogger("devwerk.test").info("written to the single business log")
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+
+    assert (log_dir / "devwerk.log").read_text(encoding="utf-8").endswith(
+        "written to the single business log\n"
+    )
+    assert [path.name for path in log_dir.iterdir()] == ["devwerk.log"]
+
+
+def test_locked_daily_rollover_keeps_appending_to_devwerk_log(tmp_path, monkeypatch, capsys):
+    log_dir = tmp_path / "logs"
+    configure_logging(SimpleNamespace(log_level="info", log_format="%(message)s",
+        log_file_enabled=True, log_dir=str(log_dir), log_file_name="devwerk.log",
+        log_retention_days=30))
+    logger = logging.getLogger("devwerk.test")
+    logger.info("before midnight")
+    handler = next(item for item in logging.getLogger().handlers
+                   if isinstance(item, TimedRotatingFileHandler))
+    attempts = []
+
+    def locked(*args):
+        attempts.append(args)
+        raise PermissionError(32, "file locked by another process")
+
+    monkeypatch.setattr(handler, "rotate", locked)
+    handler.rolloverAt = int(time.time()) - 1
+    logger.info("after locked rollover")
+    logger.info("still writable")
+    handler.flush()
+    content = (log_dir / "devwerk.log").read_text(encoding="utf-8")
+    assert content.splitlines() == ["before midnight", "after locked rollover", "still writable"]
+    assert len(attempts) == 1
+    assert handler.rolloverAt > time.time()
+    assert capsys.readouterr().err.count("rollover deferred") == 1

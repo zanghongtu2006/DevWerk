@@ -143,7 +143,7 @@ def test_cancelled_checkpoint_does_not_commit(store, tmp_path):
 
 
 def test_assignment_checkpoint_is_reloaded_after_store_restart(store, tmp_path):
-    from tests.test_persistent_agents import assignment
+    from tests.test_p0_assignment_regressions import assignment
     from app.v1.store import V1Store
     from app.v1.session_replay import replayable_session_messages
     project = store.create_project('resume','',str(tmp_path/'project'))
@@ -323,7 +323,7 @@ def test_planning_projection_preserves_required_schema_and_revision(store, tmp_p
 
 
 def test_old_receipt_cannot_resolve_new_feedback_in_same_visit(store, tmp_path):
-    from tests.test_persistent_agents import assignment
+    from tests.test_p0_assignment_regressions import assignment
     from app.v1.domain import ToolResult
     project = store.create_project('receipt boundary','',str(tmp_path/'project'))
     workflow = agent_workflow()
@@ -345,7 +345,7 @@ def test_old_receipt_cannot_resolve_new_feedback_in_same_visit(store, tmp_path):
 
 
 def test_impact_run_uses_registered_effect_kind_not_capability_name(store, tmp_path):
-    from tests.test_agent_recovery_and_fencing import begin_agent
+    from tests.test_p0_assignment_regressions import begin_agent
     project = store.create_project('external effect', '', str(tmp_path/'project'))
     workflow = agent_workflow()
     publish_planned_workflow(store, project['id'], workflow)
@@ -443,7 +443,7 @@ def test_command_preflight_and_deferred_entry_do_not_execute(store, tmp_path):
 
 
 def test_archive_unicode_pages_are_contiguous_and_project_scoped(store, tmp_path):
-    from tests.test_agent_recovery_and_fencing import begin_agent
+    from tests.test_p0_assignment_regressions import begin_agent
     project = store.create_project('archive','',str(tmp_path/'project'))
     run = begin_agent(store,project,kind='conversation')
     source = '诊断信息 expected 401 actual 429\n'*800

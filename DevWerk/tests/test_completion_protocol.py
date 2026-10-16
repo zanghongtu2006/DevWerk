@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from app.v1.agent import AgentCore, AgentRunSpec
-from app.v1.capabilities import build_core_registry
+from app.v1.agent_prompt import build_column_system_envelope
+from app.v1.capabilities import CapabilityContext, build_core_registry
 from app.v1.completion_protocol import (
     CompletionAttemptGuard,
     CompletionContract,
@@ -14,11 +17,28 @@ from app.v1.completion_protocol import (
     completion_tool_schema,
     parse_completion_submission,
 )
-from app.v1.domain import AgentModelResponse, AgentToolCall, ToolResult
+from app.v1.domain import (
+    AcceptanceCheck,
+    AgentModelResponse,
+    AgentToolCall,
+    EdgeCheck,
+    ToolResult,
+    Transition,
+    WorkflowDefinition,
+)
 from app.v1.execution_ledger import ledger_entry
+from app.v1.policy import PlatformPolicySnapshot
+from app.v1.runtime import WorkflowRuntime, _column_completion_contract
 from app.v1.services.completion_admission import CompletionAdmissionService
+from app.v1.states import FEEDBACK_STATE_MACHINE, FeedbackStatus
 from app.v1.tool_protocol import parse_await_submission
-
+from tests.helpers import (
+    agent_workflow,
+    create_planned_task,
+    publish_planned_workflow,
+    sequence_workflow,
+    workflow_plan,
+)
 
 def _entry(
     call_id: str,
@@ -439,3 +459,385 @@ def test_agent_core_stops_repeated_invalid_await_without_more_model_calls(
         ))
 
     assert calls == 2
+
+
+# ---------------------------------------------------------------------------
+# Completion evidence guidance
+# ---------------------------------------------------------------------------
+
+def _completion_contract():
+    workflow = agent_workflow()
+    return _column_completion_contract(workflow, workflow.column('work'))
+
+
+def _command_receipt(argv):
+    return ledger_entry(
+        'agent', 'command', 'project.command.run', 'process',
+        ToolResult(ok=True, capability='project.command.run', output={'exit_code': 0}),
+        arguments={'argv': argv},
+    )
+
+
+
+
+
+
+def test_unresolved_foreground_timeout_rejection_keeps_repair_hint_visible():
+    contract = _completion_contract()
+    failed = ledger_entry(
+        'agent', 'server-timeout', 'project.command.run', 'process',
+        ToolResult(ok=False, capability='project.command.run', status='failed',
+                   error={'type': 'CommandFailed',
+                          'message': 'command timed out: ' + 'STARTUP_LOG_' * 1000}),
+        arguments={'argv': ['java', '-jar', 'backend/target/demo.jar']},
+    )
+    built = _command_receipt(['mvn.cmd', '-f', 'backend/pom.xml', 'package', '-DskipTests'])
+    ledger = [failed, built]
+    submission = parse_completion_submission(
+        {'outcome': 'success', 'output': {'delivered': True}, 'summary': 'built'},
+        contract, ledger,
+    )
+    decision = CompletionAdmissionService().evaluate(submission, contract, ledger)
+    assert not decision.accepted
+    assert decision.rejection.code == 'unresolved_execution_failure'
+    assert 'command timed out' in decision.rejection.message
+    assert 'failure_resolutions' in decision.rejection.message
+    assert "failed_evidence_id='agent:server-timeout'" in decision.rejection.message
+    assert len(decision.rejection.message) < 1000
+
+
+
+
+
+
+def test_alternative_success_requires_explicit_failure_resolution():
+    contract = _completion_contract()
+    failed = ledger_entry(
+        'agent', 'failed-build', 'project.command.run', 'process',
+        ToolResult(ok=False, capability='project.command.run', status='failed',
+                   error={'type': 'CommandFailed', 'message': 'npm cache EPERM'}),
+        arguments={'argv': ['npx.cmd', 'vite', 'build']},
+    )
+    repaired = ledger_entry(
+        'agent', 'vite-build', 'project.command.run', 'process',
+        ToolResult(ok=True, capability='project.command.run', output={'exit_code': 0}),
+        arguments={'argv': ['cmd', '/c', 'cd /d frontend && node_modules\\.bin\\vite.cmd build']},
+    )
+    ledger = [failed, repaired]
+    submission = parse_completion_submission(
+        {'outcome': 'success', 'output': {'delivered': True}, 'summary': 'built'},
+        contract, ledger,
+    )
+    unresolved = CompletionAdmissionService().evaluate(submission, contract, ledger).rejection
+    assert unresolved.code == 'unresolved_execution_failure'
+    assert f"failed_evidence_id='{failed['evidence_id']}'" in unresolved.message
+    submission = parse_completion_submission({
+        'outcome': 'success', 'output': {'delivered': True}, 'summary': 'built',
+        'failure_resolutions': [{
+            'failed_evidence_id': failed['evidence_id'],
+            'resolved_by_evidence_id': repaired['evidence_id'],
+            'reason': 'The successful verification command covers the failed attempt',
+        }],
+    }, contract, ledger)
+    assert CompletionAdmissionService().evaluate(submission, contract, ledger).accepted
+
+
+# ---------------------------------------------------------------------------
+# Worker-selected acceptance
+# ---------------------------------------------------------------------------
+
+def test_column_plain_text_is_corrected_before_declared_completion(store, tmp_path):
+    project = store.create_project('column-text-correction', '', str(tmp_path / 'project'))
+    workflow = agent_workflow()
+    saved = store.create_workflow_plan(project['id'], workflow_plan(workflow))
+    store.publish_workflow(project['id'], workflow, saved['id'])
+    task = create_planned_task(store, project['id'], 'complete after reminder')
+    replies = iter([
+        AgentModelResponse(text='Here is a diagnostic summary, but no completion.'),
+        AgentModelResponse(tool_calls=[AgentToolCall(id='done', name='column.complete',
+            arguments={'outcome': 'success', 'output': {'delivered': True},
+                       'summary': 'completed after reminder'})]),
+    ])
+    seen = []
+    def model(messages, tools, **kwargs):
+        seen.append(messages[-1]['content'])
+        return next(replies)
+    runtime = WorkflowRuntime(store, store.registry, 'test-worker',
+                              AgentCore(store, store.registry, model))
+    runtime.step(task['id'])
+    assert store.get_task(task['id'])['status'] == 'done'
+    assert 'plain-text reply channel' in seen[-1]
+
+
+def test_repeated_column_plain_text_never_completes_task(store, tmp_path):
+    project = store.create_project('column-text-only', '', str(tmp_path / 'project'))
+    workflow = agent_workflow()
+    saved = store.create_workflow_plan(project['id'], workflow_plan(workflow))
+    store.publish_workflow(project['id'], workflow, saved['id'])
+    task = create_planned_task(store, project['id'], 'no fake completion')
+    runtime = WorkflowRuntime(store, store.registry, 'test-worker',
+                              AgentCore(store, store.registry,
+                                        lambda *_a, **_kw: AgentModelResponse(text='still just a summary')))
+    with pytest.raises(RuntimeError, match='without calling column.complete'):
+        runtime.step(task['id'])
+    assert store.get_task(task['id'])['status'] != 'done'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def test_qualitative_feedback_does_not_override_declared_done_edge(store, tmp_path):
+    project = store.create_project('market research', '', str(tmp_path / 'project'))
+    workflow = agent_workflow()
+    research = workflow.column('work')
+    research.executor.capabilities = ['project.files.write']
+    research.transitions = [Transition(outcome='success', target='review')]
+    review = research.model_copy(deep=True)
+    review.key, review.name = 'review', 'Independent review'
+    review.executor.capabilities = ['project.files.read', 'task.feedback.record', 'task.feedback.resolve']
+    review.transitions = [Transition(outcome='success', target='done'),
+                          Transition(outcome='rework', target='work', allows_unresolved_failures=True)]
+    workflow.columns.append(review)
+    method = workflow_plan(workflow)
+    method.task_contract.feedback_columns = ['review']
+    saved = store.create_workflow_plan(project['id'], method)
+    store.publish_workflow(project['id'], workflow, saved['id'])
+    task = create_planned_task(store, project['id'], 'source-backed market report')
+    calls = iter([
+        ('project.files.write', {'path': 'market.md', 'content': 'Draft findings'}),
+        ('column.complete', {'outcome': 'success', 'output': {'delivered': True}, 'summary': 'draft ready'}),
+        ('project.files.read', {'path': 'market.md'}),
+        ('task.feedback.record', {'task_id': task['id'], 'dedupe_key': 'missing-sources',
+            'responsible_column': 'work', 'description': 'The findings lack source citations'}),
+        ('column.complete', {'outcome': 'rework', 'output': {'delivered': False}, 'summary': 'add sources'}),
+        ('project.files.write', {'path': 'market.md', 'content': 'Findings with cited sources'}),
+        ('column.complete', {'outcome': 'success', 'output': {'delivered': True}, 'summary': 'sources added'}),
+        ('project.files.read', {'path': 'market.md'}),
+        ('column.complete', {'outcome': 'success', 'output': {'delivered': True}, 'summary': 'premature acceptance'}),
+        ('task.feedback.resolve', {'task_id': task['id'], 'feedback_id': 'pending',
+            'verification_note': 'Read the revised report and confirmed source citations'}),
+        ('column.complete', {'outcome': 'success', 'output': {'delivered': True}, 'summary': 'reviewed'}),
+    ])
+    counter = iter(range(20))
+
+    def model(*_args, **_kwargs):
+        name, arguments = next(calls)
+        if name == 'task.feedback.resolve':
+            arguments['feedback_id'] = store.feedback.list(project['id'], task['id'])[0]['id']
+        return AgentModelResponse(tool_calls=[AgentToolCall(
+            id=f'call-{next(counter)}', name=name, arguments=arguments)])
+
+    runtime = WorkflowRuntime(store, store.registry, 'test-worker', AgentCore(store, store.registry, model))
+    for _ in range(3):
+        runtime.step(task['id'])
+    assert store.feedback.list(project['id'], task['id'])[0]['state'] == 'verifying'
+    runtime.step(task['id'])
+    assert store.get_task(task['id'])['status'] == 'done'
+    feedback = store.feedback.list(project['id'], task['id'])
+    assert len(feedback) == 1 and feedback[0]['state'] == 'verifying'
+    with store.connect() as db:
+        rejected = db.execute("SELECT COUNT(*) FROM v1_tool_invocations WHERE project_id=? AND capability='column.complete' AND ok=0",
+                              (project['id'],)).fetchone()[0]
+    assert rejected == 0
+
+
+def test_qualitative_feedback_can_notify_without_review_column(store, tmp_path):
+    project = store.create_project('research without reviewer', '', str(tmp_path / 'project'))
+    workflow = agent_workflow()
+    workflow.column('work').executor.capabilities.append('task.feedback.record')
+    saved = store.create_workflow_plan(project['id'], workflow_plan(workflow))
+    store.publish_workflow(project['id'], workflow, saved['id'])
+    task = create_planned_task(store, project['id'], 'research findings')
+    ctx = CapabilityContext(project_id=project['id'], project=project, store=store)
+    feedback = store.feedback.record(ctx, {'task_id': task['id'], 'dedupe_key': 'sources',
+        'responsible_column': 'work', 'description': 'Missing source citations'})
+    assert feedback['state'] == 'open'
+
+
+def test_qualitative_feedback_does_not_require_a_future_reviewer_path(store, tmp_path):
+    project = store.create_project('review before repair', '', str(tmp_path / 'project'))
+    workflow = agent_workflow()
+    work = workflow.column('work')
+    review = work.model_copy(deep=True)
+    review.key, review.name = 'review', 'Review'
+    review.executor.capabilities = ['task.feedback.record', 'task.feedback.resolve']
+    review.transitions = [Transition(outcome='success', target='work')]
+    workflow.entry = 'review'
+    workflow.columns.append(review)
+    method = workflow_plan(workflow)
+    method.task_contract.feedback_columns = ['review']
+    saved = store.create_workflow_plan(project['id'], method)
+    store.publish_workflow(project['id'], workflow, saved['id'])
+    task = create_planned_task(store, project['id'], 'review findings')
+    ctx = CapabilityContext(project_id=project['id'], project=project, store=store)
+    feedback = store.feedback.record(ctx, {'task_id': task['id'], 'dedupe_key': 'correction',
+        'responsible_column': 'work', 'description': 'Correct the findings'})
+    assert feedback['state'] == 'open'
+
+
+# ---------------------------------------------------------------------------
+# Workflow transition authority
+# ---------------------------------------------------------------------------
+
+def _started_review(store, tmp_path):
+    workflow = agent_workflow()
+    review = workflow.column('work')
+    review.key = 'review'
+    review.transitions = [
+        Transition(outcome='accepted', target='system_test'),
+        Transition(outcome='rework', target='repair', allows_unresolved_failures=True),
+        Transition(outcome='failure', target='failed'),
+    ]
+    repair = review.model_copy(deep=True)
+    repair.key = 'repair'
+    repair.transitions = [Transition(outcome='repaired', target='review')]
+    repair.acceptance_checks = [AcceptanceCheck(
+        key='proof', capability='project.files.read', arguments={'path': 'proof.txt'}
+    )]
+    system_test = review.model_copy(deep=True)
+    system_test.key = 'system_test'
+    system_test.transitions = [Transition(outcome='passed', target='done')]
+    workflow.entry = 'review'
+    workflow.columns = [review, repair, system_test]
+    project = store.create_project('transition authority', '', str(tmp_path / 'project'))
+    publish_planned_workflow(store, project['id'], workflow)
+    task = create_planned_task(store, project['id'], 'follow the declared graph')
+    owned = store.claim_task(task['id'], 'worker')
+    run = store.begin_run(owned, {})
+    feedback = store.feedback.record(CapabilityContext(
+        project['id'], project, store, task_id=task['id'], column_run_id=run['id']
+    ), {
+        'task_id': task['id'], 'dedupe_key': 'repair-proof',
+        'responsible_column': 'repair', 'description': 'Repair has not supplied proof',
+        'checks': [{'column': 'repair', 'check_key': 'proof'}],
+    })
+    return project, task, owned, run, feedback
+
+
+@pytest.mark.parametrize('feedback_state', ['open', 'resolved'])
+def test_accepted_follows_declared_edge_even_with_feedback(store, tmp_path, feedback_state):
+    project, task, owned, run, feedback = _started_review(store, tmp_path)
+    if feedback_state == 'resolved':
+        with store.tx(immediate=True) as db:
+            db.execute("UPDATE v1_task_feedback SET state='resolved' WHERE id=?", (feedback['id'],))
+
+    store.finish_run(owned, run['id'], {'delivered': True}, 'accepted', 'system_test')
+
+    assert store.get_task(task['id'])['current_column'] == 'system_test'
+    assert store.feedback.list(project['id'], task['id'])[0]['state'] == feedback_state
+    finished = [event for event in store.events(project['id']) if event['type'] == 'column.finished']
+    assert finished[-1]['data']['outcome'] == 'accepted'
+    assert finished[-1]['data']['next'] == 'system_test'
+    assert not any(event['type'] == 'task.feedback_routed' for event in store.events(project['id']))
+
+
+def test_explicit_rework_follows_declared_edge(store, tmp_path):
+    project, task, owned, run, feedback = _started_review(store, tmp_path)
+    store.finish_run(owned, run['id'], {'delivered': False}, 'rework', 'repair')
+    assert store.get_task(task['id'])['current_column'] == 'repair'
+    assert store.feedback.list(project['id'], task['id'])[0]['state'] == 'open'
+
+
+def test_finish_run_rejects_target_other_than_declared_edge(store, tmp_path):
+    project, task, owned, run, feedback = _started_review(store, tmp_path)
+    with pytest.raises(ValueError, match='declared Workflow transition'):
+        store.finish_run(owned, run['id'], {'delivered': True}, 'accepted', 'repair')
+    assert store.get_task(task['id'])['current_column'] == 'review'
+    assert store.feedback.list(project['id'], task['id'])[0]['state'] == 'open'
+
+
+def test_feedback_does_not_add_an_implicit_terminal_guard(store, tmp_path):
+    project, task, owned, run, feedback = _started_review(store, tmp_path)
+    assert any(item['event_type'] == 'task.feedback_recorded'
+               for item in store.mailbox(project['id']))
+    store.finish_run(owned, run['id'], {'delivered': True}, 'accepted', 'system_test')
+    owned = store.claim_task(task['id'], 'worker')
+    run = store.begin_run(owned, {})
+    store.finish_run(owned, run['id'], {'delivered': True}, 'passed', 'done', terminal='done')
+    assert store.get_task(task['id'])['status'] == 'done'
+    assert store.feedback.list(project['id'], task['id'])[0]['state'] == 'open'
+
+
+def test_only_selected_edge_requires_its_declared_check(store, tmp_path):
+    from app.v1.domain import ToolResult
+    from app.v1.agent_models import AgentRunSpec
+
+    workflow = agent_workflow()
+    work = workflow.column('work')
+    work.acceptance_checks = [AcceptanceCheck(
+        key='proof', capability='project.files.read', arguments={'path': 'proof.txt'}
+    )]
+    work.transitions = [
+        Transition(outcome='verified', target='done',
+                   required_checks=[EdgeCheck(column='work', check_key='proof')]),
+        Transition(outcome='plain', target='done'),
+    ]
+    project = store.create_project('edge checks', '', str(tmp_path / 'project'))
+    publish_planned_workflow(store, project['id'], workflow)
+    task = create_planned_task(store, project['id'], 'produce proof')
+    owned = store.claim_task(task['id'], 'worker')
+    run = store.begin_run(owned, {})
+    with pytest.raises(ValueError, match='Workflow edge check missing'):
+        store.finish_run(owned, run['id'], {}, 'verified', 'done', terminal='done')
+    spec = AgentRunSpec(kind='column', project=project, instruction='',
+                        instruction_revision=1, context={}, capability_ids=[],
+                        task_id=task['id'], column_run_id=run['id'],
+                        column_attempt_id=run['attempt_id'])
+    store.feedback.record_check(spec, 'proof', 'edge-proof',
+                                ToolResult(ok=True, capability='project.files.read', output={'content': 'ok'}),
+                                task_owner=owned)
+    store.finish_run(owned, run['id'], {}, 'verified', 'done', terminal='done')
+    assert store.get_task(task['id'])['status'] == 'done'
+
+    other = create_planned_task(store, project['id'], 'plain delivery', task_ref='plain')
+    owned = store.claim_task(other['id'], 'worker')
+    run = store.begin_run(owned, {})
+    store.finish_run(owned, run['id'], {}, 'plain', 'done', terminal='done')
+    assert store.get_task(other['id'])['status'] == 'done'
+
+
+def test_resolved_feedback_cannot_reopen_in_runtime_state_machine():
+    with pytest.raises(ValueError, match='invalid FeedbackStatus transition'):
+        FEEDBACK_STATE_MACHINE.require(FeedbackStatus.RESOLVED, FeedbackStatus.VERIFYING)
+
+
+def test_capability_sequence_runs_only_the_selected_edge_check(store, tmp_path):
+    from app.v1.runtime import WorkflowRuntime
+
+    workflow = sequence_workflow()
+    column = workflow.column('execute')
+    column.acceptance_checks = [AcceptanceCheck(
+        key='written_file', capability='project.files.read', arguments={'path': 'result.txt'}
+    )]
+    column.transitions[0].required_checks = [EdgeCheck(column='execute', check_key='written_file')]
+    project = store.create_project('sequence edge', '', str(tmp_path / 'project'))
+    publish_planned_workflow(store, project['id'], workflow)
+    task = create_planned_task(store, project['id'], 'write a file')
+    WorkflowRuntime(store, store.registry, 'worker').step(task['id'])
+    assert store.get_task(task['id'])['status'] == 'done'
+    with store.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM v1_acceptance_results WHERE task_id=?',
+                          (task['id'],)).fetchone()[0] == 1
+
+
+def test_legacy_column_check_is_explicit_on_normalized_success_edge():
+    workflow = agent_workflow()
+    workflow.column('work').acceptance_checks = [AcceptanceCheck(
+        key='legacy', capability='project.files.read', arguments={'path': 'proof.txt'}
+    )]
+    old_payload = workflow.model_dump(mode='json')
+    for edge in old_payload['columns'][0]['transitions']:
+        edge.pop('required_checks')
+    normalized = WorkflowDefinition.model_validate(old_payload)
+    assert [(item.column, item.check_key)
+            for item in normalized.column('work').transitions[0].required_checks] == [('work', 'legacy')]
+    assert normalized.column('work').transitions[1].required_checks == []

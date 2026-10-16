@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import sys
+from pathlib import Path
 
 import pytest
 
+from app.v1.capabilities import CapabilityContext, _files_search
+from app.v1.command_resolution import CommandNotFound
 from app.v1.files import ProjectFiles
-
+from app.v1.policy import ExecutionLimits
+from app.v1.process_runner import run_command
 
 def test_project_files_reject_escape_and_write_hash_tracked_atomic_content(tmp_path):
     files = ProjectFiles(str(tmp_path / "project"))
@@ -141,3 +147,104 @@ def test_project_files_verify_text_routes_missing_file_as_mismatch(tmp_path):
         "path": "not-created-yet.txt",
         "exists": False,
     }
+
+
+# ---------------------------------------------------------------------------
+# Command resolution
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows batch launcher')
+@pytest.mark.parametrize('prefix',['./','.\\'])
+def test_explicit_current_directory_shim_uses_project_cwd(tmp_path, prefix):
+    project = tmp_path/'project with spaces'
+    project.mkdir()
+    (project/'local-shim.cmd').write_text('@echo off\r\necho shim-ok %1\r\nexit /b 7\r\n')
+    result = run_command([prefix+'local-shim.cmd','a & b'],project,ExecutionLimits())
+    assert result['exit_code'] == 7
+    assert 'shim-ok "a & b"' in result['stdout']
+
+
+def test_native_unicode_quotes_and_metacharacters_remain_literal(tmp_path):
+    arguments = ['中文 路径','say "yes"','a & b','%literal%!','尾部\\']
+    result = run_command([sys.executable,'-X','utf8','-c',
+        'import json,sys; print(json.dumps(sys.argv[1:],ensure_ascii=False))',*arguments],tmp_path,ExecutionLimits())
+    assert result['exit_code'] == 0
+    assert json.loads(result['stdout']) == arguments
+
+
+def test_missing_explicit_command_rejects_before_process_admission(tmp_path):
+    from contextlib import contextmanager
+    admitted = []
+    @contextmanager
+    def guard():
+        admitted.append(True)
+        yield
+    with pytest.raises(CommandNotFound):
+        run_command(['./does-not-exist-devwerk-eval.cmd'],tmp_path,ExecutionLimits(),guard=guard)
+    assert admitted == []
+
+
+def test_missing_system_command_does_not_leave_uncertain_execution(store, tmp_path):
+    from app.v1.capabilities import CapabilityContext
+
+    project = store.create_project('missing system command', '', str(tmp_path / 'project'))
+    result = store.registry.dispatch(
+        'system.command.run',
+        {'argv': ['./does-not-exist-devwerk-eval.cmd'], 'cwd': project['base_dir']},
+        CapabilityContext(project['id'], project, store, agent_run_id='arun_test'),
+    )
+
+    assert not result.ok
+    assert result.error['type'] == 'CommandNotFound'
+    assert result.checkpoint['failure_disposition'] == 'rejected_before_effect'
+    with store.connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM v1_execution_receipts WHERE project_id=? AND capability='system.command.run'",
+            (project['id'],),
+        ).fetchone()[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# Project search bounds
+# ---------------------------------------------------------------------------
+
+class _Checks:
+    def __init__(self):
+        self.calls = 0
+
+    def check(self):
+        self.calls += 1
+
+
+def test_default_project_search_keeps_project_directories_and_bounds_large_files(store, tmp_path):
+    project = store.create_project('bounded search', '', str(tmp_path / 'project'))
+    root = Path(project['base_dir'])
+    for relative, content in {
+        'src/LoginTest.java': 'class LoginTest { // target phrase\n}\n',
+        'frontend/node_modules/pkg/test.js': '// target phrase\n',
+        'frontend/.npm-cache/cache.txt': 'target phrase\n',
+        'backend/target/generated.java': '// target phrase\n',
+        '.devwerk/internal.txt': 'target phrase\n',
+    }.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding='utf-8')
+    (root / 'large.txt').write_text('target phrase\n' + 'x' * 1_000_001, encoding='utf-8')
+
+    files = ProjectFiles(project['base_dir'], store.policy)
+    paths = files.search_paths('**/*', limit=1000)
+    assert 'src/LoginTest.java' in paths
+    assert {'frontend/node_modules/pkg/test.js', 'frontend/.npm-cache/cache.txt',
+            'backend/target/generated.java'} <= set(paths)
+    assert '.devwerk/internal.txt' not in paths
+    assert len(files.search_paths('**/*', limit=1)) == 1
+    assert 'frontend/node_modules/pkg/test.js' in files.search_paths(
+        'frontend/node_modules/**/*.js', limit=1000)
+
+    checks = _Checks()
+    ctx = CapabilityContext(project['id'], project, store, execution_control=checks)
+    result = _files_search({'pattern': 'target phrase'}, ctx)
+    assert {match['path'] for match in result['matches']} == {
+        'src/LoginTest.java', 'frontend/node_modules/pkg/test.js',
+        'frontend/.npm-cache/cache.txt', 'backend/target/generated.java'}
+    assert checks.calls == len(paths)
