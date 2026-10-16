@@ -9,7 +9,7 @@ import pytest
 
 from app.v1.agent import AgentCore
 from app.v1.agent_models import AgentRunSpec
-from app.v1.capabilities import CapabilityContext
+from app.v1.capabilities import CapabilityContext, CapabilityEntry
 from app.v1.context_manager import ContextExhausted, ContextManager
 from app.v1.domain import AcceptanceCheck, AcceptanceObligation, AgentModelResponse, AgentToolCall
 from app.v1.runtime import WorkflowRuntime
@@ -76,10 +76,12 @@ def test_invalid_search_regex_is_a_tool_error_not_an_agent_crash(store, tmp_path
 def test_workflow_projection_keeps_acceptance_configuration_with_large_graph():
     from app.v1.context_manager import packed, project_result
     keys = ['backend_development', 'frontend_development', 'system_test', 'delivery', 'accept']
-    columns = [{'key': key, 'transitions': [{'when': 'x'*3000}],
+    columns = [{'key': key, 'transitions': [{'outcome':'ready','target':'done',
+                                            'required_checks':[{'column':key,'check_key':key+'_check'}],
+                                            'note':'x'*3000}],
                 'metadata': {'writable_paths': ['y'*2000]},
-                'acceptance_checks': [{'key': key+'_check', 'scenario_ids': ['S-01'],
-                                       'report_path': 'docs/'+key+'.json'}]} for key in keys]
+                'acceptance_checks': [{'key': key+'_check', 'capability':'project.files.read',
+                                       'arguments':{'path':'docs/'+key+'.md'}}]} for key in keys]
     source = {'ok': True, 'capability': 'workflow.inspect',
               'output': {'id': 'revision-4', 'definition_hash': 'digest',
                          'workflow_plan_id': 'plan', 'definition': {'columns': columns,
@@ -89,8 +91,8 @@ def test_workflow_projection_keeps_acceptance_configuration_with_large_graph():
     assert projected['output']['id'] == 'revision-4'
     assert projected['output']['definition_hash'] == 'digest'
     assert [item['key'] for item in projected['output']['column_contracts']] == keys
-    assert len(projected['output']['acceptance_obligations']) == 5
-    assert 'transitions' not in projected['output']['column_contracts'][0]
+    assert len(projected['output']['column_contracts'][0]['transitions'][0]['required_checks']) == 1
+    assert 'note' not in projected['output']['column_contracts'][0]['transitions'][0]
     assert projected['projection']['retrieve'] == 'agent.result.read'
 
 
@@ -169,32 +171,17 @@ def test_assignment_checkpoint_is_reloaded_after_store_restart(store, tmp_path):
     assert not any(m.get('tool_calls') for m in history)
 
 
-@pytest.mark.parametrize('variant',['valid','mismatch','skipped','missing','stale','source_changed','malformed'])
-def test_runtime_scenario_evidence_checks_real_report(store, tmp_path, variant):
-    project = store.create_project('reports','',str(tmp_path/'project'))
-    root = tmp_path/'project'
-    source = root/'test_behavior.py'
-    source.write_text('assert 401 == 401\n',encoding='utf-8')
-    report = {'schema_version':'devwerk.acceptance-report.v1','scenarios':[{'id':'login-failure','status':'passed',
-        'assertions':[{'expected':401,'actual':401}],
-        'test_source':{'path':source.name,'sha256':hashlib.sha256(source.read_bytes()).hexdigest()}}]}
-    if variant == 'mismatch': report['scenarios'][0]['assertions'][0]['actual'] = 429
-    if variant == 'skipped': report['scenarios'][0]['status'] = 'skipped'
-    if variant == 'missing': report['scenarios'] = []
-    if variant == 'source_changed': source.write_text('assert True\n')
-    if variant == 'malformed': report = []
-    script = "from pathlib import Path; Path('report.json').write_text("+repr(json.dumps(report))+",encoding='utf-8')"
-    if variant == 'stale':
-        (root/'report.json').write_text(json.dumps(report))
-        script = 'print("no tests executed")'
-    ctx = CapabilityContext(project['id'],project,store,execution_key='report-check')
-    result = run_acceptance_check(store.registry,ctx,{'capability':'project.command.run',
-        'arguments':{'argv':[sys.executable,'-c',script]},'report_path':'report.json','scenario_ids':['login-failure']})
-    assert result.ok == (variant == 'valid'), result
-    if result.ok:
-        assert result.output['scenario_evidence']['execution_key'] == 'report-check'
-    else:
-        assert result.error['type'] == 'AcceptanceEvidenceInvalid'
+
+
+def test_acceptance_check_uses_declared_tool_result_without_report_schema(store, tmp_path):
+    project = store.create_project('generic checks', '', str(tmp_path/'project'))
+    for exit_code in (0, 3):
+        ctx = CapabilityContext(project['id'], project, store, execution_key=f'check-{exit_code}')
+        result = run_acceptance_check(store.registry, ctx, {
+            'capability': 'project.command.run',
+            'arguments': {'argv': [sys.executable, '-c', f'import sys; sys.exit({exit_code})']},
+        })
+        assert result.ok == (exit_code == 0)
 
 
 def test_same_visit_feedback_resolves_only_after_new_acceptance(store, tmp_path):
@@ -227,8 +214,7 @@ def test_partial_acceptance_configure_preserves_graph_and_rejects_stale_base(sto
     project, plan, ctx = software_plan(store,tmp_path)
     before = store.get_workflow(project['id'])
     args = {'base_revision_id':before['id'],'base_digest':before['definition_hash'],
-            'columns':[{'key':'accept','acceptance_checks':before['definition']['columns'][-1]['acceptance_checks']}],
-            'acceptance_obligations':before['definition']['acceptance_obligations']}
+            'columns':[{'key':'accept','acceptance_checks':before['definition']['columns'][-1]['acceptance_checks']}]}
     result = store.registry.dispatch('workflow.acceptance.configure',args,ctx)
     assert result.ok, result.error
     after = store.get_workflow(project['id'])
@@ -250,25 +236,33 @@ def test_optional_acceptance_checks_can_be_configured_one_column_at_a_time(store
     empty = WorkflowDefinition.model_validate(complete['definition'])
     for column in empty.columns:
         column.acceptance_checks = []
+        for edge in column.transitions:
+            edge.required_checks = []
     empty.acceptance_obligations = []
     current = store.publish_workflow(project['id'], empty, complete['workflow_plan_id'])
     required = ['backend_development', 'frontend_development', 'system_test', 'delivery', 'accept']
     for index, key in enumerate(required):
+        original = next(item for item in complete['definition']['columns'] if item['key'] == key)
         configured = store.registry.dispatch('workflow.acceptance.configure', {
             'base_revision_id': current['id'], 'base_digest': current['definition_hash'],
-            'columns': [{'key': key, 'acceptance_checks': checks[key]}],
+            'columns': [{'key': key, 'acceptance_checks': checks[key],
+                         'transitions': [{'outcome': edge['outcome'],
+                                          'required_checks': edge['required_checks']}
+                                         for edge in original['transitions']]}],
         }, replace(ctx, execution_key=f'configure-stage-{index}'))
         assert configured.ok, configured.error
         assert configured.output['ready_for_task_plan'] is True
         assert configured.output['remaining_diagnostics'] == []
         current = store.get_workflow(project['id'])
         assert current['id'] == configured.output['id']
-        obligations = {(item['column'], item['check_key']): item['invalidated_by']
-                       for item in current['definition']['acceptance_obligations']}
-        assert set(column for column, _ in obligations) == set(required[:index + 1])
+        edge_checks = {(item['column'], item['check_key']): item['invalidated_by']
+                       for column in current['definition']['columns']
+                       for edge in column['transitions']
+                       for item in edge['required_checks']}
+        assert set(column for column, _ in edge_checks) == set(required[:index + 1])
         expected_invalidators = ([key] if key.endswith('_development')
                                  else ['backend_development', 'frontend_development'])
-        assert obligations[(key, 'verify_fixture')] == expected_invalidators
+        assert edge_checks[(key, 'verify_fixture')] == expected_invalidators
         plan.workflow_revision_id = current['id']
         validation = store.registry.dispatch('task.plan.validate',
             {'plan': plan.model_dump(mode='json')},
@@ -277,253 +271,16 @@ def test_optional_acceptance_checks_can_be_configured_one_column_at_a_time(store
         assert validation.output['valid'] is True
 
 
-def test_simple_behavior_runners_freeze_checks_and_derive_obligations(store, tmp_path):
-    from tests.test_task_entry_admission import software_plan
-    from app.v1.domain import WorkflowDefinition
-
-    project, plan, ctx = software_plan(store, tmp_path)
-    complete = store.get_workflow(project['id'])
-    empty = WorkflowDefinition.model_validate(complete['definition'])
-    for column in empty.columns:
-        column.acceptance_checks = []
-    empty.acceptance_obligations = []
-    current = store.publish_workflow(project['id'], empty, complete['workflow_plan_id'])
-    required = ['backend_development', 'frontend_development', 'system_test', 'delivery', 'accept']
-
-    def runner(key):
-        report = f'reports/{key}.json'
-        script = {'backend_development':'backend/acceptance.py',
-                  'frontend_development':'frontend/acceptance.py',
-                  'system_test':'scripts/acceptance/system_test.py',
-                  'delivery':'scripts/acceptance/system_test.py',
-                  'accept':'scripts/acceptance/system_test.py'}[key]
-        return {'column':key, 'argv':['python', script, '--report', report],
-            'report_path':report, 'scenario_ids':['entry-fixture'],
-            'purpose':f'Run real {key} assertions and write the fresh report'}
-
-    for index, batch in enumerate((required[:2], required[2:])):
-        result = store.registry.dispatch('workflow.acceptance.runners', {
-            'base_revision_id':current['id'], 'base_digest':current['definition_hash'],
-            'runners':[runner(key) for key in batch]},
-            replace(ctx, execution_key=f'runner-batch-{index}'))
-        assert result.ok, result.error
-        assert result.output['ready_for_task_plan'] is True
-        current = store.get_workflow(project['id'])
-    definition = WorkflowDefinition.model_validate(current['definition'])
-    for key in required:
-        check = definition.column(key).acceptance_checks[0]
-        assert check.evidence_kind == 'behavior' and check.launch_validation == 'deferred'
-        assert check.report_path in check.arguments['argv']
-        obligation = next(item for item in definition.acceptance_obligations
-            if item.column == key and item.check_key == check.key)
-        assert obligation.invalidated_by == ([key] if key.endswith('_development')
-            else ['backend_development','frontend_development'])
-    plan.workflow_revision_id = current['id']
-    validation = store.registry.dispatch('task.plan.validate',
-        {'plan':plan.model_dump(mode='json')}, replace(ctx, execution_key='runner-validate'))
-    assert validation.ok and validation.output['valid'], validation.error
-
-    stale = store.registry.dispatch('workflow.acceptance.runners', {
-        'base_revision_id':complete['id'], 'base_digest':complete['definition_hash'],
-        'runners':[runner('accept')]}, replace(ctx, execution_key='runner-stale'))
-    assert not stale.ok and 'WorkflowRevisionChanged' in str(stale.error)
 
 
-def test_simple_behavior_runner_rejects_missing_report_argument_and_fake_check(store, tmp_path):
-    from tests.test_task_entry_admission import software_plan
-    from app.v1.domain import WorkflowDefinition
-    project, _, ctx = software_plan(store, tmp_path)
-    current = store.get_workflow(project['id'])
-    report = 'reports/backend.json'
-    base = {'base_revision_id':current['id'], 'base_digest':current['definition_hash']}
-    runner = {'column':'backend_development', 'argv':['python','backend/acceptance.py'],
-        'report_path':report, 'scenario_ids':['entry-fixture'], 'purpose':'Compile backend'}
-    missing = store.registry.dispatch('workflow.acceptance.runners',
-        {**base,'runners':[runner]}, replace(ctx, execution_key='runner-no-report'))
-    assert not missing.ok and 'BehaviorRunnerReportArgumentMissing' in str(missing.error)
-    fake = store.registry.dispatch('workflow.acceptance.runners',
-        {**base,'runners':[{**runner,'argv':['echo',report]}]},
-        replace(ctx, execution_key='runner-echo'))
-    assert not fake.ok and 'BehaviorRunnerScriptMissing' in str(fake.error)
-    for name, argv in [('maven',['mvnw.cmd','test','--report',report]),
-                       ('npm',['npm','test','--report',report])]:
-        rejected = store.registry.dispatch('workflow.acceptance.runners',
-            {**base,'runners':[{**runner,'argv':argv}]},
-            replace(ctx, execution_key=f'runner-{name}'))
-        assert not rejected.ok and 'BehaviorRunnerScriptMissing' in str(rejected.error)
-    outside = store.registry.dispatch('workflow.acceptance.runners',
-        {**base,'runners':[{**runner,'argv':['python','../outside.py',report]}]},
-        replace(ctx, execution_key='runner-outside'))
-    assert not outside.ok and 'escapes project' in str(outside.error)
-    unowned = store.registry.dispatch('workflow.acceptance.runners',
-        {**base,'runners':[{**runner,'argv':['python','scripts/backend_acceptance.py',report]}]},
-        replace(ctx, execution_key='runner-unowned'))
-    assert not unowned.ok and 'BehaviorRunnerScriptUnowned' in str(unowned.error)
-    ctx.files.write_text('scripts/preexisting.py', 'print("ready")\n')
-    existing = store.registry.dispatch('workflow.acceptance.runners',
-        {**base,'runners':[{**runner,'argv':['python','scripts/preexisting.py',report]}]},
-        replace(ctx, execution_key='runner-existing'))
-    assert not existing.ok and 'BehaviorRunnerScriptUnowned' in str(existing.error)
-    assert store.get_workflow(project['id'])['id'] == current['id']
-    current = store.get_workflow(project['id'])
-    base = {'base_revision_id':current['id'], 'base_digest':current['definition_hash']}
-    no_scenarios = store.registry.dispatch('workflow.acceptance.runners',
-        {**base,'runners':[{**runner,'argv':['python','backend/acceptance.py',report],
-            'scenario_ids':[]}]}, replace(ctx, execution_key='runner-no-scenarios'))
-    assert not no_scenarios.ok
-    assert store.get_workflow(project['id'])['id'] == current['id']
-    node = store.registry.dispatch('workflow.acceptance.runners',
-        {**base,'runners':[{**runner,'argv':['node','backend/acceptance.mjs',report]}]},
-        replace(ctx, execution_key='runner-node'))
-    assert node.ok, node.error
-    current = store.get_workflow(project['id'])
-    ps_report = 'reports/frontend.json'
-    powershell = store.registry.dispatch('workflow.acceptance.runners', {
-        'base_revision_id':current['id'],'base_digest':current['definition_hash'],
-        'runners':[{**runner,'column':'frontend_development',
-            'argv':['powershell','-ExecutionPolicy','Bypass','-File',
-                'frontend/acceptance.ps1','-Report',ps_report],
-            'report_path':ps_report}]}, replace(ctx, execution_key='runner-powershell'))
-    assert powershell.ok, powershell.error
-    current = store.get_workflow(project['id'])
-    unrestricted = WorkflowDefinition.model_validate(current['definition'])
-    unrestricted.column('backend_development').metadata.pop('writable_paths')
-    current = store.publish_workflow(project['id'], unrestricted, current['workflow_plan_id'])
-    flexible = store.registry.dispatch('workflow.acceptance.runners', {
-        'base_revision_id':current['id'], 'base_digest':current['definition_hash'],
-        'runners':[{**runner, 'argv':['python','scripts/unrestricted.py',report]}]},
-        replace(ctx, execution_key='runner-unrestricted'))
-    assert flexible.ok, flexible.error
 
 
-def test_advanced_acceptance_editor_rejects_unowned_script(store, tmp_path):
-    from tests.test_task_entry_admission import software_plan
-
-    project, _, ctx = software_plan(store, tmp_path)
-    current = store.get_workflow(project['id'])
-    check = {'key':'verify_fixture', 'capability':'project.command.run',
-        'arguments':{'argv':['python','tests/backend_acceptance.py','--report','reports/backend.json']},
-        'evidence_kind':'behavior', 'purpose':'Run backend assertions',
-        'scenario_ids':['entry-fixture'], 'report_path':'reports/backend.json',
-        'launch_validation':'deferred'}
-    base = {'base_revision_id':current['id'], 'base_digest':current['definition_hash']}
-    rejected = store.registry.dispatch('workflow.acceptance.configure',
-        {**base, 'columns':[{'key':'backend_development', 'acceptance_checks':[check]}]},
-        replace(ctx, execution_key='advanced-unowned'))
-    assert not rejected.ok and 'BehaviorRunnerScriptUnowned' in str(rejected.error)
-    assert store.get_workflow(project['id'])['id'] == current['id']
-    direct_definition = copy.deepcopy(current['definition'])
-    next(col for col in direct_definition['columns'] if col['key'] == 'backend_development')['acceptance_checks'] = [check]
-    direct = store.registry.dispatch('workflow.publish', {
-        'workflow_plan_id': current['workflow_plan_id'], 'workflow': direct_definition},
-        replace(ctx, execution_key='direct-unowned'))
-    assert not direct.ok and 'BehaviorRunnerScriptUnowned' in str(direct.error)
-    assert store.get_workflow(project['id'])['id'] == current['id']
-    check['arguments']['argv'][1] = 'backend/acceptance.py'
-    accepted = store.registry.dispatch('workflow.acceptance.configure',
-        {**base, 'columns':[{'key':'backend_development', 'acceptance_checks':[check]}]},
-        replace(ctx, execution_key='advanced-owned'))
-    assert accepted.ok, accepted.error
 
 
-def test_direct_acceptance_script_uses_same_column_ownership_rule(store, tmp_path):
-    from tests.test_task_entry_admission import software_plan
-
-    project, _, ctx = software_plan(store, tmp_path)
-    current = store.get_workflow(project['id'])
-    base = {'base_revision_id': current['id'], 'base_digest': current['definition_hash']}
-    report = 'reports/backend.json'
-    runner = {'column': 'backend_development',
-              'argv': ['scripts/run-backend-tests.bat', '--report', report],
-              'report_path': report, 'scenario_ids': ['entry-fixture'],
-              'purpose': 'Run backend behavior assertions'}
-    ctx.files.write_text('scripts/run-backend-tests.bat', '@echo off\r\nexit /b 0\r\n')
-    rejected = store.registry.dispatch('workflow.acceptance.runners',
-        {**base, 'runners': [runner]}, replace(ctx, execution_key='direct-unowned-runner'))
-    assert not rejected.ok and 'BehaviorRunnerScriptUnowned' in str(rejected.error)
-    assert store.get_workflow(project['id'])['id'] == current['id']
-    definition = copy.deepcopy(current['definition'])
-    next(col for col in definition['columns'] if col['key'] == 'backend_development')[
-        'acceptance_checks'][0]['arguments']['argv'] = runner['argv']
-    direct = store.registry.dispatch('workflow.publish', {
-        'workflow_plan_id': current['workflow_plan_id'], 'workflow': definition},
-        replace(ctx, execution_key='direct-unowned-publish'))
-    assert not direct.ok and 'BehaviorRunnerScriptUnowned' in str(direct.error)
-    owned = {**runner, 'argv': ['backend/run-backend-tests.bat', '--report', report]}
-    accepted = store.registry.dispatch('workflow.acceptance.runners',
-        {**base, 'runners': [owned]}, replace(ctx, execution_key='direct-owned-runner'))
-    assert accepted.ok, accepted.error
 
 
-def test_advanced_acceptance_requires_separate_report_argument(store, tmp_path):
-    from tests.test_task_entry_admission import software_plan
-
-    project, _, ctx = software_plan(store, tmp_path)
-    current = store.get_workflow(project['id'])
-    base = {'base_revision_id': current['id'], 'base_digest': current['definition_hash']}
-    original = next(col for col in current['definition']['columns']
-                    if col['key'] == 'backend_development')['acceptance_checks'][0]
-    check = copy.deepcopy(original)
-    check['report_path'] = 'reports/backend.json'
-    for label, argv in [('embedded', ['python', 'backend/check.py', '--report=reports/backend.json']),
-                        ('missing', ['python', 'backend/check.py'])]:
-        check['arguments']['argv'] = argv
-        denied = store.registry.dispatch('workflow.acceptance.configure', {
-            **base, 'columns': [{'key': 'backend_development', 'acceptance_checks': [check]}]},
-            replace(ctx, execution_key=f'report-arg-{label}'))
-        assert not denied.ok and 'BehaviorRunnerReportArgumentMissing' in str(denied.error)
-        assert store.get_workflow(project['id'])['id'] == current['id']
-    definition = copy.deepcopy(current['definition'])
-    next(col for col in definition['columns'] if col['key'] == 'backend_development')[
-        'acceptance_checks'] = [check]
-    direct = store.registry.dispatch('workflow.publish', {
-        'workflow_plan_id': current['workflow_plan_id'], 'workflow': definition},
-        replace(ctx, execution_key='report-arg-direct'))
-    assert not direct.ok and 'BehaviorRunnerReportArgumentMissing' in str(direct.error)
-    check['arguments']['argv'] = ['python', 'backend/check.py', '--report', 'reports/backend.json']
-    accepted = store.registry.dispatch('workflow.acceptance.configure', {
-        **base, 'columns': [{'key': 'backend_development', 'acceptance_checks': [check]}]},
-        replace(ctx, execution_key='report-arg-owned'))
-    assert accepted.ok, accepted.error
 
 
-def test_rejects_one_backend_runner_as_distinct_frontend_and_delivery_proof(store, tmp_path):
-    from tests.test_task_entry_admission import software_plan
-    from app.v1.domain import WorkflowDefinition, WorkflowPlan
-    from app.v1.services.task_plan_compiler import acceptance_diagnostics
-    project, _, ctx = software_plan(store, tmp_path)
-    current = store.get_workflow(project['id'])
-    definition = WorkflowDefinition.model_validate(current['definition'])
-    definition.column('frontend_development').acceptance_checks[0].scenario_ids = ['frontend-ui']
-    definition.column('delivery').acceptance_checks[0].scenario_ids = ['delivery-cleanup']
-    method = WorkflowPlan.model_validate(store.get_workflow_plan(
-        project['id'], current['workflow_plan_id'])['plan'])
-    errors = acceptance_diagnostics(definition, method)
-    assert sum('AcceptanceEvidenceScopeCollision' in error['message'] for error in errors) == 2
-    args = {'base_revision_id':current['id'], 'base_digest':current['definition_hash'],
-            'columns':[{'key':column.key, 'acceptance_checks':[check.model_dump(mode='json')
-                        for check in column.acceptance_checks]} for column in definition.columns
-                       if column.key in {'frontend_development','delivery'}],
-            'acceptance_obligations':[item.model_dump(mode='json')
-                                      for item in definition.acceptance_obligations]}
-    rejected = store.registry.dispatch('workflow.acceptance.configure', args, ctx)
-    assert not rejected.ok and 'AcceptanceEvidenceScopeCollision' in str(rejected.error)
-    assert store.get_workflow(project['id'])['id'] == current['id']
-    published = store.registry.dispatch('workflow.publish', {
-        'workflow_plan_id': current['workflow_plan_id'],
-        'workflow': definition.model_dump(mode='json')},
-        replace(ctx, execution_key='direct-collision-publication'))
-    assert not published.ok and 'AcceptanceEvidenceScopeCollision' in str(published.error)
-    assert store.get_workflow(project['id'])['id'] == current['id']
-    definition.column('frontend_development').acceptance_checks[0].arguments['argv'].append('frontend-test')
-    definition.column('delivery').acceptance_checks[0].arguments['argv'].append('delivery-test')
-    assert not acceptance_diagnostics(definition, method)
-    for key in ('backend_development', 'frontend_development', 'delivery'):
-        check = definition.column(key).acceptance_checks[0]
-        check.arguments['argv'] = ['python', '-m', 'pytest', 'all_tests.py', check.report_path]
-        definition.column(key).acceptance_checks[0].scenario_ids = ['one', 'two']
-    definition.column('frontend_development').acceptance_checks[0].scenario_ids.reverse()
-    assert not acceptance_diagnostics(definition, method)
 
 
 def test_task_plan_validation_accepts_worker_selected_checks_without_writes(store, tmp_path):
@@ -532,7 +289,10 @@ def test_task_plan_validation_accepts_worker_selected_checks_without_writes(stor
     project, plan, ctx = software_plan(store,tmp_path)
     before = store.get_workflow(project['id'])
     definition = WorkflowDefinition.model_validate(before['definition'])
-    for column in definition.columns: column.acceptance_checks = []
+    for column in definition.columns:
+        column.acceptance_checks = []
+        for edge in column.transitions:
+            edge.required_checks = []
     definition.acceptance_obligations = []
     revision = store.publish_workflow(project['id'],definition,before['workflow_plan_id'])
     plan.workflow_revision_id = revision['id']
@@ -549,12 +309,16 @@ def test_planning_projection_preserves_required_schema_and_revision(store, tmp_p
     view = json.loads(project_result(packed({'ok':True,'capability':'loop.inspect','output':loop}),6900))
     assert view['output']['parameter_schema'] == loop['parameter_schema']
     assert view['output']['task_contract'] == loop['bundle']['workflow_plan']['task_contract']
+    assert view['output']['flow_unit'] == loop['bundle']['workflow_plan']['flow_unit']
+    assert view['output']['input'] == loop['input']
+    assert view['output']['selection_guide'] == loop['selection_guide']
     assert 'acceptance-report.md' in view['output']['assets']
     repeated = json.loads(project_result(packed(view), max(3000,len(packed(view).encode('utf8'))-50)))
     assert repeated['ok'] is True
     applied = store.apply_loop(project['id'],'software.ddd_delivery',{'product_name':'demo','delivery_target':'local'})
     view = json.loads(project_result(packed({'ok':True,'capability':'loop.apply','output':applied}),6900))
     assert view['output']['workflow']['definition_hash'] == applied['workflow']['definition_hash']
+    assert view['output']['workflow_plan']['flow_unit'] == applied['workflow_plan']['plan']['flow_unit']
     assert len(packed(view)) < 5000
 
 
@@ -578,6 +342,25 @@ def test_old_receipt_cannot_resolve_new_feedback_in_same_visit(store, tmp_path):
     store.feedback.record_check(spec,'check','after-feedback',result)
     with store.connect() as db:
         assert store.feedback.verified(db,task,'work','check',current_run=run['id'],after_check_rowid=feedback['observed_check_rowid'])
+
+
+def test_impact_run_uses_registered_effect_kind_not_capability_name(store, tmp_path):
+    from tests.test_agent_recovery_and_fencing import begin_agent
+    project = store.create_project('external effect', '', str(tmp_path/'project'))
+    workflow = agent_workflow()
+    publish_planned_workflow(store, project['id'], workflow)
+    task = create_planned_task(store, project['id'], 'effect check')
+    task = store.claim_task(task['id'], 'test-worker')
+    run = store.begin_run(task, {})
+    agent = begin_agent(store, project, kind='column', task_id=task['id'], column_run_id=run['id'])
+    store.registry.register(CapabilityEntry(
+        id='external.artifact.update', description='Update an external artifact',
+        input_schema={'type': 'object'}, output_schema={'type': 'object'},
+        handler=lambda args, ctx: {}, side_effect_kind='write'))
+    store.record_tool_invocation(agent_run_id=agent['id'], tool_call_id='update',
+        capability='external.artifact.update', arguments={}, result={'ok': True}, ok=True)
+    with store.connect() as db:
+        assert store.feedback._latest_impact_run(db, task['id'], 'work')['id'] == run['id']
 
 
 def test_unknown_provider_requires_explicit_context_window(monkeypatch):
@@ -624,53 +407,8 @@ def test_second_overflow_stops_without_effect_replay(store, tmp_path):
         assert db.execute('SELECT error_code FROM v1_column_attempts').fetchone()[0] == 'LLM_CONTEXT_WINDOW_EXCEEDED'
 
 
-@pytest.mark.parametrize('argv', [
-    ['cmd','/c','dir','FINAL_ACCEPTANCE.md'], ['cmd.exe','/c','dir README.md'],
-    ['mvn','package','-DskipTests'], ['mvn','test','-Dmaven.test.skip=true'],
-    ['cmd','/c','cmd /c if exist FINAL_ACCEPTANCE.md (echo OK)'],
-    ['cmd.exe','/d','/s','/c','"cmd /c if exist "folder name/report.json" (echo OK)"'],
-    ['mvnw.cmd','clean','compile','-q'],
-    ['cmd','/c','echo Backend JUnit T-01~T-10 passed'],
-    ['cmd','/c','type README.md'],
-    ['cmd','/c','findstr /C:"Windows" README.md 2>&1'],
-])
-def test_obviously_nonbehavior_commands_are_rejected_at_admission(argv):
-    from app.v1.services.task_plan_compiler import known_nonbehavior_command
-    assert known_nonbehavior_command(argv).startswith('NonBehaviorCheck:')
-    assert known_nonbehavior_command(['mvn','test','-DskipTests=false']) is None
-    assert known_nonbehavior_command(['cmd','/c','dir README.md && python verify.py']) is None
-    assert known_nonbehavior_command(['cmd','/c','if exist report.json (echo OK) && python verify.py']) is None
-    assert known_nonbehavior_command(['cmd','/c','echo preparing && python verify.py']) is None
-    assert known_nonbehavior_command(['mvn','compile','test']) is None
-    assert known_nonbehavior_command(['mvn','compile','-Pacceptance']) is None
-    assert known_nonbehavior_command(['npm.cmd','run','build']) is None
 
 
-def test_software_workflow_rejects_echo_behavior_before_publication(store, tmp_path):
-    from tests.test_task_entry_admission import software_plan
-    from app.v1.domain import WorkflowDefinition, WorkflowPlan
-    from app.v1.services.task_plan_compiler import acceptance_diagnostics
-    project, _, ctx = software_plan(store, tmp_path)
-    current = store.get_workflow(project['id'])
-    definition = WorkflowDefinition.model_validate(current['definition'])
-    check = definition.column('backend_development').acceptance_checks[0]
-    check.arguments['argv'] = ['cmd', '/c', 'echo Backend JUnit tests passed']
-    method = WorkflowPlan.model_validate(store.get_workflow_plan(
-        project['id'], current['workflow_plan_id'])['plan'])
-    assert any('NonBehaviorCheck:' in issue['message'] for issue in acceptance_diagnostics(definition, method))
-    denied = store.registry.dispatch('workflow.acceptance.configure', {
-        'base_revision_id': current['id'], 'base_digest': current['definition_hash'],
-        'columns': [{'key': 'backend_development', 'acceptance_checks': [check.model_dump(mode='json')]}],
-        'acceptance_obligations': current['definition']['acceptance_obligations'],
-    }, ctx)
-    assert not denied.ok and 'NonBehaviorCheck:' in str(denied.error)
-    assert store.get_workflow(project['id'])['id'] == current['id']
-    direct = store.registry.dispatch('workflow.publish', {
-        'workflow_plan_id': current['workflow_plan_id'],
-        'workflow': definition.model_dump(mode='json')},
-        replace(ctx, execution_key='echo-direct-publish'))
-    assert not direct.ok and 'NonBehaviorCheck:' in str(direct.error)
-    assert store.get_workflow(project['id'])['id'] == current['id']
 
 
 def test_checkpoint_notes_share_the_whole_summary_budget(store, tmp_path):

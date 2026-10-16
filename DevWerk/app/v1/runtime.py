@@ -38,7 +38,6 @@ from app.v1.domain import (
     ContextSelection,
     EventWaitPolicy,
     PollWaitPolicy,
-    TaskPlan,
     TimerWaitPolicy,
     ToolResult,
     WorkflowDefinition,
@@ -168,7 +167,6 @@ class WorkflowRuntime:
                 context["last_error"] = _failure_message(output)
             persisted_output = {**output, "context": context}
             if terminal:
-                self._validate_task_agent_terminal(task, terminal)
                 terminal_error = context.get("last_error") if terminal == "failed" else None
                 evidence = self.store.prepare_terminal_evidence(task, run["id"], terminal, persisted_output, terminal_error)
                 self.store.finish_run(
@@ -452,10 +450,6 @@ class WorkflowRuntime:
                     remaining_chars,
                     limit=remaining_files,
                     exclude_paths=seen_paths,
-                    exclude_directories={
-                        'node_modules', 'dist', 'target', 'build', '.venv', 'venv',
-                        '.next', '.cache', 'coverage',
-                    },
                 )
                 for item in selected:
                     artifact_channels["reference_artifacts"].append({
@@ -663,8 +657,12 @@ class WorkflowRuntime:
         workflow = self.store.workflow_by_id(task['project_id'],task['workflow_revision_id'])
         column = workflow.column(task['current_column'])
         transition = next((edge for edge in column.transitions if edge.outcome == outcome),None)
-        if transition and not transition.allows_unresolved_failures:
+        if transition and transition.required_checks:
+            required_keys = {item.check_key for item in transition.required_checks
+                             if item.column == column.key}
             for check in column.acceptance_checks:
+                if check.key not in required_keys:
+                    continue
                 execution_key = f"{run['id']}:acceptance:{check.key}:{time.monotonic_ns()}"
                 ctx = CapabilityContext(**{**capability_context.__dict__, 'execution_key':execution_key})
                 from app.v1.services.acceptance_execution import run_acceptance_check
@@ -736,8 +734,6 @@ class WorkflowRuntime:
         assert isinstance(column.executor, AgentExecutor)
         project = self.store.get_project(task["project_id"])
         workflow_row = self.store.get_workflow_revision(task["project_id"], task["workflow_revision_id"])
-        method = WorkflowPlan.model_validate(self.store.get_workflow_plan(
-            task["project_id"], workflow_row["workflow_plan_id"])["plan"])
         assignment = self.store.agents.assign(task, run, column)
         session = {"id": assignment["session_id"]}
         agent_input = input_data
@@ -767,13 +763,8 @@ class WorkflowRuntime:
                     **({'feedback_contract':{
                         'responsible_columns':[c.key for c in workflow.columns],
                         'checks':[{'column':c.key,'check_key':check.key,'purpose':check.purpose[:500]}
-                                  for c in workflow.columns for check in c.acceptance_checks] +
-                                 [{'column':key,'check_key':'runtime.behavior',
-                                   'purpose':'Re-run real behavior commands after repair in this Column'}
-                                  for key in method.task_contract.required_behavior_columns
-                                  if not any(check.evidence_kind == 'behavior'
-                                             for check in workflow.column(key).acceptance_checks)],
-                        'instruction':'Before reporting a defect/rework outcome, persist task.feedback.record with a responsible Column and a frozen check or runtime.behavior reference. Read existing feedback to avoid duplicates. Runtime handles the declared handoff; do not send instructions through Mailbox or run other Workers.'}}
+                                  for c in workflow.columns for check in c.acceptance_checks],
+                         'instruction':'Record concrete defects for Conversation Agent supervision. Recording feedback does not choose a route or block a terminal edge. Submit the outcome of this Column using a declared Workflow transition; choose a rework outcome when this Column cannot satisfy its selected edge. Runtime handles handoff; do not send instructions through Mailbox or run other Workers.'}}
                        if 'task.feedback.record' in column.executor.capabilities else {}),
                 },
                 runtime_ledger=runtime_ledger,
@@ -784,8 +775,7 @@ class WorkflowRuntime:
                 execution_control=ExecutionControl(
                     time.monotonic() + self.policy.execution.agent_wall_seconds,
                     validate_owner=lambda: self.store.agents.assert_owner(assignment)),
-                completion_contract=_column_completion_contract(
-                    workflow, column, method.task_contract.required_behavior_columns),
+                completion_contract=_column_completion_contract(workflow, column),
                 wait_config=column.wait_policy.model_dump(mode="json") if column.wait_policy else {},
                 agent_session_id=session["id"] if session else None,
                 assignment=assignment,
@@ -1074,39 +1064,12 @@ class WorkflowRuntime:
     def _finish_await_transition(self, task: dict[str, Any], run_id: str, workflow: WorkflowDefinition, target: str, output: dict[str, Any], outcome: str) -> None:
         terminal = workflow.terminal_kind(target)
         if terminal:
-            self._validate_task_agent_terminal(task, terminal)
             error = _failure_message(output) if terminal == "failed" else None
             evidence = self.store.prepare_terminal_evidence(task, run_id, terminal, output, error)
             self.store.finish_run(task, run_id, output, outcome, target, terminal=terminal, error=error, terminal_artifact=evidence)
         else:
             workflow.column(target)
             self.store.finish_run(task, run_id, output, outcome, target)
-
-    def _validate_task_agent_terminal(self, task: dict[str, Any], terminal: str) -> None:
-        if terminal != "done":
-            return
-        plan = TaskPlan.model_validate(
-            self.store.get_task_plan(
-                task["project_id"],
-                task["task_plan_id"],
-            )["plan"]
-        )
-        proposed = next(
-            item
-            for item in plan.tasks
-            if item.proposed_task_ref == task["proposed_task_ref"]
-        )
-        agent_run_count = len(
-            self.store.agent_runs(project_id=task["project_id"], task_id=task["id"])
-        )
-        if proposed.agent_execution == "forbidden" and agent_run_count:
-            raise ValueError(
-                f"Task Agent execution is forbidden but {agent_run_count} Task Agent Run(s) exist"
-            )
-        if proposed.agent_execution == "required" and not agent_run_count:
-            raise ValueError(
-                "Task Agent execution is required before the Task can reach done"
-            )
 
     def _await_auxiliary(self, task: dict[str, Any], handle: dict[str, Any], kind: str) -> dict[str, Any] | None:
         capability = handle.get(f"{kind}_capability")
@@ -1275,7 +1238,6 @@ def _failure_message(output: dict[str, Any]) -> str:
 def _column_completion_contract(
     workflow: WorkflowDefinition,
     column: ColumnDefinition,
-    required_behavior_columns: list[str] | None = None,
 ) -> CompletionContract:
     rules: dict[str, CompletionOutcomeRule] = {}
     for transition in column.transitions:
@@ -1289,13 +1251,8 @@ def _column_completion_contract(
             allows_unresolved_failures=(
                 transition.allows_unresolved_failures or terminal_failure
             ),
-            required_capability=(
-                'project.command.run'
-                if column.key in (required_behavior_columns or [])
-                and not transition.allows_unresolved_failures and not terminal_failure
-                and not any(check.evidence_kind == 'behavior' for check in column.acceptance_checks)
-                else None
-            ),
+            required_checks=tuple(item.check_key for item in transition.required_checks
+                                  if item.column == column.key),
         )
     return CompletionContract(
         tool_name="column.complete",

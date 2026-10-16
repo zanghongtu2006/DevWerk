@@ -77,9 +77,11 @@ class AgentExecutionRunner:
             iteration = 0
             report_rejections = 0
             empty_responses = 0
-            force_reply_tool = spec.kind == 'conversation' and any(
-                entry['ok'] and entry['capability'] in QUEUED_TASK_CAPABILITIES
-                for entry in prepared.logical_ledger
+            column_text_responses = 0
+            force_reply_tool = spec.kind == 'conversation' and (
+                any(entry['ok'] and entry['capability'] in QUEUED_TASK_CAPABILITIES
+                    for entry in prepared.logical_ledger)
+                or self._active_worker_handoff(spec, prepared.logical_ledger)
             )
             scope_id = spec.column_run_id or spec.conversation_job_id or run["id"]
             adopt_legacy_intents(self.store, self.registry, spec, run['id'])
@@ -152,6 +154,7 @@ class AgentExecutionRunner:
                         operation_ids = self.store.agents.prepare_operations(spec.project["id"], scope_id, run["id"], source_message['sequence'], response.tool_calls)
 
                 if response.tool_calls:
+                    column_text_responses = 0
                     control.check()
                     if calls_used + len(response.tool_calls) > max_tool_calls:
                         raise ExecutionBudgetExceeded("Agent tool-call ceiling reached")
@@ -181,12 +184,14 @@ class AgentExecutionRunner:
                         for entry in batch.ledger_entries
                     ):
                         force_reply_tool = True
+                    if spec.kind == 'conversation' and self._active_worker_handoff(spec, batch.ledger_entries):
+                        force_reply_tool = True
                     if spec.supervision_turn:
                         recovery = next((entry for entry in batch.ledger_entries
-                            if entry['ok'] and entry['capability'] in {'task.retry','task.reopen'}), None)
+                            if entry['ok'] and entry['capability'] in {'task.retry','task.reopen','task.successor'}), None)
                         if recovery:
                             from app.v1.conversation_report import render_report
-                            task_id = spec.context['turn_contract']['supervised_task_id']
+                            task_id = (recovery['facts']['result'].get('output') or {}).get('id') if recovery['capability'] == 'task.successor' else spec.context['turn_contract']['supervised_task_id']
                             report_text = json.dumps({'mode':'work_result','task_ids':[task_id],
                                 'tool_call_ids':[recovery['tool_call_id']]})
                             rendered, evidence = render_report(self.store, spec.project['id'],
@@ -196,9 +201,19 @@ class AgentExecutionRunner:
                     continue
 
                 if spec.kind == "column":
-                    raise RuntimeError(
-                        f"Column Agent ended without calling {completion_tool_name}"
+                    column_text_responses += 1
+                    if column_text_responses >= 3:
+                        raise RuntimeError(
+                            f"Column Agent ended without calling {completion_tool_name}"
+                        )
+                    correction = (
+                        f"This Column has no plain-text reply channel. Your last message did not complete it. "
+                        f"Continue any missing work with tools, then call {completion_tool_name} with a declared "
+                        "outcome and real evidence. A diagnostic summary alone cannot advance the Workflow."
                     )
+                    messages.append({'role': 'user', 'content': correction})
+                    self.store.add_agent_message(run['id'], 'user', correction, [], emit_progress=False)
+                    continue
                 text = response.text.strip()
                 if not text:
                     empty_responses += 1
@@ -259,6 +274,25 @@ class AgentExecutionRunner:
                 checkpoint=checkpoint,
             )
             raise
+
+    def _active_worker_handoff(self, spec: AgentRunSpec, entries: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> bool:
+        if not spec.user_initiated or spec.supervision_turn:
+            return False
+        for entry in entries:
+            if not entry.get('ok') or entry.get('capability') != 'agent.worker.send':
+                continue
+            worker_id = ((entry.get('facts') or {}).get('arguments') or {}).get('worker_id')
+            if not worker_id:
+                continue
+            with self.store.connect() as db:
+                row = db.execute('''SELECT task.status FROM v1_agent_assignments assignment
+                    JOIN v1_tasks task ON task.id=assignment.task_id
+                    WHERE assignment.project_id=? AND assignment.agent_instance_id=?
+                    ORDER BY assignment.rowid DESC LIMIT 1''',
+                    (spec.project['id'], worker_id)).fetchone()
+            if row and row['status'] in {'pending', 'running', 'waiting'}:
+                return True
+        return False
 
     @staticmethod
     def _bounded_request(control, request, *args, **kwargs):

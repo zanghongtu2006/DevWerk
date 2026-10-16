@@ -34,13 +34,15 @@ def validate_entry_evidence(store, project_id, plan, method):
                 receipt = db.execute('SELECT * FROM v1_execution_receipts WHERE project_id=? AND execution_key=?',
                                      (project_id, task.entry_evidence[rule.key])).fetchone()
                 if not receipt or receipt['status'] != 'completed' or receipt['capability'] != 'project.files.write':
-                    candidates = []
-                    for row in db.execute("SELECT * FROM v1_execution_receipts WHERE project_id=? AND capability='project.files.write' AND status='completed' ORDER BY started_at DESC LIMIT 20", (project_id,)):
-                        decoded = store._decode(dict(row), 'arguments_json', 'result_json')
-                        if decoded['arguments'].get('path') == resolve_input_pointer(task.input, rule.input_pointer):
-                            candidates.append(decoded['execution_key'])
-                    raise ValueError(f'EntryEvidenceFileMissing: {rule.key} requires the write execution_key, not an artifact ID. '
-                        f'Available write receipts at this input path: {candidates}. Use the matching accepted-scope receipt; other checks still apply.')
+                    path = resolve_input_pointer(task.input, rule.input_pointer)
+                    candidates = [row['execution_key'] for row in db.execute(
+                        "SELECT execution_key FROM v1_execution_receipts WHERE project_id=? "
+                        "AND capability='project.files.write' AND status='completed' "
+                        "AND json_extract(arguments_json, '$.path')=? ORDER BY started_at DESC LIMIT 5",
+                        (project_id, path))]
+                    raise ValueError(f'EntryEvidenceFileMissing: {rule.key} requires the write execution_key '
+                        f'for Task input path {path!r}, not a path or artifact ID. Matching write receipts: {candidates}. '
+                        'Use one belonging to the current accepted scope grant; other checks still apply.')
                 receipt = store._decode(dict(receipt), 'arguments_json', 'result_json')
                 operation = db.execute('SELECT source_run_id FROM v1_agent_operations WHERE id=? AND project_id=?',
                     (receipt['execution_key'], project_id)).fetchone()

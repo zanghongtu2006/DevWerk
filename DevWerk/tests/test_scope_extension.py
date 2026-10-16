@@ -99,6 +99,45 @@ def test_scope_extension_without_loop_keeps_workflow_and_requirement_history(sto
 
 
 @pytest.mark.parametrize('prior_status', ['done', 'pending'])
+def test_new_requirement_handover_and_task_creation_in_one_turn(store, tmp_path, prior_status):
+    project = store.create_project('Same-turn handover', '', str(tmp_path / prior_status))
+    ctx, old_req = turn(store, project)
+    definition = agent_workflow()
+    method = invoke(ctx, 'workflow.plan.save', {'plan': workflow_plan(definition).model_dump(mode='json')})
+    old_workflow = invoke(ctx, 'workflow.publish', {
+        'workflow_plan_id': method['id'], 'workflow': definition.model_dump(mode='json')})
+    old_plan = task_plan(old_workflow['id'], definition, task_ref='original')
+    saved = invoke(ctx, 'task.plan.save', {'plan': old_plan.model_dump(mode='json')})
+    old_task = invoke(ctx, 'task.create', {'task_plan_id': saved['id'], 'proposed_task_ref': 'original'})
+    if prior_status == 'done':
+        with store.tx(immediate=True) as db:
+            db.execute("UPDATE v1_tasks SET status='done' WHERE id=?", (old_task['id'],))
+
+    ctx, new_req = turn(store, project, request='begin', focus='new_scope')
+    assert new_req['id'] != old_req['id']
+    args = {'requirement_id': new_req['id'], 'expected_revision': new_req['revision'],
+            'expected_workflow_revision_id': old_workflow['id'], 'objective': 'Independent repair',
+            'binding_patch': {}, 'reason': 'User requested separate repair work'}
+    if prior_status == 'pending':
+        denied = store.registry.dispatch('project.scope.revise', args, ctx)
+        assert not denied.ok and denied.error['code'] == 'scope_revision_conflict'
+        assert store.get_workflow(project['id'])['id'] == old_workflow['id']
+        return
+
+    revised = invoke(ctx, 'project.scope.revise', args)
+    assert revised['workflow_revision_id'] != old_workflow['id']
+    assert store.get_task(old_task['id'])['workflow_revision_id'] == old_workflow['id']
+    ctx = replace(ctx, requirement_revision=revised['requirement']['revision'])
+    repair = task_plan(revised['workflow_revision_id'], definition, task_ref='repair')
+    checked = invoke(ctx, 'task.plan.validate', {'plan': repair.model_dump(mode='json')})
+    assert checked['valid'], checked['diagnostics']
+    repair_plan = invoke(ctx, 'task.plan.save', {'plan': repair.model_dump(mode='json')})
+    new_task = invoke(ctx, 'task.create', {'task_plan_id': repair_plan['id'], 'proposed_task_ref': 'repair'})
+    assert new_task['requirement_id'] == new_req['id']
+    assert new_task['workflow_revision_id'] == revised['workflow_revision_id']
+
+
+@pytest.mark.parametrize('prior_status', ['done', 'pending'])
 def test_new_requirement_can_take_over_only_after_previous_tasks_finish(store, tmp_path, prior_status):
     project = store.create_project('Workflow handover', '', str(tmp_path / prior_status))
     ctx, old_req = turn(store, project)
@@ -296,7 +335,7 @@ def test_tool_free_prose_is_recorded_as_discussion_without_execution_effects(sto
     job = store.get_conversation_job(queued['job']['id'])
     assert job['status'] == 'succeeded'
     assert job['result']['business_outcome'] == 'discussion'
-    assert job['result']['reply'].startswith('本轮仅讨论，未新建任务。')
+    assert job['result']['reply'] == 'Chapters 7–12 are queued and chapter 7 is running.'
     assert store.list_tasks(project['id']) == []
 
 

@@ -29,9 +29,6 @@
       "entry_meaning": "需求文件存在，用户已确认其功能边界与验收标准。",
       "terminal_meaning": "done 表示软件和运行证据均验收通过；failed 表示明确且不可在本轮恢复的执行失败，可 reopen 原 Task。",
       "task_contract": {
-        "scenario_input_pointer": "/acceptance_scenarios",
-        "required_behavior_columns": ["backend_development", "frontend_development", "system_test", "delivery", "accept"],
-        "acceptance_invalidated_by": ["backend_development", "frontend_development"],
         "feedback_columns": ["integration_review", "system_test", "delivery", "accept"],
         "identity_pointer": "/requirements_path",
         "entry_requirements": [
@@ -468,7 +465,7 @@
         {
           "key": "backend_development",
           "name": "后端实现与定向返修",
-          "instruction": "读取需求、DDD、架构、API契约、测试设计、当前后端源码和前序 Column 反馈。实现服务端领域、应用和适配器代码，按当前项目技术栈选择真实开发测试命令并执行；若 Workflow 显式冻结了 acceptance_checks，也需通过这些检查。测试通过后尽快 complete backend_ready；不得修改 frontend/**、交付文件或最终验收文件。需求无法支持实现 complete requirement_gap；无法继续 complete execution_failed。",
+          "instruction": "读取需求、DDD、架构、API契约、测试设计、当前后端源码和前序 Column 反馈。实现服务端领域、应用和适配器代码，执行后端编译、单元测试或定向行为测试并保留真实成功回执；通过后立即 complete backend_ready。完整 HTTP、服务启动、重启和到期验收由后续 system_test 独立完成，本列不启动服务做在线验收，也不运行尚未创建的 frontend 项目。若 Workflow 显式冻结了本列 acceptance_checks，也需通过这些检查。不得修改 frontend/**、交付文件或最终验收文件。若反馈确认问题只属于后续测试列的脚本，本列后端行为已验证，则记录责任反馈并 complete backend_ready，沿现有前向路径交给测试列处理；不得越权改测试脚本，也不得仅因别列文件无写权限而 complete execution_failed。需求无法支持实现 complete requirement_gap；本列确实无法继续 complete execution_failed。",
           "executor": {
             "kind": "agent",
             "capabilities": [
@@ -528,7 +525,7 @@
         {
           "key": "frontend_development",
           "name": "前端实现与定向返修",
-          "instruction": "读取需求、架构、API契约、已实现后端、当前前端源码和前序 Column 反馈。实现客户端交互、状态、接口适配和前端开发测试，按当前项目技术栈选择真实命令验证前后端契约；若 Workflow 显式冻结了 acceptance_checks，也需通过这些检查。测试通过后尽快 complete frontend_ready；不得修改 backend/**、交付文件或最终验收文件。发现后端契约问题 complete backend_contract_issue 并给出端点、请求、响应和期望；需求无法支持实现 complete requirement_gap；无法继续 complete execution_failed。",
+          "instruction": "读取需求、架构、API契约、已实现后端、当前前端源码和前序 Column 反馈。实现客户端交互、状态、接口适配和前端开发测试；执行前端构建与定向测试，并按冻结 API 契约核对适配，不在本列启动后端做完整联调，联调由后续集成和系统测试列负责。若 Workflow 显式冻结了 acceptance_checks，也需通过这些检查。前端验证通过后尽快 complete frontend_ready；不得修改 backend/**、交付文件或最终验收文件。发现后端契约问题 complete backend_contract_issue 并给出端点、请求、响应和期望；需求无法支持实现 complete requirement_gap；无法继续 complete execution_failed。",
           "executor": {
             "kind": "agent",
             "capabilities": [
@@ -592,7 +589,7 @@
         {
           "key": "integration_review",
           "name": "独立集成审查",
-          "instruction": "对照冻结需求、领域设计和 API 契约审查当前前后端代码并运行必要的集成检查，重点验证用户行为、接口一致性、错误路径、可维护性和不必要复杂度；不得直接修改实现。必须把问题、文件、行为、依据和期望修改写入 docs/pair-review.md。通过 complete accepted；后端问题 complete backend_changes_requested；前端问题 complete frontend_changes_requested；需求不明确 complete requirement_gap；无法检查 complete execution_failed。",
+          "instruction": "对照冻结需求、领域设计和 API 契约审查当前前后端代码及已有运行证据，可运行编译、单元测试和前端构建检查，重点核对接口一致性、错误路径、可维护性和不必要复杂度；完整 HTTP、重启与到期行为测试由 system_test 执行，不是本列通过前提。收到测试失败时读取原始请求/响应及测试脚本记录的前置条件判定，复核请求输入、时区、事件时间与有效窗口；窗口外的执行或输入与冻结需求/测试夹具不一致时，视为本次测试无效，沿现有 accepted 前向边交回 system_test 重跑，不误退实现列。输入与需求一致但结果失败时，不得反推输入错误；结合有效回执和实现证据再决定是否沿返工边退给责任开发列。本列只写 docs/pair-review.md；没有现成的有界在线测试入口时，不自行用前台服务命令拼接在线验证。若使用现成入口做额外在线检查，必须在同一次 project.command.run 中启动、检查并停止，不能跨工具调用保留后台服务，也不能前台运行服务等待退出；不得直接修改实现。必须把问题、文件、行为、依据和期望修改写入 docs/pair-review.md。只有必须返给责任列并要求其重新验证的缺陷才调用 task.feedback.record，且同时提交相应返工 outcome；非阻断建议只能写入审查报告，不得调用 task.feedback.record，也不得仅因此请求返工。后续 delivery Column 负责的 README 和启动/停止说明尚未生成时，只记录为待交付事项，不得仅因此请求前序返工、报需求缺口或阻止本阶段通过；最终验收仍须核对这些交付物。核对客户端实际构造的请求方法、内容类型和请求体与服务端处理入口；未经实际执行的兼容性只能标为待 system_test 验证，不得仅凭文档或源码表面一致宣称联调通过。已复现的用户关键路径不兼容是实现缺陷，记录原始输入和响应并沿责任返工边返回。当前阶段通过 complete accepted；后端问题 complete backend_changes_requested；前端问题 complete frontend_changes_requested；需求不明确 complete requirement_gap；无法检查 complete execution_failed。",
           "executor": {
             "kind": "agent",
             "capabilities": [
@@ -657,7 +654,7 @@
         {
           "key": "system_test",
           "name": "独立自动化与集成测试",
-          "instruction": "作为独立QA读取需求、测试设计和当前实现。按项目技术栈补齐必要的独立自动化测试，不修改前后端产品实现；真实执行单元、接口和用户关键路径测试。若 Workflow 显式冻结了 acceptance_checks，也需通过并产生其要求的报告。记录命令、退出码、环境和结果到 docs/test-report.md。全部通过后尽快 complete tests_passed；发现产品或代码问题 complete tests_failed 并给出可执行反馈；环境本身无法验证 complete execution_failed。不得仅凭代码阅读、构建成功或跳过项宣称行为测试通过。",
+          "instruction": "作为独立QA读取需求、测试设计和当前实现。按项目技术栈补齐必要的独立自动化测试，不修改前后端产品实现；真实执行单元、接口和用户关键路径测试。需要在线 HTTP 验证时，先维护可重复运行的测试入口，在同一次 project.command.run 内启动服务、等待就绪、执行冻结场景，并在 finally 停止服务；子进程输出写入文件或持续读取，不得用未排空的 PIPE 阻塞服务。跨工具调用启动的子进程会被清理，不能先后台启动再另起命令测试，也不能前台运行服务等待退出。对时间敏感的场景，测试脚本必须从响应记录截止时间和实际请求时间，在同一时区比较并把前置条件判定写入证据；固定等待秒数不得替代此判定。若检查请求已晚于截止时间，本次测试无效，须在本列重新初始化该场景并完整重跑，不得以该结果报告产品失败；重启耗时超过测试窗口时，可在用户已确认的测试配置范围内调整后完整重跑。每一步成功断言须先核对实际请求输入与冻结需求或测试夹具一致；输入一致而结果失败时继续调查实现，不能仅凭失败响应反推输入错误。测试入口失败先核实测试脚本自身的输入、断言、初始化、清理和重启步骤，必要时用独立请求复现；报告中分别记录无效执行、重跑结果和有效产品失败。若是脚本问题先修复本列脚本；确认产品问题后记录原始失败回执和责任列，并 complete tests_failed 沿返工边处理。交付物自身构建失败、启动失败或已声明接口不可用都属于产品问题，不得用 execution_failed 代替返工。若 Workflow 显式冻结了 acceptance_checks，也需通过并产生其要求的报告。从冻结需求的行为用例追踪到实际执行的请求和断言。涉及客户端与服务端联动时，从客户端实现提取真实请求方法、内容类型和请求体并以等价输入在线测试；只验证另一种被服务端支持的输入不能算客户端路径通过。区分静态 UI 审查、服务启动和真实用户操作；若冻结验收要求客户端页面交互，等价 HTTP 请求只证明接口，须实际运行客户端操作并核对可见结果；缺少页面操作回执时将该用例标为未验证，不得写 PASS 或 complete tests_passed；不能执行必要用例时 complete execution_failed，并保留未验证原因。记录真实命令、退出码、环境和结果到 docs/test-report.md。全部通过后尽快 complete tests_passed；只有与交付物无关的工具、权限或外部环境故障阻止验证时 complete execution_failed，并给出其独立于产品实现的证据。不得仅凭代码阅读、构建成功或跳过项宣称行为测试通过。",
           "executor": {
             "kind": "agent",
             "capabilities": [
@@ -716,7 +713,7 @@
         {
           "key": "delivery",
           "name": "构建、运行与交付验证",
-          "instruction": "根据 project.loop.bindings.delivery_target 验证安装、构建、配置、启动、健康检查和停止路径；需要时验证容器或CI资产，但不得自行增加未声明的平台绑定。补齐README和必要启动/停止文件，写 docs/delivery-report.md，包含真实命令和退出码。可复现时 complete delivery_ready；实现问题 complete delivery_failed 返回开发；环境无法完成 complete execution_failed。",
+          "instruction": "根据 project.loop.bindings.delivery_target 验证安装、构建、配置、启动、健康检查和停止路径；需要时验证容器或CI资产，但不得自行增加未声明的平台绑定。交付文件是否存在用 project.files.list/read 核对，不把 PowerShell 内置命令交给 cmd /c。需要启动常驻服务时，在同一次 project.command.run 中运行会自行启动、检查并停止服务的有界入口；不能前台运行服务等待退出，也不能跨工具调用保留后台服务。系统测试已完成的场景无需在本列重复全量执行。交付报告须区分页面交互、接口请求和构建各自的实际证据；冻结目标要求页面操作而没有其执行回执时，不能把等价接口测试写成页面验收通过。如果本列额外执行发现客户端真实路径与上游成功结论冲突，必须在交付报告、Task Feedback 和完成输出中一致记录原始命令、输入、响应及需求影响；影响冻结目标时 complete delivery_failed 走返工边，不得因其它路径通过而改称非阻塞。补齐README和必要启动/停止文件，写 docs/delivery-report.md，包含真实命令和退出码。可复现时 complete delivery_ready；实现问题 complete delivery_failed 返回开发；环境无法完成 complete execution_failed。",
           "executor": {
             "kind": "agent",
             "capabilities": [
@@ -772,7 +769,7 @@
         {
           "key": "accept",
           "name": "最终需求验收",
-          "instruction": "逐条读取当前 Task input.requirements_path 指定的已接受需求快照及 docs/requirements-traceability.md 的验收标准，并核对DDD/接口设计、集成审查、真实测试与交付运行证据。写 FINAL_ACCEPTANCE.md，逐项列出证据。全部满足 complete delivered；产品问题 complete acceptance_failed 返回开发；执行失败 complete execution_failed。不得把存在文件等同于行为通过。",
+          "instruction": "逐条读取当前 Task input.requirements_path 指定的已接受需求快照及 docs/requirements-traceability.md 的验收标准，并核对DDD/接口设计、集成审查、真实测试与交付运行证据。读取现存 Task Feedback；未结反馈按已有返工边返回责任列，不得调用 task.feedback.record 记录已解决事项或非阻断建议，否则会产生新的待验证缺陷。独立读取各列完成输出中的已知问题，并将成功声称与原始工具回执和冻结目标交叉核对；无反馈或上游标注非阻塞不等于目标满足。若冻结目标包含客户端页面操作，须找到该操作与可见结果的实际执行回执；接口请求通过、客户端构建和源码阅读均不能代替页面证据。若影响必需用户路径的失败仍未解决，或必要行为缺少对应执行证据，写明缺口并 complete acceptance_failed，不得 delivered。写 FINAL_ACCEPTANCE.md，逐项列出证据。全部满足 complete delivered；产品问题 complete acceptance_failed 返回开发；执行失败 complete execution_failed。不得把存在文件等同于行为通过。",
           "executor": {
             "kind": "agent",
             "capabilities": [

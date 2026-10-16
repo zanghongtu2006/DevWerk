@@ -200,7 +200,7 @@ def project_result(content, max_bytes):
     if planning is not None:
         planning['projection'] = {'truncated':True,'source_bytes':len(content.encode('utf8')),
             'sha256':digest(original),'reference':reference,'retrieve':'agent.result.read',
-            'note':'Complete planning contract fields; omitted prose and graph instructions remain in the archived result. Fixed acceptance runners are optional.'}
+            'note':'Complete planning contract fields; omitted prose and graph instructions remain in the archived result. Acceptance checks are optional.'}
         if len(packed(planning).encode('utf8')) <= max_bytes:
             return packed(planning)
     for limit in (2400, 1200, 600, 200, 40):
@@ -232,25 +232,27 @@ def planning_projection(result):
         bundle = output.get('bundle') or {}
         method = bundle.get('workflow_plan') or {}
         workflow = bundle.get('workflow') or {}
-        view = {k:output[k] for k in ('loop_key','version','digest','parameter_schema') if k in output}
+        view = {k:output[k] for k in ('loop_key','version','digest','parameter_schema',
+                                     'use_case','selection_guide','input','output') if k in output}
+        view['flow_unit'] = method.get('flow_unit')
         view['task_contract'] = method.get('task_contract',{})
         view['columns'] = [{'key':c['key'],'writable_paths':c.get('metadata',{}).get('writable_paths',[])} for c in workflow.get('columns',[])]
         view['assets'] = [a['path'] for a in output.get('assets',[])]
-        if view['task_contract'].get('required_behavior_columns'):
-            view['behavior_evidence_contract'] = {
-                'rules':'No test script is needed before Task admission. Each named Column Worker selects and runs real commands during execution; Runtime requires successful command evidence. Keep scenario IDs in the Task input and verify them independently at acceptance. Fixed workflow.acceptance.runners remain optional.'}
     elif capability == 'loop.apply':
         workflow = output.get('workflow') or {}
         method = output.get('workflow_plan') or {}
         view = {'workflow':{k:workflow[k] for k in ('id','definition_hash','workflow_plan_id') if k in workflow},
-                'workflow_plan':{'id':method.get('id'),'task_contract':method.get('plan',{}).get('task_contract',{})},
-                'next':'Revise this template when needed, then use task.plan.contract and task.plan.validate. Fixed acceptance runners are optional.'}
+                'workflow_plan':{'id':method.get('id'),'flow_unit':method.get('plan',{}).get('flow_unit'),
+                                 'task_contract':method.get('plan',{}).get('task_contract',{})},
+                'next':'Revise this template when needed. Each Task is one independently accepted flow unit and traverses every Column; use task.plan.contract, task.plan.validate, task.plan.save, then task.create. Acceptance checks are optional.'}
     elif capability == 'workflow.inspect':
         definition = output.get('definition') or {}
         view = {k:output[k] for k in ('id','definition_hash','workflow_plan_id','source_loop_key','source_loop_version','source_loop_digest') if k in output}
-        view['column_contracts'] = [{'key':c['key'],'acceptance_checks':c.get('acceptance_checks',[])}
+        view['column_contracts'] = [{'key':c['key'],'acceptance_checks':c.get('acceptance_checks',[]),
+                                     'transitions':[{'outcome':edge.get('outcome'),'target':edge.get('target'),
+                                                     'required_checks':edge.get('required_checks',[])}
+                                                    for edge in c.get('transitions',[])]}
                                     for c in definition.get('columns',[])]
-        view['acceptance_obligations'] = definition.get('acceptance_obligations',[])
     else:
         return None
     return {**result, 'output':view}

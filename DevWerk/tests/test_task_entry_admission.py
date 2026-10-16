@@ -1,4 +1,5 @@
 from dataclasses import replace
+import json
 import sys
 
 import pytest
@@ -21,9 +22,8 @@ def software_plan(store, tmp_path):
     definition = WorkflowDefinition.model_validate(workflow['definition'])
     for key in ('backend_development','frontend_development','system_test','delivery','accept'):
         definition.column(key).acceptance_checks = [AcceptanceCheck(key='verify_fixture',capability='project.command.run',
-            arguments={'argv':[sys.executable,'-c',"from pathlib import Path; assert Path('docs/baseline.md').exists()", 'fixture-report.json']},
-            evidence_kind='behavior',purpose='Test fixture for entry-admission contract, not software acceptance',
-            scenario_ids=['entry-fixture'],report_path='fixture-report.json')]
+            arguments={'argv':[sys.executable,'-c',"from pathlib import Path; assert Path('docs/baseline.md').exists()"]},
+            purpose='Verify this test fixture exists')]
         definition.acceptance_obligations.append(AcceptanceObligation(column=key,check_key='verify_fixture',
             invalidated_by=[key] if key.endswith('_development') else ['backend_development','frontend_development']))
     workflow = store.publish_workflow(project['id'],definition,workflow['workflow_plan_id'])
@@ -153,6 +153,34 @@ def test_unsaved_plan_is_not_misdiagnosed_as_requirement_conflict(store, tmp_pat
     created = store.registry.dispatch('task.create',{'task_plan_id':saved.output['id'],'proposed_task_ref':'primary'},ctx)
     assert created.ok, created.error
     assert len(store.list_tasks(project['id'])) == 1
+
+
+def test_json_object_plan_transport_is_validated_and_saved(store, tmp_path):
+    project, plan, ctx = software_plan(store, tmp_path)
+    encoded = json.dumps(plan.model_dump(mode='json'), ensure_ascii=False)
+    validation = store.registry.dispatch('task.plan.validate', {'plan': encoded}, ctx)
+    assert validation.ok and validation.output['valid'], validation.error
+    saved = store.registry.dispatch('task.plan.save', {'plan': encoded}, ctx)
+    assert saved.ok, saved.error
+    assert saved.output['next_action'] == {'capability': 'task.create', 'arguments': {
+        'task_plan_id': saved.output['id'], 'proposed_task_ref': 'primary'}}
+    invalid = store.registry.dispatch('task.plan.validate', {'plan': '[1,2]'}, ctx)
+    assert not invalid.ok and invalid.error['type'] == 'ContractError'
+
+
+def test_entry_evidence_error_finds_matching_receipt_after_many_other_writes(store, tmp_path):
+    project, plan, ctx = software_plan(store, tmp_path)
+    baseline_key = plan.tasks[0].entry_evidence['requirements_file']
+    for index in range(25):
+        receipt = store.registry.dispatch('project.files.write', {
+            'path': f'docs/other-{index}.md', 'content': str(index)},
+            replace(ctx, execution_key=f'{ctx.agent_run_id}:other-{index}'))
+        assert receipt.ok, receipt.error
+    plan.tasks[0].entry_evidence['requirements_file'] = 'wrong-id'
+    rejected = store.registry.dispatch('task.plan.save', {'plan': plan.model_dump(mode='json')}, ctx)
+    assert not rejected.ok
+    assert "Task input path 'docs/baseline.md'" in rejected.error['message']
+    assert baseline_key in rejected.error['message']
 
 
 def test_plan_validate_rejects_stale_terminal_repair_predecessor(store, tmp_path):

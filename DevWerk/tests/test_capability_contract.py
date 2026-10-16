@@ -7,6 +7,7 @@ import pytest
 
 from app.v1.capabilities import (
     CapabilityContext,
+    CapabilityEntry,
     _command_run,
     _system_command_run,
     build_core_registry,
@@ -17,11 +18,38 @@ from app.v1.capabilities import (
 from app.v1.files import ProjectFiles, SystemFiles
 from app.v1.contracts import ContractError
 from app.v1.domain import (
+    AcceptanceCheck,
     CapabilityStep,
     ExactTaskInputString,
     Transition,
 )
 from tests.helpers import agent_workflow, create_planned_task, publish_initial_workflow, publish_planned_workflow, sequence_workflow, task_plan, workflow_plan
+
+
+def test_acceptance_check_accepts_registered_read_tool_and_rejects_mutating_tool(store):
+    store.registry.register(CapabilityEntry(
+        id='external.evidence.read', description='Read external evidence',
+        input_schema={'type': 'object', 'properties': {'key': {'type': 'string'}},
+                      'required': ['key'], 'additionalProperties': False},
+        output_schema={'type': 'object'}, handler=lambda args, ctx: {'key': args['key']},
+        side_effect_kind='read'))
+    workflow = agent_workflow()
+    workflow.column('work').acceptance_checks = [AcceptanceCheck(
+        key='evidence', capability='external.evidence.read', arguments={'key': 'result'})]
+    validate_workflow_capabilities(workflow, store.registry)
+    workflow.column('work').acceptance_checks[0].capability = 'project.files.write'
+    with pytest.raises(ValueError, match='registered Column capability with none/read/process effect'):
+        validate_workflow_capabilities(workflow, store.registry)
+    workflow.column('work').acceptance_checks[0].capability = 'external.missing'
+    with pytest.raises(ValueError, match='registered Column capability'):
+        validate_workflow_capabilities(workflow, store.registry)
+    store.registry.register(CapabilityEntry(
+        id='external.private.read', description='Private read', input_schema={'type': 'object'},
+        output_schema={'type': 'object'}, handler=lambda args, ctx: {},
+        side_effect_kind='read', delegable_to_column=False))
+    workflow.column('work').acceptance_checks[0].capability = 'external.private.read'
+    with pytest.raises(ValueError, match='registered Column capability'):
+        validate_workflow_capabilities(workflow, store.registry)
 
 
 def test_command_tool_advertises_bounded_process_lifecycle(store, tmp_path):
@@ -30,7 +58,18 @@ def test_command_tool_advertises_bounded_process_lifecycle(store, tmp_path):
     context = CapabilityContext(project_id=project['id'], project=project, store=store)
     description = registry.schemas(['project.command.run'], context)[0]['function']['description']
     assert 'Child processes are cleaned up when the call ends' in description
+    assert 'Start-Process or start /b call can exit 0' in description
     assert 'one bounded command' in description
+
+
+def test_feedback_tool_advertises_notification_without_routing(store, tmp_path):
+    project = store.create_project('feedback contract', '', str(tmp_path / 'project'))
+    registry = build_core_registry()
+    context = CapabilityContext(project_id=project['id'], project=project, store=store)
+    description = registry.schemas(['task.feedback.record'], context)[0]['function']['description']
+    assert 'Conversation Agent supervision' in description
+    assert 'does not select a Workflow edge or block done' in description
+    assert 'declared Column outcome' in description
 
 
 def test_registry_dispatches_generic_file_capability_and_tracks_artifact(store, tmp_path):
@@ -155,14 +194,17 @@ def test_command_failure_receipt_names_timeout_or_truncation(
         store, tmp_path, monkeypatch, command, files, failure_flag, expected):
     project = store.create_project('command-receipt', '', str(tmp_path / 'project'))
     context = CapabilityContext(project_id=project['id'], project=project, store=store)
-    output = {'exit_code': 0, 'stdout': '', 'stderr': '',
+    output = {'exit_code': 0, 'stdout': 'STARTUP_LOG_' * 1000, 'stderr': '',
               'timed_out': failure_flag == 'timed_out',
               'output_truncated': failure_flag == 'output_truncated'}
     monkeypatch.setattr(files, 'run', lambda self, *args, **kwargs: output)
     result = command({'argv': ['example']}, context)
     assert not result.ok
     assert result.error['type'] == 'CommandFailed'
-    assert result.error['message'] == expected
+    assert result.error['message'].startswith(expected)
+    assert len(result.error['message']) < 200
+    assert 'STARTUP_LOG_' not in result.error['message']
+    assert result.output['stdout'].startswith('STARTUP_LOG_')
     assert result.error['exit_code'] == 0
     assert result.error[failure_flag] is True
 
@@ -312,8 +354,8 @@ def test_command_schema_explains_exact_output_encoding(store, tmp_path):
         ["project.command.run"], context
     )[0]["function"]["description"]
 
-    assert "BOM-free" in description
-    assert "expected content has no BOM" in description
+    assert "Preserve the contracted bytes" in description
+    assert "PowerShell" not in description
 
 
 def test_workflow_publish_schema_exposes_live_capability_catalog(store, tmp_path):

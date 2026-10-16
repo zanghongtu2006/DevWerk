@@ -45,7 +45,7 @@ def project_ledger(entries: list[dict[str, Any]], *, max_bytes: int = 6000) -> d
                 if entry.get(key) is not None}
         item['ok'] = bool(entry.get('ok'))
         if isinstance(output, dict):
-            for key in ('exit_code', 'path', 'report_path'):
+            for key in ('exit_code', 'path'):
                 if key in output:
                     item[key] = _short(output[key], 180) if key != 'exit_code' else output[key]
         if isinstance(error, dict):

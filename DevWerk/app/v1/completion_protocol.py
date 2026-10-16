@@ -22,7 +22,7 @@ class CompletionOutcomeRule:
     target: str
     evidence_requirement: EvidenceRequirement = "required"
     allows_unresolved_failures: bool = False
-    required_capability: str | None = None
+    required_checks: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -183,8 +183,9 @@ def completion_tool_schema(contract: CompletionContract) -> dict[str, Any]:
             "description": (
                 "Submit one declared assignment outcome with structured output and auditable evidence. "
                 "Runtime collects evidence automatically. Frozen acceptance checks and successful identical retries "
-                "discharge failures. Without frozen checks, a later successful identifiable build/test/verification command can "
-                "discharge earlier exploratory command failures. Unrelated commands cannot discharge fixed checks."
+                "discharge failures. For an alternative repair, pass failure_resolutions linking the failed receipt "
+                "to later successful evidence from the same capability, with a concrete reason. "
+                "An unrelated or non-verifying action cannot resolve a failure."
             ),
             "parameters": completion_arguments_schema(contract),
         },

@@ -3,54 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 import json
-import ntpath
-import re
-import shlex
 
 from app.v1.completion_protocol import CompletionContract, CompletionSubmission
 from app.v1.execution_ledger import (
     evidence_entries,
     unresolved_execution_failures,
 )
-
-
-def _recognizable_verification_command(argv: list[str]) -> bool:
-    """Only an identifiable test entrypoint may automatically supersede failures."""
-    from app.v1.services.task_plan_compiler import known_nonbehavior_command
-
-    if known_nonbehavior_command(argv) or not argv or not all(isinstance(arg, str) for arg in argv):
-        return False
-    tokens = list(argv)
-    executable = ntpath.basename(tokens[0]).lower()
-    if executable in {'cmd', 'cmd.exe'} and len(tokens) > 2 and tokens[1].lower() == '/c':
-        command = ' '.join(tokens[2:]).strip().strip('"')
-        if '||' in command or re.search(r'(?<!&)&(?!&)', command):
-            return False
-        try:
-            tokens = shlex.split(command.split('&&')[-1].strip(), posix=False)
-        except ValueError:
-            return False
-        executable = ntpath.basename(tokens[0].strip('"')).lower() if tokens else ''
-    lower = [arg.lower() for arg in tokens]
-    if executable in {'mvn', 'mvn.cmd', 'mvnw', 'mvnw.cmd', 'gradle', 'gradlew', 'gradlew.bat'}:
-        return any(arg in {'test', 'verify', 'integration-test', 'check', 'build', 'compile', 'package', 'surefire:test',
-                           'failsafe:integration-test', 'failsafe:verify'} for arg in lower[1:])
-    if executable in {'pytest', 'pytest.exe', 'go', 'cargo', 'dotnet', 'npm', 'npm.cmd',
-                      'pnpm', 'pnpm.cmd', 'yarn', 'yarn.cmd'}:
-        return any(arg in {'test', 'verify', 'check', 'build', 'compile', 'package'} for arg in lower[1:]) or executable.startswith('pytest')
-    if executable in {'python', 'python.exe', 'py', 'py.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe'}:
-        if '-m' in lower:
-            index = lower.index('-m')
-            if index + 1 < len(lower) and lower[index + 1] in {'pytest', 'unittest'}:
-                return True
-        if '-file' in lower:
-            index = lower.index('-file')
-            script = lower[index + 1] if index + 1 < len(lower) else ''
-        else:
-            script = next((arg for arg in lower[1:] if arg.endswith(('.py', '.ps1', '.sh', '.bat', '.cmd'))), '')
-        return bool(re.search(r'(^|[._-])(test|tests|verify|check|acceptance)([._-]|$)',
-                              ntpath.basename(script)))
-    return bool(re.search(r'(^|[._-])(test|tests|verify|check|acceptance)([._-]|$)', executable))
 
 
 @dataclass(frozen=True)
@@ -97,10 +55,12 @@ class CompletionAdmissionService:
             ledger,
             excluded_capabilities=excluded,
         )
-        if contract.acceptance_checks and not rule.allows_unresolved_failures:
+        if rule.required_checks:
             # Ordinary failed exploration is not an acceptance obligation. Only
             # Runtime-executed checks from the frozen contract can discharge it.
             for check in contract.acceptance_checks:
+                if check['key'] not in rule.required_checks:
+                    continue
                 verified = next((item for item in reversed(ledger)
                                  if item.get('acceptance_check') == check['key']), None)
                 if not verified or not verified.get('ok') or verified.get('status') != 'completed':
@@ -110,25 +70,8 @@ class CompletionAdmissionService:
                         message += f" ({str(error.get('type') or 'CheckFailed')[:80]}: {str(error['message'])[:300]})"
                     return self._reject('acceptance_check_failed', message)
             unresolved = {}
-        elif not rule.allows_unresolved_failures:
-            # Worker-selected checks have no frozen command to retry verbatim.
-            # A later successful behavior command can supersede exploratory
-            # command failures, while other failed actions still block success.
-            failed_commands = [item for item in unresolved.values()
-                               if item.get('capability') == 'project.command.run']
-            if failed_commands:
-                last_failure = max(ledger.index(item) for item in failed_commands)
-                repaired = any(
-                    item.get('capability') == 'project.command.run'
-                    and item.get('ok') and item.get('status') == 'completed'
-                    and item.get('evidence_id') in referenced_ids
-                    and _recognizable_verification_command(
-                        ((item.get('facts') or {}).get('arguments') or {}).get('argv', []))
-                    for item in ledger[last_failure + 1:]
-                )
-                if repaired:
-                    unresolved = {key: item for key, item in unresolved.items()
-                                  if item.get('capability') != 'project.command.run'}
+        # Identical successful retries are removed by the execution ledger.
+        # Alternative operations need an explicit evidence-to-evidence resolution.
         unresolved_by_evidence = {
             str(item.get("evidence_id")): item
             for item in unresolved.values()
@@ -155,14 +98,11 @@ class CompletionAdmissionService:
                 )
             if ledger.index(repaired) <= ledger.index(failed):
                 return self._reject("resolution_precedes_failure", "repair evidence must be executed after the failure")
-            if (
-                failed.get("capability") != repaired.get("capability")
-                or failed.get("effect_kind") != repaired.get("effect_kind")
-                or failed.get("operation_sha256") != repaired.get("operation_sha256")
-            ):
+            if (failed.get("capability") != repaired.get("capability")
+                    or failed.get("effect_kind") != repaired.get("effect_kind")):
                 return self._reject(
                     "unrelated_resolution_evidence",
-                    "Unrelated commands cannot discharge a failed operation; use frozen acceptance checks for alternative repairs",
+                    "A failure resolution must use later evidence from the same capability and effect kind",
                 )
             if resolution.resolved_by_evidence_id not in referenced_ids:
                 return self._reject(
@@ -183,16 +123,21 @@ class CompletionAdmissionService:
                     "message"
                 )
                 or "a failed Column action has not been repaired"
-            )
+            )[:300]
             operation = {"capability": failed.get("capability"), "arguments": (failed.get("facts") or {}).get("arguments") or {}}
             repair_hint = (
-                "Retry this operation successfully, run a later successful behavior check, "
-                "or submit a declared failure/rework outcome. "
-                if not contract.acceptance_checks and failed.get('capability') == 'project.command.run'
-                else "Retry this operation successfully, or submit a declared failure/rework outcome. "
+                "Retry the same operation successfully, explicitly link an alternative successful "
+                "operation with failure_resolutions and a concrete reason, or submit a declared "
+                "failure/rework outcome. "
             )
+            pending_ids = list(remaining_failures)[:16]
+            pending_hint = ("; unresolved_failed_evidence_ids=" +
+                            json.dumps(pending_ids, ensure_ascii=False) +
+                            f"; unresolved_failure_count={len(remaining_failures)}")
             return self._reject("unresolved_execution_failure", message +
+                                "; failed_evidence_id=" + repr(str(failed.get("evidence_id") or "")) +
                                 "; unresolved operation=" + json.dumps(operation, ensure_ascii=False) +
+                                pending_hint +
                                 ". " + repair_hint +
                                 "Unrelated commands/noops do not repair this failure; Runtime collects receipt IDs automatically.")
 
@@ -224,23 +169,6 @@ class CompletionAdmissionService:
                     "successful_evidence_required",
                     f"outcome {submission.outcome!r} requires at least one successful action evidence",
                 )
-
-        if rule.required_capability:
-            from app.v1.services.task_plan_compiler import known_nonbehavior_command
-            valid_command = any(
-                item.get('capability') == rule.required_capability
-                and item.get('ok') and item.get('status') == 'completed'
-                and not known_nonbehavior_command(
-                    ((item.get('facts') or {}).get('arguments') or {}).get('argv', []))
-                for item in referenced
-            )
-        else:
-            valid_command = True
-        if not valid_command:
-            return self._reject(
-                'behavior_evidence_required',
-                f"outcome {submission.outcome!r} requires a successful {rule.required_capability} receipt from this Column",
-            )
 
         return CompletionDecision(accepted=True, submission=submission)
 

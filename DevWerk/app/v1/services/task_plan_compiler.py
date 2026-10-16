@@ -1,7 +1,7 @@
 """Shared, side-effect-free preparation for plan admission and materialization."""
 from app.v1.contracts import canonicalize_contract_value, validate_contract
 from app.v1.domain import ReadinessDecision, TaskPlan
-from app.v1.task_identity import logical_task_key, resolve_input_pointer
+from app.v1.task_identity import logical_task_key
 
 COMPILER_VERSION = 1
 
@@ -18,105 +18,11 @@ def acceptance_diagnostics(definition, method, data=None):
     column_paths = {c.key:f'/workflow/columns/{i}' for i,c in enumerate(definition.columns)}
     def issue(path, message):
         errors.append({'path': path, 'message': message})
-    for column in definition.columns:
-        for index, check in enumerate(column.acceptance_checks):
-            if check.evidence_kind != 'behavior':
-                continue
-            reason = known_nonbehavior_command(check.arguments.get('argv', []))
-            if reason:
-                issue(column_paths[column.key]+f'/acceptance_checks/{index}/arguments', reason)
-            if check.report_path and check.report_path not in check.arguments.get('argv', []):
-                issue(column_paths[column.key]+f'/acceptance_checks/{index}/arguments',
-                      'BehaviorRunnerReportArgumentMissing: argv must include report_path as a separate argument')
-    errors.extend(acceptance_scope_collision_diagnostics(definition, method))
     for key in method.task_contract.feedback_columns:
         executor = definition.column(key).executor
         if executor.kind != 'agent' or 'task.feedback.record' not in executor.capabilities:
             issue(column_paths[key]+'/executor/capabilities', f'FeedbackContractMissing: {key} must expose task.feedback.record')
-    pointer = method.task_contract.scenario_input_pointer
-    if pointer and data is not None:
-        values = resolve_input_pointer(data, pointer)
-        if not isinstance(values, list) or not values or any(not isinstance(v, str) or not v.strip() for v in values) or len(set(values)) != len(values):
-            issue('/input'+pointer, 'ScenarioContractInvalid: expected unique nonempty scenario IDs from the accepted requirement')
-    for key in method.task_contract.required_behavior_columns:
-        if key not in column_paths:
-            issue('/task_contract/required_behavior_columns', f'UnknownBehaviorColumn: {key}')
-            continue
-        executor = definition.column(key).executor
-        if executor.kind != 'agent' or 'project.command.run' not in executor.capabilities:
-            issue(column_paths[key]+'/executor/capabilities',
-                  f'BehaviorEvidenceCapabilityMissing: {key} must let its Worker run tests or other commands')
     return errors
-
-
-def acceptance_scope_collision_diagnostics(definition, method):
-    """Reject one proven false-scope reuse shape without interpreting scripts."""
-    errors = []
-    distinct_stages = ('backend_development', 'frontend_development', 'delivery')
-    known = {column.key for column in definition.columns}
-    if all(key in method.task_contract.required_behavior_columns and key in known for key in distinct_stages):
-        checks_by_stage = [[check for check in definition.column(key).acceptance_checks
-                            if check.evidence_kind == 'behavior'] for key in distinct_stages]
-        if all(len(checks) == 1 and checks[0].capability == 'project.command.run'
-               for checks in checks_by_stage):
-            checks = [items[0] for items in checks_by_stage]
-            signatures = {(tuple(check.arguments.get('argv', [])), check.arguments.get('cwd', '.'),
-                           check.report_path) for check in checks}
-            if len(signatures) == 1 and len({frozenset(check.scenario_ids) for check in checks}) > 1:
-                for key in distinct_stages[1:]:
-                    errors.append({'path': f'/workflow/columns/{next(i for i,c in enumerate(definition.columns) if c.key == key)}/acceptance_checks',
-                                   'message': 'AcceptanceEvidenceScopeCollision: backend, frontend and delivery cannot use the same sole command and report for different scenario sets; configure stage-specific evidence'})
-    return errors
-
-
-def known_nonbehavior_command(argv):
-    """Reject a few provably non-testing commands, not arbitrary script semantics.
-
-    This is only a coarse guard; the Worker and acceptance Column must judge
-    whether a command actually tests the Task. Frozen definitions keep their checks.
-    """
-    if not argv or not all(isinstance(a,str) for a in argv):
-        return None
-    import re
-    import shlex
-
-    lowered = [a.lower() for a in argv]
-    if any(a in {'-dskiptests','-dskiptests=true','-dmaven.test.skip=true','--list'} for a in lowered):
-        return 'NonBehaviorCheck: tests are disabled or only listed; configure an assertion runner and a fresh report'
-    command = lowered
-    for _ in range(8):
-        executable = command[0].strip('"').replace('\\','/').rsplit('/',1)[-1] if command else ''
-        if executable not in {'cmd','cmd.exe'} or '/c' not in command:
-            break
-        command = command[command.index('/c')+1:]
-        if len(command) == 1:
-            payload = command[0].strip()
-            if payload.startswith('"') and payload.endswith('"'):
-                payload = payload[1:-1]
-            try:
-                command = shlex.split(payload, posix=False)
-            except ValueError:
-                return None  # Malformed shell syntax is diagnosed by execution, not guessed here.
-    if command and command[0] in {'dir','ls','get-childitem','test-path'} and not any(any(c in token for c in '&|;><') for token in command):
-        return 'NonBehaviorCheck: listing or checking file existence is artifact evidence, not a behavior assertion/report producer'
-    if command and command[0] in {'echo', 'type', 'findstr'} and not any(
-        token in {'&', '&&', '|', '||', ';'} for token in command
-    ):
-        return 'NonBehaviorCheck: printing text or searching a file cannot execute behavior assertions and write a fresh scenario report'
-    if command and command[0] in {'del', 'erase', 'rm', 'remove-item', 'copy', 'cp', 'move', 'mv',
-                                  'mkdir', 'md', 'rmdir', 'rd', 'touch'} and not any(
-        token in {'&', '&&', '|', '||', ';'} for token in command
-    ):
-        return 'NonBehaviorCheck: changing files is not behavior verification'
-    if re.fullmatch(r'if\s+(?:not\s+)?exist\s+(?:"[^"]+"|[^\s&|;<>]+)\s+\(?\s*echo\s+[^&|;<>]+?\)?', ' '.join(command)):
-        return 'NonBehaviorCheck: if exist/echo only checks an artifact; configure an entry script that executes assertions and writes a fresh scenario report'
-    # Only built-in Maven lifecycle prefixes before test, with simple logging flags.
-    # Custom plugin goals/profiles and npm scripts can run tests; do not guess their semantics.
-    if command and command[0].strip('"').replace('\\','/').rsplit('/',1)[-1] in {'mvn','mvn.cmd','mvnw','mvnw.cmd'}:
-        goals = [a for a in command[1:] if a not in {'-q','--quiet','-b','--batch-mode','-ntp','--no-transfer-progress'}]
-        if goals and all(a in {'clean','validate','initialize','generate-sources','process-sources','generate-resources','process-resources','compile'} for a in goals):
-            return 'NonBehaviorCheck: Maven stops before the test phase; configure an assertion runner that also writes the fresh scenario report'
-    return None
 
 
 def prepare_task_input(proposed, definition, method, registry):
@@ -174,8 +80,7 @@ def diagnose_task_plan(plan, definition, method, registry):
         except ValueError as exc:
             errors.append({'path': '/tasks', 'message': str(exc)})
     return {'valid': not errors, 'diagnostics': errors,
-            'legal_columns': [c.key for c in definition.columns],
-            'required_behavior_columns': method.task_contract.required_behavior_columns}
+            'legal_columns': [c.key for c in definition.columns]}
 
 
 def diagnose_acceptance_launches(store, project_id, definition):

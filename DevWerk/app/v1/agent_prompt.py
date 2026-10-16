@@ -38,7 +38,14 @@ def build_run_envelope(
             **({"content": platform_policy.content} if spec.kind == "conversation" else {}),
         },
         "context": spec.context,
-        "completion_checks": list(spec.completion_contract.acceptance_checks) if spec.completion_contract else [],
+        "available_checks": list(spec.completion_contract.acceptance_checks) if spec.completion_contract else [],
+        "completion_evidence": {
+            outcome: {
+                "evidence_requirement": rule.evidence_requirement,
+                "required_checks": list(rule.required_checks),
+            }
+            for outcome, rule in spec.completion_contract.outcomes.items()
+        } if spec.completion_contract else {},
     }
 
 

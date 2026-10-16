@@ -77,7 +77,10 @@ def test_stale_generation_cannot_write(store, tmp_path):
 
 
 def test_pause_does_not_invalidate_current_column_finish(store, tmp_path):
-    project, task = setup_task(store, tmp_path)
+    workflow = sequence_workflow()
+    workflow.column('execute').transitions[0] = Transition(outcome='success', target='execute')
+    workflow.column('execute').transitions.append(Transition(outcome='finish', target='done'))
+    project, task = setup_task(store, tmp_path, workflow)
     owned = store.claim_task(task["id"], "worker")
     run = store.begin_run(owned, {})
     paused = store.pause_task(task["id"])
@@ -395,9 +398,6 @@ def test_command_timeout_kills_descendant_after_parent_exit(tmp_path):
     assert result["timed_out"] or result["exit_code"] == 0
 
 
-def test_wait_runtime_failure_preserves_handle_and_is_bounded(store, tmp_path, monkeypatch):
-    project = store.create_project("poll retry", "", str(tmp_path / "project"))
-    runtime, task, handle = _waiting_poll_task(store, project, {"status": "succeeded", "output": {"ready": True}})
 @pytest.mark.skipif(sys.platform != 'win32', reason='Windows inherited pipe handles')
 def test_finished_launcher_does_not_wait_for_background_child_pipe(tmp_path):
     child = "import time; from pathlib import Path; time.sleep(2); Path('late.txt').write_text('orphan')"
@@ -430,6 +430,9 @@ def test_powershell_script_exit_is_not_background_service_timeout(tmp_path):
     assert 'script complete' in result['stdout']
 
 
+def test_wait_runtime_failure_preserves_handle_and_is_bounded(store, tmp_path, monkeypatch):
+    project = store.create_project("poll retry", "", str(tmp_path / "project"))
+    runtime, task, handle = _waiting_poll_task(store, project, {"status": "succeeded", "output": {"ready": True}})
     store.policy = store.policy.model_copy(update={"execution": ExecutionLimits(max_recovery_attempts=1)})
     original = store.registry.dispatch
     def disconnect(capability, *a, **kw):

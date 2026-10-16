@@ -5,7 +5,7 @@ from app.v1.capabilities import CapabilityContext
 from app.v1.conversation import ConversationGateway
 from app.v1.domain import AgentModelResponse, AgentToolCall, ToolResult
 from app.v1.execution_ledger import ledger_entry, repeats_failed_operation
-from tests.helpers import agent_workflow, create_planned_task, publish_planned_workflow
+from tests.helpers import agent_workflow, create_planned_task, publish_planned_workflow, task_plan, workflow_plan
 from tests.test_agent_recovery_and_fencing import begin_agent
 from tests.test_conversation_intent_contract import turn
 
@@ -91,6 +91,98 @@ def test_supervision_grant_is_same_task_only_and_never_expands_scope(store, tmp_
 
     store.agents.close_requirement(project['id'], requirement['id'], 'cancelled')
     assert store.intents.denial(ctx, 'task.reopen', {'task_id':task['id']}, 'control') == 'SupervisionScopeExpired'
+    assert store.intents.denial(ctx, 'workflow.plan.save', {'plan':{}}, 'control') == 'SupervisionScopeExpired'
+
+
+def test_supervision_repairs_failed_task_with_same_scope_successor(store, tmp_path):
+    from app.v1.conversation_report import render_report
+    import json
+
+    project, _, task = failed_task_with_user_grant(store, tmp_path)
+    job, mailbox = claim_event(store, project)
+    assert store.bind_supervision_job(job['id'], mailbox)
+    run = begin_agent(store, project, kind='conversation', conversation_job_id=job['id'])
+    ctx = CapabilityContext(project['id'], project, store, agent_run_id=run['id'],
+                            agent_instance_id=store.agents.main(project['id'])['id'])
+    unrelated = store.registry.dispatch('task.create', {'task_plan_id':'other', 'proposed_task_ref':'other'}, ctx)
+    assert not unrelated.ok and unrelated.error['type'] == 'SupervisionMutationDisabled'
+
+    corrected = agent_workflow(instruction='Complete the corrected task.')
+    plan = store.registry.dispatch('workflow.plan.save',
+        {'plan':workflow_plan(corrected).model_dump(mode='json')}, ctx)
+    assert plan.ok, plan.error
+    revision = store.registry.dispatch('workflow.publish',
+        {'workflow_plan_id':plan.output['id'], 'workflow':corrected.model_dump(mode='json')}, ctx)
+    assert revision.ok, revision.error
+    repair = task_plan(revision.output['id'], corrected, task_ref=task['proposed_task_ref'])
+    repair.repair_of_task_id = task['id']
+    unrelated_plan = task_plan(revision.output['id'], corrected, task_ref='unrelated')
+    unrelated_plan.repair_of_task_id = task['id']
+    rejected_plan = store.registry.dispatch('task.plan.save',
+        {'plan':unrelated_plan.model_dump(mode='json')}, ctx)
+    assert not rejected_plan.ok and rejected_plan.error['type'] == 'SupervisionRepairPlanMismatch'
+    saved = store.registry.dispatch('task.plan.save', {'plan':repair.model_dump(mode='json')}, ctx)
+    assert saved.ok, saved.error
+    wrong_target = store.registry.dispatch('task.successor',
+        {'task_id':'tsk_other', 'task_plan_id':saved.output['id']}, ctx)
+    assert not wrong_target.ok and wrong_target.error['type'] == 'SupervisionTaskMismatch'
+    successor = store.registry.dispatch('task.successor',
+        {'task_id':task['id'], 'task_plan_id':saved.output['id']}, ctx)
+    assert successor.ok, successor.error
+    assert successor.output['rerun_of_task_id'] == task['id']
+    store.record_tool_invocation(agent_run_id=run['id'], tool_call_id='successor',
+        capability='task.successor', arguments={'task_id':task['id'], 'task_plan_id':saved.output['id']},
+        result=successor.model_dump(mode='json'), ok=True)
+    rendered, _ = render_report(store, project['id'], run['id'],
+        json.dumps({'mode':'work_result', 'tool_call_ids':['successor']}))
+    assert '待执行' in rendered
+    assert store.get_task(successor.output['id'])['status'] == 'pending'
+    repeated = store.registry.dispatch('task.successor',
+        {'task_id':task['id'], 'task_plan_id':saved.output['id']}, ctx)
+    assert not repeated.ok and repeated.error['type'] == 'SupervisionSuccessorAlreadyQueued'
+
+
+def test_supervision_agent_queues_successor_and_reports_its_state(store, tmp_path):
+    project, _, task = failed_task_with_user_grant(store, tmp_path)
+    job, _ = claim_event(store, project)
+    corrected = agent_workflow(instruction='Complete the corrected task.')
+    calls = 0
+
+    def model(messages, tools, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            name = 'workflow.plan.save'
+            args = {'plan':workflow_plan(corrected).model_dump(mode='json')}
+        elif calls == 2:
+            name = 'workflow.publish'
+            args = {'workflow_plan_id':store.list_workflow_plans(project['id'], 1)[0]['id'],
+                    'workflow':corrected.model_dump(mode='json')}
+        elif calls == 3:
+            name = 'task.plan.save'
+            repair = task_plan(store.get_workflow(project['id'])['id'], corrected,
+                               task_ref=task['proposed_task_ref'])
+            repair.repair_of_task_id = task['id']
+            args = {'plan':repair.model_dump(mode='json')}
+        elif calls == 4:
+            name = 'task.successor'
+            args = {'task_id':task['id'],
+                    'task_plan_id':store.list_task_plans(project['id'], 1)[0]['id']}
+        else:
+            raise AssertionError('a queued successor must end the notification turn')
+        return AgentModelResponse(tool_calls=[AgentToolCall(id=f'repair-{calls}', name=name, arguments=args)])
+
+    gateway = ConversationGateway(store, store.registry,
+                                  agent_core=AgentCore(store, store.registry, model))
+    gateway._process(job)
+    result = store.get_conversation_job(job['id'])
+    assert result['status'] == 'succeeded'
+    assert calls == 4
+    assert len(result['result']['task_ids']) == 1
+    successor = store.get_task(result['result']['task_ids'][0])
+    assert successor['rerun_of_task_id'] == task['id']
+    assert successor['status'] == 'pending'
+    assert '修复任务' in result['result']['reply']
 
 
 def test_supervision_wakes_project_agent_but_not_on_closed_scope(store, tmp_path):
@@ -171,6 +263,7 @@ def test_supervision_can_recover_only_once_per_notification(store, tmp_path):
     assert wrong_action.error['type'] == 'SupervisionTaskNotRecoverable'
     reopened = store.registry.dispatch('task.reopen', {'task_id':task['id']}, ctx)
     assert reopened.ok, reopened.error
+    assert store.intents.denial(ctx, 'workflow.plan.save', {'plan':{}}, 'control') == 'SupervisionTaskNotFailed: Workflow repair requires a failed Task'
     store.record_tool_invocation(agent_run_id=run['id'], tool_call_id='first-reopen',
         capability='task.reopen', arguments={'task_id':task['id']},
         result=reopened.model_dump(mode='json'), ok=True)
@@ -229,6 +322,33 @@ def test_supervision_hands_diagnosis_to_blocked_worker_then_stops_after_retry(st
     assert queued[0]['assignment_id'] == fresh['id']
 
 
+def test_user_worker_input_to_pending_task_ends_turn_after_handoff(store, tmp_path):
+    from app.v1.agent_models import AgentRunSpec
+    from app.v1.agent_runner import AgentExecutionRunner
+    from app.v1.execution_ledger import ledger_entry
+    from app.v1.domain import ToolResult
+
+    project, task, assignment = blocked_task_with_user_grant(store, tmp_path)
+    runner = AgentExecutionRunner(store=store, registry=store.registry,
+                                  model_complete=lambda *_a, **_kw: None,
+                                  runtime_policy=store.policy, platform_policy=None)
+    entry = ledger_entry('arun_user', 'send-feedback', 'agent.worker.send', 'control',
+                         ToolResult(ok=True, capability='agent.worker.send', output={'id': 'input'}),
+                         arguments={'worker_id': assignment['agent_instance_id'],
+                                    'content': 'Repair the test and verify it.'})
+    user_turn = AgentRunSpec(kind='conversation', project=project, instruction='',
+                             instruction_revision=1, context={}, capability_ids=[],
+                             user_initiated=True)
+    assert not runner._active_worker_handoff(user_turn, [entry])
+    store.retry_task(task['id'], column_key='work')
+    assert store.get_task(task['id'])['status'] == 'pending'
+    assert runner._active_worker_handoff(user_turn, [entry])
+    assert not runner._active_worker_handoff(
+        AgentRunSpec(kind='conversation', project=project, instruction='',
+                     instruction_revision=1, context={}, capability_ids=[],
+                     user_initiated=False, supervision_turn=True), [entry])
+
+
 def test_supervision_cannot_finish_as_recovered_after_only_queuing_worker_input(store, tmp_path):
     project, task, assignment = blocked_task_with_user_grant(store, tmp_path)
     job, mailbox = claim_event(store, project)
@@ -279,6 +399,38 @@ def test_user_recovery_rejects_resume_boundary_before_it_can_block_retry(store, 
     assert authorized.ok, authorized.error
     retried = store.registry.dispatch('task.retry', {'task_id': task['id']}, ctx)
     assert retried.ok, retried.error
+    assert store.get_task(task['id'])['status'] == 'pending'
+
+
+def test_failed_task_recovery_does_not_bind_resume_control_turn(store, tmp_path):
+    project, requirement, task = failed_task_with_user_grant(store, tmp_path)
+    job, ctx = turn(store, project, f'继续修复 Task {task["id"]} 的交付失败')
+
+    wrong_boundary = store.registry.dispatch('conversation.task.control.authorize', {
+        'action': 'task.resume', 'task_id': task['id']}, ctx)
+    assert not wrong_boundary.ok
+    assert 'FailedTaskRequiresReopen' in str(wrong_boundary.error)
+    assert store.intents.contract(job)['phase'] == 'unresolved'
+
+    state = store.intents.context(job)
+    direct_boundary = store.registry.dispatch('conversation.turn.resolve', {
+        'source_message_id': job['user_message_id'],
+        'based_on_intent_revision': state['revision'],
+        'user_evidence': [{'message_id': job['user_message_id']}],
+        'act': 'control', 'control_capability': 'task.resume',
+        'control_task_id': task['id']}, ctx)
+    assert not direct_boundary.ok
+    assert 'FailedTaskRequiresReopen' in str(direct_boundary.error)
+    assert store.intents.contract(job)['phase'] == 'unresolved'
+
+    unauthorized = store.registry.dispatch('task.reopen', {'task_id': task['id']}, ctx)
+    assert not unauthorized.ok
+    assert 'RecoveryRequiresExecutionAuthorization' in str(unauthorized.error)
+    authorized = store.registry.dispatch('conversation.execution.authorize', {
+        'request': 'continue', 'requirement_id': requirement['id']}, ctx)
+    assert authorized.ok, authorized.error
+    reopened = store.registry.dispatch('task.reopen', {'task_id': task['id']}, ctx)
+    assert reopened.ok, reopened.error
     assert store.get_task(task['id'])['status'] == 'pending'
 
 

@@ -320,8 +320,11 @@ class ConversationGateway:
                 is_user_turn = trigger_kind == "user"
                 main = self.store.agents.main(project_id)
                 requirement = self.store.agents.turn_requirement(job, mailbox)
-                graph_mutation_allowed = bool(is_user_turn and requirement and
+                supervision_repair_allowed = bool(supervision and
+                    self.store.get_project_task(project_id, supervision['supervised_task_id'])['status'] == 'failed')
+                graph_mutation_allowed = bool((is_user_turn and requirement and
                     requirement['status'] == 'active' and self.store.intents.contract(job)['phase'] == 'execution')
+                    or supervision_repair_allowed)
                 context = {
                     "turn_contract": self.store.intents.contract(job),
                     "work_intent": self.store.intents.context(job),
@@ -365,22 +368,26 @@ class ConversationGateway:
                             "For a user-requested scope extension use project.scope.inspect then project.scope.revise, never close/create the old scope. "
                             "Save a new TaskPlan against the returned Workflow and create only additional Tasks. Scope revision itself creates no Tasks. "
                             "If a frozen method must change, inspect its current Loop digest and pass loop_digest explicitly. "
-                            "For continued novels use ending_policy=continue; do not raise chapter length limits without the user's request. "
                             "Columns execute one leaf Worker each; collaboration belongs in the workflow. "
-                            "When the user confirms an exact Column sequence, publish that sequence only; "
-                            "done/failed are terminals, not extra Agent Columns. Assign every requested "
-                            "deliverable, including run instructions, to the confirmed Columns before publishing. "
+                            "Use the user's current request and the published Workflow contract to decide the work. "
+                            "For user-requested Workflow delivery, create the Task before doing its Column work; "
+                            "only prepare contract-required planning inputs and entry evidence in this turn. "
                             "After task.create, task.retry, task.resume, task.reopen, task.rerun, or task.successor "
                             "queues work, finish this turn with conversation.reply stating the observed queued state. "
+                            "When the user corrects work in an existing pending or running Task, inspect its current Worker and send concise input with agent.worker.send; "
+                            "omit assignment_id for an existing Worker awaiting the next Assignment. Report the queued receipt and finish the turn so that Worker can continue. "
+                            "When the Workflow declares review or rework edges, use them for defects rather than duplicating a pending Worker's work. "
                             "Workers cannot start while this Conversation turn holds the Project planning lease; "
                             "polling a pending Task in this turn does not advance it. Supervisor runs it after your "
                             "reply; review delivery in later user turns or supervision wakeups."
                             + (" This is a supervision wakeup for one failed Task under an existing user Grant. "
                                "The mailbox only identifies the event; inspect the Task and feedback yourself. "
-                               "Only same-Task retry/reopen or input to its current Worker Assignment is permitted. "
-                               "For a blocked Worker, inspect concrete failure evidence and send concise diagnostic input before retrying; the input follows its next Assignment. "
-                               "One successful recovery ends this notification turn, so send any Worker input first. "
-                               "Do not create scope, Workflow, Task, files or a new user grant. "
+                               "For a failed Task, you may reopen it or revise the Workflow and save a single corrected TaskPlan with repair_of_task_id, then call task.successor for this Task. "
+                               "For a recovering Task, retry it or send input to its current Worker Assignment. "
+                               "For a blocked Worker, inspect concrete failure evidence and send concise corrective input before retrying; the input follows its next Assignment. "
+                               "Do not ask the Worker for a plain-text diagnostic reply: it must continue work and submit column.complete with a declared outcome. "
+                               "One successful retry, reopen or successor ends this notification turn, so complete any planning first. "
+                               "Do not create a new Requirement, unrelated Task, project files or a new user grant. "
                                "Finish with conversation.reply and cite real receipts; the user notification is rendered from current Task state."
                                if supervision else "")
                         ),
@@ -454,7 +461,7 @@ class ConversationGateway:
                 workflow_publications = [
                     item["result"]["output"]
                     for item in all_invocations
-                    if item["capability"] in {"workflow.publish", "workflow.acceptance.configure", "workflow.acceptance.runners"}
+                    if item["capability"] in {"workflow.publish", "workflow.acceptance.configure"}
                     and item["ok"]
                     and isinstance(item.get("result", {}).get("output"), dict)
                 ]
@@ -480,7 +487,7 @@ class ConversationGateway:
                 ]
                 conversation_reply = result.text.strip()
                 if supervision:
-                    conversation_reply = _notification_text(self.store, job, mailbox)
+                    conversation_reply = _notification_text(self.store, job, mailbox, successors=tasks)
                 publish_reply = trigger_kind == "user" or mailbox_requires_user_update
                 notification = (
                     {
@@ -494,7 +501,7 @@ class ConversationGateway:
                             "task_ids": [task["id"] for task in tasks],
                             "workflow_revision_ids": [item["id"] for item in workflow_publications],
                             "mailbox_ids": [item["id"] for item in mailbox],
-                            "subject_status": (self.store.get_project_task(project_id, supervision['supervised_task_id'])['status']
+                            "subject_status": ((tasks[0]['status'] if tasks else self.store.get_project_task(project_id, supervision['supervised_task_id'])['status'])
                                                if supervision else _mailbox_subject_status(mailbox)),
                         },
                     }
@@ -638,7 +645,7 @@ class ConversationGateway:
              'task_ids':list(tasks),'mailbox_ids':[m['id'] for m in mailbox]},notification=notification)
 
 
-def _notification_text(store, job, mailbox):
+def _notification_text(store, job, mailbox, *, successors=()):
     tasks = {m['task_id']: store.get_project_task(job['project_id'], m['task_id'])
              for m in mailbox if m.get('task_id')}
     labels = {'done':'已交付', 'failed':'失败', 'recovering':'需要处理', 'running':'执行中', 'pending':'待执行', 'waiting':'等待外部结果'}
@@ -658,6 +665,9 @@ def _notification_text(store, job, mailbox):
         elif task.get('error'):
             text += '；' + str(task['error'])[:300]
         parts.append(text)
+    for task in successors:
+        if task.get('rerun_of_task_id') in tasks:
+            parts.append(f"修复任务 {task['title']}：{labels.get(task['status'], task['status'])}")
     for item in mailbox:
         if not item.get('task_id'):
             payload = item.get('payload') or {}
@@ -704,7 +714,6 @@ def _has_durable_governance_progress(
         "workflow.plan.save",
         "workflow.publish",
         "workflow.acceptance.configure",
-        "workflow.acceptance.runners",
         "loop.apply",
         "agent.worker.send",
     }

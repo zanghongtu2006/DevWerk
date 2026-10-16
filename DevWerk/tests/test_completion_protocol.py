@@ -16,7 +16,7 @@ from app.v1.completion_protocol import (
 )
 from app.v1.domain import AgentModelResponse, AgentToolCall, ToolResult
 from app.v1.execution_ledger import ledger_entry
-from app.v1.services.completion_admission import CompletionAdmissionService, _recognizable_verification_command
+from app.v1.services.completion_admission import CompletionAdmissionService
 from app.v1.tool_protocol import parse_await_submission
 
 
@@ -65,7 +65,7 @@ def test_custom_intermediate_outcome_requires_declared_evidence() -> None:
 def test_acceptance_rejection_exposes_bounded_check_failure() -> None:
     contract = CompletionContract(
         tool_name='column.complete',
-        outcomes={'advance': CompletionOutcomeRule(target='next')},
+        outcomes={'advance': CompletionOutcomeRule(target='next', required_checks=('backend_unit_tests',))},
         acceptance_checks=({'key': 'backend_unit_tests'},),
     )
     submission = CompletionSubmission(outcome='advance', output={}, summary='ready', evidence_ids=())
@@ -185,30 +185,45 @@ def test_exact_retry_resets_completion_rejection_ceiling() -> None:
     assert guard.rejections == 1
 
 
-def test_worker_selected_behavior_check_repairs_earlier_command_failure() -> None:
-    failed = _entry('failed', 'project.command.run', 'process', ok=False,
-                    arguments={'argv': ['mvn', 'exec:java']})
-    passed = _entry('passed', 'project.command.run', 'process', ok=True,
-                    arguments={'argv': ['mvn', 'test']})
-    cleanup = _entry('cleanup', 'project.command.run', 'process', ok=True,
-                     arguments={'argv': ['cmd', '/c', 'del', 'temporary.java']})
-    failed_write = _entry('write', 'project.files.write', 'write', ok=False)
+
+
+def test_completion_rejection_discloses_all_pending_failed_receipt_ids() -> None:
+    first = _entry('first-failure', 'project.command.run', 'process', ok=False,
+                   arguments={'argv': ['mvn', 'test']})
+    second = _entry('second-failure', 'project.command.run', 'process', ok=False,
+                    arguments={'argv': ['java', '-jar', 'app.jar']})
     contract = CompletionContract('column.complete',
-        {'ready': CompletionOutcomeRule(target='next', required_capability='project.command.run')},
+        {'ready': CompletionOutcomeRule(target='next')}, evidence_collection='runtime')
+    submission = CompletionSubmission('ready', {}, 'verified',
+                                      (first['evidence_id'], second['evidence_id']))
+
+    result = CompletionAdmissionService().evaluate(submission, contract, [first, second])
+
+    assert result.rejection.code == 'unresolved_execution_failure'
+    assert 'unresolved_failure_count=2' in result.rejection.message
+    assert f'"{first["evidence_id"]}"' in result.rejection.message
+    assert f'"{second["evidence_id"]}"' in result.rejection.message
+
+
+def test_failed_listing_can_be_resolved_by_later_successful_listing() -> None:
+    failed = _entry('bad-listing', 'project.command.run', 'process', ok=False,
+                    arguments={'argv': ['cmd', '/c', 'dir', 'frontend/src', '/s', '/b']})
+    repaired = _entry('good-listing', 'project.command.run', 'process', ok=True,
+                      arguments={'argv': ['cmd', '/c', 'dir', '/s', '/b', 'frontend/src']})
+    built = _entry('build', 'project.command.run', 'process', ok=True,
+                   arguments={'argv': ['npm', 'run', 'build']})
+    contract = CompletionContract('column.complete',
+        {'ready': CompletionOutcomeRule(target='next')},
         evidence_collection='runtime')
+    submission = CompletionSubmission('ready', {}, 'built',
+        tuple(item['evidence_id'] for item in (failed, repaired, built)),
+        (FailureResolution(failed['evidence_id'], repaired['evidence_id'],
+                           'Corrected the directory listing arguments'),))
 
-    def decision(ledger):
-        return CompletionAdmissionService().evaluate(
-            CompletionSubmission('ready', {}, 'verified',
-                                 tuple(item['evidence_id'] for item in ledger)), contract, ledger)
+    assert CompletionAdmissionService().evaluate(
+        submission, contract, [failed, repaired, built]).accepted
 
-    assert decision([failed, passed]).accepted
-    rejected = decision([passed, failed])
-    assert rejected.rejection.code == 'unresolved_execution_failure'
-    assert 'later successful behavior check' in rejected.rejection.message
-    assert decision([failed, cleanup]).rejection.code == 'unresolved_execution_failure'
-    assert decision([failed, passed, failed_write]).rejection.code == 'unresolved_execution_failure'
-    assert 'later successful identifiable build/test/verification command' in completion_tool_schema(contract)['function']['description']
+
 
 
 def test_successful_frontend_build_supersedes_failed_install_without_model_evidence_ids() -> None:
@@ -217,10 +232,14 @@ def test_successful_frontend_build_supersedes_failed_install_without_model_evide
     built = _entry('built', 'project.command.run', 'process', ok=True,
                    arguments={'argv': ['cmd', '/c', 'cd /d frontend && pnpm run build']})
     contract = CompletionContract('column.complete',
-        {'frontend_done': CompletionOutcomeRule(target='next', required_capability='project.command.run')},
+        {'frontend_done': CompletionOutcomeRule(target='next')},
         evidence_collection='runtime')
-    submission = parse_completion_submission(
-        {'outcome': 'frontend_done', 'output': {}, 'summary': 'build passed'}, contract, [failed, built])
+    submission = parse_completion_submission({
+        'outcome': 'frontend_done', 'output': {}, 'summary': 'build passed',
+        'failure_resolutions': [{'failed_evidence_id': failed['evidence_id'],
+                                 'resolved_by_evidence_id': built['evidence_id'],
+                                 'reason': 'The later verification covers the failed setup'}]},
+        contract, [failed, built])
 
     assert CompletionAdmissionService().evaluate(submission, contract, [failed, built]).accepted
 
@@ -235,34 +254,22 @@ def test_unfrozen_acceptance_column_can_complete_after_later_successful_behavior
     contract = CompletionContract('column.complete',
         {'done': CompletionOutcomeRule(target='done')}, evidence_collection='runtime')
 
-    def decision(ledger, *, frozen=False):
+    def decision(ledger, *, frozen=False, resolve=False):
         selected = contract if not frozen else CompletionContract(
-            'column.complete', contract.outcomes, evidence_collection='runtime',
+            'column.complete', {'done': CompletionOutcomeRule(target='done', required_checks=('http_check',))}, evidence_collection='runtime',
             acceptance_checks=({'key': 'http_check'},))
         return CompletionAdmissionService().evaluate(
             CompletionSubmission('done', {}, 'verified',
-                                 tuple(item['evidence_id'] for item in ledger)), selected, ledger)
+                                 tuple(item['evidence_id'] for item in ledger),
+                                 (FailureResolution(failed['evidence_id'], passed['evidence_id'],
+                                                    'Later command verifies the failed attempt'),) if resolve else ()),
+            selected, ledger)
 
-    assert decision([failed, passed]).accepted
+    assert decision([failed, passed]).rejection.code == 'unresolved_execution_failure'
+    assert decision([failed, passed], resolve=True).accepted
     assert decision([passed, failed]).rejection.code == 'unresolved_execution_failure'
     assert decision([failed, cleanup]).rejection.code == 'unresolved_execution_failure'
     assert decision([failed, passed], frozen=True).rejection.code == 'acceptance_check_failed'
-
-
-@pytest.mark.parametrize(('argv', 'expected'), [
-    (['mvn', '-f', 'backend/pom.xml', 'test', '-q'], True),
-    (['npm', 'run', 'build'], True),
-    (['cmd', '/c', 'cd /d frontend && pnpm run build'], True),
-    (['cmd', '/c', 'cd /d frontend && pnpm run build && exit /b 0'], False),
-    (['npm', 'install'], False),
-    (['npm', '--version'], False),
-    (['powershell', '-ExecutionPolicy', 'Bypass', '-File', 'acceptance-test.ps1'], True),
-    (['cmd', '/c', 'python frontend/verify_acceptance.py'], True),
-    (['python', '-c', "print('different operation')"], False),
-    (['cmd', '/c', 'del', 'temporary.java'], False),
-])
-def test_only_identifiable_verification_commands_supersede_failures(argv, expected) -> None:
-    assert _recognizable_verification_command(argv) is expected
 
 
 def test_runtime_evidence_collection_ignores_model_supplied_evidence_ids() -> None:

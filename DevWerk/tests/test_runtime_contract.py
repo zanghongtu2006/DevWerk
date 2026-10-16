@@ -83,7 +83,7 @@ def test_runtime_artifact_context_is_bounded_and_deduplicated_across_globs(store
     assert all(item["sha256"] for item in manifest["preloaded_project_artifacts"])
 
 
-def test_runtime_reference_context_excludes_generated_frontend_dependencies(store, tmp_path):
+def test_runtime_reference_context_respects_character_budget_without_directory_assumptions(store, tmp_path):
     from app.v1.files import ProjectFiles
 
     project = store.create_project('frontend source context', '', str(tmp_path / 'project'))
@@ -99,10 +99,27 @@ def test_runtime_reference_context_excludes_generated_frontend_dependencies(stor
     context = WorkflowRuntime(store, build_core_registry(), 'context-worker')._input_for(
         task, workflow, workflow.columns[0])
 
-    assert [item['path'] for item in context['reference_artifacts']] == [
-        'frontend/src/App.vue']
+    assert {item['path'] for item in context['reference_artifacts']} == {
+        'frontend/dist/assets/bundle.js', 'frontend/node_modules/pkg/index.js',
+        'frontend/src/App.vue'}
+    assert sum(len(item['content']) for item in context['reference_artifacts']) <= (
+        store.policy.context.artifact_context_max_characters)
     assert files.read_text('frontend/dist/assets/bundle.js').startswith('generated')
     assert 'frontend/node_modules/pkg/index.js' in files.list_paths('frontend/**/*')
+
+
+def test_runtime_reference_context_can_select_project_build_directories(store, tmp_path):
+    from app.v1.files import ProjectFiles
+
+    project = store.create_project('selected reference', '', str(tmp_path / 'project'))
+    workflow = sequence_workflow()
+    workflow.columns[0].context.artifact_globs = ['build/target/*.txt']
+    publish_planned_workflow(store, project['id'], workflow)
+    task = create_planned_task(store, project['id'], 'selected reference')
+    ProjectFiles(project['base_dir']).write_text('build/target/report.txt', 'requested evidence')
+    context = WorkflowRuntime(store, build_core_registry(), 'context-worker')._input_for(
+        task, workflow, workflow.columns[0])
+    assert [item['path'] for item in context['reference_artifacts']] == ['build/target/report.txt']
 
 
 def test_runtime_separates_accepted_working_and_reference_artifact_provenance(store, tmp_path):
@@ -373,41 +390,12 @@ def test_task_admission_rejects_missing_dynamic_reference_before_runtime(
     assert store.list_tasks(project["id"]) == []
 
 
-def test_terminal_guard_enforces_immutable_task_agent_execution_policy(store, tmp_path, monkeypatch):
-    project = store.create_project("terminal agent policy", "", str(tmp_path / "project"))
-    _plan_row, _revision = publish_planned_workflow(store, project["id"], sequence_workflow())
-    task = create_planned_task(store, project["id"], "task")
-    runtime = WorkflowRuntime(store, build_core_registry(), "worker")
-
-    runtime._validate_task_agent_terminal(task, "done")
-
-    original_agent_runs = store.agent_runs
-    monkeypatch.setattr(store, "agent_runs", lambda **_kwargs: [{"id": "arun_test"}])
-    with pytest.raises(ValueError, match="forbidden"):
-        runtime._validate_task_agent_terminal(task, "done")
-
-    original_get_plan = store.get_task_plan
-    required_plan = original_get_plan(project["id"], task["task_plan_id"])
-    required_plan = {
-        **required_plan,
-        "plan": {
-            **required_plan["plan"],
-            "tasks": [
-                {**item, "agent_execution": "required"}
-                for item in required_plan["plan"]["tasks"]
-            ],
-        },
-    }
-    monkeypatch.setattr(
-        store,
-        "get_task_plan",
-        lambda *_args, **_kwargs: required_plan,
-    )
-    monkeypatch.setattr(store, "agent_runs", lambda **_kwargs: [])
-    with pytest.raises(ValueError, match="required"):
-        runtime._validate_task_agent_terminal(task, "done")
-
-    monkeypatch.setattr(store, "agent_runs", original_agent_runs)
+def test_agent_execution_policy_is_checked_before_task_creation(store, tmp_path):
+    project = store.create_project("agent policy", "", str(tmp_path / "project"))
+    publish_planned_workflow(store, project["id"], sequence_workflow())
+    with pytest.raises(ValueError, match="Workflow contains no Agent executor"):
+        create_planned_task(store, project["id"], "invalid task", agent_execution="required")
+    assert store.list_tasks(project["id"]) == []
 
 
 def test_capability_sequence_routes_file_assertion_mismatch_from_evidence(store, tmp_path):

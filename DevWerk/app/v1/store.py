@@ -1202,6 +1202,9 @@ class V1Store:
         initial_loop: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.get_project(project_id)
+        # Callers may mutate a Pydantic Workflow after construction. Revalidate
+        # the serialized graph so legacy global checks become edge conditions.
+        workflow = WorkflowDefinition.model_validate(workflow.model_dump(mode="json"))
         validate_workflow_capabilities(workflow, self.registry)
         plan_row = self.get_workflow_plan(project_id, workflow_plan_id)
         plan = WorkflowPlan.model_validate(plan_row["plan"])
@@ -1270,7 +1273,9 @@ class V1Store:
             ).fetchone())
         if not row:
             raise KeyError(f"no active workflow for {project_id}")
-        row["definition"] = json.loads(row.pop("definition_json"))
+        row["definition"] = WorkflowDefinition.model_validate_json(
+            row.pop("definition_json")
+        ).model_dump(mode="json")
         binding = self.get_project_loop_binding(project_id, row['id'])
         row["loop_bindings"] = binding['bindings'] if binding else {}
         if binding:
@@ -1369,7 +1374,9 @@ class V1Store:
             row = self._dict(db.execute("SELECT * FROM v1_workflow_revisions WHERE id=? AND project_id=?", (workflow_id, project_id)).fetchone())
         if not row:
             raise KeyError(workflow_id)
-        row["definition"] = json.loads(row.pop("definition_json"))
+        row["definition"] = WorkflowDefinition.model_validate_json(
+            row.pop("definition_json")
+        ).model_dump(mode="json")
         row["active"] = bool(row["active"])
         return row
 
@@ -1502,11 +1509,6 @@ class V1Store:
                 raise ValueError("a Task successor must preserve proposed task identity")
             if plan.repair_of_task_id and plan.repair_of_task_id != rerun_of_task_id and predecessor['task_plan_id'] != task_plan_id:
                 raise ValueError('Corrected TaskPlan names a different predecessor')
-            previous_definition = self.workflow_by_id(project_id, predecessor['workflow_revision_id'])
-            obligations = {(o.column,o.check_key):set(o.invalidated_by) for o in definition.acceptance_obligations}
-            for old in previous_definition.acceptance_obligations:
-                if (old.column,old.check_key) not in obligations or not set(old.invalidated_by).issubset(obligations[(old.column,old.check_key)]):
-                    raise ValueError('A repair successor must preserve accepted verification obligations and their invalidation scope')
         elif plan.repair_of_task_id:
             repair_target = self.get_project_task(project_id,plan.repair_of_task_id)
             if proposed.proposed_task_ref == repair_target['proposed_task_ref']:
@@ -1973,9 +1975,13 @@ class V1Store:
             attempt_row = db.execute("SELECT status FROM v1_column_attempts WHERE id=?", (attempt[0],)).fetchone()
             if not run_row or not attempt_row:
                 raise RuntimeError("Column Run state disappeared while finishing")
-            if not error:
-                self.feedback.record_column_evidence(db, task, run_id, attempt[0])
-            next_column, terminal = self.feedback.settle(db, task, run_id, outcome, next_column, terminal)
+            workflow = self.workflow_by_id(task["project_id"], task["workflow_revision_id"])
+            declared = next((edge for edge in workflow.column(task["current_column"]).transitions
+                             if edge.outcome == outcome), None)
+            if not declared or next_column != declared.target or terminal != workflow.terminal_kind(declared.target):
+                raise ValueError("Column completion must follow its declared Workflow transition")
+            self.feedback.verify_transition_checks(db, task, run_id, declared)
+            self.feedback.apply_completion_evidence(db, task, run_id, outcome, terminal)
             task_status = terminal or ('failed' if error else 'pending')
             COLUMN_RUN_STATE_MACHINE.require(run_row[0], run_status)
             ATTEMPT_STATE_MACHINE.require(attempt_row[0], run_status)

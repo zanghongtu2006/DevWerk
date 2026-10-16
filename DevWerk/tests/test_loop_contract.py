@@ -9,7 +9,7 @@ from pydantic import ValidationError
 
 from app.v1.capabilities import build_core_registry
 from app.v1.contracts import ContractError
-from app.v1.domain import TaskPlan, WorkflowDefinition
+from app.v1.domain import TaskPlan, Transition, WorkflowDefinition
 from app.v1.runtime import WorkflowRuntime
 from tests.helpers import create_planned_task, publish_planned_workflow, sequence_workflow, task_plan, workflow_plan
 
@@ -140,7 +140,7 @@ def test_workflow_column_rejects_nested_multi_agent_executor():
 def test_ddd_software_delivery_loop_has_generic_engineering_lifecycle(store):
     loop = store.get_loop("software.ddd_delivery")
     assert loop["directory"] == "ddd-software-delivery"
-    assert loop["version"] == "1.4.1"
+    assert loop["version"] == "1.4.10"
     assert loop["category"] == "software_delivery"
     assert set(loop["tags"]) >= {
         "domain-driven-design",
@@ -162,6 +162,17 @@ def test_ddd_software_delivery_loop_has_generic_engineering_lifecycle(store):
     ]
     columns = {column["key"]: column for column in workflow["columns"]}
     assert all(column["executor"]["kind"] == "agent" for column in workflow["columns"])
+    for key in ("integration_review", "system_test", "delivery"):
+        assert "同一次 project.command.run" in columns[key]["instruction"]
+        assert "不能" in columns[key]["instruction"] or "不得" in columns[key]["instruction"]
+    assert "finally 停止服务" in columns["system_test"]["instruction"]
+    assert "非阻断建议只能写入审查报告" in columns["integration_review"]["instruction"]
+    assert "完整 HTTP、重启与到期行为测试由 system_test 执行" in columns["integration_review"]["instruction"]
+    assert "读取原始请求/响应及测试脚本记录的前置条件判定" in columns["integration_review"]["instruction"]
+    assert "沿现有 accepted 前向边交回 system_test 重跑" in columns["integration_review"]["instruction"]
+    assert "输入与需求一致但结果失败时，不得反推输入错误" in columns["integration_review"]["instruction"]
+    assert "不得调用 task.feedback.record 记录已解决事项" in columns["accept"]["instruction"]
+    assert "project.files.list/read 核对" in columns["delivery"]["instruction"]
     assert all({'task.feedback.record','task.feedback.list'}.issubset(column['executor']['capabilities']) for column in workflow['columns'])
     assert columns["backend_development"]["metadata"]["writable_paths"] == [
         "backend/**",
@@ -173,6 +184,15 @@ def test_ddd_software_delivery_loop_has_generic_engineering_lifecycle(store):
     ]
     assert columns["integration_review"]["metadata"]["writable_paths"] == ["docs/pair-review.md"]
     assert "scripts/acceptance/**" in columns["system_test"]["metadata"]["writable_paths"]
+    assert "测试脚本自身" in columns["system_test"]["instruction"]
+    assert "重启耗时超过测试窗口" in columns["system_test"]["instruction"]
+    assert "测试脚本必须从响应记录截止时间和实际请求时间" in columns["system_test"]["instruction"]
+    assert "固定等待秒数不得替代此判定" in columns["system_test"]["instruction"]
+    assert "本次测试无效，须在本列重新初始化该场景并完整重跑" in columns["system_test"]["instruction"]
+    assert "报告中分别记录无效执行、重跑结果和有效产品失败" in columns["system_test"]["instruction"]
+    assert "backend_ready" in columns["backend_development"]["instruction"]
+    assert "完整 HTTP、服务启动、重启和到期验收由后续 system_test 独立完成" in columns["backend_development"]["instruction"]
+    assert "不运行尚未创建的 frontend 项目" in columns["backend_development"]["instruction"]
     assert "scripts/delivery/**" in columns["delivery"]["metadata"]["writable_paths"]
     assert "scripts/accept/**" in columns["accept"]["metadata"]["writable_paths"]
     assert columns["backend_development"]["metadata"]["agent_session_key"] == "backend_development"
@@ -593,6 +613,52 @@ def test_failed_task_reopen_reuses_identity_and_returns_to_graph_entry(store, tm
     assert reopened["status"] == "pending"
     assert reopened["current_column"] == workflow.entry
     assert len(store.runs(project["id"], task["id"])) == 2
+
+
+def test_failed_task_reopen_cannot_skip_failed_column(store, tmp_path):
+    project = store.create_project("reopen boundary", "", str(tmp_path / "reopen-boundary"))
+    workflow = sequence_workflow()
+    execute = workflow.column("execute")
+    execute.transitions = [Transition(outcome="success", target="review"),
+                           Transition(outcome="failure", target="failed")]
+    review = copy.deepcopy(execute)
+    review.key = "review"
+    review.name = "Review"
+    review.transitions = [Transition(outcome="success", target="later"),
+                          Transition(outcome="failure", target="failed")]
+    later = copy.deepcopy(execute)
+    later.key = "later"
+    later.name = "Later"
+    later.transitions = [Transition(outcome="success", target="done"),
+                         Transition(outcome="failure", target="failed")]
+    workflow.columns.extend([review, later])
+    publish_planned_workflow(store, project["id"], workflow)
+    task = create_planned_task(store, project["id"], "deliver")
+
+    claimed = store.claim_task(task["id"], "worker")
+    run = store.begin_run(claimed, {})
+    store.finish_run(claimed, run["id"], {}, "success", "review")
+    claimed = store.claim_task(task["id"], "worker")
+    run = store.begin_run(claimed, {})
+    store.finish_run(claimed, run["id"], {}, "failure", "failed",
+                     terminal="failed", error="build failed")
+    failed = store.get_task(task["id"])
+    assert failed["status"] == "failed"
+    run_count = len(store.runs(project["id"], task["id"]))
+
+    with pytest.raises(ValueError, match="cannot skip the failed Column"):
+        store.reopen_task(task["id"], "later")
+    assert store.get_task(task["id"])["terminal_event_id"] == failed["terminal_event_id"]
+    assert len(store.runs(project["id"], task["id"])) == run_count
+
+    reopened = store.reopen_task(task["id"], "review")
+    assert reopened["status"] == "pending"
+    assert reopened["current_column"] == "review"
+    with pytest.raises(ValueError, match="cannot skip an uncorrected failed Column"):
+        store.retry_task(task["id"], "later")
+    assert store.get_task(task["id"])["current_column"] == "review"
+    rewound = store.retry_task(task["id"], "execute")
+    assert rewound["current_column"] == "execute"
 
 
 def test_writer_rework_reuses_one_logical_agent_session(store, tmp_path):

@@ -17,6 +17,8 @@ logger = logging.getLogger("devwerk.files")
 
 
 class ProjectFiles:
+    SEARCH_INTERNAL_DIRECTORIES = frozenset({'.devwerk'})
+
     def __init__(self, base_dir: str, policy: V1RuntimePolicy | None = None):
         self.policy = policy or DEFAULT_V1_RUNTIME_POLICY
         self.root = Path(base_dir).expanduser().resolve()
@@ -72,6 +74,28 @@ class ProjectFiles:
             paths.append(relative.as_posix())
             if len(paths) >= max(1, min(limit, self.policy.service_limits.max_file_list_size)):
                 break
+        return paths
+
+    def search_paths(self, pattern: str = "**/*", *, limit: int) -> list[str]:
+        """Bound default content searches without assuming project directory roles."""
+        normalized = self._normalize_relative(pattern or "**/*", kind="glob")
+        if normalized != "**/*":
+            return self.list_paths(normalized, limit=limit)
+        paths: list[str] = []
+        maximum = max(1, min(limit, self.policy.service_limits.max_file_list_size))
+        for directory, subdirectories, filenames in os.walk(self.root):
+            subdirectories[:] = sorted(
+                name for name in subdirectories
+                if name.lower() not in self.SEARCH_INTERNAL_DIRECTORIES
+            )
+            for name in sorted(filenames):
+                textual = Path(directory) / name
+                if not textual.is_file():
+                    continue
+                relative = self._relative_resolved(textual, source=str(textual))
+                paths.append(relative.as_posix())
+                if len(paths) >= maximum:
+                    return paths
         return paths
 
     def write_text(self, relative_path: str, content: str) -> dict[str, Any]:

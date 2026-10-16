@@ -50,6 +50,12 @@ class ToolInvocationStatus(StringStatus):
     FAILED = "failed"
 
 
+class FeedbackStatus(StringStatus):
+    OPEN = "open"
+    VERIFYING = "verifying"
+    RESOLVED = "resolved"
+
+
 class MailboxStatus(StringStatus):
     PENDING = "pending"
     DELIVERED = "delivered"
@@ -183,6 +189,15 @@ AGENT_RUN_STATE_MACHINE = StateMachine(
     },
 )
 
+FEEDBACK_STATE_MACHINE = StateMachine(
+    FeedbackStatus,
+    {
+        FeedbackStatus.OPEN: {FeedbackStatus.VERIFYING},
+        FeedbackStatus.VERIFYING: {FeedbackStatus.RESOLVED},
+        FeedbackStatus.RESOLVED: set(),
+    },
+)
+
 MAILBOX_STATE_MACHINE = StateMachine(
     MailboxStatus,
     {
@@ -210,6 +225,7 @@ def runtime_status_catalog() -> dict[str, dict[str, object]]:
         "column_run": COLUMN_RUN_STATE_MACHINE,
         "attempt": ATTEMPT_STATE_MACHINE,
         "agent_run": AGENT_RUN_STATE_MACHINE,
+        "feedback": FEEDBACK_STATE_MACHINE,
     }
     catalog = {
         name: {

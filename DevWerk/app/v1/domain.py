@@ -16,12 +16,20 @@ from app.v1.states import (
 KEY_PATTERN = r"^[a-z][a-z0-9_.-]{0,127}$"
 
 
+class EdgeCheck(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    column: str = Field(pattern=KEY_PATTERN)
+    check_key: str = Field(pattern=KEY_PATTERN)
+    invalidated_by: list[str] = Field(default_factory=list, max_length=200)
+
+
 class Transition(BaseModel):
     model_config = ConfigDict(extra="forbid")
     outcome: str = Field(default="success", pattern=KEY_PATTERN)
     target: str = Field(pattern=KEY_PATTERN)
     evidence_requirement: Literal["required", "optional", "forbidden"] | None = None
     allows_unresolved_failures: bool = False
+    required_checks: list[EdgeCheck] = Field(default_factory=list, max_length=200)
 
 
 class WaitPolicyBase(BaseModel):
@@ -152,31 +160,11 @@ class AcceptanceCheck(BaseModel):
     """A frozen, executable obligation selected by the workflow author."""
     model_config = ConfigDict(extra="forbid")
     key: str = Field(pattern=KEY_PATTERN)
-    capability: Literal["project.command.run", "project.files.read"]
+    capability: str = Field(pattern=KEY_PATTERN)
     arguments: dict[str, Any]
-    evidence_kind: Literal['artifact', 'behavior'] = 'artifact'
     purpose: str = Field(default='', max_length=4000)
-    scenario_ids: list[str] = Field(default_factory=list, max_length=200,
-        description='Required behavior scenario IDs. Every ID needs a passed assertion in the fresh report.')
-    report_path: str | None = Field(default=None,
-          description='Project-relative JSON report written by this command, schema devwerk.acceptance-report.v1.')
     launch_validation: Literal['preflight', 'deferred'] = Field(default='deferred',
         description='preflight checks executable resolution at TaskPlan admission; deferred permits a future generated entry. Runtime always checks before execution.')
-
-    @model_validator(mode='after')
-    def behavior_requires_execution(self):
-        if bool(self.scenario_ids) != bool(self.report_path):
-            raise ValueError('Scenario evidence requires both scenario_ids and report_path')
-        if len(set(self.scenario_ids)) != len(self.scenario_ids) or any(not s.strip() for s in self.scenario_ids):
-            raise ValueError('Scenario IDs must be unique and nonempty')
-        if self.report_path and (self.evidence_kind != 'behavior' or self.capability != 'project.command.run'):
-            raise ValueError('A scenario report requires a behavioral command')
-        if self.evidence_kind == 'behavior':
-            if self.capability != 'project.command.run' or not self.purpose.strip():
-                raise ValueError('Behavior acceptance requires an executable command and a concrete purpose')
-            if '--list' in self.arguments.get('argv', []):
-                raise ValueError('Listing tests is not behavioral execution evidence')
-        return self
 
 
 class ColumnDefinition(BaseModel):
@@ -197,8 +185,6 @@ class ColumnDefinition(BaseModel):
     def validate_execution(self) -> "ColumnDefinition":
         if len({check.key for check in self.acceptance_checks}) != len(self.acceptance_checks):
             raise ValueError('Acceptance check keys must be unique')
-        if any(check.key == 'runtime.behavior' for check in self.acceptance_checks):
-            raise ValueError('runtime.behavior is reserved for Worker-selected command evidence')
         if self.executor is None:
             raise ValueError(f"column {self.key!r} requires an executor")
         if not self.transitions:
@@ -284,7 +270,40 @@ class WorkflowDefinition(BaseModel):
     entry: str = Field(pattern=KEY_PATTERN)
     terminals: TerminalSentinels = Field(default_factory=TerminalSentinels)
     columns: list[ColumnDefinition] = Field(min_length=1, max_length=200)
-    acceptance_obligations: list[AcceptanceObligation] = Field(default_factory=list, max_length=200)
+    acceptance_obligations: list[AcceptanceObligation] = Field(
+        default_factory=list, max_length=200,
+        description="Legacy input only; normalized into required_checks on done edges before publication.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_column_checks(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        terminal_data = value.get("terminals") or {}
+        failure = (terminal_data.get("failure", "failed") if isinstance(terminal_data, dict)
+                   else getattr(terminal_data, "failure", "failed"))
+        columns = []
+        for original in value.get("columns", []):
+            if not isinstance(original, dict):
+                columns.append(original)
+                continue
+            column = dict(original)
+            check_keys = [item.get("key") for item in column.get("acceptance_checks", [])
+                          if isinstance(item, dict) and item.get("key")]
+            edges = []
+            for original_edge in column.get("transitions", []):
+                edge = dict(original_edge)
+                if "required_checks" not in edge and check_keys and (
+                    edge.get("target") != failure and not edge.get("allows_unresolved_failures", False)
+                ):
+                    edge["required_checks"] = [
+                        {"column": column.get("key"), "check_key": key} for key in check_keys
+                    ]
+                edges.append(edge)
+            column["transitions"] = edges
+            columns.append(column)
+        return {**value, "columns": columns}
 
     @model_validator(mode="after")
     def validate_graph(self) -> "WorkflowDefinition":
@@ -292,20 +311,36 @@ class WorkflowDefinition(BaseModel):
         if len(keys) != len(set(keys)):
             raise ValueError("workflow column keys must be unique")
         known = set(keys)
-        references = [(o.column,o.check_key) for o in self.acceptance_obligations]
-        if len(references) != len(set(references)):
-            raise ValueError('Acceptance obligations must be unique')
-        for obligation in self.acceptance_obligations:
-            if set(obligation.invalidated_by) - known:
-                raise ValueError('Acceptance invalidation must reference Workflow columns')
-            if obligation.column not in known or not any(c.key == obligation.check_key for c in self.column(obligation.column).acceptance_checks):
-                raise ValueError('Acceptance obligation must reference a frozen Column check')
         if self.entry not in known:
             raise ValueError("workflow entry must reference a column")
 
         terminal_keys = {self.terminals.success, self.terminals.failure}
         if known & terminal_keys:
             raise ValueError("done and failed are reserved terminal sentinel keys")
+
+        # Older revisions carried a global done-only gate. Normalize it into
+        # the declared terminal edges so there is only one completion authority.
+        if self.acceptance_obligations:
+            done_edges = [edge for column in self.columns for edge in column.transitions
+                          if edge.target == self.terminals.success]
+            if not done_edges:
+                raise ValueError("acceptance_obligations require a declared done edge")
+            for obligation in self.acceptance_obligations:
+                source = self.column(obligation.column)
+                for edge in source.transitions:
+                    if edge.target == self.terminals.failure or edge.allows_unresolved_failures:
+                        continue
+                    if not any(item.column == obligation.column and item.check_key == obligation.check_key
+                               for item in edge.required_checks):
+                        edge.required_checks.append(EdgeCheck.model_validate(obligation.model_dump()))
+            for edge in done_edges:
+                existing = {(item.column, item.check_key) for item in edge.required_checks}
+                for obligation in self.acceptance_obligations:
+                    key = (obligation.column, obligation.check_key)
+                    if key not in existing:
+                        edge.required_checks.append(EdgeCheck.model_validate(obligation.model_dump()))
+                        existing.add(key)
+            self.acceptance_obligations = []
 
         for column in self.columns:
             unknown_upstream = sorted(set(column.context.upstream_outputs) - known)
@@ -318,6 +353,16 @@ class WorkflowDefinition(BaseModel):
                 outcomes.add(transition.outcome)
                 if transition.target not in known | terminal_keys:
                     raise ValueError(f"unknown transition target {transition.target!r}")
+                references = [(item.column, item.check_key) for item in transition.required_checks]
+                if len(references) != len(set(references)):
+                    raise ValueError(f"duplicate required check on {column.key!r}/{transition.outcome!r}")
+                for item in transition.required_checks:
+                    if set(item.invalidated_by) - known:
+                        raise ValueError("check invalidation must reference Workflow columns")
+                    if item.column not in known or not any(
+                        check.key == item.check_key for check in self.column(item.column).acceptance_checks
+                    ):
+                        raise ValueError("edge check must reference a frozen Column check")
             declared = {item.outcome for item in column.transitions}
             if isinstance(column.executor, CapabilitySequenceExecutor):
                 if column.executor.completed_outcome and column.executor.completed_outcome not in declared:
@@ -339,6 +384,25 @@ class WorkflowDefinition(BaseModel):
         unreachable = known - reachable
         if unreachable:
             raise ValueError(f"workflow contains unreachable columns: {sorted(unreachable)}")
+
+        for column in self.columns:
+            for transition in column.transitions:
+                for requirement in transition.required_checks:
+                    if requirement.column == column.key:
+                        continue
+                    seen_from_source: set[str] = set()
+                    pending_from_source = [requirement.column]
+                    while pending_from_source:
+                        key = pending_from_source.pop()
+                        if key in seen_from_source or key in terminal_keys:
+                            continue
+                        seen_from_source.add(key)
+                        pending_from_source.extend(edge.target for edge in self.column(key).transitions)
+                    if column.key not in seen_from_source:
+                        raise ValueError(
+                            f"edge check {requirement.column}/{requirement.check_key} "
+                            f"cannot precede {column.key}/{transition.outcome}"
+                        )
 
         for column in self.columns:
             seen: set[str] = set()
@@ -749,7 +813,8 @@ class OrderedTaskDependencyContract(BaseModel):
 class TaskEntryRequirement(BaseModel):
     model_config = ConfigDict(extra='forbid')
     key: str = Field(min_length=1)
-    kind: Literal['accepted_scope_snapshot', 'input_file_snapshot']
+    kind: Literal['accepted_scope_snapshot', 'input_file_snapshot'] = Field(
+        description='accepted_scope_snapshot refers to the current execution grant ID, never a memory ID; input_file_snapshot refers to a completed file-write execution key.')
     input_pointer: str | None = None
     scope_evidence_key: str | None = None
 
@@ -757,6 +822,8 @@ class TaskEntryRequirement(BaseModel):
     def file_reference(self):
         if self.kind == 'input_file_snapshot' and (not self.input_pointer or not self.input_pointer.startswith('/') or not self.scope_evidence_key):
             raise ValueError('input_file_snapshot requires input_pointer and scope_evidence_key')
+        if self.kind == 'accepted_scope_snapshot' and (self.input_pointer is not None or self.scope_evidence_key is not None):
+            raise ValueError('accepted_scope_snapshot uses the current execution grant ID; omit input_pointer and scope_evidence_key, and do not use a memory ID')
         return self
 
 
@@ -764,13 +831,8 @@ class TaskContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
     input_schema: dict[str, Any] = Field(default_factory=dict)
     entry_requirements: list[TaskEntryRequirement] = Field(default_factory=list)
-    required_behavior_columns: list[str] = Field(default_factory=list, max_length=200,
-        description='Columns that must produce successful command evidence during execution; no command or script is required before Task admission.')
-    acceptance_invalidated_by: list[str] = Field(default_factory=list, max_length=200)
     feedback_columns: list[str] = Field(default_factory=list, max_length=200,
         description='Columns that must expose task.feedback.record for persistent defect handoff.')
-    scenario_input_pointer: str | None = Field(default=None, pattern=r'^/',
-        description='Task input JSON pointer listing scenario IDs to be checked by the executing and acceptance Columns.')
     identity_pointer: str | None = Field(
         default=None,
         pattern=r"^/.*",
@@ -791,6 +853,8 @@ class TaskContract(BaseModel):
         rules = {rule.key: rule for rule in self.entry_requirements}
         if len(rules) != len(self.entry_requirements):
             raise ValueError('Entry requirement keys must be unique')
+        if sum(rule.kind == 'accepted_scope_snapshot' for rule in self.entry_requirements) > 1:
+            raise ValueError('Declare at most one accepted_scope_snapshot entry requirement for the current Requirement grant')
         for rule in self.entry_requirements:
             if rule.kind == 'input_file_snapshot':
                 target = rules.get(rule.scope_evidence_key)

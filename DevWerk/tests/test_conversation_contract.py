@@ -48,8 +48,8 @@ def test_platform_policy_defines_concise_human_facing_replies():
     policy = (Path(__file__).resolve().parents[1] / "DEVWERK.md").read_text(encoding="utf-8")
 
     assert "Communicate as a human project manager, not as an audit log" in policy
-    assert "one to three short sentences" in policy
-    assert "at most 300 Chinese characters or 120 English words" in policy
+    assert "Keep replies clear and proportionate to the user's request" in policy
+    assert "at most 300 Chinese characters or 120 English words" not in policy
     assert "Runtime records and inspection views rather than ordinary chat" in policy
 
 

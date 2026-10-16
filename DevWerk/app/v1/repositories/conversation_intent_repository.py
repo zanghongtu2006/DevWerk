@@ -206,7 +206,14 @@ class ConversationIntentRepository:
                     self.store.scopes.remember(requirement, job_id=job['id'], reason='user execution request')
                     phase = 'execution'
                 elif resolution.act == 'control':
-                    self.store.get_project_task(ctx.project_id, resolution.control_task_id)
+                    controlled_task = self.store.get_project_task(ctx.project_id, resolution.control_task_id)
+                    if resolution.control_capability == 'task.resume':
+                        if controlled_task['status'] == 'recovering':
+                            raise ValueError('RecoveringTaskRequiresRetry: call conversation.execution.authorize '
+                                             'with request=continue, then task.retry for the same Task')
+                        if controlled_task['status'] == 'failed':
+                            raise ValueError('FailedTaskRequiresReopen: call conversation.execution.authorize '
+                                             'with request=continue, then task.reopen for the same Task')
                     phase = 'targeted_control'
                 state['revision'] = latest + 1
                 contract = {'phase': phase, 'act': resolution.act, 'source_message_id': job['user_message_id'], 'intent_revision': state['revision'],
@@ -283,9 +290,9 @@ class ConversationIntentRepository:
         if contract['phase'] == 'targeted_control':
             return None if (capability == contract['control_capability'] and arguments.get('task_id') == contract['control_task_id']) else 'TurnControlScopeMismatch: only the requested Task control is allowed'
         if contract['phase'] != 'execution':
-            if contract['phase'] == 'unresolved' and capability in {'task.retry', 'agent.worker.send'}:
+            if contract['phase'] == 'unresolved' and capability in {'task.retry', 'task.reopen', 'agent.worker.send'}:
                 return ('RecoveryRequiresExecutionAuthorization: call conversation.execution.authorize '
-                        'with request=continue before Worker input or task.retry')
+                        'with request=continue before Worker input, task.retry or task.reopen')
             return 'TurnUnresolved: call conversation.execution.authorize or conversation.task.control.authorize before business mutations' if contract['phase'] == 'unresolved' else 'ConversationMutationDisabled: continue discussing; no work was authorized'
         with self.store.connect() as db:
             grant = db.execute('SELECT * FROM v1_execution_grants WHERE id=? AND project_id=?',
@@ -300,7 +307,19 @@ class ConversationIntentRepository:
         if (job['requirement_id'], job['requirement_revision']) != (grant['requirement_id'], grant['requirement_revision']):
             return 'ExecutionScopeMismatch: this Job cannot select a scope outside its grant'
         if capability == 'project.scope.revise' and grant['kind'] != 'extend':
-            return 'ScopeExtensionRequestMissing: a new user extension turn is required to expand the scope'
+            # A newly begun, independent Requirement may take over the current
+            # Workflow in this same user turn. ScopeRepository.revise still
+            # enforces terminal predecessors and publishes a new revision.
+            current = self.store.scopes.inspect(ctx.project_id)
+            new_scope_handover = (
+                grant['kind'] == 'begin' and grant['source_job_id'] == job['id']
+                and req['revision'] == 1
+                and arguments.get('requirement_id') == req['id']
+                and current.get('workflow_revision_id') == arguments.get('expected_workflow_revision_id')
+                and current.get('requirement_id') not in (None, req['id'])
+            )
+            if not new_scope_handover:
+                return 'ScopeExtensionRequestMissing: use request=extend for the existing Requirement; a new begin Requirement may only take over a previous completed Workflow in its creation turn'
         if capability == 'requirement.create' and (arguments.get('scope_key'), arguments.get('objective')) != (req['scope_key'], req['objective']):
             return 'ExecutionScopeMismatch: resolve a new user scope instead of replacing this turn requirement'
         return None
@@ -312,7 +331,7 @@ class ConversationIntentRepository:
         with self.store.connect() as db:
             grant = db.execute("SELECT state,requirement_id,requirement_revision FROM v1_execution_grants WHERE id=? AND project_id=?",
                                (job['execution_grant_id'],ctx.project_id)).fetchone()
-            task = db.execute('SELECT requirement_id,requirement_revision,status,current_column FROM v1_tasks WHERE id=? AND project_id=?',
+            task = db.execute('SELECT requirement_id,requirement_revision,status,current_column,proposed_task_ref FROM v1_tasks WHERE id=? AND project_id=?',
                               (task_id,ctx.project_id)).fetchone()
             requirement = db.execute('SELECT status,revision FROM v1_requirements WHERE id=? AND project_id=?',
                                      (job['requirement_id'],ctx.project_id)).fetchone()
@@ -324,6 +343,37 @@ class ConversationIntentRepository:
                     (job['requirement_id'],job['requirement_revision']) or
                     requirement['revision'] != job['requirement_revision']):
                 return 'SupervisionScopeExpired'
+            if capability in {'workflow.plan.save', 'workflow.publish',
+                              'workflow.acceptance.configure', 'task.plan.save', 'task.successor'}:
+                if task['status'] != 'failed':
+                    return 'SupervisionTaskNotFailed: Workflow repair requires a failed Task'
+                successor = db.execute(
+                    'SELECT 1 FROM v1_tasks WHERE project_id=? AND rerun_of_task_id=? LIMIT 1',
+                    (ctx.project_id, task_id),
+                ).fetchone()
+                if successor:
+                    return 'SupervisionSuccessorAlreadyQueued: inspect the existing successor Task'
+                if capability == 'task.plan.save':
+                    plan = arguments.get('plan')
+                    if isinstance(plan, str):
+                        try:
+                            plan = json.loads(plan)
+                        except ValueError:
+                            plan = None
+                    planned = plan.get('tasks') if isinstance(plan, dict) else None
+                    if (not isinstance(planned, list) or len(planned) != 1 or
+                            not isinstance(planned[0], dict) or
+                            planned[0].get('proposed_task_ref') != task['proposed_task_ref'] or
+                            plan.get('repair_of_task_id') != task_id):
+                        return 'SupervisionRepairPlanMismatch: save one corrected TaskPlan for the supervised Task'
+                if capability == 'task.successor':
+                    if arguments.get('task_id') != task_id:
+                        return 'SupervisionTaskMismatch: successor must target the supervised Task'
+                    saved = db.execute('SELECT plan_json FROM v1_task_plans WHERE id=? AND project_id=?',
+                                       (arguments.get('task_plan_id'),ctx.project_id)).fetchone()
+                    if not saved or json.loads(saved['plan_json']).get('repair_of_task_id') != task_id:
+                        return 'SupervisionRepairPlanMismatch: successor requires a saved repair TaskPlan'
+                return None
             if capability in {'task.retry','task.reopen'}:
                 if arguments.get('task_id') != task_id or arguments.get('clear_context'):
                     return 'SupervisionTaskMismatch: preserve the same Task and Worker context'
@@ -331,7 +381,7 @@ class ConversationIntentRepository:
                     "SELECT 1 FROM v1_tool_invocations invocation "
                     "JOIN v1_agent_runs run ON run.id=invocation.agent_run_id "
                     "WHERE run.conversation_job_id=? AND invocation.ok=1 "
-                    "AND invocation.capability IN ('task.retry','task.reopen') LIMIT 1",
+                    "AND invocation.capability IN ('task.retry','task.reopen','task.successor') LIMIT 1",
                     (job['id'],),
                 ).fetchone()
                 if prior_recovery:

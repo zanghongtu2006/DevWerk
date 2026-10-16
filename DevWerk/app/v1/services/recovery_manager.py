@@ -160,6 +160,29 @@ class RecoveryManager:
         if workflow.terminal_kind(target):
             raise ValueError("retry target must be a non-terminal Column")
         workflow.column(target)
+        with self.store.connect() as db:
+            visited = {row["column_key"] for row in db.execute(
+                "SELECT DISTINCT column_key FROM v1_column_runs WHERE task_id=? "
+                "AND status IN ('running','succeeded','failed','interrupted')",
+                (task_id,),
+            )}
+            unresolved = db.execute(
+                "SELECT failed.column_key FROM v1_column_runs failed "
+                "WHERE failed.task_id=? AND failed.status='failed' "
+                "AND NOT EXISTS (SELECT 1 FROM v1_column_runs repaired "
+                "WHERE repaired.task_id=failed.task_id "
+                "AND repaired.column_key=failed.column_key "
+                "AND repaired.sequence>failed.sequence AND repaired.status='succeeded') "
+                "ORDER BY failed.sequence DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        allowed_targets = ({workflow.entry, unresolved["column_key"]} if unresolved
+                           else {workflow.entry, task["current_column"], *visited})
+        if target not in allowed_targets:
+            raise ValueError(
+                "task.retry cannot skip an uncorrected failed Column or an unvisited Column; "
+                f"target must be one of: {', '.join(sorted(allowed_targets))}"
+            )
         if task["status"] == "pending" and target == task["current_column"]:
             raise ValueError("Task is already pending in the retry target Column")
         now = utcnow()
@@ -416,6 +439,22 @@ class RecoveryManager:
         if workflow.terminal_kind(target):
             raise ValueError("task.reopen target must be a non-terminal Column")
         workflow.column(target)
+        with self.store.connect() as db:
+            failed_run = db.execute(
+                "SELECT run.column_key FROM v1_events event "
+                "JOIN v1_column_runs run ON run.id=event.run_id "
+                "WHERE event.id=? AND event.task_id=? AND event.type='task.failed' "
+                "AND run.status='failed'",
+                (task.get("terminal_event_id"), task_id),
+            ).fetchone()
+        allowed_targets = {workflow.entry}
+        if failed_run:
+            allowed_targets.add(failed_run["column_key"])
+        if target not in allowed_targets:
+            raise ValueError(
+                "task.reopen cannot skip the failed Column; target must be "
+                f"one of: {', '.join(sorted(allowed_targets))}"
+            )
         now = utcnow()
         context = {} if clear_context else task["context"]
         with self.store.tx(immediate=True) as db:

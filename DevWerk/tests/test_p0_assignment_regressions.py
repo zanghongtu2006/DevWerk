@@ -13,7 +13,7 @@ import requests
 from app.v1.agent import AgentCore
 from app.v1.capabilities import CapabilityEntry, CapabilityContext
 from app.v1.conversation import ConversationGateway
-from app.v1.domain import AgentModelResponse, AgentToolCall, AcceptanceCheck, TimerWaitPolicy, PollWaitPolicy, ToolResult
+from app.v1.domain import AgentModelResponse, AgentToolCall, AcceptanceCheck, EdgeCheck, TimerWaitPolicy, PollWaitPolicy, ToolResult
 from app.v1.execution_control import ExecutionBudgetExceeded
 from app.v1.policy import ExecutionLimits
 from app.v1.runtime import WorkflowRuntime
@@ -50,6 +50,10 @@ def test_new_identical_operation_after_await_executes_again(store, tmp_path):
     wf = agent_workflow()
     wf.column('work').executor.capabilities.append('project.command.run')
     wf.column('work').wait_policy = TimerWaitPolicy(delay_seconds=1)
+    wf.column('work').acceptance_checks = [AcceptanceCheck(
+        key='result', capability='project.command.run',
+        arguments=command("from pathlib import Path; assert Path('result.txt').read_text() == 'xx'"))]
+    wf.column('work').transitions[0].required_checks = [EdgeCheck(column='work', check_key='result')]
     args = command("with open('result.txt','a') as f: f.write('x')")
     project, task, runtime = setup(store, tmp_path, wf, [response('project.command.run', args), response('column.await', {'provider': 'timer'}), response('project.command.run', args), response('column.complete', COMPLETE)])
     runtime.step(task['id'])
@@ -59,7 +63,8 @@ def test_new_identical_operation_after_await_executes_again(store, tmp_path):
     with store.connect() as db:
         assignment = dict(db.execute('SELECT * FROM v1_agent_assignments').fetchone())
         assert (assignment['status'], assignment['resumes'], assignment['model_calls']) == ('completed', 2, 4)
-        assert db.execute("SELECT COUNT(*) FROM v1_execution_receipts WHERE capability='project.command.run'").fetchone()[0] == 2
+        assert db.execute("SELECT COUNT(*) FROM v1_execution_receipts WHERE capability='project.command.run'").fetchone()[0] == 3
+        assert db.execute("SELECT COUNT(*) FROM v1_acceptance_results WHERE task_id=?", (task['id'],)).fetchone()[0] == 1
     assert store.agents.get_worker(project['id'], assignment['agent_instance_id'])['active_assignment_id'] is None
 
 
@@ -119,6 +124,7 @@ def test_unsettled_runtime_acceptance_effect_is_not_reexecuted(store, tmp_path):
     wf.column('work').acceptance_checks = [AcceptanceCheck(
         key='delivery', capability='project.command.run',
         arguments=command("with open('acceptance-once.txt','a') as f: f.write('x')"))]
+    wf.column('work').transitions[0].required_checks = [EdgeCheck(column='work', check_key='delivery')]
     _, task, runtime = setup(store, tmp_path, wf, [response('column.complete', COMPLETE)] * 2)
     # Exit the actual Worker process, bypassing all Python exception handlers,
     # after the command effect and before committing its terminal receipt.
@@ -186,6 +192,7 @@ def test_frozen_acceptance_allows_corrected_command_after_exploration_failure(st
     wf = agent_workflow()
     wf.column('work').executor.capabilities.append('project.command.run')
     wf.column('work').acceptance_checks = [AcceptanceCheck(key='delivery', capability='project.command.run', arguments=command("from pathlib import Path; assert Path('delivery.txt').read_text() == 'ready'"))]
+    wf.column('work').transitions[0].required_checks = [EdgeCheck(column='work', check_key='delivery')]
     _, task, runtime = setup(store, tmp_path, wf, [response('project.command.run', command('raise SystemExit(1)')), response('project.command.run', command("from pathlib import Path; Path('delivery.txt').write_text('ready')")), response('column.complete', COMPLETE)])
     runtime.step(task['id'])
     assert store.get_task(task['id'])['status'] == 'done'
@@ -195,6 +202,7 @@ def test_noop_cannot_satisfy_frozen_delivery_check(store, tmp_path):
     wf = agent_workflow()
     wf.column('work').executor.capabilities.append('project.command.run')
     wf.column('work').acceptance_checks = [AcceptanceCheck(key='delivery', capability='project.files.read', arguments={'path': 'missing.txt'})]
+    wf.column('work').transitions[0].required_checks = [EdgeCheck(column='work', check_key='delivery')]
     _, task, runtime = setup(store, tmp_path, wf, [response('project.command.run', command("print('done')"))] + [response('column.complete', COMPLETE)] * 6)
     with pytest.raises(RuntimeError):
         runtime.step(task['id'])
@@ -336,6 +344,7 @@ def test_retired_worker_and_closed_requirement_do_not_revive(store, tmp_path):
 def test_completion_recovery_rechecks_workspace_after_interrupted_task_commit(store, tmp_path, monkeypatch):
     wf = agent_workflow()
     wf.column('work').acceptance_checks = [AcceptanceCheck(key='content', capability='project.command.run', arguments=command("from pathlib import Path; assert Path('delivery.txt').read_text() == 'ready'"))]
+    wf.column('work').transitions[0].required_checks = [EdgeCheck(column='work', check_key='content')]
     _, task, runtime = setup(store, tmp_path, wf, [response('column.complete', COMPLETE)] * 6)
     artifact = tmp_path / 'project/delivery.txt'
     artifact.write_text('ready')

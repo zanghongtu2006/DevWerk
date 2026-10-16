@@ -188,13 +188,21 @@ class CapabilityRegistry:
             if context.execution_control:
                 context.execution_control.check()
             entry = self.resolve([capability_id], context)[0]
+            if capability_id in {'task.plan.validate', 'task.plan.save'} and isinstance(arguments.get('plan'), str):
+                try:
+                    decoded_plan = json.loads(arguments['plan'])
+                except ValueError:
+                    decoded_plan = None
+                if isinstance(decoded_plan, dict):
+                    arguments = {**arguments, 'plan': decoded_plan}
             self.validate_arguments(capability_id, arguments)
             arguments = normalized_operation_arguments(capability_id, arguments)
             if capability_id == "project.files.write":
                 _files_write_preflight(arguments, context)
-            if capability_id == 'project.command.run':
+            if capability_id in {'project.command.run', 'system.command.run'}:
                 from app.v1.command_resolution import resolve_command
-                resolve_command(arguments['argv'], context.files.resolve(str(arguments.get('cwd') or '.')))
+                files = context.files if capability_id == 'project.command.run' else context.system_files
+                resolve_command(arguments['argv'], files.resolve(str(arguments.get('cwd') or '.')))
             if capability_id == 'project.memory.write':
                 _memory_write_scope(arguments, context)
             if capability_id == 'project.memory.supersede':
@@ -578,7 +586,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         _turn_resolution_schema(), _resolve_current_turn,
         side_effect_kind='session_control', delegable_to_column=False)
     add('conversation.execution.authorize',
-        'Bind an explicit current user request to start, continue or extend delivery. Call alone before business effects. Host supplies message evidence and revision.',
+        'Bind an explicit current user request. Use continue with the existing requirement_id for more work within its scope; use extend with that ID before project.scope.revise when changing its scope; use begin only for an independent new Requirement. A new Requirement must take over an existing Workflow with project.scope.revise before task.plan.save, or publish its own Workflow. Call alone before business effects. Host supplies message evidence and revision.',
         {'type':'object','required':['request'],'properties':{
             'request':{'type':'string','enum':['begin','continue','extend']},
             'scope_summary':{'type':'string','maxLength':30000},
@@ -587,7 +595,8 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         _authorize_execution, side_effect_kind='session_control', delegable_to_column=False)
     add('conversation.task.control.authorize',
         'Bind an explicit current user request to pause, resume or cancel one Task. Call alone before the Task control tool. '
-        'A recovering Task needs conversation.execution.authorize(request=continue) then task.retry, not task.resume.',
+        'A recovering Task needs conversation.execution.authorize(request=continue) then task.retry; '
+        'a failed Task needs the same execution authorization then task.reopen. Neither uses task.resume.',
         {'type':'object','required':['action','task_id'],'properties':{
             'action':{'type':'string','enum':['task.pause','task.resume','task.cancel']},
             'task_id':{'type':'string','minLength':1}},'additionalProperties':False},
@@ -915,7 +924,9 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
             "The successful receipt already contains byte size, UTF-8 and non-whitespace character counts, line count, "
             "and SHA-256; do not call project.files.measure merely to rediscover those same facts. "
             "For Task-owned exact paths or content, pass the value losslessly from Task input with an explicit "
-            "JSON Pointer $ref; never retype or normalize content, including trailing newlines."
+            "JSON Pointer $ref; never retype or normalize content, including trailing newlines. "
+            "For user-requested Workflow delivery, the Conversation Agent writes only planning inputs or "
+            "entry evidence required by the Task Contract; Column Workers produce Task deliverables."
         ),
         {
             "type": "object",
@@ -932,7 +943,9 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     )
     add(
         "project.files.search",
-        "Search UTF-8 Project files for a regular expression and return bounded matching lines.",
+        "Search UTF-8 Project files for a regular expression and return bounded matching lines. "
+        "Default search skips generated dependency/build directories; use a narrow glob to include one explicitly. "
+        "Files over 1 MB are skipped; narrow the search or read such a file directly.",
         {
             "type": "object",
             "required": ["pattern"],
@@ -951,11 +964,9 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         (
             "Run a bounded argv command without a shell inside the Project base directory; success requires exit 0. "
             "Child processes are cleaned up when the call ends, and a foreground service will time out. "
-            "For live HTTP checks, start the service, assert responses, and stop it in one bounded command, "
-            "or use a test runner that exits. When a command generates content that a later exact "
-            "file check will consume, it must preserve the contracted bytes, including encoding markers and "
-            "newlines; on Windows PowerShell, `Set-Content -Encoding utf8` adds a UTF-8 BOM, so use a BOM-free "
-            "writer when the expected content has no BOM."
+            "A separate Start-Process or start /b call can exit 0 while its service is unavailable to the next call. "
+            "If a later call needs a live child process, manage that process within one bounded command. "
+            "Preserve the contracted bytes when generating files that later exact checks consume."
         ),
         {
             "type": "object",
@@ -1042,7 +1053,9 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
             "First identify the reusable flow_unit; derive lifecycle Columns from that unit instead of from a "
             "work-item list; choose agent or capability_sequence execution for each Column; then simulate the "
             "lifecycle from entry to terminal with explicit receives, action, produces, completion evidence, and "
-            "transition outcome. Declare the Task Contract and default WIP facts. Never include concrete Tasks."
+            "transition outcome. Declare the Task Contract and default WIP facts. Never include concrete Tasks. "
+            "Entry requirements are optional; if needed, one accepted_scope_snapshot uses the current execution "
+            "grant ID, never a memory ID."
         ),
         {"type": "object", "required": ["plan"], "properties": {"plan": workflow_plan_schema}, "additionalProperties": False, "$defs": workflow_plan_defs},
         _workflow_plan_save,
@@ -1074,7 +1087,9 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
             "Read task.plan.contract first for the current frozen input and evidence candidates, then "
             "task.plan.validate before saving. If validation rejects a call before persistence, correct and "
             "resubmit the same complete user-owned plan. A queue readiness decision is automatically admitted "
-            "when dependencies and WIP constraints allow."
+            "when dependencies and WIP constraints allow. A Task traverses the complete Column lifecycle: do not "
+            "make separate Tasks for its stages. After a successful save, use the returned plan ID with "
+            "task.create before preparing another plan for the same requested work."
         ),
         {"type": "object", "required": ["plan"], "properties": {"plan": task_plan_schema}, "additionalProperties": False, "$defs": task_plan_defs},
         _task_plan_save,
@@ -1190,7 +1205,8 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         "task.retry",
         "Retry a non-terminal Task on its pinned Workflow revision. For a paused uncertain command, "
         "retry records its missing exit result as failed without rerunning it; inspect partial workspace effects "
-        "before issuing a new command. Other uncertain effects remain blocked. Terminal Tasks remain immutable.",
+        "before issuing a new command. Other uncertain effects remain blocked. A target Column cannot skip "
+        "an uncorrected failed Column or jump into an unvisited later Column. Terminal Tasks remain immutable.",
         {
             "type": "object",
             "required": ["task_id"],
@@ -1208,8 +1224,10 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     add(
         "task.reopen",
         (
-            "Reopen the same failed Task at the Workflow entry or a declared non-terminal Column, preserving "
-            "its ID, artifacts, failure history, and logical Agent sessions. Use this for a recoverable execution "
+            "Reopen the same failed Task at its failed Column, or at the Workflow entry for a full replay; "
+            "later Columns cannot skip the failure. Preserve its ID, artifacts, failure history, and "
+            "logical Agent sessions. In a user turn, first call conversation.execution.authorize(request=continue); "
+            "task.resume control authorization cannot reopen a failed Task. Use this for a recoverable execution "
             "failure; review rejection must follow the Workflow graph instead of entering failed."
         ),
         {
@@ -1248,43 +1266,41 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         {'type':'object','required':['plan'],'properties':{'plan':{'type':'object'}},'additionalProperties':False},
         lambda args, ctx: _task_plan_validate(args, ctx, registry), output_schema=validation_receipt,
         side_effect_kind='read', delegable_to_column=False)
-    add('task.plan.contract', 'Read the active Workflow Task input contract, authorizing user request, frozen scenario IDs and real entry-evidence candidates before building a Task Plan. Read-only; it does not create or validate a plan.',
+    add('task.plan.contract', 'Read the active Workflow Task input contract, authorizing user request, real entry-evidence candidates before building a Task Plan. An accepted_scope_snapshot uses one of the returned execution grant IDs, not a memory ID. Read-only; it does not create or validate a plan.',
         {'type':'object','additionalProperties':False},
         lambda args, ctx: _task_plan_contract(ctx), side_effect_kind='read', delegable_to_column=False)
-    add('workflow.acceptance.configure', 'Optional advanced editor for fixed Workflow acceptance checks. It is not required before Task creation: Workers can select their own behavior commands during execution. Configure the exact active revision using base_revision_id and base_digest from workflow.inspect. Listed columns replace only their checks; omitted acceptance_obligations are derived for changed behavior checks. Fixed behavior checks require real assertions and fresh reports. Frozen Tasks keep their old revision.',
+    add('workflow.acceptance.configure', 'Optional editor for Workflow checks and the exact outcome edges that require them. Inspect the active revision, then provide base_revision_id and base_digest. Listed columns replace their check definitions; listed transitions replace only their required_checks. Frozen Tasks keep their old revision.',
         {'type':'object','required':['base_revision_id','base_digest','columns'],
          'properties':{'base_revision_id':{'type':'string'},'base_digest':{'type':'string'},
            'columns':{'type':'array','minItems':1,'items':{'type':'object','required':['key','acceptance_checks'],
-              'properties':{'key':{'type':'string'},'acceptance_checks':{'type':'array','items':{'$ref':'#/$defs/AcceptanceCheck'}}},'additionalProperties':False}},
+              'properties':{'key':{'type':'string'},'acceptance_checks':{'type':'array','items':{'$ref':'#/$defs/AcceptanceCheck'}},
+                'transitions':{'type':'array','items':{'type':'object','required':['outcome','required_checks'],
+                  'properties':{'outcome':{'type':'string'},'required_checks':{'type':'array','items':{'$ref':'#/$defs/EdgeCheck'}}},
+                  'additionalProperties':False}}},'additionalProperties':False}},
            'acceptance_obligations':workflow_schema['properties']['acceptance_obligations']},
-         'additionalProperties':False,'$defs':{k:workflow_defs[k] for k in ('AcceptanceCheck','AcceptanceObligation')}},
+         'additionalProperties':False,'$defs':{k:workflow_defs[k] for k in ('AcceptanceCheck','AcceptanceObligation','EdgeCheck')}},
         lambda args, ctx: _workflow_acceptance_configure(args, ctx, registry), side_effect_kind='control', delegable_to_column=False)
-    add('workflow.acceptance.runners', 'Optional fixed behavioral test runners; do not call this merely to admit a Task. Each argv must invoke a dedicated Project-relative test script and pass report_path separately. A missing or existing script must have a responsible Column that can create or repair it under writable_paths; earlier Column ownership may be reused. The Worker executes real assertions and writes a fresh devwerk.acceptance-report.v1 report. Host derives checks and invalidation obligations.',
-        {'type':'object','required':['base_revision_id','base_digest','runners'],
-         'properties':{'base_revision_id':{'type':'string'},'base_digest':{'type':'string'},
-           'runners':{'type':'array','minItems':1,'maxItems':30,'items':{
-             'type':'object','required':['column','argv','report_path','scenario_ids','purpose'],
-             'properties':{'column':{'type':'string'},'argv':{'type':'array','minItems':1,
-                 'items':{'type':'string'}},'report_path':{'type':'string','minLength':1},
-               'scenario_ids':{'type':'array','minItems':1,'items':{'type':'string'}},
-               'purpose':{'type':'string','minLength':1}},'additionalProperties':False}}},
-         'additionalProperties':False},
-        lambda args, ctx: _workflow_acceptance_runners(args, ctx, registry),
-        side_effect_kind='control', delegable_to_column=False)
     add('task.successor',
-        'Create a terminal Task successor using an explicitly selected corrected TaskPlan and the same proposed_task_ref. The predecessor remains immutable.',
+        'Create a corrected successor of a done/failed Task. First authorize the owning Requirement, save a corrected TaskPlan on its current Workflow, and preserve the predecessor proposed_task_ref with repair_of_task_id. For an independent new Task use a new proposed_task_ref and task.create. The predecessor remains immutable.',
         {'type':'object', 'required':['task_id','task_plan_id'],
          'properties':{'task_id':{'type':'string'},'task_plan_id':{'type':'string'}}, 'additionalProperties':False},
         _task_successor, side_effect_kind='control', delegable_to_column=False)
     add('task.feedback.record',
-        'Persist a Task defect for a responsible Column. checks reference frozen checks or runtime.behavior for a Workflow Plan required_behavior_column; the latter verifies a fresh successful Worker-selected command after repair. Runtime routes only at a safe Column boundary along declared Workflow edges. This does not send Mailbox instructions or start another Agent.',
-        {'type':'object', 'required':['task_id','dedupe_key','responsible_column','description','checks'],
+        'Record a concrete Task defect for Conversation Agent supervision. Feedback does not select a Workflow edge or block done by itself. Optional checks reference frozen Workflow checks for later verification. Submit one declared Column outcome to choose the next edge; use a declared rework outcome when this Column cannot meet its selected edge. This tool does not send Mailbox instructions or run another Agent.',
+        {'type':'object', 'required':['task_id','dedupe_key','responsible_column','description'],
          'properties':{'task_id':{'type':'string'},'dedupe_key':{'type':'string','minLength':1,'maxLength':200},
              'responsible_column':{'type':'string'},'description':{'type':'string','minLength':1,'maxLength':12000},
-             'checks':{'type':'array','minItems':1,'maxItems':30,'items':{'type':'object',
+             'checks':{'type':'array','maxItems':30,'items':{'type':'object',
                  'required':['column','check_key'],'properties':{'column':{'type':'string'},'check_key':{'type':'string'}},'additionalProperties':False}}},
          'additionalProperties':False},
         lambda args, ctx: ctx.store.feedback.record(ctx,args), side_effect_kind='control')
+    add('task.feedback.resolve',
+        'Confirm a checkless qualitative Task feedback only after its responsible Column has completed a later repair visit. A different active review Column must provide a concrete verification note. Fixed-check feedback resolves through its checks, not this tool; this tool never changes Workflow routing.',
+        {'type':'object', 'required':['task_id','feedback_id','verification_note'],
+         'properties':{'task_id':{'type':'string'},'feedback_id':{'type':'string'},
+             'verification_note':{'type':'string','minLength':1,'maxLength':12000}},
+         'additionalProperties':False},
+        lambda args, ctx: ctx.store.feedback.resolve(ctx,args), side_effect_kind='control')
     add('task.feedback.list', 'Read durable Task feedback and Runtime verification references.',
         {'type':'object','required':['task_id'],'properties':{'task_id':{'type':'string'}},'additionalProperties':False},
         lambda args, ctx: ctx.store.feedback.list(ctx.project_id,args['task_id']), side_effect_kind='read')
@@ -1378,7 +1394,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     add('agent.worker.inspect', 'Inspect a Worker, its Assignments and durable message consumption state.',
         {'type': 'object', 'required': ['worker_id'], 'properties': {'worker_id': {'type': 'string'}}, 'additionalProperties': False},
         lambda args, ctx: ctx.store.agents.inspect_worker(ctx.project_id, args['worker_id']), side_effect_kind='read', delegable_to_column=False)
-    add('agent.worker.send', 'Persist steering input for a Worker. Accepted means queued; inspect consumed_by_run_id for consumption. This does not complete work or start an idle Worker without a workflow Assignment.',
+    add('agent.worker.send', 'Persist steering input for an existing Worker. For a running Assignment, pass its assignment_id; for a pending next Column visit, omit assignment_id so the next Assignment consumes the input. Accepted means queued, not consumed; inspect consumed_by_run_id later. This does not complete work or start an idle Worker.',
         {'type': 'object', 'required': ['worker_id', 'content'], 'properties': {'worker_id': {'type': 'string'}, 'content': {'type': 'string', 'minLength': 1}, 'assignment_id': {'type': 'string'}, 'dedupe_key': {'type': 'string'}}, 'additionalProperties': False},
         lambda args, ctx: ctx.store.agents.send(ctx.project_id, args['worker_id'], args['content'], assignment_id=args.get('assignment_id'), dedupe_key=args.get('dedupe_key')),
         side_effect_kind='control', delegable_to_column=False)
@@ -1495,7 +1511,7 @@ def _bind_workflow_authoring_contract(workflow_schema: dict[str, Any], schema_de
     if isinstance(properties.get('acceptance_checks'), dict):
         properties['acceptance_checks']['description'] = (
             'Fixed synchronous delivery checks, frozen at Assignment creation and run by Runtime on completion. '
-            'For executable delivery work, declare project.command.run with a real build/test or project.files.read '
+            'For executable work, declare project.command.run with a relevant verification command or project.files.read '
             'for a required artifact. These checks allow the Worker to correct exploratory commands without '
             'having to repeat every failed probe. An empty list retains conservative legacy failure handling; '
             'successful noops never waive an unresolved failure. Review should be a separate Column.'
@@ -1575,6 +1591,11 @@ def validate_workflow_capabilities(workflow: WorkflowDefinition, registry: Capab
     known = set(registry.column_ids())
     for column in workflow.columns:
         for check in column.acceptance_checks:
+            if check.capability not in known or registry.side_effect_kind(check.capability) not in {"none", "read", "process"}:
+                raise ValueError(
+                    f"column {column.key!r} acceptance check {check.key!r} requires "
+                    "a registered Column capability with none/read/process effect"
+                )
             registry.validate_arguments(check.capability, check.arguments)
         if column.executor is None:
             continue
@@ -2083,12 +2104,7 @@ def _system_command_run(args: dict[str, Any], ctx: CapabilityContext) -> ToolRes
     exit_code = int(output["exit_code"])
     if exit_code in accepted and not output.get("timed_out") and not output.get("output_truncated"):
         return ToolResult(ok=True, capability="system.command.run", output=output)
-    detail = str(output.get("stderr") or output.get("stdout") or "").strip()
-    message = ("command timed out" if output.get("timed_out") else
-               "command output exceeded limit" if output.get("output_truncated") else
-               f"command exited with code {exit_code}")
-    if detail:
-        message = f"{message}: {detail}"
+    message = _command_failure_message(output, exit_code)
     return ToolResult(
         ok=False,
         capability="system.command.run",
@@ -2210,7 +2226,13 @@ def _files_search(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any
         raise ValueError(f"invalid search pattern: {exc}") from exc
     limit = int(args.get("limit") or ctx.store.policy.service_limits.default_search_results)
     matches: list[dict[str, Any]] = []
-    for path in ctx.files.list_paths(str(args.get("glob") or "**/*"), limit=ctx.store.policy.service_limits.max_file_list_size):
+    paths = ctx.files.search_paths(str(args.get("glob") or "**/*"),
+                                   limit=ctx.store.policy.service_limits.max_file_list_size)
+    for path in paths:
+        if ctx.execution_control:
+            ctx.execution_control.check()
+        if ctx.files.resolve(path).stat().st_size > 1_000_000:
+            continue
         try:
             content = ctx.files.read_text(path)
         except UnicodeDecodeError:
@@ -2235,12 +2257,7 @@ def _command_run(args: dict[str, Any], ctx: CapabilityContext) -> ToolResult:
     exit_code = int(output["exit_code"])
     if exit_code in accepted and not output.get("timed_out") and not output.get("output_truncated"):
         return ToolResult(ok=True, capability="project.command.run", output=output)
-    detail = str(output.get("stderr") or output.get("stdout") or "").strip()
-    message = ("command timed out" if output.get("timed_out") else
-               "command output exceeded limit" if output.get("output_truncated") else
-               f"command exited with code {exit_code}")
-    if detail:
-        message = f"{message}: {detail}"
+    message = _command_failure_message(output, exit_code)
     return ToolResult(
         ok=False,
         capability="project.command.run",
@@ -2316,6 +2333,15 @@ def _loop_apply(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
     return result
 
 
+def _command_failure_message(output: dict[str, Any], exit_code: int) -> str:
+    if output.get('timed_out'):
+        return ('command timed out; inspect output.stdout/stderr. A foreground service must be '
+                'started, checked, and stopped within one bounded command')
+    if output.get('output_truncated'):
+        return 'command output exceeded limit; inspect bounded output.stdout/stderr'
+    return f'command exited with code {exit_code}; inspect output.stdout/stderr'
+
+
 def _workflow_plan_save(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
     _require_user_planning_turn(ctx, "workflow.plan.save")
     result = ctx.store.create_workflow_plan(ctx.project_id, WorkflowPlan.model_validate(args["plan"]))
@@ -2328,7 +2354,8 @@ def _task_plan_save(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, A
     _check_workflow_scope(ctx, args['plan']['workflow_revision_id'])
     result = ctx.store.create_task_plan(ctx.project_id, TaskPlan.model_validate(args["plan"]))
     _bind_requirement(ctx, 'v1_task_plans', result['id'])
-    return result
+    return {**result, 'next_action': {'capability': 'task.create', 'arguments': {
+        'task_plan_id': result['id'], 'proposed_task_ref': args['plan']['tasks'][0]['proposed_task_ref']}}}
 
 
 def _task_plan_validate(args, ctx, registry):
@@ -2393,10 +2420,6 @@ def _task_plan_contract(ctx):
         ctx.project_id, workflow['workflow_plan_id'])['plan'])
     contract = method.task_contract
     scope = ctx.store.scopes.for_workflow(workflow['id']) or {}
-    scenario_ids = list(dict.fromkeys(
-        identity for column in workflow['definition']['columns']
-        for check in column.get('acceptance_checks', [])
-        for identity in check.get('scenario_ids', [])))
     evidence = {}
     with ctx.store.connect() as db:
         grants = [dict(row) for row in db.execute(
@@ -2448,16 +2471,10 @@ def _task_plan_contract(ctx):
         'workflow_revision_id': workflow['id'],
         'flow_unit': method.flow_unit,
         'input_schema': contract.input_schema,
-        'required_behavior_columns': contract.required_behavior_columns,
-        'required_acceptance_invalidators': {
-            key: [key] if key in contract.acceptance_invalidated_by else contract.acceptance_invalidated_by
-            for key in contract.required_behavior_columns},
-        'scenario_input_pointer': contract.scenario_input_pointer,
         'identity_pointer': contract.identity_pointer,
-        'frozen_scenario_ids': scenario_ids[:100],
         'entry_evidence': evidence,
         'authorized_scope': authorized_scope,
-        'next_action': 'Pair each file receipt with its execution_grant_id as confirmed_scope; submit actual input and matching evidence through task.plan.validate before task.plan.save.',
+        'next_action': 'Build Tasks from independent accepted flow units, not Column stages. Match each declared entry requirement to its exact Task input and current grant; validate the complete plan, save it, then call task.create with the returned plan ID.',
     }
 
 
@@ -2479,26 +2496,17 @@ def _workflow_acceptance_configure(args, ctx, registry):
                 raise ValueError('Unknown or duplicate column; legal columns: '+', '.join(columns))
             seen.add(item['key'])
             columns[item['key']]['acceptance_checks'] = item['acceptance_checks']
+            edges = {edge['outcome']: edge for edge in columns[item['key']]['transitions']}
+            for change in item.get('transitions', []):
+                if change['outcome'] not in edges:
+                    raise ValueError('Unknown outcome for Column '+item['key']+': '+change['outcome'])
+                edges[change['outcome']]['required_checks'] = change['required_checks']
         method = WorkflowPlan.model_validate(ctx.store.get_workflow_plan(ctx.project_id, base['workflow_plan_id'])['plan'])
         if 'acceptance_obligations' in args:
             value['acceptance_obligations'] = args['acceptance_obligations']
-        else:
-            value['acceptance_obligations'] = [item for item in value.get('acceptance_obligations', [])
-                                               if item['column'] not in seen]
-            contract = method.task_contract
-            for key in sorted(seen & set(contract.required_behavior_columns)):
-                invalidators = ([key] if key in contract.acceptance_invalidated_by
-                                else list(contract.acceptance_invalidated_by))
-                for check in columns[key]['acceptance_checks']:
-                    if check.get('evidence_kind') == 'behavior':
-                        value['acceptance_obligations'].append({
-                            'column': key, 'check_key': check['key'], 'invalidated_by': invalidators})
-        _validate_acceptance_script_owners(value, ctx)
         definition = WorkflowDefinition.model_validate(canonicalize_workflow_capability_arguments(value, registry))
         errors = acceptance_diagnostics(definition, method)
-        impossible = [item for item in errors if item['message'].startswith((
-            'NonBehaviorCheck:', 'BehaviorRunnerReportArgumentMissing:',
-            'AcceptanceEvidenceScopeCollision:', 'FeedbackContractMissing:'))]
+        impossible = [item for item in errors if item['message'].startswith('FeedbackContractMissing:')]
         if impossible:
             raise PlanAdmissionError(impossible)
         result = _workflow_publish({'workflow_plan_id':base['workflow_plan_id'],'workflow':definition.model_dump(mode='json')},ctx,registry)
@@ -2508,113 +2516,12 @@ def _workflow_acceptance_configure(args, ctx, registry):
             'remaining_diagnostics':errors[:12]}
 
 
-def _workflow_acceptance_runners(args, ctx, registry):
-    columns = {}
-    for runner in args['runners']:
-        report_path = runner['report_path']
-        ctx.files.resolve(report_path)
-        script_index = _behavior_runner_script_index(runner['argv'])
-        if script_index is None:
-            raise ValueError('BehaviorRunnerScriptMissing: use a dedicated Project-relative .py, .js, .mjs, .ps1, .sh, .cmd or .bat script; Maven/npm with --report cannot write the required report')
-        ctx.files.resolve(runner['argv'][script_index])
-        if report_path not in runner['argv'][script_index+1:]:
-            raise ValueError('BehaviorRunnerReportArgumentMissing: argv must include report_path as a separate argument')
-        if not runner['scenario_ids'] or not runner['purpose'].strip():
-            raise ValueError('BehaviorRunnerIncomplete: scenario_ids and purpose are required')
-        checks = columns.setdefault(runner['column'], [])
-        checks.append({'key':f'{runner["column"][:90]}_behavior_{len(checks)+1}',
-            'capability':'project.command.run', 'arguments':{'argv':runner['argv']},
-            'evidence_kind':'behavior', 'purpose':runner['purpose'],
-            'scenario_ids':runner['scenario_ids'], 'report_path':report_path,
-            'launch_validation':'deferred'})
-    return _workflow_acceptance_configure({
-        'base_revision_id':args['base_revision_id'], 'base_digest':args['base_digest'],
-        'columns':[{'key':key,'acceptance_checks':checks} for key,checks in columns.items()],
-    }, ctx, registry)
-
-
-def _validate_acceptance_script_owners(definition, ctx):
-    columns = definition['columns']
-
-    def writable(column, script):
-        metadata = column.get('metadata') or {}
-        if 'writable_paths' not in metadata:
-            return True
-        return any(fnmatch.fnmatchcase(script, pattern.replace('\\', '/'))
-                   for pattern in metadata['writable_paths'])
-
-    for position, column in enumerate(columns):
-        for check in column.get('acceptance_checks', []):
-            if check.get('evidence_kind') != 'behavior' or check.get('capability') != 'project.command.run':
-                continue
-            argv = (check.get('arguments') or {}).get('argv') or []
-            script_index = _behavior_runner_script_index(argv)
-            if script_index is None:
-                continue
-            script = argv[script_index].replace('\\', '/')
-            ctx.files.resolve(script)
-            if writable(column, script):
-                continue
-            owned_earlier = any(
-                writable(prior, script) and any(
-                    (index := _behavior_runner_script_index(
-                        (earlier.get('arguments') or {}).get('argv') or [])) is not None
-                    and (earlier.get('arguments') or {})['argv'][index].replace('\\', '/') == script
-                    for earlier in prior.get('acceptance_checks', []))
-                for prior in columns[:position])
-            if not owned_earlier:
-                raise ValueError(
-                    f'BehaviorRunnerScriptUnowned: {script!r} cannot be created by '
-                    f'{column["key"]}; use its writable_paths '
-                    f'{(column.get("metadata") or {}).get("writable_paths", [])!r}, '
-                    'reuse a prior Column acceptance script with a repair owner; '
-                    'a pre-existing script outside every responsible Column remains unrepairable')
-
-
-def _behavior_runner_script_index(argv):
-    if not argv:
-        return None
-    executable_path = argv[0].replace('\\', '/')
-    executable = executable_path.rsplit('/', 1)[-1].lower()
-    if '/' in executable_path and executable.endswith(
-            ('.py', '.js', '.mjs', '.cjs', '.ps1', '.sh', '.cmd', '.bat')):
-        return 0
-    if executable in {'python', 'python.exe', 'py', 'py.exe'}:
-        index, extensions = 1, ('.py',)
-    elif executable in {'node', 'node.exe'}:
-        index, extensions = 1, ('.js', '.mjs', '.cjs')
-    elif executable in {'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe'}:
-        lowered = [str(item).lower() for item in argv]
-        if '-file' not in lowered:
-            return None
-        index, extensions = lowered.index('-file')+1, ('.ps1',)
-    elif executable in {'bash', 'bash.exe', 'sh', 'sh.exe'}:
-        index, extensions = 1, ('.sh',)
-    elif executable in {'cmd', 'cmd.exe'}:
-        lowered = [str(item).lower() for item in argv]
-        if '/c' not in lowered:
-            return None
-        index, extensions = lowered.index('/c')+1, ('.cmd', '.bat')
-    else:
-        return None
-    return index if index < len(argv) and argv[index].lower().endswith(extensions) else None
-
-
 def _workflow_publish(args: dict[str, Any], ctx: CapabilityContext, registry: CapabilityRegistry) -> dict[str, Any]:
-    from app.v1.services.task_plan_compiler import acceptance_diagnostics, PlanAdmissionError
     _require_user_planning_turn(ctx, "workflow.publish")
     _bind_requirement(ctx, 'v1_workflow_plans', str(args['workflow_plan_id']))
     workflow = WorkflowDefinition.model_validate(
         canonicalize_workflow_capability_arguments(args["workflow"], registry)
     )
-    _validate_acceptance_script_owners(workflow.model_dump(mode='json'), ctx)
-    method = WorkflowPlan.model_validate(ctx.store.get_workflow_plan(
-        ctx.project_id, str(args['workflow_plan_id']))['plan'])
-    impossible_checks = [issue for issue in acceptance_diagnostics(workflow, method)
-                         if issue['message'].startswith(('AcceptanceEvidenceScopeCollision:', 'NonBehaviorCheck:',
-                                                         'BehaviorRunnerReportArgumentMissing:'))]
-    if impossible_checks:
-        raise PlanAdmissionError(impossible_checks)
     result = ctx.store.publish_workflow(ctx.project_id, workflow, str(args["workflow_plan_id"]))
     scope = ctx.store.scopes.for_workflow(result['id'])
     ctx.store.scopes.bind_workflow(result['id'], scope['binding_id'], ctx.requirement_id, ctx.requirement_revision)
@@ -2690,7 +2597,12 @@ def _check_workflow_scope(ctx, workflow_revision_id):
     scope = ctx.store.scopes.for_workflow(workflow_revision_id)
     if scope and ctx.requirement_id and scope['requirement_id']:
         if (scope['requirement_id'], scope['requirement_revision']) != (ctx.requirement_id, ctx.requirement_revision):
-            raise ValueError('Workflow belongs to a different Requirement revision; plan against the Workflow returned by project.scope.revise')
+            raise ValueError(
+                'WorkflowScopeMismatch: Workflow belongs to Requirement '
+                f'{scope["requirement_id"]} revision {scope["requirement_revision"]}, '
+                f'but this turn uses {ctx.requirement_id} revision {ctx.requirement_revision}. '
+                'Use conversation.execution.authorize(request=continue) for that existing scope in a new turn, '
+                'or project.scope.revise to take over/publish a new Workflow revision in this authorized turn.')
 
 
 def _agent_context_read(args, ctx):
@@ -2723,12 +2635,12 @@ def _agent_evidence_list(args, ctx):
 def _agent_result_read(args, ctx):
     from app.v1.context_projection import slice_source_text
     with ctx.store.connect() as db:
-        row = db.execute('''SELECT t.result_json FROM v1_tool_invocations t
-            JOIN v1_agent_runs r ON r.id=t.agent_run_id
         source = db.execute('SELECT agent_instance_id FROM v1_agent_runs WHERE id=? AND project_id=?',
                             (args['agent_run_id'], ctx.project_id)).fetchone()
         if not source or (ctx.column_run_id and source['agent_instance_id'] != ctx.agent_instance_id):
             raise ValueError('Tool result is absent or outside this Agent scope')
+        row = db.execute('''SELECT t.result_json FROM v1_tool_invocations t
+            JOIN v1_agent_runs r ON r.id=t.agent_run_id
             WHERE t.project_id=? AND t.agent_run_id=? AND t.tool_call_id=?
             AND (? IS NULL OR r.agent_instance_id=?) ORDER BY t.id DESC LIMIT 1''',
             (ctx.project_id,args['agent_run_id'],args['tool_call_id'],ctx.column_run_id,ctx.agent_instance_id)).fetchone()
@@ -2882,11 +2794,6 @@ def _authorize_execution(args, ctx):
 
 
 def _authorize_task_control(args, ctx):
-    if args['action'] == 'task.resume':
-        task = ctx.store.get_project_task(ctx.project_id, args['task_id'])
-        if task['status'] == 'recovering':
-            raise ValueError('RecoveringTaskRequiresRetry: call conversation.execution.authorize '
-                             'with request=continue, then task.retry for the same Task')
     return _resolve_current_turn({
         'act':'control', 'control_capability':args['action'],
         'control_task_id':args['task_id'],

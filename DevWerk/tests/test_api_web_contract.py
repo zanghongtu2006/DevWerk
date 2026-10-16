@@ -21,7 +21,7 @@ def test_web_routes_and_modular_assets_are_served():
         statuses = web.get("/v1/runtime-statuses").json()
         assert "recovering" in statuses["task"]["values"]
         assert set(statuses) == {
-            "task", "column_run", "attempt", "agent_run", "tool_invocation", "mailbox"
+            "task", "column_run", "attempt", "agent_run", "tool_invocation", "mailbox", "feedback"
         }
         settings = web.get("/v1/settings")
         assert settings.status_code == 200

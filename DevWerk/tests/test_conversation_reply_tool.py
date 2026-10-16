@@ -23,13 +23,16 @@ def test_reply_tool_finishes_same_run_with_real_task_state(store, tmp_path):
             return AgentModelResponse(tool_calls=[AgentToolCall(id='resolve',name='conversation.turn.resolve',arguments={
                 'source_message_id':job['user_message_id'],'based_on_intent_revision':0,'act':'status'})])
         return AgentModelResponse(tool_calls=[AgentToolCall(id='reply',name='conversation.reply',arguments={
-            'mode':'work_result','task_ids':[task['id']],'message':'This invented completion claim must be ignored.'})])
+            'mode':'work_result','task_ids':[task['id']],
+            'message':'I will review the result after the queued Task runs.'})])
     result = AgentCore(store,store.registry,model).run(AgentRunSpec(kind='conversation',project=project,
         instruction='',instruction_revision=1,context={},conversation_job_id=job['id'],
         agent_instance_id=store.conversation_agent(project['id'])['logical_id'],
         capability_ids=['conversation.turn.resolve'],require_conversation_report=True))
     assert 'Actual task：待执行' in result.text
-    assert 'invented' not in result.text
+    assert 'Agent 说明（未作为完成依据）' in result.text
+    assert 'Actual task：待执行' in result.text.splitlines()[0]
+    assert 'review the result' in result.text
     assert calls == 2
     assert len(store.agent_runs(project_id=project['id'])) == 1
     assert result.completion['conversation_report']['tasks'][0]['id'] == task['id']
@@ -101,6 +104,33 @@ def test_execution_reply_cannot_use_old_task_status_without_current_effect(store
         json.dumps({'mode': 'work_result', 'task_ids': [task['id']],
                     'tool_call_ids': ['current-write']}))
     assert '项目文件已写入' in rendered
+
+
+def test_execution_reply_cannot_present_old_done_task_as_new_work(store, tmp_path):
+    from app.v1.conversation_report import render_report
+
+    project = store.create_project('terminal provenance', '', str(tmp_path/'project'))
+    first, first_ctx = turn(store, project, '开始交付')
+    assert resolve(first_ctx, first, act='execute', execution_request='begin',
+                   scope_summary='original', user_evidence=[{'message_id': first['user_message_id']}]).ok
+    store.finish_conversation_job(first['id'], None, first_ctx.agent_run_id, {})
+    publish_planned_workflow(store, project['id'], sequence_workflow())
+    task = create_planned_task(store, project['id'], 'Old delivery')
+    with store.tx(immediate=True) as db:
+        db.execute("UPDATE v1_tasks SET status='done' WHERE id=?", (task['id'],))
+
+    job, ctx = turn(store, project, '为已交付项目建立修复任务')
+    assert resolve(ctx, job, act='execute', execution_request='begin', focus='new_scope',
+                   scope_summary='separate repair', user_evidence=[{'message_id': job['user_message_id']}]).ok
+    store.record_tool_invocation(agent_run_id=ctx.agent_run_id, tool_call_id='scope-created',
+        capability='requirement.create', arguments={}, result={'ok': True, 'output': {'id': 'new-scope'}}, ok=True)
+    with pytest.raises(ValueError, match='HistoricalTerminalTaskNotCurrentWork'):
+        render_report(store, project['id'], ctx.agent_run_id,
+            json.dumps({'mode': 'work_result', 'task_ids': [task['id']]}))
+
+    rendered, _ = render_report(store, project['id'], ctx.agent_run_id,
+        json.dumps({'mode': 'work_result', 'tool_call_ids': ['scope-created']}))
+    assert '需求已建立' in rendered and 'Old delivery' not in rendered
 
 
 def test_execution_reply_reports_partial_workflow_configuration_as_incomplete(store, tmp_path):

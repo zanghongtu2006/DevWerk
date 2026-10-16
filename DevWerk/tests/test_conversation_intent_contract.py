@@ -309,7 +309,7 @@ def test_natural_reply_for_non_execution_turns(store, tmp_path, act):
         assert resolve(ctx, job, **fields).ok
     if act in {'unresolved', 'discuss', 'status'}:
         text, evidence = render_report(store, project['id'],ctx.agent_run_id,'建议先确定接口，再开始开发。')
-        assert text.startswith('本轮仅讨论，未新建任务。')
+        assert text == '建议先确定接口，再开始开发。'
         assert evidence['discussion_prose']
         assert not store.agents.list_requirements(project['id'])
         if act == 'unresolved':

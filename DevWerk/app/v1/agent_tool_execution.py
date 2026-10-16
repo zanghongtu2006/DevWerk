@@ -325,8 +325,9 @@ class AgentToolBatchExecutor:
                 self.completion_contract,
                 self.logical_ledger,
             )
-            if not self.completion_contract.rule(submission.outcome).allows_unresolved_failures:
-                self._run_acceptance_checks()
+            rule = self.completion_contract.rule(submission.outcome)
+            if rule.required_checks:
+                self._run_acceptance_checks(rule.required_checks)
                 submission = parse_completion_submission(arguments, self.completion_contract, self.logical_ledger)
             decision = self.completion_admission.evaluate(
                 submission,
@@ -363,9 +364,11 @@ class AgentToolBatchExecutor:
                 None,
             )
 
-    def _run_acceptance_checks(self):
+    def _run_acceptance_checks(self, required_keys: tuple[str, ...]):
         from app.v1.services.acceptance_execution import run_acceptance_check
         for check in self.completion_contract.acceptance_checks:
+            if check['key'] not in required_keys:
+                continue
             if self.spec.assignment:
                 self.store.agents.charge(self.spec.assignment, tools=1)
             call_id = f"acceptance-{len(self.logical_ledger)}-{check['key']}"

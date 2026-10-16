@@ -5,10 +5,13 @@ from pydantic import ValidationError
 
 from app.v1.domain import (
     AgentExecutor,
+    AcceptanceObligation,
     CapabilitySequenceExecutor,
     CapabilityStep,
     ColumnDefinition,
     ExactTaskInputString,
+    TaskContract,
+    TaskEntryRequirement,
     TaskPlan,
     TaskPlanItem,
     TaskPlanReadiness,
@@ -31,7 +34,7 @@ def test_runtime_status_catalog_is_the_single_public_status_definition():
     ]
     assert "recovering" in catalog["task"]["transitions"]["running"]
     assert set(catalog) == {
-        "task", "column_run", "attempt", "agent_run", "tool_invocation", "mailbox"
+        "task", "column_run", "attempt", "agent_run", "tool_invocation", "mailbox", "feedback"
     }
     assert catalog["mailbox"]["values"] == [
         "pending", "delivered", "received", "acknowledged", "failed", "attention"
@@ -47,6 +50,33 @@ def test_task_state_machine_rejects_terminal_drift():
 
     with pytest.raises(ValueError, match="done -> running"):
         TASK_STATE_MACHINE.require(TaskStatus.DONE, TaskStatus.RUNNING)
+
+
+def test_acceptance_invalidation_lives_on_workflow_obligations_only():
+    with pytest.raises(ValidationError, match='acceptance_invalidated_by'):
+        TaskContract.model_validate({'acceptance_invalidated_by': ['work']})
+    obligation = AcceptanceObligation(column='review', check_key='check', invalidated_by=['work'])
+    assert obligation.invalidated_by == ['work']
+
+
+def test_task_entry_scope_snapshot_is_one_execution_grant_not_memory():
+    with pytest.raises(ValidationError, match='execution grant ID'):
+        TaskEntryRequirement(key='memory_baseline', kind='accepted_scope_snapshot',
+                             scope_evidence_key='mem_example')
+    with pytest.raises(ValidationError, match='at most one accepted_scope_snapshot'):
+        TaskContract(expected_outputs=['result'], acceptance_contract=['accepted'],
+                     entry_requirements=[
+                         TaskEntryRequirement(key='scope', kind='accepted_scope_snapshot'),
+                         TaskEntryRequirement(key='second_scope', kind='accepted_scope_snapshot'),
+                     ])
+    contract = TaskContract(expected_outputs=['result'], acceptance_contract=['accepted'],
+                            entry_requirements=[
+                                TaskEntryRequirement(key='scope', kind='accepted_scope_snapshot'),
+                                TaskEntryRequirement(key='baseline', kind='input_file_snapshot',
+                                                     input_pointer='/requirements_path',
+                                                     scope_evidence_key='scope'),
+                            ])
+    assert len(contract.entry_requirements) == 2
 
 
 def test_workflow_is_domain_agnostic_and_serializes_declarative_executor():

@@ -200,7 +200,7 @@ def test_terminal_transaction_rejects_claim_without_runtime_acceptance_receipt(s
     task = create_planned_task(store,project['id'],'must verify')
     owned = store.claim_task(task['id'],'owner')
     run = store.begin_run(owned,{})
-    with pytest.raises(ValueError,match='Required acceptance evidence missing'):
+    with pytest.raises(ValueError,match='Workflow edge check missing'):
         store.finish_run(owned,run['id'],{'report':'All checks passed'},'success','done',terminal='done')
     assert store.get_task(task['id'])['status'] == 'running'
     assert not any(e['type']=='task.done' for e in store.events(project['id']))
@@ -231,6 +231,8 @@ def test_software_template_admits_task_before_workers_select_checks(store, tmp_p
     definition.acceptance_obligations = []
     for column in definition.columns:
         column.acceptance_checks = []
+        for edge in column.transitions:
+            edge.required_checks = []
     revision = store.publish_workflow(project['id'],definition,current['workflow_plan_id'])
     plan.workflow_revision_id = revision['id']
     saved = store.create_task_plan(project['id'],plan)
