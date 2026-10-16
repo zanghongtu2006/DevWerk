@@ -6,7 +6,7 @@ Each Project has one persistent Conversation Agent that works with the user to d
 
 The aim is more precise context and memory management: decide which agent needs which information, for which step, and for how long. DevWerk applies this approach to general tasks, including software development and long-form writing.
 
-**Status: pre-1.0, under active development.** This README describes the current development tree. Published packages may contain an earlier implementation; see their [release notes](https://github.com/zanghongtu2006/DevWerk/releases) for the corresponding version.
+**Release: v0.1.0.** The [service guide](DevWerk/README.md) covers installation, configuration, operation, and verification.
 
 ## Why DevWerk
 
@@ -22,7 +22,7 @@ DevWerk organizes this work around explicit boundaries:
 
 A single agent still uses a model–tool loop inside its Column. DevWerk's additional structure is at the collaboration and lifecycle level: it controls how work is divided, which context crosses a boundary, and when results are accepted.
 
-The goal is finer control than a single long agent loop or one shared harness. This is a design hypothesis, not a claim of demonstrated superiority. Reliability, context relevance, token consumption, and coordination overhead still need comparative evaluation.
+The goal is finer control over context selection and agent continuity than a single long agent loop or shared transcript.
 
 ## Architecture
 
@@ -86,13 +86,11 @@ Explicit Worker inputs use a separate durable input channel. Normal handoffs and
 
 Semantic memory lives under `{project.base_dir}/.devwerk/memory/`. Its supported scopes are `project`, `conversation`, `workflow`, and `task`. Worker Session context is separate from these file-memory scopes.
 
-The current development tree includes per-request context budgeting, bounded tool-result views, Assignment checkpoints, and a limited smaller-context retry for explicit provider overflow. Original evidence remains available for inspection. Summaries and model statements cannot substitute for successful verification.
-
-Context projection and summarization are lossy. They aim to preserve useful continuity without making every historical token part of every request; they do not guarantee that every relevant fact will always be selected.
+The runtime includes per-request context budgeting, bounded tool-result views, Assignment checkpoints, and a smaller-context retry for explicit provider overflow. Original evidence remains available for inspection and verification.
 
 ## Reusable Workflows
 
-Process definitions live in versioned `loops/<name>/` bundles. The repository includes Loops for novel production, software delivery, GitLab delivery, and parameter optimization. Their presence is not a guarantee that every end-to-end scenario has passed validation.
+Process definitions live in versioned `loops/<name>/` bundles. The repository includes Loops for novel production, software delivery, GitLab delivery, and parameter optimization.
 
 A Loop supplies a reusable method. A Workflow Revision freezes the executable Columns and transitions. A Task Plan selects that revision and supplies concrete tasks, inputs, dependencies, and acceptance obligations. Publishing a new revision does not rewrite existing Tasks.
 
@@ -162,16 +160,16 @@ DevWerk/
   startup.*
   shutdown.*
 
-idea-plugin/           Suspended; outside the standalone V1 release scope
+idea-plugin/           IntelliJ integration source
 ```
 
-## Current Boundaries and Verification
+## Verification
 
-V1 prioritizes completing the user conversation → planning → execution → verification → delivery loop. It is a development system with detailed local debug traces; production security hardening remains future work.
+The v0.1.0 flow is user conversation → planning → execution → verification → delivery. Runtime traces and task evidence support local diagnosis.
 
-The current runtime has one active Workflow per Project, immutable revisions, persistent logical agent identities, scoped context, and explicit execution budgets. Collaboration does not imply unrestricted parallel writes; dependency, resource, and ownership rules still apply.
+The runtime has one active Workflow per Project, immutable revisions, persistent logical agent identities, scoped context, and explicit execution budgets. Dependencies, resources, and ownership govern parallel work.
 
-Automated tests cover planning, single-agent Columns, persistent Workers, memory, passive notifications, recovery, context management, and evidence-based acceptance. Complete real-provider software delivery and subsequent user repair remain under validation. Passing local tests does not establish a general delivery guarantee or a measured token-saving ratio.
+Automated tests cover planning, single-agent Columns, persistent Workers, memory, passive notifications, recovery, context management, and evidence-based acceptance. A fresh-project black-box run completed a Vue/Spring Boot login demonstration through the Workflow; its [run record](DevWerk/docs/archive/2026-10-15/2026-10-15-fresh-workflow-blackbox-regression.md) includes the observed results.
 
 From `DevWerk/`:
 
@@ -179,7 +177,7 @@ From `DevWerk/`:
 .\venv\Scripts\python.exe -m pytest tests -q
 ```
 
-See the [runtime guide](DevWerk/README.md), [current implementation and validation record](DevWerk/docs/bugs/2026-09-22-context-overflow-implementation.md), and [README architecture review](DevWerk/docs/bugs/2026-09-27-readme-proposal-review.md).
+See the [runtime guide](DevWerk/README.md), [document map](DevWerk/docs/README.md), and [v0.1.0 release notes](DevWerk/docs/releases/v0.1.0.md).
 
 ## License
 

@@ -10,9 +10,9 @@ Kanban 状态、工作流设计和任务运行由 `../DevWerk/` 下的 FastAPI �
 - IntelliJ Platform 基线：`2024.1`（`sinceBuild=241`，`untilBuild=243.*`）
 - JVM：Java 17
 - 主要入口：IDE 右侧 **DevWerk** 工具窗口
-- 开发阶段：暂时挂起；DevWerk Version 1 服务能够独立完成任务后再恢复插件开发
+- 集成用途：提供 IDE 工作区能力
 
-服务端已不再把旧 `/v1/plan`、`/v1/execute` 作为正式接口。后续集成应使用 `/v1/workflows`、工作流事件/消息和语义 action。
+服务集成使用 `/v1/workflows`、工作流事件/消息和语义 action。
 
 ## 主要职责
 
@@ -27,7 +27,7 @@ Kanban 状态、工作流设计和任务运行由 `../DevWerk/` 下的 FastAPI �
 
 `SnapshotGuard` 在修改前保存目标文件快照，并在 apply 前检查快照完整性；执行成功后再保存修改后的状态。路径守卫用于阻止操作逃逸出项目根目录。
 
-生成结果仍需要人工检查。HTTP 请求成功不等于代码交付成功，还应检查实际修改路径、IDE 诊断和工作流工件。
+根据实际修改路径、IDE 诊断和工作流工件检查生成结果。
 
 ## 构建
 

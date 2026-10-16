@@ -14,12 +14,10 @@ Kanban-Zustand und Workflow-Definition gehören zum FastAPI-Dienst unter
 - IntelliJ-Platform: `2024.1` (`sinceBuild=241`, `untilBuild=243.*`)
 - JVM-Ziel: Java 17
 - Oberfläche: rechtes **DevWerk**-Toolfenster
-- Entwicklungsstatus: pausiert, bis der eigenständige DevWerk-Version-1-Dienst
-  Aufgaben selbstständig abschließen kann; danach wird die Plugin-Arbeit fortgesetzt
+- Integration: IDE-seitige Workspace-Funktionen
 
-Die früheren Endpunkte `/v1/plan` und `/v1/execute` gehören nicht mehr zum
-aktuellen Dienstvertrag. Neue Integrationen sollen `/v1/workflows`,
-Workflow-Ereignisse/-Nachrichten und semantische Aktionen verwenden.
+Die Integration verwendet `/v1/workflows`, Workflow-Ereignisse/-Nachrichten
+und semantische Aktionen.
 
 ## Aufgaben des Plugins
 
@@ -37,9 +35,8 @@ die Vollständigkeit der Snapshots vor dem Apply-Schritt. Nach erfolgreicher
 Ausführung wird der neue Zustand erfasst. Pfadprüfungen verhindern Zugriffe
 außerhalb des Projektstamms.
 
-Generierte Änderungen müssen weiterhin geprüft werden. Eine erfolgreiche
-HTTP-Antwort ersetzt weder die Kontrolle der geänderten Pfade noch IDE-Diagnosen
-oder Workflow-Artefakte.
+Generierte Änderungen anhand der betroffenen Pfade, IDE-Diagnosen und
+Workflow-Artefakte prüfen.
 
 ## Build
 

@@ -14,11 +14,9 @@ belong to the FastAPI service in `../DevWerk/`.
 - IntelliJ Platform baseline: `2024.1` (`sinceBuild=241`, `untilBuild=243.*`)
 - JVM target: Java 17
 - Primary UI: right-side **DevWerk** tool window
-- Development state: paused while the standalone DevWerk Version 1 service is
-  completed; plugin work resumes after the service can complete tasks independently
+- Integration source for IDE-side workspace capabilities
 
-The service no longer documents legacy `/v1/plan` and `/v1/execute` endpoints.
-New integration work should use `/v1/workflows`, workflow events/messages, and
+Service integration uses `/v1/workflows`, workflow events/messages, and
 semantic actions.
 
 ## Responsibilities
@@ -36,8 +34,7 @@ semantic actions.
 snapshot set before apply. After successful execution, the plugin captures the
 resulting state. Path guards prevent operations from escaping the project root.
 
-Generated changes must still be reviewed. A successful HTTP response does not
-replace checking the applied paths, IDE diagnostics, and workflow artifacts.
+Review generated changes using the applied paths, IDE diagnostics, and workflow artifacts.
 
 ## Build
 

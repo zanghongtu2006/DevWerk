@@ -1,7 +1,6 @@
 # DevWerk Loop Authoring Guide
 
-A Loop is a reusable filesystem method package. It is not a Project draft and
-must not be stored inside a Project output directory.
+A Loop is a reusable filesystem method package stored in the service `loops/` directory.
 
 ## Package layout
 
@@ -14,14 +13,12 @@ loops/<directory>/
 └── assets/          # optional UTF-8 method files
 ```
 
-Use `system.files.write` for authoring and then call `loop.inspect` with the
-declared Loop Key. A Loop is usable only after `loop.inspect` validates it.
-Apply it to a Project with `loop.apply`; never publish an initial Workflow
-directly.
+Use `system.files.write` for authoring, then call `loop.inspect` with the
+declared Loop Key. After validation, apply it to a Project with `loop.apply`.
 
 ## `loop.meta`
 
-`loop.meta` is Markdown, not JSON or YAML. Use this exact section structure:
+`loop.meta` uses Markdown with this section structure:
 
 ```markdown
 # Human-readable Loop name
@@ -82,10 +79,9 @@ The root object must contain exactly:
 
 Use an installed Loop such as `ddd-software-delivery` as the structural
 reference. Keep Project-level facts in `parameter_schema`/Loop bindings and
-Task-level facts in the Workflow Plan Task Contract; the two sets of fields
-must not overlap. Columns form a directed graph and each Column has exactly one
-executor. Concrete Tasks and Project-specific deliverables do not belong in a
-reusable Loop package.
+Task-level facts in the Workflow Plan Task Contract. Columns form a directed
+graph and each Column has exactly one executor. A Task Plan supplies concrete
+Tasks and Project-specific deliverables when the Loop is applied.
 
 ## Validation sequence
 
@@ -95,5 +91,4 @@ reusable Loop package.
 4. Call `loop.apply` only after inspection succeeds and the user wants the
    method applied to the current Project.
 
-Do not claim that a Loop or Workflow exists without the corresponding successful
-tool receipt.
+Use the successful tool receipt as the source of truth for Loop and Workflow creation.
