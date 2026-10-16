@@ -1,5 +1,7 @@
 # Loop Runtime V1
 
+> Archived v0.1.0 design record (2026-10-16). Status and authority claims below describe its historical version only.
+
 ## Purpose
 
 DevWerk stores reusable project-delivery knowledge as version-controlled Loops. The Conversation Agent discovers a suitable Loop from human-readable metadata, binds confirmed Project facts, and applies it. Application creates an immutable Workflow Plan and initial Workflow Revision, but no concrete Tasks. A later Task Plan expresses the current user objective and is the only source from which Tasks are materialized. The Kanban Runtime remains a domain-neutral interpreter of the resulting declarative directed graph.

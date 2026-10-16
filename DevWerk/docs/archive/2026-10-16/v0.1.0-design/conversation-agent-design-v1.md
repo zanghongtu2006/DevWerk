@@ -1,5 +1,7 @@
 # DevWerk Conversation Agent — Version 1 核心设计
 
+> Archived v0.1.0 design record (2026-10-16). Status and authority claims below describe its historical version only.
+
 > 实现规范提示：本文定义已确认的产品身份、职责和治理决策。通用 AgentCore、Capability Registry、prompt 数据边界、Workflow/Column schema 与 Runtime 实现以 [`generic-conversation-agent-and-declarative-column-runtime.md`](./generic-conversation-agent-and-declarative-column-runtime.md) 为第一事实。
 
 **文档状态**：Version 1 已确认核心设计  

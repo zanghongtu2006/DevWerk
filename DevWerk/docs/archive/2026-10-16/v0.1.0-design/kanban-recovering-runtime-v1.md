@@ -1,5 +1,7 @@
 # Kanban Recovering Runtime V1
 
+> Archived v0.1.0 design record (2026-10-16). Status and authority claims below describe its historical version only.
+
 ## 1. Purpose
 
 Kanban Runtime is responsible for keeping a Task moving when a Column execution is interrupted by a temporary infrastructure failure. Recovery is part of workflow execution and does not depend on a Conversation Agent turn.

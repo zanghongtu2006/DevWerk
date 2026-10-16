@@ -307,18 +307,6 @@ The separate [software context evaluation script](scripts/eval_software_context.
 
 The [fresh-project black-box record](docs/archive/2026-10-15/2026-10-15-fresh-workflow-blackbox-regression.md) documents a completed Workflow, generated login demo, compilation, and independent browser observations.
 
-## Design References and Revisions
+## Design and Release Records
 
-Read the [document map](docs/README.md) for current architecture references and the dated archive for the design and test history.
-
-| Topic | References and applicable refinement |
-| --- | --- |
-| Planning ownership | [Loop / Task Plan decoupling](docs/loop-task-plan-decoupling-v1.md) |
-| Column boundary | [Single-agent Column decision](docs/single-agent-column-runtime-v0.1.0.md); its earlier Session-default description is refined by the lifecycle changes below |
-| Persistent main/leaf agent structure | [Hermes architecture review](docs/archive/2026-09-09/DEVWERK_Hermes_Architecture_Review_2026-09-09.md), [lifecycle remediation plan](docs/archive/2026-09-09/DEVWERK_P0_Runtime_Remediation_Plan_2026-09-09.md) |
-| Sole main agent and scope continuation | [Scope extension revision](docs/archive/2026-09-10/2026-09-10-conversation-scope-extension-review-and-plan.md) |
-| Passive Mailbox, separate inputs and feedback | [Feedback/evidence revision](docs/archive/2026-09-21/DEVWERK_Repair_Evidence_Token_Fix_2026-09-21.md); supersedes the older proposal to use Mailbox for Worker inputs |
-| Context lifecycle and current validation | [Context audit and plan](docs/archive/2026-09-22/2026-09-22-context-overflow-full-audit-and-fix-plan.md), [implementation record](docs/archive/2026-09-22/2026-09-22-context-overflow-implementation.md) |
-| README alignment | [Architecture review and update record](docs/archive/2026-09-27/2026-09-27-readme-proposal-review.md) |
-
-The runtime supports user conversation → scoped planning → multi-agent execution → verification → delivery, with explicit control over each agent's context and memory.
+This README describes the current runtime. New architecture designs and future goals belong in `docs/`; completed design, repair, and test records belong in `docs/archive/`. The [v0.1.0 release notes](docs/archive/2026-10-16/v0.1.0-release/v0.1.0.md) and [release verification](docs/archive/2026-10-16/v0.1.0-release/v0.1.0-verification.md) preserve the published version's results and limits.

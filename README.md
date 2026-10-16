@@ -152,7 +152,7 @@ DevWerk/
     web/               Browser workbench
   loops/               Reusable workflow bundles
   config/              LLM routing and startup settings
-  docs/                Designs, revisions, audits and verification records
+  docs/                Architecture proposals and future goals; history in archive/
   tests/               Automated runtime and contract tests
   scripts/             Operational and isolated evaluation helpers
   Dockerfile
@@ -177,7 +177,7 @@ From `DevWerk/`:
 .\venv\Scripts\python.exe -m pytest tests -q
 ```
 
-See the [runtime guide](DevWerk/README.md), [document map](DevWerk/docs/README.md), and [v0.1.0 release notes](DevWerk/docs/releases/v0.1.0.md).
+See the [runtime guide](DevWerk/README.md) and the [v0.1.0 release notes](DevWerk/docs/archive/2026-10-16/v0.1.0-release/v0.1.0.md). Earlier designs and test records are retained under `DevWerk/docs/archive/`.
 
 ## License
 

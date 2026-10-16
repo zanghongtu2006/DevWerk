@@ -1,5 +1,7 @@
 # DevWerk Conversation Agent 编排灵魂与 Workflow 治理设计
 
+> Archived v0.1.0 design record (2026-10-16). Status and authority claims below describe its historical version only.
+
 **状态**：Proposed  
 **版本**：1.0-proposal  
 **日期**：2026-07-18  

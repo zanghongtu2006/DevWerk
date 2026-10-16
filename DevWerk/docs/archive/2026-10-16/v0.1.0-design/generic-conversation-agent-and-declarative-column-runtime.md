@@ -1,5 +1,7 @@
 # DevWerk 通用 Conversation Agent 与声明式 Column Runtime 设计
 
+> Archived v0.1.0 design record (2026-10-16). Status and authority claims below describe its historical version only.
+
 状态：**Normative / Implementation Source of Truth**  
 版本：1.0-draft  
 日期：2026-07-17

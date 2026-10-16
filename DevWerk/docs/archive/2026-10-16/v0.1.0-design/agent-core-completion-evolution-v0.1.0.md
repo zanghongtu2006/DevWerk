@@ -1,5 +1,7 @@
 # Agent Core Completion Evolution v0.1.0
 
+> Archived v0.1.0 design record (2026-10-16). Status and authority claims below describe its historical version only.
+
 ## Purpose
 
 This document records the approved incremental migration that separates Provider/tool protocol handling from Workflow completion admission and execution evidence. The migration applies to every DevWerk Loop and must not contain product-specific rules.

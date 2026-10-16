@@ -1,5 +1,7 @@
 # DevWerk V1 Global Settings
 
+> Archived v0.1.0 design record (2026-10-16). Status and authority claims below describe its historical version only.
+
 ## Purpose
 
 DevWerk reads one repository-local YAML file as the source of truth for global runtime settings:

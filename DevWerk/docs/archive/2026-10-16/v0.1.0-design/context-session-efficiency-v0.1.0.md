@@ -1,5 +1,7 @@
 # DevWerk Context and Session Efficiency — v0.1.0
 
+> Archived v0.1.0 design record (2026-10-16). Status and authority claims below describe its historical version only.
+
 Status: **Normative / Release Optimization**
 Version: **0.1.0**
 Date: **2026-08-27**

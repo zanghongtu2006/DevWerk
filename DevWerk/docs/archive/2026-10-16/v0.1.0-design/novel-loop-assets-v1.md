@@ -1,5 +1,7 @@
 # Novel Loop Asset Boundary V1
 
+> Archived v0.1.0 design record (2026-10-16). Status and authority claims below describe its historical version only.
+
 ## Purpose
 
 The Novel Production Loop supplies a stable writing and review method while each Project and each chapter retain their own facts. A Column receives all three layers without copying the same fact into multiple owners.

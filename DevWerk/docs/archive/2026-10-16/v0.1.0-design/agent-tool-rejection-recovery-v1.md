@@ -1,5 +1,7 @@
 # Agent Tool Rejection Recovery V1
 
+> Archived v0.1.0 design record (2026-10-16). Status and authority claims below describe its historical version only.
+
 ## Purpose
 
 An Agent must be able to observe a tool rejection, change its plan and still complete the current Column when the rejected call produced no side effect.

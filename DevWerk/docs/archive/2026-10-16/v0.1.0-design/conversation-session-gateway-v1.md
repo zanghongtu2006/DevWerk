@@ -1,5 +1,7 @@
 # DevWerk Conversation Session Gateway — Version 1 设计
 
+> Archived v0.1.0 design record (2026-10-16). Status and authority claims below describe its historical version only.
+
 ## 1. 目标
 
 每个 Project 拥有一个长期 Conversation Agent Session。用户消息、Task 终态、运行异常和定时监督都进入同一 Session，由它持续理解项目、调整 Workflow、重新调度 Task、执行恢复操作并向用户汇报。

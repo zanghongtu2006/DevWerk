@@ -1,5 +1,7 @@
 # DevWerk Single-Agent Column Runtime — v0.1.0
 
+> Archived v0.1.0 design record (2026-10-16). Status and authority claims below describe its historical version only.
+
 ## Decision
 
 A Workflow Column is the smallest observable execution and context boundary. It may execute:

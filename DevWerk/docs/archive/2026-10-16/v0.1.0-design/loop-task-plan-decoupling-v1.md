@@ -1,5 +1,7 @@
 # Loop、Workflow 与 Task Plan 解耦设计（V1）
 
+> Archived v0.1.0 design record (2026-10-16). Status and authority claims below describe its historical version only.
+
 ## 目标
 
 DevWerk V1 将可复用工作方法与一次具体工作拆分为三个稳定事实：

@@ -1,5 +1,7 @@
 # V1 Store Decomposition
 
+> Archived v0.1.0 design record (2026-10-16). Status and authority claims below describe its historical version only.
+
 ## Objective
 
 Reduce `V1Store` to a compatibility facade over explicit persistence and domain-service boundaries while preserving the V1 API, SQLite schema, transactions, and Runtime behavior.
