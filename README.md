@@ -154,7 +154,7 @@ DevWerk/
   config/              LLM routing and startup settings
   docs/                Architecture proposals and future goals; history in archive/
   tests/               Automated runtime and contract tests
-  scripts/             Operational and isolated evaluation helpers
+  scripts/             Isolated real-provider delivery evaluation
   Dockerfile
   install.*
   startup.*
