@@ -1004,6 +1004,10 @@ def test_mcp_stdio_tool_discovered_and_dispatched_through_registry(store, tmp_pa
     manager = MCPToolManager(load_mcp_servers(config_path), registry)
     try:
         assert manager.discover() == {'fixture':['mcp__fixture__echo']}
+        workflow_schema = registry.input_schema('workflow.publish')
+        definitions = workflow_schema['$defs']
+        assert 'mcp__fixture__echo' in definitions['AgentExecutor']['properties']['capabilities']['items']['enum']
+        assert 'mcp__fixture__echo' in definitions['CapabilityStep']['properties']['capability']['enum']
         project = store.create_project('mcp', '', str(tmp_path / 'project'))
         ctx = CapabilityContext(project['id'], project, store)
         entry = registry.resolve(['mcp__fixture__echo'], ctx)[0]

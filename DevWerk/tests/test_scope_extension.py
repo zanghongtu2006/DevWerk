@@ -65,6 +65,35 @@ def save_chapters(ctx, workflow, chapters):
     return invoke(ctx, 'task.plan.save', {'plan': plan.model_dump(mode='json')})
 
 
+def test_scope_extension_before_first_workflow_allows_initial_publication(store, tmp_path):
+    project = store.create_project('Research', '', str(tmp_path / 'research'))
+    _, requirement = turn(store, project)
+    ctx, _ = turn(store, project, requirement)
+    definition = agent_workflow()
+    plan = workflow_plan(definition).model_dump(mode='json')
+
+    pending = store.registry.dispatch('workflow.plan.save', {'plan': plan}, ctx)
+    assert not pending.ok and 'ScopeRevisionPending' in pending.error['message']
+    revised = invoke(ctx, 'project.scope.revise', {
+        'requirement_id': requirement['id'], 'expected_revision': requirement['revision'],
+        'expected_workflow_revision_id': None, 'objective': 'Research and deliver verified results',
+        'binding_patch': {}, 'reason': 'The user expanded source discussion into delivery',
+    })
+    assert revised['requirement']['revision'] == requirement['revision'] + 1
+    assert revised['workflow_revision_id'] is None
+    assert store.scopes.inspect(project['id'])['workflow'] is None
+    with store.connect() as db:
+        grant = db.execute('SELECT state,requirement_revision FROM v1_execution_grants WHERE source_job_id=?',
+                           (store.agents.conversation_job(ctx)['id'],)).fetchone()
+    assert (grant['state'], grant['requirement_revision']) == ('active', revised['requirement']['revision'])
+
+    ctx = replace(ctx, requirement_revision=revised['requirement']['revision'])
+    planned = invoke(ctx, 'workflow.plan.save', {'plan': plan})
+    published = invoke(ctx, 'workflow.publish', {
+        'workflow_plan_id': planned['id'], 'workflow': definition.model_dump(mode='json')})
+    assert store.get_workflow(project['id'])['id'] == published['id']
+
+
 def test_scope_extension_without_loop_keeps_workflow_and_requirement_history(store, tmp_path):
     project = store.create_project('Direct workflow', '', str(tmp_path / 'direct-workflow'))
     ctx, req = turn(store, project)

@@ -1,0 +1,20 @@
+# Copy to config/mcp-servers.yaml to enable these optional MCP servers.
+# On Windows, Python subprocess needs npx.cmd; on macOS/Linux use npx.
+mcp_servers:
+  chrome_headless:
+    transport: stdio
+    command: npx.cmd
+    args:
+      - -y
+      - chrome-devtools-mcp@1.11.0
+      - --headless
+      - --isolated
+      - --slim
+    timeout_seconds: 60
+  chrome_headed:
+    transport: stdio
+    command: npx.cmd
+    args:
+      - -y
+      - chrome-devtools-mcp@1.11.0
+    timeout_seconds: 60

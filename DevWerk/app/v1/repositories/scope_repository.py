@@ -104,7 +104,28 @@ class ScopeRepository:
             if ctx.execution_control:
                 ctx.execution_control.check()
             current = self.store.agents.get_requirement(ctx.project_id, requirement_id)
-            active = self.store.get_workflow(ctx.project_id)
+            try:
+                active = self.store.get_workflow(ctx.project_id)
+            except KeyError:
+                active = None
+            if active is None:
+                if current['revision'] != expected_revision or expected_workflow_revision_id is not None:
+                    raise ScopeConflict('Scope changed; inspect the current Requirement and Workflow revisions before revising')
+                if binding_patch or loop_digest:
+                    raise ScopeConflict('A Workflow must exist before revising Loop bindings')
+                self.remember(current)
+                changed = db.execute('UPDATE v1_requirements SET revision=revision+1,objective=?,status=\'active\',updated_at=? WHERE id=? AND revision=?',
+                                     (objective, utcnow(), requirement_id, expected_revision)).rowcount
+                if changed != 1:
+                    raise ScopeConflict('Requirement revision changed during scope commit')
+                revised = self.store.agents.get_requirement(ctx.project_id, requirement_id)
+                self.remember(revised, job_id=self.store.agents.conversation_job(ctx)['id'], reason=reason)
+                self.store.agents.select_requirement(ctx, requirement_id)
+                self.store.intents.bind_revised_scope(ctx, revised)
+                result = {'requirement': revised, 'workflow_revision_id': None, 'binding_id': None,
+                          'bindings': {}, 'previous_workflow_revision_id': None, 'task_ids': []}
+                self.store._event(db, ctx.project_id, None, None, 'project.scope.revised', result)
+                return result
             owner = self.for_workflow(active['id'])
             if owner and owner['requirement_id'] not in (None, requirement_id):
                 unfinished = db.execute("""SELECT 1 FROM v1_tasks

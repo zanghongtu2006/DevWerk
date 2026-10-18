@@ -16,6 +16,12 @@ from app.v1.states import (
 KEY_PATTERN = r"^[a-z][a-z0-9_.-]{0,127}$"
 
 
+def _normalize_task_input_pointer(value: Any) -> Any:
+    if isinstance(value, str) and value.startswith("/input/task/input/"):
+        return value[len("/input/task/input"):]
+    return value
+
+
 class EdgeCheck(BaseModel):
     model_config = ConfigDict(extra="forbid")
     column: str = Field(pattern=KEY_PATTERN)
@@ -562,9 +568,7 @@ class ExactTaskInputString(BaseModel):
     @field_validator("pointer", mode="before")
     @classmethod
     def normalize_runtime_pointer(cls, value: Any) -> Any:
-        if isinstance(value, str) and value.startswith("/input/task/input/"):
-            return value[len("/input/task/input"):]
-        return value
+        return _normalize_task_input_pointer(value)
 
     @model_validator(mode="after")
     def validate_pointer(self) -> "ExactTaskInputString":
@@ -809,6 +813,11 @@ class OrderedTaskDependencyContract(BaseModel):
     continuity: Literal["contiguous_integer", "strictly_increasing"] = "strictly_increasing"
     first_value: int | str | None = None
 
+    @field_validator("order_pointer", mode="before")
+    @classmethod
+    def normalize_runtime_pointer(cls, value: Any) -> Any:
+        return _normalize_task_input_pointer(value)
+
 
 class TaskEntryRequirement(BaseModel):
     model_config = ConfigDict(extra='forbid')
@@ -817,6 +826,11 @@ class TaskEntryRequirement(BaseModel):
         description='accepted_scope_snapshot refers to the current execution grant ID, never a memory ID; input_file_snapshot refers to a completed file-write execution key.')
     input_pointer: str | None = None
     scope_evidence_key: str | None = None
+
+    @field_validator("input_pointer", mode="before")
+    @classmethod
+    def normalize_runtime_pointer(cls, value: Any) -> Any:
+        return _normalize_task_input_pointer(value)
 
     @model_validator(mode='after')
     def file_reference(self):
@@ -847,6 +861,11 @@ class TaskContract(BaseModel):
     required_context: list[str] = Field(default_factory=list, max_length=200)
     expected_outputs: list[str] = Field(min_length=1, max_length=200)
     acceptance_contract: list[str] = Field(min_length=1, max_length=200)
+
+    @field_validator("identity_pointer", mode="before")
+    @classmethod
+    def normalize_runtime_pointer(cls, value: Any) -> Any:
+        return _normalize_task_input_pointer(value)
 
     @model_validator(mode='after')
     def entry_evidence_references(self):

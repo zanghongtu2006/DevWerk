@@ -238,6 +238,14 @@ Complete `context_window` for alternative routes in the example before selecting
 
 Keep actual provider credentials out of source control. The example contains variable names, not keys.
 
+## MCP Tools
+
+DevWerk discovers configured MCP servers at startup and exposes their tools as `mcp__<server>__<tool>` capabilities to the Project Conversation Agent. A Workflow Column can use one when its executor declares that capability. MCP is optional; without a server configuration, no browser or Internet search tool is available.
+
+For a local Chrome browser on Windows, install Node.js and Chrome, then copy [config/mcp-servers.example.yaml](config/mcp-servers.example.yaml) to `config/mcp-servers.yaml` and restart DevWerk. The example exposes a headless Chrome MCP session and a visible, persistent Chrome MCP session as separate capability sets; the agent can select either set of tools. Browser state does not transfer between the sessions. On macOS/Linux, change `npx.cmd` to `npx`. The actual config is local and ignored by Git. Alternatively, point `DEVWERK_MCP_SERVERS_PATH` at a different server configuration file. Confirm discovery in the startup log and the Project capability list before asking an agent to use the tool.
+
+Chrome navigation can open a search engine and source pages, but it is not a search API. Site access and source quality still require verification; a successful browser call alone does not establish that a research claim is correct.
+
 ## Docker
 
 To run the implementation in this checkout, build it from the service directory:

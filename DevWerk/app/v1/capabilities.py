@@ -113,6 +113,11 @@ class CapabilityRegistry:
             if entry.id in self._entries:
                 raise ValueError(f"capability {entry.id!r} is already registered")
             self._entries[entry.id] = entry
+            workflow_entry = self._entries.get("workflow.publish")
+            if entry.delegable_to_column and workflow_entry is not None:
+                schema_defs = workflow_entry.input_schema.get("$defs")
+                if isinstance(schema_defs, dict):
+                    _bind_workflow_capability_catalog(schema_defs, self.column_ids())
 
     def contains(self, capability_id: str) -> bool:
         with self._lock:
@@ -1436,10 +1441,10 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     add('project.scope.inspect', 'Inspect the current Requirement, Workflow revision and optional frozen Loop bindings before extending delivery.',
         {'type': 'object', 'properties': {}, 'additionalProperties': False},
         lambda args, ctx: ctx.store.scopes.inspect(ctx.project_id), side_effect_kind='read', delegable_to_column=False)
-    add('project.scope.revise', 'Atomically extend or revise the authorized Requirement on a user request. If the current Workflow belongs to another Requirement, its Tasks must all be done or failed before this Requirement can take over in a new Workflow revision. Historical Tasks and Worker contexts stay intact. For a Workflow without a Loop, pass an empty binding_patch. Do not close the Requirement first. This does not create Tasks; save a new TaskPlan against the returned Workflow then materialize it. For a Loop-backed Workflow, optionally select a new Loop digest from loop.inspect.',
+    add('project.scope.revise', 'Atomically extend or revise the authorized Requirement on a user request. Before the first Workflow exists, pass expected_workflow_revision_id=null and an empty binding_patch; this revises only the Requirement, then you can save and publish the first Workflow. If the current Workflow belongs to another Requirement, its Tasks must all be done or failed before this Requirement can take over in a new Workflow revision. Historical Tasks and Worker contexts stay intact. For a Workflow without a Loop, pass an empty binding_patch. Do not close the Requirement first. This does not create Tasks; after revising an existing Workflow, save a new TaskPlan against the returned Workflow then materialize it. For a Loop-backed Workflow, optionally select a new Loop digest from loop.inspect.',
         {'type': 'object', 'required': ['requirement_id', 'expected_revision', 'expected_workflow_revision_id', 'objective', 'binding_patch', 'reason'],
          'properties': {'requirement_id': {'type': 'string'}, 'expected_revision': {'type': 'integer', 'minimum': 1},
-                        'expected_workflow_revision_id': {'type': 'string'}, 'objective': {'type': 'string', 'minLength': 1},
+                        'expected_workflow_revision_id': {'type': ['string', 'null']}, 'objective': {'type': 'string', 'minLength': 1},
                         'binding_patch': {'type': 'object'}, 'reason': {'type': 'string', 'minLength': 1}, 'loop_digest': {'type': 'string'}},
          'additionalProperties': False},
         lambda args, ctx: ctx.store.scopes.revise(ctx, **args), side_effect_kind='control', delegable_to_column=False)

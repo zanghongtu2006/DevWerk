@@ -23,6 +23,7 @@ env/
 .env
 .env.*
 config/llm.json
+config/mcp-servers.yaml
 
 # Tests and coverage
 .pytest_cache/

@@ -249,11 +249,11 @@ def test_materialization_rechecks_baseline_changed_after_save(store, tmp_path):
 # Task Plan compiler
 # ---------------------------------------------------------------------------
 
-def prepare(store, tmp_path):
+def prepare(store, tmp_path, *, identity_pointer='/requirements_path'):
     project = store.create_project('plan admission', '', str(tmp_path / 'project'))
     workflow = agent_workflow()
     method = workflow_plan(workflow)
-    method.task_contract.identity_pointer = '/requirements_path'
+    method.task_contract.identity_pointer = identity_pointer
     method.task_contract.input_schema = {
         'type': 'object', 'required': ['requirements_path', 'requirements_confirmed'],
         'properties': {'requirements_path': {'type': 'string'}, 'requirements_confirmed': {'const': True}},
@@ -264,6 +264,31 @@ def prepare(store, tmp_path):
     plan = task_plan(revision['id'], workflow, input_data={
         'requirements_path': 'docs/requirements.md', 'requirements_confirmed': True})
     return project, plan
+
+
+def test_runtime_form_task_input_pointer_saves_and_materializes(store, tmp_path):
+    project, plan = prepare(store, tmp_path, identity_pointer='/input/task/input/requirements_path')
+    saved = store.create_task_plan(project['id'], plan)
+    task = store.materialize_task_plan(project['id'], task_plan_id=saved['id'], proposed_task_ref='primary')
+    assert task['input']['requirements_path'] == 'docs/requirements.md'
+
+
+def test_runtime_form_task_input_contract_pointers_are_canonical():
+    from app.v1.domain import OrderedTaskDependencyContract, TaskContract, TaskEntryRequirement
+
+    contract = TaskContract.model_validate({
+        'identity_pointer': '/input/task/input/country',
+        'dependency_contract': {'order_pointer': '/input/task/input/country'},
+        'entry_requirements': [{
+            'key': 'source', 'kind': 'input_file_snapshot',
+            'input_pointer': '/input/task/input/source_path', 'scope_evidence_key': 'scope',
+        }, {'key': 'scope', 'kind': 'accepted_scope_snapshot'}],
+        'expected_outputs': ['result'], 'acceptance_contract': ['result recorded'],
+    })
+    assert contract.identity_pointer == '/country'
+    assert contract.dependency_contract == OrderedTaskDependencyContract(order_pointer='/country')
+    assert contract.entry_requirements[0] == TaskEntryRequirement(
+        key='source', kind='input_file_snapshot', input_pointer='/source_path', scope_evidence_key='scope')
 
 
 @pytest.mark.parametrize('pointer', ['/input/requirements_path', '/requirements_confirmed'])
