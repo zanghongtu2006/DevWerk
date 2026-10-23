@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.v1.repositories.base import StoreHost
+from app.v1.protocols.storage.repository_event_contracts import ExternalEventData, ExternalEventReceipt
 from app.v1.storage_support import utcnow
 
 class EventRepository:
@@ -42,9 +43,11 @@ class EventRepository:
         self.store.get_project(project_id)
         now = utcnow()
         with self.store.tx(immediate=True) as db:
-            self.store._event(db, project_id, None, None, event_type, {"correlation_key": correlation_key, "output": output, "source": "automation_api"})
+            self.store._event(db, project_id, None, None, event_type,
+                ExternalEventData(correlation_key=correlation_key, output=output).model_dump(mode='json'))
             event_id = int(db.execute("SELECT last_insert_rowid()").fetchone()[0])
-        return {"id": event_id, "project_id": project_id, "type": event_type, "correlation_key": correlation_key, "output": output, "created_at": now}
+        return ExternalEventReceipt(id=event_id, project_id=project_id, type=event_type,
+            correlation_key=correlation_key, output=output, created_at=now).model_dump(mode='json')
 
 
     def correlated_event(self, project_id: str, event_type: str, correlation_key: str, after: str) -> dict[str, Any] | None:

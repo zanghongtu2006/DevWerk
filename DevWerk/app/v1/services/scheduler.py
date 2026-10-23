@@ -6,15 +6,19 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.v1.repositories.base import StoreHost
-from app.v1.states import (
+from app.v1.execution.states import (
     ATTEMPT_STATE_MACHINE,
     COLUMN_RUN_STATE_MACHINE,
     TASK_STATE_MACHINE,
     AttemptStatus,
     ColumnRunStatus,
     TaskStatus,
+    TaskControlState,
 )
 from app.v1.storage_support import utcnow
+from app.v1.protocols.tools.planning.capability_task_receipts import DependencyFact, SchedulingProjection
+from app.v1.protocols.workflow.scheduler_receipt_contracts import (DependencyContextRecord,
+    DependencyTerminalArtifact, SchedulerStartupReceipt, SchedulingDecisionReceipt)
 from app.v1.services.dependency_resolver import canonical_task as _canonical_task
 
 
@@ -51,12 +55,8 @@ class SchedulerService:
 
     def prepare_startup(self, auto_resume_previous_tasks: bool) -> dict[str, Any]:
         if auto_resume_previous_tasks:
-            return {
-                "auto_resume_previous_tasks": True,
-                "paused_tasks": 0,
-                "dependency_tasks_released": 0,
-                "projects": [],
-            }
+            return SchedulerStartupReceipt(auto_resume_previous_tasks=True, paused_tasks=0,
+                dependency_tasks_released=0, projects=[]).model_dump(mode='json')
 
         now = utcnow()
         interruption = "DevWerk startup paused unfinished Task because automatic resume is disabled"
@@ -100,12 +100,8 @@ class SchedulerService:
                 projects = sorted({str(row[1]) for row in dependency_rows})
                 for project_id in projects:
                     self.store._refresh_projection(db, project_id)
-                return {
-                    "auto_resume_previous_tasks": False,
-                    "paused_tasks": 0,
-                    "dependency_tasks_released": len(dependency_rows),
-                    "projects": projects,
-                }
+                return SchedulerStartupReceipt(auto_resume_previous_tasks=False, paused_tasks=0,
+                    dependency_tasks_released=len(dependency_rows), projects=projects).model_dump(mode='json')
 
             for row in rows:
                 TASK_STATE_MACHINE.require(row[2], TaskStatus.PENDING)
@@ -168,12 +164,8 @@ class SchedulerService:
             for project_id in projects:
                 self.store._refresh_projection(db, project_id)
 
-        return {
-            "auto_resume_previous_tasks": False,
-            "paused_tasks": len(rows),
-            "dependency_tasks_released": len(dependency_rows),
-            "projects": projects,
-        }
+        return SchedulerStartupReceipt(auto_resume_previous_tasks=False, paused_tasks=len(rows),
+            dependency_tasks_released=len(dependency_rows), projects=projects).model_dump(mode='json')
 
     def schedule_task(
         self,
@@ -269,7 +261,9 @@ class SchedulerService:
             )
             db.execute("UPDATE v1_tasks SET updated_at=? WHERE id=?", (now, task_id))
             self.store._event(db, project_id, task_id, None, "scheduling.decided", {"state": state, "priority": priority, "wip_group": wip_group, "wip_limit": wip_limit, "dependencies": dependencies, "resources": resources})
-        return {"project_id": project_id, "task_id": task_id, "state": state, "priority": priority, "wip_group": wip_group, "wip_limit": wip_limit, "dependencies": dependencies, "resources": resources, "updated_at": now}
+        return SchedulingDecisionReceipt(project_id=project_id, task_id=task_id,
+            state=state, priority=priority, wip_group=wip_group, wip_limit=wip_limit,
+            dependencies=dependencies, resources=resources, updated_at=now).model_dump(mode='json')
 
 
     def task_scheduling(self, project_id: str, task_id: str) -> dict[str, Any]:
@@ -295,30 +289,23 @@ class SchedulerService:
                         "ORDER BY created_at DESC LIMIT 1",
                         (project_id, plan_id, task_ref),
                     ).fetchone()
-                    dependency_facts.append({
-                        "reference": dependency,
-                        "plan_id": plan_id,
-                        "task_ref": task_ref,
-                        "resolved_task_id": None,
-                        "required_terminal": "done",
-                        "latest_task_id": latest[0] if latest else None,
-                        "status": latest[1] if latest else "unmaterialized",
-                        "resolved_by_task_id": latest[2] if latest else None,
-                        "satisfied": False,
-                    })
+                    dependency_facts.append(DependencyFact(reference=dependency,
+                        plan_id=plan_id, task_ref=task_ref, resolved_task_id=None,
+                        required_terminal="done", latest_task_id=latest[0] if latest else None,
+                        status=latest[1] if latest else "unmaterialized",
+                        resolved_by_task_id=latest[2] if latest else None,
+                        satisfied=False).model_dump(mode='json', exclude_unset=True))
                     continue
                 dependency_row = db.execute(
                     "SELECT id,status,proposed_task_ref FROM v1_tasks WHERE id=? AND project_id=?",
                     (dependency, project_id),
                 ).fetchone()
-                dependency_facts.append({
-                    "reference": dependency,
-                    "task_ref": dependency_row[2] if dependency_row else None,
-                    "resolved_task_id": dependency_row[0] if dependency_row else None,
-                    "required_terminal": "done",
-                    "status": dependency_row[1] if dependency_row else "missing",
-                    "satisfied": bool(dependency_row and dependency_row[1] == "done"),
-                })
+                dependency_facts.append(DependencyFact(reference=dependency,
+                    task_ref=dependency_row[2] if dependency_row else None,
+                    resolved_task_id=dependency_row[0] if dependency_row else None,
+                    required_terminal="done", status=dependency_row[1] if dependency_row else "missing",
+                    satisfied=bool(dependency_row and dependency_row[1] == "done")
+                    ).model_dump(mode='json', exclude_unset=True))
             eligible = self._dispatch_eligible(db, task_id, now)
         row["dependencies"] = dependency_facts
         row["resources"] = json.loads(row.pop("resources_json") or "[]")
@@ -330,7 +317,7 @@ class SchedulerService:
             pending_reason = "running"
         elif task["status"] == "waiting":
             pending_reason = "external_wait"
-        elif task.get("control_state") != "active":
+        elif task.get("control_state") != TaskControlState.ACTIVE:
             pending_reason = task.get("supervision_action") or task.get("control_state") or "paused"
         elif any(not item["satisfied"] for item in dependency_facts):
             pending_reason = "waiting_dependency"
@@ -346,7 +333,7 @@ class SchedulerService:
         row["blocked_by"] = [
             item for item in dependency_facts if not item["satisfied"]
         ]
-        return row
+        return SchedulingProjection.model_validate(row).model_dump(mode='json', exclude_unset=True)
 
 
     def task_dependency_context(self, project_id: str, task_id: str) -> list[dict[str, Any]]:
@@ -372,27 +359,11 @@ class SchedulerService:
                         (task["id"],),
                     ).fetchone()
             rows = list(canonical_rows.values())
-        return [
-            {
-                "task_id": row[0],
-                "task_ref": row[1],
-                "title": row[2],
-                "status": row[3],
-                "finished_at": row[4],
-                "terminal_artifact": (
-                    {
-                        "id": row[5],
-                        "kind": row[6],
-                        "path": row[7],
-                        "sha256": row[8],
-                        "size": row[9],
-                    }
-                    if row[5]
-                    else None
-                ),
-            }
-            for row in rows
-        ]
+        return [DependencyContextRecord(task_id=row[0], task_ref=row[1],
+            title=row[2], status=row[3], finished_at=row[4],
+            terminal_artifact=DependencyTerminalArtifact(id=row[5], kind=row[6],
+                path=row[7], sha256=row[8], size=row[9]) if row[5] else None
+            ).model_dump(mode='json') for row in rows]
 
 
     def claim_task(self, task_id: str, owner: str, lease_seconds: int | None = None) -> dict[str, Any] | None:
@@ -427,6 +398,7 @@ class SchedulerService:
                 return None
             cursor = db.execute(
                 "UPDATE v1_tasks SET status='running',lease_owner=?,lease_until=?,next_retry_at=NULL,state_version=state_version+1,updated_at=? WHERE id=? AND status IN ('pending','recovering') AND control_state='active' "
+                "AND workflow_revision_id=(SELECT active_revision_id FROM v1_workflows WHERE project_id=v1_tasks.project_id) "
                 "AND (status!='recovering' OR next_retry_at IS NULL OR next_retry_at<=?) "
                 "AND EXISTS (SELECT 1 FROM v1_scheduling_entries s WHERE s.task_id=v1_tasks.id AND s.project_id=v1_tasks.project_id AND s.state='admitted' "
                 "AND NOT EXISTS (SELECT 1 FROM json_each(s.dependencies_json) d LEFT JOIN v1_tasks dep ON dep.id=d.value WHERE dep.id IS NULL OR dep.status!='done') "
@@ -473,6 +445,7 @@ class SchedulerService:
         with self.store.tx(immediate=True) as db:
             rows = db.execute(
                 "SELECT t.id,t.status FROM v1_tasks t JOIN v1_scheduling_entries s ON s.task_id=t.id AND s.project_id=t.project_id "
+                "JOIN v1_workflows w ON w.project_id=t.project_id AND w.active_revision_id=t.workflow_revision_id "
                 "WHERE t.control_state='active' AND t.status IN ('pending','recovering') "
                 "AND (t.status!='recovering' OR t.next_retry_at IS NULL OR t.next_retry_at<=?) "
                 "ORDER BY s.priority DESC,t.updated_at LIMIT ?",
@@ -492,7 +465,7 @@ class SchedulerService:
             "SELECT t.project_id,t.status,t.control_state,s.state,s.wip_group,s.wip_limit,"
             "s.dependencies_json,s.resources_json,t.next_retry_at "
             "FROM v1_tasks t JOIN v1_scheduling_entries s ON s.task_id=t.id AND s.project_id=t.project_id "
-            "WHERE t.id=?",
+            "WHERE t.id=? AND t.workflow_revision_id=(SELECT active_revision_id FROM v1_workflows WHERE project_id=t.project_id)",
             (task_id,),
         ).fetchone()
         if not row:

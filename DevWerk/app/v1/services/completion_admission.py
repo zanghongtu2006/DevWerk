@@ -4,11 +4,12 @@ from dataclasses import dataclass
 from typing import Any
 import json
 
-from app.v1.completion_protocol import CompletionContract, CompletionSubmission
-from app.v1.execution_ledger import (
+from app.v1.tooling.completion_protocol import CompletionContract, CompletionSubmission
+from app.v1.execution.execution_ledger import (
     evidence_entries,
     unresolved_execution_failures,
 )
+from app.v1.protocols.workflow.runtime_json_contracts import FailedOperationSummary
 
 
 @dataclass(frozen=True)
@@ -124,7 +125,10 @@ class CompletionAdmissionService:
                 )
                 or "a failed Column action has not been repaired"
             )[:300]
-            operation = {"capability": failed.get("capability"), "arguments": (failed.get("facts") or {}).get("arguments") or {}}
+            operation = FailedOperationSummary(
+                capability=failed.get("capability"),
+                arguments=(failed.get("facts") or {}).get("arguments") or {},
+            )
             repair_hint = (
                 "Retry the same operation successfully, explicitly link an alternative successful "
                 "operation with failure_resolutions and a concrete reason, or submit a declared "
@@ -136,7 +140,7 @@ class CompletionAdmissionService:
                             f"; unresolved_failure_count={len(remaining_failures)}")
             return self._reject("unresolved_execution_failure", message +
                                 "; failed_evidence_id=" + repr(str(failed.get("evidence_id") or "")) +
-                                "; unresolved operation=" + json.dumps(operation, ensure_ascii=False) +
+                                "; unresolved operation=" + operation.model_dump_json() +
                                 pending_hint +
                                 ". " + repair_hint +
                                 "Unrelated commands/noops do not repair this failure; Runtime collects receipt IDs automatically.")

@@ -9,7 +9,12 @@ from jsonschema.exceptions import SchemaError, ValidationError
 
 
 class ContractError(ValueError):
-    pass
+    def __init__(self, message: str, *, path: str | None = None,
+                 expected: str | None = None, actual: str | None = None) -> None:
+        super().__init__(message)
+        self.path = path
+        self.expected = expected
+        self.actual = actual
 
 
 def canonicalize_contract_value(value: Any, schema: dict[str, Any]) -> Any:
@@ -48,7 +53,7 @@ def _canonicalize(value: Any, schema: Any, root: dict[str, Any]) -> Any:
             for choice in choices:
                 candidate = _canonicalize(value, choice, root)
                 try:
-                    Draft202012Validator({**root, **choice}).validate(candidate)
+                    Draft202012Validator(root).evolve(schema=choice).validate(candidate)
                     return candidate
                 except (SchemaError, ValidationError):
                     continue
@@ -182,196 +187,15 @@ def _provider_reference(value: Any) -> dict[str, str] | None:
         if index + 1 >= len(pointer) or pointer[index + 1] not in {"0", "1"}:
             return None
         index += 2
-    return {"$ref": pointer}
+    from app.v1.protocols.tools.core.provider_schema_contracts import ProviderSchemaNode
+    return ProviderSchemaNode(reference=pointer).wire()
 
 
 def provider_contract_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    """Materialize a compact provider-facing schema without weakening validation.
+    """Build a typed compatibility view while retaining the strict source contract."""
+    from app.v1.protocols.tools.core.provider_schema_contracts import provider_view
 
-    Provider tool protocols do not consistently resolve local JSON Schema
-    references or discriminated nullable unions. This view inlines references,
-    removes presentation-only metadata, and presents discriminated object unions
-    as one object with an explicit discriminator. Tool results are still
-    canonicalized and validated against the original schema.
-    """
-    return _provider_schema(schema, schema, ())
-
-
-def _provider_schema(schema: Any, root: dict[str, Any], seen: tuple[str, ...]) -> Any:
-    if not isinstance(schema, dict):
-        return schema
-    reference = schema.get("$ref")
-    if isinstance(reference, str) and reference.startswith("#/"):
-        if reference in seen:
-            return {"type": "object"}
-        resolved = _resolve_reference(root, reference)
-        siblings = {key: value for key, value in schema.items() if key != "$ref"}
-        materialized = _provider_schema({**resolved, **siblings}, root, (*seen, reference))
-        return materialized
-
-    choices_keyword = "oneOf" if isinstance(schema.get("oneOf"), list) else "anyOf" if isinstance(schema.get("anyOf"), list) else None
-    if choices_keyword:
-        choices = [
-            _provider_schema(choice, root, seen)
-            for choice in schema[choices_keyword]
-            if isinstance(choice, dict)
-        ]
-        non_null = [choice for choice in choices if choice.get("type") != "null"]
-        if len(non_null) == 1 and len(non_null) != len(choices):
-            return _merge_provider_annotations(non_null[0], schema)
-        discriminator = schema.get("discriminator")
-        if non_null and all(choice.get("type") == "object" for choice in non_null):
-            property_name = discriminator.get("propertyName") if isinstance(discriminator, dict) else None
-            if property_name:
-                prepared = [
-                    _require_provider_discriminator(choice, str(property_name))
-                    for choice in non_null
-                ]
-                return _merge_provider_discriminated_objects(prepared, str(property_name))
-
-    result: dict[str, Any] = {}
-    for key, value in schema.items():
-        if key in {"$defs", "definitions", "title", "default", "discriminator"}:
-            continue
-        if key in {"oneOf", "anyOf"} and isinstance(value, list):
-            result[key] = [_provider_schema(choice, root, seen) for choice in value]
-        elif key == "properties" and isinstance(value, dict):
-            result[key] = {
-                name: _provider_schema(property_schema, root, seen)
-                for name, property_schema in value.items()
-            }
-        elif key == "items":
-            result[key] = _provider_schema(value, root, seen)
-        else:
-            result[key] = value
-    constant = result.pop("const", None)
-    if constant is not None:
-        result["enum"] = [constant]
-        result.setdefault("type", _json_type(constant))
-    return result
-
-
-def _resolve_reference(root: dict[str, Any], reference: str) -> dict[str, Any]:
-    resolved: Any = root
-    for token in reference[2:].split("/"):
-        if not isinstance(resolved, dict):
-            return {}
-        resolved = resolved.get(token.replace("~1", "/").replace("~0", "~"))
-    return resolved if isinstance(resolved, dict) else {}
-
-
-def _merge_provider_annotations(base: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
-    result = dict(base)
-    if isinstance(source.get("description"), str):
-        result.setdefault("description", source["description"])
-    return result
-
-
-def _require_provider_discriminator(choice: dict[str, Any], discriminator: str) -> dict[str, Any]:
-    result = dict(choice)
-    required = set(result.get("required") or [])
-    if discriminator in (result.get("properties") or {}):
-        required.add(discriminator)
-    if required:
-        result["required"] = sorted(required)
-    return result
-
-
-def _merge_provider_discriminated_objects(
-    choices: list[dict[str, Any]],
-    discriminator: str,
-) -> dict[str, Any]:
-    """Expose one shallow Provider object while preserving strict validation.
-
-    Some Anthropic-compatible Providers translate nested ``oneOf`` object
-    unions through an XML-shaped intermediate representation and emit an empty
-    object for the selected branch. A merged authoring view keeps the
-    discriminator and all variant properties visible without asking that
-    transport to preserve nested union structure. Returned values are still
-    validated against the original discriminated schema.
-    """
-
-    properties: dict[str, Any] = {}
-    shared_required: set[str] | None = None
-    variant_requirements: list[str] = []
-    discriminator_values: list[Any] = []
-
-    for choice in choices:
-        choice_properties = choice.get("properties")
-        if not isinstance(choice_properties, dict):
-            continue
-        required = set(choice.get("required") or [])
-        shared_required = required if shared_required is None else shared_required & required
-        discriminator_schema = choice_properties.get(discriminator)
-        values = (
-            discriminator_schema.get("enum")
-            if isinstance(discriminator_schema, dict)
-            and isinstance(discriminator_schema.get("enum"), list)
-            else []
-        )
-        discriminator_values.extend(value for value in values if value not in discriminator_values)
-        label = repr(values[0]) if len(values) == 1 else repr(values)
-        variant_fields = sorted(required - {discriminator})
-        variant_requirements.append(
-            f"When {discriminator}={label}, required fields are "
-            f"{', '.join(variant_fields) if variant_fields else '(none beyond the discriminator)'}."
-        )
-        for name, property_schema in choice_properties.items():
-            existing = properties.get(name)
-            if existing is None:
-                properties[name] = property_schema
-            elif existing != property_schema:
-                if (
-                    isinstance(existing, dict)
-                    and isinstance(property_schema, dict)
-                    and isinstance(existing.get("enum"), list)
-                    and isinstance(property_schema.get("enum"), list)
-                ):
-                    merged_values = list(existing["enum"])
-                    merged_values.extend(
-                        value for value in property_schema["enum"] if value not in merged_values
-                    )
-                    properties[name] = {**existing, "enum": merged_values}
-                else:
-                    properties[name] = {"anyOf": [existing, property_schema]}
-
-    if discriminator_values:
-        properties[discriminator] = {
-            "type": "string",
-            "enum": discriminator_values,
-            "description": "Selects the strict object variant validated by DevWerk.",
-        }
-    required = set(shared_required or set())
-    required.add(discriminator)
-    return {
-        "type": "object",
-        "properties": properties,
-        "required": sorted(required),
-        "additionalProperties": False,
-        "description": " ".join(
-            [
-                f"Select one object shape using discriminator property {discriminator!r}.",
-                *variant_requirements,
-                "Do not mix fields from different variants.",
-            ]
-        ),
-    }
-
-
-def _json_type(value: Any) -> str:
-    if isinstance(value, bool):
-        return "boolean"
-    if isinstance(value, int):
-        return "integer"
-    if isinstance(value, float):
-        return "number"
-    if value is None:
-        return "null"
-    if isinstance(value, list):
-        return "array"
-    if isinstance(value, dict):
-        return "object"
-    return "string"
+    return provider_view(schema)
 
 
 def check_schema(schema: dict[str, Any], *, label: str) -> None:
@@ -393,9 +217,45 @@ def validate_contract(value: Any, schema: dict[str, Any], *, label: str) -> None
         location = "/".join(str(part) for part in exc.absolute_path) or "$"
         detail = _nested_validation_detail(exc)
         suffix = f"; branch details: {detail}" if detail else ""
+        expected = str(exc.validator_value) if exc.validator == "type" else None
+        actual = _json_value_type(exc.instance) if expected else None
+        reason = f"expected {expected}, received {actual}" if expected else exc.message
         raise ContractError(
-            f"{label} rejected value at {location}: {exc.message}{suffix}"
+            f"{label} rejected value at {location}: {reason}{suffix}",
+            path=location, expected=expected, actual=actual,
         ) from exc
+
+
+def _json_value_type(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
+def validate_optional_defaults(value: dict[str, Any], schema: dict[str, Any], *, label: str) -> None:
+    """Validate supplied defaults without mutating the declared parameter schema.
+
+    Only missing top-level required parameters are deferred until callers supply
+    bindings. Nested required fields in an explicitly supplied value remain errors.
+    """
+    check_schema(schema, label=label)
+    for error in Draft202012Validator(schema).iter_errors(value):
+        if error.validator == "required" and not error.absolute_path:
+            continue
+        location = "/".join(str(part) for part in error.absolute_path) or "$"
+        raise ContractError(f"{label} rejected value at {location}: {error.message}") from error
 
 
 def validate_contract_template(value: Any, schema: dict[str, Any], *, label: str) -> None:
@@ -414,8 +274,12 @@ def validate_contract_template(value: Any, schema: dict[str, Any], *, label: str
         location = "/".join(str(part) for part in error.absolute_path) or "$"
         detail = _nested_validation_detail(error)
         suffix = f"; branch details: {detail}" if detail else ""
+        expected = str(error.validator_value) if error.validator == "type" else None
+        actual = _json_value_type(error.instance) if expected else None
+        reason = f"expected {expected}, received {actual}" if expected else error.message
         raise ContractError(
-            f"{label} rejected value at {location}: {error.message}{suffix}"
+            f"{label} rejected value at {location}: {reason}{suffix}",
+            path=location, expected=expected, actual=actual,
         ) from error
 
 

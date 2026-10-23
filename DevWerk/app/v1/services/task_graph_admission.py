@@ -10,7 +10,7 @@ from app.v1.domain import (
     TaskContractValueReference,
     TaskPlan,
 )
-from app.v1.task_identity import resolve_input_pointer
+from app.v1.workflows.task_identity import resolve_input_pointer
 
 
 @dataclass(frozen=True)

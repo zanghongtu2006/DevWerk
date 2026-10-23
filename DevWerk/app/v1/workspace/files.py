@@ -1,0 +1,381 @@
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+import re
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, V1RuntimePolicy
+from app.v1.workspace.process_runner import run_command
+from app.v1.protocols.tools.workspace.capability_workspace_receipts import (
+    FileMeasureReceipt, FilePageReceipt, FileSearchMatch, FileSearchReceipt,
+    FileWriteFacts, SystemFileWriteFacts,
+)
+from app.v1.protocols.tools.workspace.capability_file_contracts import (
+    FileVerificationMissing, FileVerificationPresent, FileVerifyOutput,
+)
+
+
+logger = logging.getLogger("devwerk.files")
+
+
+class ProjectFiles:
+    SEARCH_INTERNAL_DIRECTORIES = frozenset({'.devwerk'})
+
+    def __init__(self, base_dir: str, policy: V1RuntimePolicy | None = None):
+        self.policy = policy or DEFAULT_V1_RUNTIME_POLICY
+        self.root = Path(base_dir).expanduser().resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def resolve(self, relative_path: str) -> Path:
+        normalized = self._normalize_relative(relative_path, kind="path")
+        if not normalized:
+            raise ValueError(f"path must be relative to project base_dir: {relative_path!r}")
+        candidate = (self.root / normalized).resolve()
+        self._relative_resolved(candidate, source=relative_path)
+        return candidate
+
+    @staticmethod
+    def _normalize_relative(value: str, *, kind: str) -> str:
+        normalized = str(value or "").replace("\\", "/")
+        parsed = Path(normalized)
+        if parsed.is_absolute() or ".." in parsed.parts:
+            raise ValueError(f"{kind} escapes project base_dir: {value!r}")
+        return normalized
+
+    def _relative_resolved(self, candidate: Path, *, source: str) -> Path:
+        """Return a canonical project-relative path, including for glob matches.
+
+        ``Path.glob`` may traverse a junction or symlink whose textual path is below
+        the project while its concrete target is not. Every filesystem capability
+        therefore validates the resolved object, not only the supplied pattern.
+        """
+        resolved = candidate.resolve()
+        try:
+            return resolved.relative_to(self.root)
+        except ValueError as exc:
+            raise ValueError(f"path escapes project base_dir: {source!r}") from exc
+
+    def _matched_files(self, pattern: str) -> list[tuple[Path, Path]]:
+        normalized = self._normalize_relative(pattern or "**/*", kind="glob")
+        if normalized.endswith('/**'):
+            normalized += '/*'
+        matches: list[tuple[Path, Path]] = []
+        for textual in sorted(self.root.glob(normalized)):
+            if not textual.is_file():
+                continue
+            relative = self._relative_resolved(textual, source=str(textual))
+            if relative.parts and relative.parts[0] == ".devwerk":
+                continue
+            matches.append((textual.resolve(), relative))
+        return matches
+
+    def list_paths(self, pattern: str = "**/*", *, limit: int | None = None) -> list[str]:
+        limit = limit or self.policy.service_limits.default_file_list_size
+        paths: list[str] = []
+        for _path, relative in self._matched_files(pattern):
+            paths.append(relative.as_posix())
+            if len(paths) >= max(1, min(limit, self.policy.service_limits.max_file_list_size)):
+                break
+        return paths
+
+    def search_paths(self, pattern: str = "**/*", *, limit: int) -> list[str]:
+        """Bound default content searches without assuming project directory roles."""
+        normalized = self._normalize_relative(pattern or "**/*", kind="glob")
+        if normalized != "**/*":
+            return self.list_paths(normalized, limit=limit)
+        paths: list[str] = []
+        maximum = max(1, min(limit, self.policy.service_limits.max_file_list_size))
+        for directory, subdirectories, filenames in os.walk(self.root):
+            subdirectories[:] = sorted(
+                name for name in subdirectories
+                if name.lower() not in self.SEARCH_INTERNAL_DIRECTORIES
+            )
+            for name in sorted(filenames):
+                textual = Path(directory) / name
+                if not textual.is_file():
+                    continue
+                relative = self._relative_resolved(textual, source=str(textual))
+                paths.append(relative.as_posix())
+                if len(paths) >= maximum:
+                    return paths
+        return paths
+
+    def write_text(self, relative_path: str, content: str) -> dict[str, Any]:
+        target = self.resolve(relative_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = content.encode("utf-8")
+        fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return FileWriteFacts(path=target.relative_to(self.root).as_posix(),
+            size=len(data), utf8_characters=len(content),
+            non_whitespace_characters=sum(1 for character in content if not character.isspace()),
+            line_count=len(content.splitlines()),
+            sha256=hashlib.sha256(data).hexdigest()).model_dump(mode="json")
+
+    def read_text(self, relative_path: str, max_chars: int | None = None) -> str:
+        text = self.resolve(relative_path).read_text(encoding="utf-8")
+        return text if max_chars is None else text[:max_chars]
+
+    def read_text_page(self, relative_path: str, *, offset: int = 0,
+                       max_chars: int | None = None) -> dict[str, Any]:
+        text = self.resolve(relative_path).read_text(encoding="utf-8")
+        start = min(offset, len(text))
+        end = len(text) if max_chars is None else min(start + max_chars, len(text))
+        return FilePageReceipt(path=relative_path, content=text[start:end],
+            offset=start, next_offset=end if end < len(text) else None,
+            total_characters=len(text), content_complete=end >= len(text)
+        ).model_dump(mode="json")
+
+    def measure_text(self, relative_path: str) -> dict[str, Any]:
+        target = self.resolve(relative_path)
+        data = target.read_bytes()
+        text = data.decode("utf-8")
+        return FileMeasureReceipt(path=target.relative_to(self.root).as_posix(),
+            size_bytes=len(data), utf8_characters=len(text),
+            non_whitespace_characters=sum(1 for character in text if not character.isspace()),
+            line_count=len(text.splitlines()), sha256=hashlib.sha256(data).hexdigest(),
+            modified_at_ns=target.stat().st_mtime_ns).model_dump(mode="json")
+
+    def verify_text(self, relative_path: str, expectations: dict[str, Any]) -> dict[str, Any]:
+        target = self.resolve(relative_path)
+        expectation_keys = (
+            "expected_content",
+            "expected_sha256",
+            "expected_size_bytes",
+            "expected_utf8_characters",
+            "expected_non_whitespace_characters",
+            "expected_line_count",
+            "expected_ends_with_newline",
+            "minimum_non_whitespace_characters",
+            "maximum_non_whitespace_characters",
+        )
+        declared = [key for key in expectation_keys if expectations.get(key) is not None]
+        if not declared:
+            raise ValueError("project.files.verify requires at least one explicit expectation")
+        if not target.exists():
+            checks = {key: False for key in declared}
+            return FileVerifyOutput(outcome="mismatch", matched=False, checks=checks,
+                mismatches=sorted(checks), actual=FileVerificationMissing(
+                    path=target.relative_to(self.root).as_posix())
+            ).model_dump(mode="json")
+        data = target.read_bytes()
+        text = data.decode("utf-8")
+        actual = FileVerificationPresent(path=target.relative_to(self.root).as_posix(),
+            size_bytes=len(data), utf8_characters=len(text),
+            non_whitespace_characters=sum(1 for character in text if not character.isspace()),
+            line_count=len(text.splitlines()), ends_with_newline=text.endswith(("\n", "\r")),
+            sha256=hashlib.sha256(data).hexdigest(),
+            modified_at_ns=target.stat().st_mtime_ns)
+        checks: dict[str, bool] = {}
+        expected_content = expectations.get("expected_content")
+        if expected_content is not None:
+            checks["expected_content"] = text == str(expected_content)
+        scalar_fields = (
+            "expected_sha256",
+            "expected_size_bytes",
+            "expected_utf8_characters",
+            "expected_non_whitespace_characters",
+            "expected_line_count",
+            "expected_ends_with_newline",
+        )
+        actual_fields = (
+            "sha256",
+            "size_bytes",
+            "utf8_characters",
+            "non_whitespace_characters",
+            "line_count",
+            "ends_with_newline",
+        )
+        for expected_key, actual_key in zip(scalar_fields, actual_fields):
+            if expectations.get(expected_key) is not None:
+                checks[expected_key] = getattr(actual, actual_key) == expectations[expected_key]
+        minimum = expectations.get("minimum_non_whitespace_characters")
+        if minimum is not None:
+            checks["minimum_non_whitespace_characters"] = (
+                actual.non_whitespace_characters >= int(minimum)
+            )
+        maximum = expectations.get("maximum_non_whitespace_characters")
+        if maximum is not None:
+            checks["maximum_non_whitespace_characters"] = (
+                actual.non_whitespace_characters <= int(maximum)
+            )
+        mismatches = sorted(name for name, matched in checks.items() if not matched)
+        return FileVerifyOutput(outcome="matched" if not mismatches else "mismatch",
+            matched=not mismatches, checks=checks, mismatches=mismatches,
+            actual=actual).model_dump(mode="json")
+
+    def existing_texts(
+        self,
+        pattern: str,
+        max_total_chars: int | None = None,
+        *,
+        limit: int | None = None,
+        exclude_paths: set[str] | None = None,
+        exclude_directories: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        remaining = max_total_chars
+        maximum_files = max(1, limit or self.policy.context.artifact_context_max_files)
+        excluded = exclude_paths or set()
+        for path, relative in self._matched_files(pattern):
+            relative_path = relative.as_posix()
+            if relative_path in excluded:
+                continue
+            if exclude_directories and any(
+                part in exclude_directories for part in relative.parts[:-1]
+            ):
+                continue
+            if remaining is not None and remaining <= 0:
+                break
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    text = handle.read(remaining + 1 if remaining is not None else -1)
+            except UnicodeDecodeError as exc:
+                logger.debug(
+                    "context artifact skipped path=%s reason=non_utf8 error=%s",
+                    relative_path,
+                    exc,
+                )
+                continue
+            if remaining is not None and len(text) > remaining:
+                logger.debug(
+                    "context artifact skipped path=%s reason=context_character_limit",
+                    relative_path,
+                )
+                continue
+            if remaining is not None:
+                remaining -= len(text)
+            encoded = text.encode("utf-8")
+            result.append({
+                "path": relative_path,
+                "content": text,
+                "size_bytes": len(encoded),
+                "utf8_characters": len(text),
+                "non_whitespace_characters": sum(
+                    1 for character in text if not character.isspace()
+                ),
+                "line_count": len(text.splitlines()),
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+            })
+            if len(result) >= maximum_files:
+                break
+        return result
+
+    def run(self, argv: list[str], cwd: str = ".", *, check=None, limits=None, guard=None) -> dict[str, Any]:
+        working_dir = self.resolve(cwd)
+        working_dir.mkdir(parents=True, exist_ok=True)
+        output = run_command(argv, working_dir, limits or getattr(self, "policy", DEFAULT_V1_RUNTIME_POLICY).execution, check, guard)
+        output["cwd"] = str(working_dir.relative_to(self.root)) if isinstance(self, ProjectFiles) else str(working_dir)
+        return output
+
+
+class SystemFiles:
+    """Conversation Agent filesystem access outside a Project boundary.
+
+    Relative paths are resolved from the DevWerk process working directory;
+    absolute paths remain absolute. Column agents never receive these tools.
+    """
+
+    def __init__(self, working_dir: str | Path | None = None):
+        self.root = Path(working_dir or Path.cwd()).expanduser().resolve()
+
+    def resolve(self, path: str) -> Path:
+        candidate = Path(str(path or ".")).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.root / candidate
+        return candidate.resolve()
+
+    def list_paths(
+        self,
+        path: str = ".",
+        pattern: str = "**/*",
+        *,
+        limit: int,
+    ) -> list[str]:
+        directory = self.resolve(path)
+        if not directory.is_dir():
+            raise FileNotFoundError(f"system directory does not exist: {directory}")
+        paths: list[str] = []
+        for item in sorted(directory.glob(pattern)):
+            if item.is_file():
+                paths.append(str(item.resolve()))
+                if len(paths) >= limit:
+                    break
+        return paths
+
+    def read_text(self, path: str, max_chars: int | None = None) -> str:
+        text = self.resolve(path).read_text(encoding="utf-8")
+        return text if max_chars is None else text[:max_chars]
+
+    def write_text(self, path: str, content: str) -> dict[str, Any]:
+        target = self.resolve(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = content.encode("utf-8")
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return SystemFileWriteFacts(path=str(target), size_bytes=len(data),
+            utf8_characters=len(content), line_count=len(content.splitlines()),
+            sha256=hashlib.sha256(data).hexdigest()).model_dump(mode="json")
+
+    def search_text(
+        self,
+        path: str,
+        pattern: str,
+        glob: str,
+        *,
+        limit: int,
+    ) -> dict[str, Any]:
+        try:
+            expression = re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(f"invalid search pattern: {exc}") from exc
+        matches: list[dict[str, Any]] = []
+        directory = self.resolve(path)
+        if not directory.is_dir():
+            raise FileNotFoundError(f"system directory does not exist: {directory}")
+        for item in sorted(directory.glob(glob)):
+            if not item.is_file():
+                continue
+            try:
+                text = item.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            for number, line in enumerate(text.splitlines(), 1):
+                if expression.search(line):
+                    matches.append(FileSearchMatch(path=str(item.resolve()),
+                        line=number, text=line[:1000]))
+                    if len(matches) >= limit:
+                        return FileSearchReceipt(matches=matches,
+                            truncated=True).model_dump(mode="json")
+        return FileSearchReceipt(matches=matches, truncated=False).model_dump(mode="json")
+
+    def run(self, argv: list[str], cwd: str = ".", *, check=None, limits=None, guard=None) -> dict[str, Any]:
+        working_dir = self.resolve(cwd)
+        if not working_dir.is_dir():
+            raise FileNotFoundError(f"system command cwd does not exist: {working_dir}")
+        output = run_command(argv, working_dir, limits or getattr(self, "policy", DEFAULT_V1_RUNTIME_POLICY).execution, check, guard)
+        output["cwd"] = str(working_dir.relative_to(self.root)) if isinstance(self, ProjectFiles) else str(working_dir)
+        return output

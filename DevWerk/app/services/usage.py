@@ -3,6 +3,9 @@ from __future__ import annotations
 import contextvars
 import logging
 import sqlite3
+from contextlib import contextmanager
+from collections.abc import Iterator
+from app.services.usage_contracts import NormalizedUsage, UsageAggregate, UsageScope, UsageSummary
 import time
 import uuid
 from dataclasses import dataclass
@@ -282,7 +285,7 @@ def usage_summary(
     end: str | None = None,
 ) -> dict[str, Any]:
     if not _enabled():
-        return {"ok": True, "enabled": False, "projects": [], "request_count": 0}
+        return UsageSummary(enabled=False, projects=[], request_count=0).wire()
 
     init_usage_db()
     filters = []
@@ -404,38 +407,23 @@ def usage_summary(
 
     row_dicts = [dict(row) for row in rows]
     totals = _sum_usage_rows(row_dicts)
-    totals["request_count"] = request_count
+    totals.request_count = request_count
 
-    return {
-        "ok": True,
-        "enabled": True,
-        "scope": {
-            "project_id": project_id,
-            "task_id": task_id,
-            "start": start,
-            "end": end,
-        },
-        "totals": totals,
-        "request_count": request_count,
-        "projects": row_dicts,
-        "by_project": [dict(row) for row in project_rows],
-        "by_task": [dict(row) for row in task_rows],
-        "by_agent": [dict(row) for row in agent_rows],
-    }
+    return UsageSummary(enabled=True, scope=UsageScope(project_id=project_id,
+        task_id=task_id, start=start, end=end), totals=totals,
+        request_count=request_count,
+        projects=[UsageAggregate.model_validate(row) for row in row_dicts],
+        by_project=[UsageAggregate.model_validate(dict(row)) for row in project_rows],
+        by_task=[UsageAggregate.model_validate(dict(row)) for row in task_rows],
+        by_agent=[UsageAggregate.model_validate(dict(row)) for row in agent_rows]).wire()
 
 
-def _sum_usage_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    totals = {
-        "calls": 0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-        "duration_ms": 0,
-        "successful_calls": 0,
-    }
+def _sum_usage_rows(rows: list[dict[str, Any]]) -> UsageAggregate:
+    totals = UsageAggregate(calls=0, input_tokens=0, output_tokens=0,
+        total_tokens=0, duration_ms=0, successful_calls=0)
     for row in rows:
-        for key in totals:
-            totals[key] += int(row.get(key) or 0)
+        for key in ("calls", "input_tokens", "output_tokens", "total_tokens", "duration_ms", "successful_calls"):
+            setattr(totals, key, getattr(totals, key) + int(row.get(key) or 0))
     return totals
 
 
@@ -450,16 +438,12 @@ def _normalize_usage(usage: dict[str, Any]) -> dict[str, Any]:
     cache_creation_input_tokens = _int_or_none(usage.get("cache_creation_input_tokens"))
     cached_output_tokens = _int_or_none(usage.get("cached_output_tokens"))
 
-    return {
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "total_tokens": total_tokens,
-        "cached_input_tokens": cached_input_tokens,
-        "cache_creation_input_tokens": cache_creation_input_tokens,
-        "cached_output_tokens": cached_output_tokens,
-        "input_cache_hit_rate": _rate(cached_input_tokens, input_tokens),
-        "output_cache_hit_rate": _rate(cached_output_tokens, output_tokens),
-    }
+    return NormalizedUsage(input_tokens=input_tokens, output_tokens=output_tokens,
+        total_tokens=total_tokens, cached_input_tokens=cached_input_tokens,
+        cache_creation_input_tokens=cache_creation_input_tokens,
+        cached_output_tokens=cached_output_tokens,
+        input_cache_hit_rate=_rate(cached_input_tokens, input_tokens),
+        output_cache_hit_rate=_rate(cached_output_tokens, output_tokens)).model_dump(mode="json")
 
 
 def _enabled() -> bool:
@@ -473,8 +457,14 @@ def _db_path() -> Path:
     return Path(__file__).resolve().parents[2] / configured
 
 
-def _connect(path: Path) -> sqlite3.Connection:
-    return sqlite3.connect(path, timeout=30)
+@contextmanager
+def _connect(path: Path) -> Iterator[sqlite3.Connection]:
+    connection = sqlite3.connect(path, timeout=30)
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:

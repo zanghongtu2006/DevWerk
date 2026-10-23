@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.v1.agent_models import AgentRunResult, AgentRunSpec, ModelComplete
-from app.v1.agent_runner import AgentExecutionRunner
+from app.v1.agents.agent_models import AgentRunResult, AgentRunSpec, ModelComplete
+from app.v1.agents.agent_runner import AgentExecutionRunner
 from app.v1.capabilities import CapabilityRegistry
-from app.v1.llm import complete as provider_complete
+from app.v1.agents.llm import complete as provider_complete
 from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, PlatformPolicySnapshot, V1RuntimePolicy
 
 

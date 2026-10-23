@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.global_settings import GlobalSettings, load_global_settings
+from app.core.llm_config_contracts import ProviderClientConfig
 
 
 def _project_root() -> Path:
@@ -112,23 +113,16 @@ class AgentModelConfig:
     context_window: int | None = None
 
     def as_client_config(self) -> dict[str, Any]:
-        return {
-            "agent": self.agent,
-            "api_name": self.api.name,
-            "protocol": self.api.protocol,
-            "base_url": self.api.base_url,
-            "api_key": self.api.api_key,
-            "model": self.model,
-            "effort_level": self.api.effort_level,
-            "trust_env_proxy": self.api.trust_env_proxy,
-            "connect_max_attempts": self.api.connect_max_attempts,
-            "request_timeout_seconds": self.api.request_timeout_seconds,
-            "thinking_mode": self.thinking_mode,
-            "temperature": self.temperature,
-            "top_p": self.top_p,
-            "max_tokens": self.max_tokens,
-            "context_window": self.context_window,
-        }
+        return ProviderClientConfig(agent=self.agent, api_name=self.api.name,
+            protocol=self.api.protocol, base_url=self.api.base_url,
+            api_key=self.api.api_key, model=self.model,
+            effort_level=self.api.effort_level,
+            trust_env_proxy=self.api.trust_env_proxy,
+            connect_max_attempts=self.api.connect_max_attempts,
+            request_timeout_seconds=self.api.request_timeout_seconds,
+            thinking_mode=self.thinking_mode, temperature=self.temperature,
+            top_p=self.top_p, max_tokens=self.max_tokens,
+            context_window=self.context_window).model_dump(mode="json")
 
 
 class Settings(BaseSettings):

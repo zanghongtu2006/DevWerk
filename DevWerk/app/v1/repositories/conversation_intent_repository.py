@@ -2,7 +2,10 @@
 import hashlib
 import json
 
-from app.v1.conversation_intent import TurnResolution, DiscussionDraftUpdate, IntentQuestion
+from app.v1.conversations.conversation_intent import (TurnResolution, DiscussionDraftUpdate, IntentDecision,
+                                        IntentQuestion, IntentProposal, WorkIntentState)
+from app.v1.protocols.conversation.conversation_intent_contracts import (RequirementSnapshot, TurnResolutionReceipt,
+                                                  UserTurnContract)
 from app.v1.storage_support import new_id, utcnow
 
 
@@ -10,22 +13,37 @@ def stable(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
 
 
-def merge_intent_updates(state, field, updates):
-    merged = {item['key']:item for item in state[field]}
+def merge_decisions(state: WorkIntentState, updates: list[IntentDecision]) -> None:
+    merged = {item.key: item for item in state.decisions}
     for update in updates:
-        if field == 'open_questions':
-            if update.key not in merged and update.question is None and update.state == 'resolved':
-                decided = any(item['key'] == update.key and item['status'] in {'user_decided', 'delegated_choice'}
-                              for item in state['decisions'])
-                if decided:
-                    continue
-            item = {**merged.get(update.key, {}), **update.model_dump(mode='json', exclude_unset=True, exclude_none=True)}
-            if not item.get('question'):
+        merged[update.key] = update
+    state.decisions = list(merged.values())
+
+
+def merge_questions(state: WorkIntentState, updates) -> None:
+    merged = {item.key: item for item in state.open_questions}
+    for update in updates:
+        if update.key not in merged and update.question is None and update.state == 'resolved':
+            decided = any(item.key == update.key and item.status in {'user_decided', 'delegated_choice'}
+                          for item in state.decisions)
+            if decided:
+                continue
+        prior = merged.get(update.key)
+        if prior is None:
+            if not update.question:
                 raise ValueError(f'NewQuestionMissing: {update.key} needs question text; existing keys may update state only')
-            merged[update.key] = IntentQuestion.model_validate(item).model_dump(mode='json')
+            question = IntentQuestion.model_validate(update)
         else:
-            merged[update.key] = update.model_dump(mode='json')
-    state[field] = list(merged.values())
+            question = prior.model_copy(deep=True)
+            for name in update.model_fields_set:
+                replacement = getattr(update, name)
+                if replacement is not None:
+                    setattr(question, name, replacement)
+            question = IntentQuestion.model_validate(question)
+        if not question.question:
+            raise ValueError(f'NewQuestionMissing: {update.key} needs question text; existing keys may update state only')
+        merged[update.key] = question
+    state.open_questions = list(merged.values())
 
 
 class ConversationIntentRepository:
@@ -70,16 +88,15 @@ class ConversationIntentRepository:
                 requirement_id TEXT, requirement_revision INTEGER, kind TEXT NOT NULL, state TEXT NOT NULL,
                 snapshot_json TEXT NOT NULL, snapshot_hash TEXT NOT NULL, created_at TEXT NOT NULL)''')
 
-    def context(self, job):
+    def _context_model(self, job) -> WorkIntentState:
         with self.store.connect() as db:
             row = db.execute('''SELECT snapshot_json FROM v1_work_intents WHERE project_id=?
                 AND source_message_id<=? ORDER BY revision DESC LIMIT 1''',
                 (job['project_id'], job['user_message_id'])).fetchone()
-        return json.loads(row[0]) if row else {
-            'revision': 0, 'draft_id': None, 'execution_hold': False, 'hold_source_id': None,
-            'scope_summary': '', 'decisions': [], 'open_questions': [], 'proposal': None,
-            'requirement_id': None,
-        }
+        return WorkIntentState.model_validate_json(row[0]) if row else WorkIntentState()
+
+    def context(self, job):
+        return self._context_model(job).model_dump(mode='json')
 
     def job_for_run(self, run_id, project_id):
         if not run_id:
@@ -91,7 +108,8 @@ class ConversationIntentRepository:
         return dict(row) if row else None
 
     def contract(self, job):
-        return json.loads(job.get('turn_contract_json') or '{}') or {'phase': 'unresolved'}
+        return UserTurnContract.model_validate_json(job.get('turn_contract_json') or '{}').model_dump(
+            mode='json', exclude_none=True)
 
     def _evidence(self, db, job, resolution):
         if resolution.source_message_id != job['user_message_id']:
@@ -126,70 +144,71 @@ class ConversationIntentRepository:
                 if prior:
                     if prior['resolution_json'] != payload:
                         raise ValueError('TurnAlreadyResolved: a committed turn boundary cannot be upgraded')
-                    return json.loads(prior['result_json'])
+                    return TurnResolutionReceipt.model_validate_json(prior['result_json']).model_dump(mode='json')
                 self._evidence(db, job, resolution)
-                state = self.context(job)
+                state = self._context_model(job)
                 latest = db.execute('SELECT MAX(revision) FROM v1_work_intents WHERE project_id=?', (ctx.project_id,)).fetchone()[0] or 0
-                if state['revision'] != resolution.based_on_intent_revision or latest != state['revision']:
-                    raise ValueError(f'TurnRevisionConflict: expected based_on_intent_revision={state["revision"]}, '
+                if state.revision != resolution.based_on_intent_revision or latest != state.revision:
+                    raise ValueError(f'TurnRevisionConflict: expected based_on_intent_revision={state.revision}, '
                                      f'source_message_id={job["user_message_id"]}. Rejected calls do not increment the revision. '
                                      'Use conversation.turn.inspect if context is unclear.')
                 if resolution.act in {'execute', 'control'} and (not job['start_task'] or job['requested_mode'] == 'discuss'):
                     raise ValueError('ConversationMutationDisabled: explicit discussion mode is this turn\'s upper bound')
                 if resolution.focus == 'new_scope':
-                    state = {**state, 'draft_id': new_id('draft'), 'scope_summary': '', 'decisions': [],
-                             'open_questions': [], 'proposal': None, 'requirement_id': None}
-                state['draft_id'] = state['draft_id'] or new_id('draft')
+                    state.reset_scope(new_id('draft'))
+                state.draft_id = state.draft_id or new_id('draft')
                 if resolution.constraint_change == 'set_hold' or resolution.act in {'discuss', 'clarify'}:
-                    source_id = state.get('hold_source_id') if state['execution_hold'] and resolution.constraint_change != 'set_hold' else None
-                    state.update(execution_hold=True, hold_source_id=source_id or job['user_message_id'])
+                    source_id = state.hold_source_id if state.execution_hold and resolution.constraint_change != 'set_hold' else None
+                    state.execution_hold = True
+                    state.hold_source_id = source_id or job['user_message_id']
                 if resolution.constraint_change == 'release_hold':
-                    state.update(execution_hold=False, hold_source_id=None)
-                if resolution.act == 'execute' and state['execution_hold']:
+                    state.execution_hold = False
+                    state.hold_source_id = None
+                if resolution.act == 'execute' and state.execution_hold:
                     raise ValueError('DiscussionHoldActive: the prior discussion boundary still applies. Re-evaluate the current request: '
                         'technical choices, recommendations and a proposed plan are discussion, not permission to implement. '
                         'Resolve discuss and answer those questions. Only an actual current instruction to perform the work can release the hold.')
-                for field, updates in [('decisions', resolution.decision_updates), ('open_questions', resolution.open_question_updates)]:
-                    merge_intent_updates(state, field, updates)
+                merge_decisions(state, resolution.decision_updates)
+                merge_questions(state, resolution.open_question_updates)
                 if resolution.scope_summary:
-                    state['scope_summary'] = resolution.scope_summary
+                    state.scope_summary = resolution.scope_summary
                 if resolution.accepted_proposal_id:
-                    proposal = state.get('proposal')
-                    if not proposal or proposal['id'] != resolution.accepted_proposal_id:
+                    proposal = state.proposal
+                    if not proposal or proposal.id != resolution.accepted_proposal_id:
                         raise ValueError('ProposalConflict: accepted proposal is not the current immutable proposal')
-                    state['scope_summary'] = proposal['content']
+                    state.scope_summary = proposal.content
                 action = json.loads(job.get('user_action_json') or 'null')
                 if action and resolution.act == 'execute':
-                    proposal = state.get('proposal')
-                    if not proposal or (action['proposal_id'], action['proposal_hash']) != (proposal['id'], proposal['hash']):
+                    proposal = state.proposal
+                    if not proposal or (action['proposal_id'], action['proposal_hash']) != (proposal.id, proposal.hash):
                         raise ValueError('ProposalConflict: the user action refers to a superseded proposal')
-                    if resolution.accepted_proposal_id != proposal['id']:
+                    if resolution.accepted_proposal_id != proposal.id:
                         raise ValueError('ProposalConflict: bind the exact proposal selected by the user')
                 if resolution.proposal is not None:
                     if resolution.act == 'execute':
                         raise ValueError('Accept the existing proposal or a direct user scope; do not invent an accepted proposal')
-                    state['proposal'] = {'id': new_id('proposal'), 'content': resolution.proposal,
-                                         'hash': hashlib.sha256(resolution.proposal.encode()).hexdigest()}
+                    state.proposal = IntentProposal(id=new_id('proposal'), content=resolution.proposal,
+                        hash=hashlib.sha256(resolution.proposal.encode()).hexdigest())
                 requirement = None
                 grant_id = None
                 phase = 'discussion'
-                target = resolution.requirement_id or state.get('requirement_id')
+                target = resolution.requirement_id or state.requirement_id
                 if resolution.act == 'execute':
-                    if not state['scope_summary']:
+                    if not state.scope_summary:
                         raise ValueError('ScopeSummaryMissing: record the actual requested delivery scope')
                     if resolution.execution_request in {'continue', 'extend'}:
                         if not target:
                             raise ValueError('RequirementMissing: identify the existing scope to continue/extend')
                         requirement = self.store.agents.get_requirement(ctx.project_id, target)
                     else:
-                        requirement = self.store.agents.requirement(ctx.project_id, objective=state['scope_summary'],
-                                                                    scope_key=state['draft_id'], strict=True)
+                        requirement = self.store.agents.requirement(ctx.project_id, objective=state.scope_summary,
+                                                                    scope_key=state.draft_id, strict=True)
                     if resolution.execution_request != 'extend' and requirement['status'] != 'active':
                         raise ValueError('RequirementClosed: use an explicit scope extension')
-                    state['requirement_id'] = requirement['id']
+                    state.requirement_id = requirement['id']
                     existing_grant = None
                     if resolution.execution_request == 'continue':
-                        state['scope_summary'] = requirement['objective']
+                        state.scope_summary = requirement['objective']
                         existing_grant = db.execute("SELECT id FROM v1_execution_grants WHERE project_id=? AND requirement_id=? AND requirement_revision=? AND state='active' ORDER BY created_at DESC LIMIT 1",
                             (ctx.project_id, requirement['id'], requirement['revision'])).fetchone()
                     if existing_grant:
@@ -197,7 +216,7 @@ class ConversationIntentRepository:
                     else:
                         grant_id = new_id('grant')
                         grant_state = 'pending_scope_revision' if resolution.execution_request == 'extend' else 'active'
-                        snapshot = stable(state)
+                        snapshot = stable(state.model_dump(mode='json'))
                         db.execute('INSERT INTO v1_execution_grants VALUES(?,?,?,?,?,?,?,?,?,?)',
                             (grant_id, ctx.project_id, job['id'], requirement['id'], requirement['revision'],
                              resolution.execution_request, grant_state, snapshot, hashlib.sha256(snapshot.encode()).hexdigest(), utcnow()))
@@ -215,22 +234,24 @@ class ConversationIntentRepository:
                             raise ValueError('FailedTaskRequiresReopen: call conversation.execution.authorize '
                                              'with request=continue, then task.reopen for the same Task')
                     phase = 'targeted_control'
-                state['revision'] = latest + 1
-                contract = {'phase': phase, 'act': resolution.act, 'source_message_id': job['user_message_id'], 'intent_revision': state['revision'],
-                            'execution_grant_id': grant_id, 'control_capability': resolution.control_capability,
-                            'control_task_id': resolution.control_task_id}
-                result = {'turn_contract': contract, 'work_intent': state, 'requirement': requirement,
-                          'next_reply_contract': 'Boundary committed. Do not include turn_resolution in the final report. '
-                          'For discussion answer naturally; save durable work notes with project.memory.write if needed. '
-                          'For work_result use conversation.reply with actual tool/task IDs. '
-                          'A Task traverses all Columns. Never describe lifecycle steps as separate Tasks of the same delivery.'}
+                state.revision = latest + 1
+                contract = UserTurnContract(phase=phase, act=resolution.act,
+                    source_message_id=job['user_message_id'], intent_revision=state.revision,
+                    execution_grant_id=grant_id, control_capability=resolution.control_capability,
+                    control_task_id=resolution.control_task_id)
+                result = TurnResolutionReceipt(turn_contract=contract, work_intent=state,
+                    requirement=RequirementSnapshot.model_validate(requirement) if requirement else None,
+                    next_reply_contract='Boundary committed. Do not include turn_resolution in the final report. '
+                    'For discussion answer naturally; save durable work notes with project.memory.write if needed. '
+                    'For work_result use conversation.reply with actual tool/task IDs. '
+                    'A Task traverses all Columns. Never describe lifecycle steps as separate Tasks of the same delivery.')
                 db.execute('INSERT INTO v1_work_intents VALUES(?,?,?,?,?,?)',
-                           (ctx.project_id, state['revision'], job['user_message_id'], job['id'], stable(state), utcnow()))
-                db.execute('UPDATE v1_conversation_jobs SET turn_contract_json=? WHERE id=?', (stable(contract), job['id']))
-                db.execute('INSERT INTO v1_turn_resolutions VALUES(?,?,?,?)', (job['id'], payload, stable(result), utcnow()))
+                           (ctx.project_id, state.revision, job['user_message_id'], job['id'], stable(state.model_dump(mode='json')), utcnow()))
+                db.execute('UPDATE v1_conversation_jobs SET turn_contract_json=? WHERE id=?', (stable(contract.model_dump(mode='json')), job['id']))
+                db.execute('INSERT INTO v1_turn_resolutions VALUES(?,?,?,?)', (job['id'], payload, stable(result.model_dump(mode='json')), utcnow()))
                 self.store._event(db, ctx.project_id, None, None, 'conversation.turn_resolved',
-                                  {'job_id':job['id'], 'phase':phase, 'intent_revision':state['revision']})
-                return result
+                                  {'job_id':job['id'], 'phase':phase, 'intent_revision':state.revision})
+                return result.model_dump(mode='json')
 
     def update_draft(self, ctx, arguments):
         update = DiscussionDraftUpdate.model_validate(arguments)
@@ -246,24 +267,25 @@ class ConversationIntentRepository:
                     if prior['update_json'] != payload:
                         raise ValueError('DraftRevisionConflict: this draft revision already has a different committed update')
                     return json.loads(prior['result_json'])
-                state = self.context(job)
+                state = self._context_model(job)
                 latest = db.execute('SELECT MAX(revision) FROM v1_work_intents WHERE project_id=?', (ctx.project_id,)).fetchone()[0]
-                if update.based_on_intent_revision != state['revision'] or latest != state['revision']:
+                if update.based_on_intent_revision != state.revision or latest != state.revision:
                     raise ValueError('TurnRevisionConflict: use the latest discussion revision')
-                evidence = TurnResolution(source_message_id=job['user_message_id'], based_on_intent_revision=state['revision'],
+                evidence = TurnResolution(source_message_id=job['user_message_id'], based_on_intent_revision=state.revision,
                                           act='discuss', decision_updates=update.decision_updates, open_question_updates=update.open_question_updates)
                 self._evidence(db, job, evidence)
-                for field, changes in [('decisions',update.decision_updates),('open_questions',update.open_question_updates)]:
-                    merge_intent_updates(state, field, changes)
+                merge_decisions(state, update.decision_updates)
+                merge_questions(state, update.open_question_updates)
                 if update.proposal is not None:
-                    state['proposal'] = {'id':new_id('proposal'), 'content':update.proposal,
-                                         'hash':hashlib.sha256(update.proposal.encode()).hexdigest()}
-                state['revision'] += 1
+                    state.proposal = IntentProposal(id=new_id('proposal'), content=update.proposal,
+                        hash=hashlib.sha256(update.proposal.encode()).hexdigest())
+                state.revision += 1
+                saved = state.model_dump(mode='json')
                 db.execute('INSERT INTO v1_work_intents VALUES(?,?,?,?,?,?)',
-                           (ctx.project_id,state['revision'],job['user_message_id'],job['id'],stable(state),utcnow()))
+                           (ctx.project_id,state.revision,job['user_message_id'],job['id'],stable(saved),utcnow()))
                 db.execute('INSERT INTO v1_discussion_draft_revisions VALUES(?,?,?,?)',
-                           (job['id'],update.based_on_intent_revision,payload,stable(state)))
-                return state
+                           (job['id'],update.based_on_intent_revision,payload,stable(saved)))
+                return saved
 
     def denial(self, ctx, capability, arguments, effect):
         if ctx.column_run_id:
@@ -319,7 +341,10 @@ class ConversationIntentRepository:
                 and current.get('requirement_id') not in (None, req['id'])
             )
             if not new_scope_handover:
-                return 'ScopeExtensionRequestMissing: use request=extend for the existing Requirement; a new begin Requirement may only take over a previous completed Workflow in its creation turn'
+                return ('ScopeExtensionRequestMissing: project.scope.revise changes Requirement scope and requires request=extend. '
+                        'If only changing Columns or transitions within the current Requirement, keep request=continue, '
+                        'call workflow.create instead. A new begin Requirement may take over '
+                        'a previous completed Workflow only in its creation turn')
         if capability == 'requirement.create' and (arguments.get('scope_key'), arguments.get('objective')) != (req['scope_key'], req['objective']):
             return 'ExecutionScopeMismatch: resolve a new user scope instead of replacing this turn requirement'
         return None
@@ -343,7 +368,7 @@ class ConversationIntentRepository:
                     (job['requirement_id'],job['requirement_revision']) or
                     requirement['revision'] != job['requirement_revision']):
                 return 'SupervisionScopeExpired'
-            if capability in {'workflow.plan.save', 'workflow.publish',
+            if capability in {'workflow.plan.save', 'workflow.publish', 'workflow.create',
                               'workflow.acceptance.configure', 'task.plan.save', 'task.successor'}:
                 if task['status'] != 'failed':
                     return 'SupervisionTaskNotFailed: Workflow repair requires a failed Task'

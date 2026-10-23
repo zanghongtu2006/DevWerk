@@ -6,6 +6,7 @@ from copy import deepcopy
 
 from app.v1.contracts import canonicalize_contract_value, validate_contract
 from app.v1.domain import WorkflowDefinition, WorkflowPlan
+from app.v1.protocols.storage.repository_event_contracts import ScopeRevisionReceipt
 from app.v1.storage_support import new_id, utcnow
 
 
@@ -66,7 +67,8 @@ class ScopeRepository:
             row = db.execute('SELECT * FROM v1_requirement_revisions WHERE requirement_id=? AND revision=?', (requirement_id, revision)).fetchone()
         if not row:
             raise ScopeConflict('The requested Requirement revision has no snapshot')
-        return {**current, 'revision': row['revision'], 'objective': row['objective'], 'status': row['status']}
+        from app.v1.protocols.tools.planning.capability_requirement_contracts import RequirementVersion
+        return RequirementVersion.from_snapshot(current, row)
 
     def for_workflow(self, revision_id):
         with self.store.connect() as db:
@@ -86,13 +88,17 @@ class ScopeRepository:
                            prior['requirement_id'] if prior else None, prior['requirement_revision'] if prior else None)
 
     def inspect(self, project_id):
+        from app.v1.protocols.tools.planning.capability_requirement_contracts import ScopeInspectReceipt
         try:
             workflow = self.store.get_workflow(project_id)
         except KeyError:
-            return {'workflow': None, 'requirements': self.store.agents.list_requirements(project_id)}
+            return ScopeInspectReceipt(
+                workflow=None, requirements=self.store.agents.list_requirements(project_id),
+            ).model_dump(mode='json', exclude_unset=True)
         scope = self.for_workflow(workflow['id']) or {}
-        return {'workflow_revision_id': workflow['id'], **scope,
-                'bindings': workflow['loop_bindings'], 'requirements': self.store.agents.list_requirements(project_id)}
+        return ScopeInspectReceipt.current(
+            workflow, scope, self.store.agents.list_requirements(project_id),
+        )
 
     def revise(self, ctx, *, requirement_id, expected_revision, expected_workflow_revision_id,
                objective, binding_patch, reason, loop_digest=None):
@@ -122,8 +128,9 @@ class ScopeRepository:
                 self.remember(revised, job_id=self.store.agents.conversation_job(ctx)['id'], reason=reason)
                 self.store.agents.select_requirement(ctx, requirement_id)
                 self.store.intents.bind_revised_scope(ctx, revised)
-                result = {'requirement': revised, 'workflow_revision_id': None, 'binding_id': None,
-                          'bindings': {}, 'previous_workflow_revision_id': None, 'task_ids': []}
+                result = ScopeRevisionReceipt(requirement=revised, workflow_revision_id=None,
+                    binding_id=None, bindings={}, previous_workflow_revision_id=None,
+                    task_ids=[], workflow_definition_changed=False).model_dump(mode='json')
                 self.store._event(db, ctx.project_id, None, None, 'project.scope.revised', result)
                 return result
             owner = self.for_workflow(active['id'])
@@ -149,7 +156,11 @@ class ScopeRepository:
                     package = self.store.get_loop(binding['loop_key'])
                     if package['digest'] != loop_digest:
                         raise ScopeConflict('The selected Loop digest is no longer available')
-                parameters = canonicalize_contract_value({**package['bundle'].get('defaults', {}), **binding['bindings'], **binding_patch}, package['parameter_schema'])
+                from app.v1.protocols.workflow.loop_bindings import LoopBindings, LoopPackageSnapshot
+                parameters = canonicalize_contract_value(
+                    LoopBindings.combine(package['bundle'].get('defaults') or {}, binding['bindings'], binding_patch).values,
+                    package['parameter_schema'],
+                )
                 validate_contract(parameters, package['parameter_schema'], label='Revised scope bindings')
                 old_material = _resolve_loop_parameters(old_package['bundle'], binding['bindings'])
                 new_material = _resolve_loop_parameters(package['bundle'], parameters)
@@ -173,8 +184,8 @@ class ScopeRepository:
                 db.execute('''INSERT INTO v1_project_loop_bindings
                     (id,project_id,loop_key,loop_version,loop_digest,bindings_json,workflow_plan_id,workflow_revision_id,created_at,package_json)
                     VALUES(?,?,?,?,?,?,?,?,?,?)''',
-                    (binding_id, ctx.project_id, package['loop_key'], package['version'], package['digest'], json.dumps(parameters, ensure_ascii=False),
-                     plan['id'], published['id'], utcnow(), json.dumps(package, ensure_ascii=False)))
+                    (binding_id, ctx.project_id, package['loop_key'], package['version'], package['digest'], LoopBindings(values=parameters).json_text(),
+                     plan['id'], published['id'], utcnow(), LoopPackageSnapshot.model_validate(package).json_text()))
             changed = db.execute('UPDATE v1_requirements SET revision=revision+1,objective=?,status=\'active\',updated_at=? WHERE id=? AND revision=?',
                                  (objective, utcnow(), requirement_id, expected_revision)).rowcount
             if changed != 1:
@@ -184,8 +195,10 @@ class ScopeRepository:
             self.bind_workflow(published['id'], binding_id, requirement_id, revised['revision'])
             self.store.agents.select_requirement(ctx, requirement_id)
             self.store.intents.bind_revised_scope(ctx, revised)
-            result = {'requirement': revised, 'workflow_revision_id': published['id'], 'binding_id': binding_id,
-                      'bindings': parameters, 'previous_workflow_revision_id': active['id'], 'task_ids': []}
+            result = ScopeRevisionReceipt(requirement=revised,
+                workflow_revision_id=published['id'], binding_id=binding_id,
+                bindings=parameters, previous_workflow_revision_id=active['id'], task_ids=[],
+                workflow_definition_changed=published['definition_hash'] != active['definition_hash']).model_dump(mode='json')
             self.store._event(db, ctx.project_id, None, None, 'project.scope.revised', result)
             return result
 

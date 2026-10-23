@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from app.v1.repositories.base import StoreHost
 
-from app.v1.states import (
+from app.v1.execution.states import (
     AGENT_RUN_STATE_MACHINE,
     ATTEMPT_STATE_MACHINE,
     COLUMN_RUN_STATE_MACHINE,

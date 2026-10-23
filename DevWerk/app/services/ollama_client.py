@@ -12,6 +12,8 @@ from urllib3.util.retry import Retry
 
 from app.core.debug_trace import trace_json
 from app.services.provider_errors import provider_timeout_error
+from app.services.provider_request_contracts import OllamaCompletionRequest, OllamaOptions
+from app.services.provider_response_contracts import ProviderCompletionResponse, ProviderToolCall, ProviderUsage
 
 
 _trace_log = logging.getLogger("devwerk.llm.provider.ollama")
@@ -46,16 +48,14 @@ class OllamaClient:
         self.session.mount("https://", transport)
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, *, trace_id: str | None = None, require_tool: bool = False, required_tool_name: str | None = None) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "stream": False,
-            "messages": messages,
-            "options": {"temperature": self.temperature},
-        }
-        if self.top_p is not None:
-            payload["options"]["top_p"] = float(self.top_p)
-        if tools:
-            payload["tools"] = tools
+        payload = OllamaCompletionRequest(
+            model=self.model, messages=messages,
+            options=OllamaOptions(
+                temperature=self.temperature,
+                top_p=float(self.top_p) if self.top_p is not None else None,
+            ),
+            tools=tools or None,
+        ).wire()
         trace_json(
             _trace_log,
             "llm.provider_request",
@@ -94,7 +94,7 @@ class OllamaClient:
         message = data.get("message")
         if not isinstance(message, dict):
             raise ValueError("Ollama returned no message")
-        calls: list[dict[str, Any]] = []
+        calls: list[ProviderToolCall] = []
         for index, raw in enumerate(message.get("tool_calls") or []):
             function = raw.get("function") if isinstance(raw, dict) else None
             if not isinstance(function, dict):
@@ -104,13 +104,16 @@ class OllamaClient:
                 arguments = json.loads(arguments)
             if not isinstance(arguments, dict):
                 raise ValueError("tool call arguments must be a JSON object")
-            calls.append({"id": str(raw.get("id") or f"ollama-{index}"), "name": str(function.get("name") or ""), "arguments": arguments})
+            calls.append(ProviderToolCall(id=str(raw.get("id") or f"ollama-{index}"),
+                name=str(function.get("name") or ""), arguments=arguments))
         content = message.get("content")
-        return {"text": content if isinstance(content, str) else "", "tool_calls": calls, "usage": self.last_usage}
+        return ProviderCompletionResponse(text=content if isinstance(content, str) else "",
+            tool_calls=calls, usage=ProviderUsage.model_validate(self.last_usage)).wire()
 
 
 def _usage(data: dict[str, Any]) -> dict[str, Any]:
     input_tokens = data.get("prompt_eval_count")
     output_tokens = data.get("eval_count")
     total = input_tokens + output_tokens if isinstance(input_tokens, int) and isinstance(output_tokens, int) else None
-    return {"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total}
+    return ProviderUsage(input_tokens=input_tokens, output_tokens=output_tokens,
+        total_tokens=total).wire()

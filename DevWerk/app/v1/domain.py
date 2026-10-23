@@ -5,13 +5,15 @@ from typing import Any, Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.v1.states import (
+from app.v1.execution.states import (
     AgentRunStatus,
     AttemptStatus,
     ColumnRunStatus,
     TaskStatus,
     ToolInvocationStatus,
 )
+from app.v1.protocols.tools.core.capability_protocol import ToolError
+from app.v1.protocols.tools.core.provider_schema_contracts import ProviderSchemaNode
 
 KEY_PATTERN = r"^[a-z][a-z0-9_.-]{0,127}$"
 
@@ -114,19 +116,35 @@ class MemorySelector(BaseModel):
 class CapabilityStep(BaseModel):
     model_config = ConfigDict(extra="forbid")
     capability: str = Field(pattern=KEY_PATTERN)
-    arguments: dict[str, Any] = Field(default_factory=dict)
+    arguments: dict[str, Any] = Field(default_factory=dict, description=(
+        "Use the selected capability's declared input types. Runtime values use an object containing only $ref with an absolute JSON Pointer. "
+        "Task input starts at /input/task/input; for example "
+        '{"$ref":"/input/task/input/contract/content"}. Strings such as ${input.contract.content} are literals, '
+        "not references. XML-like or tagged $ref strings are invalid rather than executable references. "
+        "Preserve Task-owned exact values through references instead of copying or weakening them. "
+        "Generated helper programs, command fragments, sentinel content, verifier literals, and every multiline "
+        "or escape-sensitive string are exact Task inputs: declare them in the Task Plan exact_input_strings and "
+        "reference them here. Never inline those strings in a Workflow capability argument."
+    ))
     save_as: str | None = Field(default=None, pattern=KEY_PATTERN)
 
 
 class AgentExecutor(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: Literal["agent"] = "agent"
-    capabilities: list[str] = Field(min_length=1)
+    capabilities: list[str] = Field(min_length=1, description=(
+        "Explicit non-empty allowlist for this Column Agent. Use exact IDs from the live Capability Registry."
+    ))
     worker_key: str | None = Field(default=None, min_length=1, max_length=200)
     worker_role: str = Field(default="worker", min_length=1, max_length=100)
 
 
 class CapabilitySequenceExecutor(BaseModel):
+    """Deterministic steps. Supply completed_outcome or outcome_from and omit the other field;
+    when both are omitted the fixed outcome defaults to success. Never send a null placeholder.
+    outcome_from selects a schema-declared string enum under /steps/<save_as>/output/...;
+    declare a transition for every selected outcome.
+    """
     model_config = ConfigDict(extra="forbid")
     kind: Literal["capability_sequence"] = "capability_sequence"
     steps: list[CapabilityStep] = Field(min_length=1, max_length=200)
@@ -167,7 +185,10 @@ class AcceptanceCheck(BaseModel):
     model_config = ConfigDict(extra="forbid")
     key: str = Field(pattern=KEY_PATTERN)
     capability: str = Field(pattern=KEY_PATTERN)
-    arguments: dict[str, Any]
+    arguments: dict[str, Any] = Field(description=(
+        "Use the selected capability's declared input schema exactly; field types are required, "
+        "including integer versus string. The live Workflow Tool schema binds this field to its capability."
+    ))
     purpose: str = Field(default='', max_length=4000)
     launch_validation: Literal['preflight', 'deferred'] = Field(default='deferred',
         description='preflight checks executable resolution at TaskPlan admission; deferred permits a future generated entry. Runtime always checks before execution.')
@@ -178,12 +199,24 @@ class ColumnDefinition(BaseModel):
     key: str = Field(pattern=KEY_PATTERN)
     name: str = Field(min_length=1, max_length=200)
     instruction: str = Field(default="", max_length=60_000)
-    executor: ColumnExecutor | None = None
+    executor: ColumnExecutor = Field(description="Required execution strategy for this non-terminal process Column.")
     context: ContextSelection = Field(default_factory=ContextSelection)
-    input_contract: dict[str, Any] = Field(default_factory=dict)
+    input_contract: dict[str, Any] = Field(default_factory=dict, description=(
+        "JSON Schema for the selected Runtime input envelope. Root keys always include "
+        "column and planning; project and task are present when selected by context; "
+        "upstream_outputs and artifacts are present only when their selectors are non-empty. "
+        "Task-owned input is nested at task.input, so a Task contract is task.input.contract, "
+        "never a root-level contract property."
+    ))
     output_contract: dict[str, Any] = Field(default_factory=dict)
-    acceptance_checks: list[AcceptanceCheck] = Field(default_factory=list, max_length=30)
-    transitions: list[Transition] = Field(default_factory=list)
+    acceptance_checks: list[AcceptanceCheck] = Field(default_factory=list, max_length=30, description=(
+        "Fixed synchronous delivery checks, frozen at Assignment creation and run by Runtime on completion. "
+        "Checks are declared using registered capabilities. Exploratory failures can be corrected without "
+        "repeating every probe; an empty list retains conservative failure handling."
+    ))
+    transitions: list[Transition] = Field(min_length=1, description=(
+        "One target for every business and runtime outcome used by this Column."
+    ))
     wait_policy: WaitPolicy | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -273,9 +306,16 @@ class WorkflowDefinition(BaseModel):
     schema_version: Literal["devwerk.workflow.v1"] = "devwerk.workflow.v1"
     name: str = Field(min_length=1, max_length=200)
     description: str = Field(default="", max_length=10_000)
-    entry: str = Field(pattern=KEY_PATTERN)
+    entry: str = Field(pattern=KEY_PATTERN, description=(
+        "Common entry process stage applicable to every Task Plan item using this Workflow Revision."
+    ))
     terminals: TerminalSentinels = Field(default_factory=TerminalSentinels)
-    columns: list[ColumnDefinition] = Field(min_length=1, max_length=200)
+    columns: list[ColumnDefinition] = Field(min_length=1, max_length=200, description=(
+        "Non-terminal reusable process stages only. Every Task starts at the common entry and "
+        "traverses this graph. Do not create Columns that mirror Task identifiers, deliverable "
+        "slices, files, modules, batches, ranges, or numbered work units. The done and failed "
+        "sentinels are transition targets and must not appear in this array."
+    ))
     acceptance_obligations: list[AcceptanceObligation] = Field(
         default_factory=list, max_length=200,
         description="Legacy input only; normalized into required_checks on done edges before publication.",
@@ -286,30 +326,12 @@ class WorkflowDefinition(BaseModel):
     def migrate_legacy_column_checks(cls, value: Any) -> Any:
         if not isinstance(value, dict):
             return value
-        terminal_data = value.get("terminals") or {}
-        failure = (terminal_data.get("failure", "failed") if isinstance(terminal_data, dict)
-                   else getattr(terminal_data, "failure", "failed"))
-        columns = []
-        for original in value.get("columns", []):
-            if not isinstance(original, dict):
-                columns.append(original)
-                continue
-            column = dict(original)
-            check_keys = [item.get("key") for item in column.get("acceptance_checks", [])
-                          if isinstance(item, dict) and item.get("key")]
-            edges = []
-            for original_edge in column.get("transitions", []):
-                edge = dict(original_edge)
-                if "required_checks" not in edge and check_keys and (
-                    edge.get("target") != failure and not edge.get("allows_unresolved_failures", False)
-                ):
-                    edge["required_checks"] = [
-                        {"column": column.get("key"), "check_key": key} for key in check_keys
-                    ]
-                edges.append(edge)
-            column["transitions"] = edges
-            columns.append(column)
-        return {**value, "columns": columns}
+        # Model instances already carry their defaults and do not need wire migration.
+        # Serializing them through a legacy JSON view would drop unset discriminators.
+        if any(not isinstance(column, dict) for column in value.get("columns", [])):
+            return value
+        from app.v1.workflows.workflow_transport import LegacyWorkflowTransport
+        return LegacyWorkflowTransport.model_validate(value).migrate_column_checks()
 
     @model_validator(mode="after")
     def validate_graph(self) -> "WorkflowDefinition":
@@ -442,6 +464,99 @@ class WorkflowDefinition(BaseModel):
         return None
 
 
+class WorkflowColumnTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["column"]
+    key: str = Field(pattern=KEY_PATTERN)
+
+
+class WorkflowTerminalTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["terminal"]
+    status: Literal["done", "failed"]
+
+
+WorkflowAuthoringTarget = Annotated[
+    WorkflowColumnTarget | WorkflowTerminalTarget,
+    Field(discriminator="kind"),
+]
+
+
+class WorkflowAuthoringTransition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    outcome: str = Field(default="success", pattern=KEY_PATTERN)
+    target: WorkflowAuthoringTarget = Field(description=(
+        "Choose exactly one typed target: kind=column with key of a declared executable Column, "
+        "or kind=terminal with status=done or failed. There is no generic terminal status."
+    ))
+    evidence_requirement: Literal["required", "optional", "forbidden"] | None = None
+    allows_unresolved_failures: bool = False
+    required_checks: list[EdgeCheck] = Field(default_factory=list, max_length=200)
+
+
+class WorkflowAuthoringColumn(BaseModel):
+    """One explicit stage in a compact Workflow authoring request."""
+
+    model_config = ConfigDict(extra="forbid")
+    key: str = Field(
+        pattern=KEY_PATTERN,
+        json_schema_extra={"not": {"enum": ["done", "failed"]}},
+        description="Executable Column key; done and failed are reserved terminal targets.",
+    )
+    name: str = Field(min_length=1, max_length=200)
+    instruction: str = Field(min_length=1, max_length=60_000)
+    executor: ColumnExecutor
+    transitions: list[WorkflowAuthoringTransition] = Field(
+        min_length=1,
+        description=(
+            "At least one outcome-to-target edge for every Column, including the last executable Column. "
+            "Use a target with kind=terminal and status=done or failed to finish; never use an empty list."
+        ),
+    )
+    context: ContextSelection | None = Field(
+        default=None,
+        description=("Omit for Task and direct predecessor Column outputs. An empty "
+                     "upstream_outputs list also selects those predecessors; a nonempty list "
+                     "selects explicit Column keys, never artifact paths."),
+    )
+    input_contract: dict[str, Any] = Field(default_factory=dict)
+    output_contract: dict[str, Any] = Field(default_factory=dict)
+    acceptance_checks: list[AcceptanceCheck] = Field(default_factory=list)
+    wait_policy: WaitPolicy | None = None
+
+    @field_validator("key")
+    @classmethod
+    def reject_terminal_key(cls, value: str) -> str:
+        if value in {"done", "failed"}:
+            raise ValueError("done and failed are terminal targets, not executable Column keys")
+        return value
+
+
+class WorkflowAuthoringRequest(BaseModel):
+    """Single source for creating both a Workflow graph and its planning record."""
+
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=200)
+    description: str = Field(default="", max_length=10_000)
+    flow_unit: str = Field(min_length=1, max_length=4_000)
+    entry: str = Field(pattern=KEY_PATTERN)
+    columns: list[WorkflowAuthoringColumn] = Field(
+        min_length=1,
+        max_length=200,
+        description=(
+            "Executable process Columns only. Do not add done or failed as Columns: they are terminal "
+            "transition targets. The last executable Column still needs a transition to a terminal."
+        ),
+    )
+    task_input_schema: dict[str, Any] = Field(
+        default_factory=lambda: ProviderSchemaNode(schema_type="object").wire(),
+        description="JSON Schema for Task input; omit to accept any object-shaped Task input.",
+    )
+    expected_outputs: list[str] = Field(min_length=1, max_length=200)
+    completion_conditions: list[str] = Field(min_length=1, max_length=200)
+    wip_limit: int = Field(default=1, ge=1, le=100)
+
+
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     description: str = Field(default="", max_length=4000)
@@ -470,6 +585,11 @@ class ExternalEventSignal(BaseModel):
 
 
 class WorkflowColumnPlan(BaseModel):
+    """One reusable lifecycle stage, not a Task, batch, numbered work unit, file group, or deliverable slice.
+    The execution_mode is a deliberate choice: agent runs one stage-scoped Agent;
+    capability_sequence performs declared deterministic operations without an Agent.
+    A Column may execute at most one Agent; collaboration uses separate Workflow Columns.
+    """
     model_config = ConfigDict(extra="forbid")
     key: str = Field(pattern=KEY_PATTERN)
     responsibility: str = Field(min_length=1, max_length=4_000)
@@ -648,15 +768,26 @@ class TaskPlanItem(BaseModel):
             "Each agent Column runs one leaf Worker; this field does not request a multi-agent loop."
         ),
     )
-    dependencies: list[str] = Field(default_factory=list, max_length=200)
+    dependencies: list[str] = Field(default_factory=list, max_length=200, description=(
+        "Zero or more other proposed_task_ref values that must complete first. "
+        "Never include this Task's own proposed_task_ref; the complete dependency graph must be acyclic."
+    ))
     conflict_domains: list[ConflictDomain] = Field(default_factory=list, max_length=200)
     exact_input_strings: list[ExactTaskInputString] = Field(
         default_factory=list,
         max_length=10_000,
         description=(
-            "Authoritative exact string values for deterministic Task-input references. "
-            "Declare each value with one escaped_value string; Task creation decodes and "
-            "materializes it instead of trusting a lossy Provider copy."
+            "Authoritative values for every exact string a deterministic Workflow step consumes, including "
+            "source and acceptance strings, generated helper-program bodies, command fragments, sentinel "
+            "content, verifier literals, and all multiline or escape-sensitive strings. Every such value must "
+            "be consumed through a Task-input $ref and must not be inlined in Workflow arguments. Use a "
+            "Task-input-relative pointer such as /contract/content; the "
+            "full /input/task/input/contract/content form is also accepted and normalized. Put "
+            "the entire string in escaped_value and use simple backslash escapes such as \\n for "
+            "LF or \\u0020 for significant space. Do not add entries for numbers or booleans. "
+            "Task creation decodes and injects the value, so the lossy task.create copy may be omitted. "
+            "Generated execution literals define the process; never place a producer's requested derived "
+            "result here merely because it can be calculated during planning."
         ),
     )
     review_scope: str = Field(min_length=1, max_length=4_000)
@@ -736,6 +867,10 @@ def _workflow_task_input_references(value: Any) -> set[str]:
 
 
 class WorkflowPlanSelfCheck(BaseModel):
+    """Seven required governance assertions from the V1 workflow policy.
+    Every value must be true before publication; the service derives graph,
+    executor, context, transition, and capability facts from the actual Workflow.
+    """
     model_config = ConfigDict(extra="forbid")
     every_task_can_start_at_entry: Literal[True]
     every_column_applies_to_every_task: Literal[True]
@@ -747,6 +882,10 @@ class WorkflowPlanSelfCheck(BaseModel):
 
 
 class WorkflowWalkthroughStep(BaseModel):
+    """One observable step in the reusable lifecycle simulation.
+    Its column_key and outcome are validated against the subsequently published
+    Workflow; this is governance evidence, not private reasoning.
+    """
     model_config = ConfigDict(extra="forbid")
     column_key: str = Field(pattern=KEY_PATTERN)
     receives: list[str] = Field(
@@ -901,7 +1040,7 @@ class WorkflowPlan(BaseModel):
     task_contract: TaskContract
     columns: list[WorkflowColumnPlan] = Field(min_length=1, max_length=200)
     lifecycle_walkthrough: list[WorkflowWalkthroughStep] = Field(
-        min_length=1,
+        default_factory=list,
         max_length=1_000,
         description=(
             "Ordered entry-to-terminal lifecycle simulation. Each step states "
@@ -924,7 +1063,7 @@ class WorkflowPlan(BaseModel):
     progress_evidence: list[str] = Field(min_length=1, max_length=200)
     review_points: list[str] = Field(default_factory=list, max_length=200)
     intervention_conditions: list[str] = Field(min_length=1, max_length=200)
-    self_check: WorkflowPlanSelfCheck
+    self_check: WorkflowPlanSelfCheck | None = None
 
     @model_validator(mode="after")
     def validate_references(self) -> "WorkflowPlan":
@@ -1034,6 +1173,13 @@ class ToolResult(BaseModel):
     error: dict[str, Any] | None = None
     await_handle_draft: dict[str, Any] | None = None
     checkpoint: dict[str, Any] | None = None
+
+    @field_validator("error", mode="before")
+    @classmethod
+    def validate_error(cls, value: Any) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        return ToolError.model_validate(value).model_dump(mode="json", exclude_none=True)
 
     @model_validator(mode="after")
     def validate_protocol(self) -> "ToolResult":

@@ -5,6 +5,7 @@ This is deliberately separate from deterministic runtime regression tests.
 """
 import argparse
 import asyncio
+from contextlib import closing
 from datetime import datetime, timezone
 import json
 import logging
@@ -34,7 +35,7 @@ def resume_evidence(path):
     if not evidence.is_relative_to((ROOT/'data/evals').resolve()):
         raise ValueError('Resume is restricted to isolated data/evals directories')
     report = json.loads((evidence/'report.json').read_text(encoding='utf8'))
-    with sqlite3.connect((evidence/'runtime.db').as_uri()+'?mode=ro', uri=True) as db:
+    with closing(sqlite3.connect((evidence/'runtime.db').as_uri()+'?mode=ro', uri=True)) as db:
         rows = db.execute('SELECT id,base_dir FROM v1_projects').fetchall()
     if len(rows) != 1 or rows[0][0] != report['project_id'] or Path(rows[0][1]).resolve() != evidence/'project':
         raise ValueError('Resume DB/project does not match the isolated evidence directory')
@@ -108,9 +109,9 @@ async def main():
     reload_settings()
     logging.disable(logging.CRITICAL)
     from app.v1.capabilities import build_core_registry
-    from app.v1.conversation import ConversationGateway
+    from app.v1.conversations.conversation import ConversationGateway
     from app.v1.policy import PlatformPolicyLoader
-    from app.v1.runtime import WorkflowRuntime
+    from app.v1.execution.runtime import WorkflowRuntime
     from app.v1.store import V1Store
     store = V1Store(str(evidence/'runtime.db'),registry=build_core_registry())
     store.register_platform_policy(PlatformPolicyLoader(ROOT/'DEVWERK.md').load())

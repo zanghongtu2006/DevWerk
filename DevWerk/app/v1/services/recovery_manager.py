@@ -5,15 +5,17 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from app.v1.files import ProjectFiles
+from app.v1.workspace.files import ProjectFiles
 from app.v1.repositories.base import StoreHost
-from app.v1.states import (
+from app.v1.execution.states import (
     ATTEMPT_STATE_MACHINE,
     COLUMN_RUN_STATE_MACHINE,
     TASK_STATE_MACHINE,
+    TaskControlState,
     TaskStatus,
 )
 from app.v1.storage_support import new_id, utcnow
+from app.v1.protocols.workflow.runtime_json_contracts import FailedTaskTerminalPayload, FailedTerminalArtifactMeta
 
 
 class RecoveryManager:
@@ -224,7 +226,7 @@ class RecoveryManager:
 
     @staticmethod
     def _reconcile_interrupted_command_receipts(db, task, target, now):
-        if not (task["status"] == "recovering" and task.get("control_state") == "paused"
+        if not (task["status"] == TaskStatus.RECOVERING and task.get("control_state") == TaskControlState.PAUSED
                 and task.get("failure_code") == "effect_outcome_unknown"):
             return []
         if target != task["current_column"]:
@@ -561,7 +563,7 @@ class RecoveryManager:
             raise ValueError('RecoveringTaskRequiresRetry: use task.retry to queue the interrupted Column')
         if task["status"] in {"done", "failed"}:
             raise ValueError("terminal Tasks are immutable")
-        if task.get("control_state") not in {"paused", "pause_requested"}:
+        if task.get("control_state") not in {TaskControlState.PAUSED, TaskControlState.PAUSE_REQUESTED}:
             raise ValueError("Task is not paused")
         now = utcnow()
         with self.store.tx(immediate=True) as db:
@@ -733,19 +735,14 @@ class RecoveryManager:
                 (task["id"],),
             ).fetchone()
         run_id = row[0] if row else None
-        payload = {
-            "schema": "devwerk.task-terminal.v1",
-            "project_id": task["project_id"],
-            "task_id": task["id"],
-            "column_run_id": run_id,
-            "terminal": "failed",
-            "failure_code": failure_code,
-            "error": reason,
-            "recorded_at": now,
-        }
+        payload = FailedTaskTerminalPayload(
+            project_id=task["project_id"], task_id=task["id"],
+            column_run_id=run_id, failure_code=failure_code,
+            error=reason, recorded_at=now,
+        )
         info = ProjectFiles(self.store.get_project(task["project_id"])["base_dir"], self.store.policy).write_text(
             f".devwerk/terminal/{task['id']}/{new_id('cancel')}.json",
-            json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
+            json.dumps(payload.model_dump(mode="json", by_alias=True), ensure_ascii=False, sort_keys=True, indent=2),
         )
         with self.store.tx(immediate=True) as db:
             current = db.execute("SELECT status FROM v1_tasks WHERE id=?", (task["id"],)).fetchone()
@@ -775,7 +772,7 @@ class RecoveryManager:
             artifact_id = new_id("art")
             db.execute(
                 "INSERT INTO v1_artifacts(id,project_id,task_id,run_id,kind,path,sha256,size,meta_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(project_id,path) DO UPDATE SET id=excluded.id,task_id=excluded.task_id,run_id=excluded.run_id,kind=excluded.kind,sha256=excluded.sha256,size=excluded.size,meta_json=excluded.meta_json,created_at=excluded.created_at",
-                (artifact_id, task["project_id"], task["id"], run_id, "task_terminal", info["path"], info["sha256"], info["size"], json.dumps({"terminal": "failed", "failure_code": failure_code}, ensure_ascii=False), now),
+                (artifact_id, task["project_id"], task["id"], run_id, "task_terminal", info["path"], info["sha256"], info["size"], FailedTerminalArtifactMeta(failure_code=failure_code).model_dump_json(), now),
             )
             data = {"error": reason, "failure_code": failure_code, "artifact_id": artifact_id}
             self.store._event(db, task["project_id"], task["id"], run_id, "task.failed", data)

@@ -77,6 +77,8 @@ class PlanningRepository:
                     item.proposed_task_ref == predecessor['proposed_task_ref'] for item in plan.tasks):
                 raise ValueError('repair_of_task_id must name a terminal Task whose proposed_task_ref is preserved')
         revision = self.store.get_workflow_revision(project_id, plan.workflow_revision_id)
+        if not revision['active']:
+            raise ValueError('WorkflowRevisionRetired: save the Task Plan against the active Workflow revision')
         workflow = self.store.workflow_by_id(project_id, plan.workflow_revision_id)
         method = WorkflowPlan.model_validate(
             self.get_workflow_plan(project_id, str(revision["workflow_plan_id"]))["plan"]
@@ -110,7 +112,11 @@ class PlanningRepository:
         )
         now = utcnow()
         with self.store.tx(immediate=True) as db:
-            from app.v1.task_identity import logical_task_key
+            active = db.execute('SELECT active_revision_id FROM v1_workflows WHERE project_id=?',
+                                (project_id,)).fetchone()
+            if not active or active[0] != plan.workflow_revision_id:
+                raise ValueError('WorkflowRevisionRetired: save the Task Plan against the active Workflow revision')
+            from app.v1.workflows.task_identity import logical_task_key
             for item in plan.tasks:
                 identity = logical_task_key(method.task_contract, item.input)
                 prior = db.execute('SELECT id,status,proposed_task_ref FROM v1_tasks WHERE project_id=? AND logical_task_key=? ORDER BY created_at DESC LIMIT 1', (project_id,identity)).fetchone() if identity else None

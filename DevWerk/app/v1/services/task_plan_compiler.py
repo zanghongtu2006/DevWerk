@@ -1,7 +1,9 @@
 """Shared, side-effect-free preparation for plan admission and materialization."""
 from app.v1.contracts import canonicalize_contract_value, validate_contract
 from app.v1.domain import ReadinessDecision, TaskPlan
-from app.v1.task_identity import logical_task_key
+from app.v1.workflows.task_identity import logical_task_key
+from app.v1.protocols.tools.planning.capability_contracts import (AcceptanceLaunchDiagnostics, DeferredCommandCheck,
+                                         ValidationDiagnostic, ValidationReceipt)
 
 COMPILER_VERSION = 1
 
@@ -17,11 +19,17 @@ def acceptance_diagnostics(definition, method, data=None):
     errors = []
     column_paths = {c.key:f'/workflow/columns/{i}' for i,c in enumerate(definition.columns)}
     def issue(path, message):
-        errors.append({'path': path, 'message': message})
+        errors.append(ValidationDiagnostic(path=path, message=message).model_dump(mode='json'))
     for key in method.task_contract.feedback_columns:
+        if key not in column_paths:
+            issue('/workflow/columns', f'FeedbackContractUnknownColumn: {key} is not a Workflow Column')
+            continue
         executor = definition.column(key).executor
         if executor.kind != 'agent' or 'task.feedback.record' not in executor.capabilities:
-            issue(column_paths[key]+'/executor/capabilities', f'FeedbackContractMissing: {key} must expose task.feedback.record')
+            issue(column_paths[key]+'/executor/capabilities',
+                  f'FeedbackContractMissing: {key} must expose task.feedback.record. '
+                  'Revise its agent executor and publish the corrected Workflow; '
+                  'workflow.acceptance.configure cannot change executor capabilities.')
     return errors
 
 
@@ -40,11 +48,21 @@ def prepare_task_input(proposed, definition, method, registry):
     if errors:
         raise PlanAdmissionError(errors)
     proposed.validate_exact_input_workflow(definition)
-    readiness = ReadinessDecision.model_validate({
-        **proposed.readiness.model_dump(mode='json'), 'objective': proposed.objective,
-        'dependencies': list(proposed.dependencies),
-        'conflict_domains': [item.model_dump(mode='json') for item in proposed.conflict_domains],
-    }).model_dump(mode='json')
+    facts = proposed.readiness
+    readiness = ReadinessDecision(
+        decision=facts.decision,
+        objective=proposed.objective,
+        scope=facts.scope,
+        non_scope=facts.non_scope,
+        deliverables=facts.deliverables,
+        acceptance_criteria=facts.acceptance_criteria,
+        dependencies_checked=facts.dependencies_checked,
+        dependencies=list(proposed.dependencies),
+        conflict_domains=list(proposed.conflict_domains),
+        risks=facts.risks,
+        reason_summary=facts.reason_summary,
+        next_review_at=facts.next_review_at,
+    ).model_dump(mode='json')
     _validate_deterministic_deliverable_coverage(definition, readiness)
     return data, readiness, logical_task_key(method.task_contract, data)
 
@@ -71,21 +89,25 @@ def diagnose_task_plan(plan, definition, method, registry):
         try:
             prepare_task_input(proposed, definition, method, registry)
         except PlanAdmissionError as exc:
-            errors.extend({**d, 'path': d['path'] if d['path'].startswith('/workflow/') else f'/tasks/{index}'+d['path']} for d in exc.diagnostics)
+            for item in exc.diagnostics:
+                diagnostic = ValidationDiagnostic.model_validate(item)
+                if not diagnostic.path.startswith('/workflow/'):
+                    diagnostic.path = f'/tasks/{index}{diagnostic.path}'
+                errors.append(diagnostic.model_dump(mode='json'))
         except ValueError as exc:
-            errors.append({'path': f'/tasks/{index}', 'message': str(exc)})
+            errors.append(ValidationDiagnostic(path=f'/tasks/{index}', message=str(exc)).model_dump(mode='json'))
     if not errors:
         try:
             compile_task_plan(plan, definition, method, registry)
         except ValueError as exc:
-            errors.append({'path': '/tasks', 'message': str(exc)})
-    return {'valid': not errors, 'diagnostics': errors,
-            'legal_columns': [c.key for c in definition.columns]}
+            errors.append(ValidationDiagnostic(path='/tasks', message=str(exc)).model_dump(mode='json'))
+    return ValidationReceipt(valid=not errors, diagnostics=errors,
+        legal_columns=[c.key for c in definition.columns]).model_dump(mode='json', exclude_unset=True)
 
 
 def diagnose_acceptance_launches(store, project_id, definition):
-    from app.v1.command_resolution import resolve_command
-    from app.v1.files import ProjectFiles
+    from app.v1.workspace.command_resolution import resolve_command
+    from app.v1.workspace.files import ProjectFiles
     files = ProjectFiles(store.get_project(project_id)['base_dir'], store.policy)
     errors, deferred = [], []
     for index, column in enumerate(definition.columns):
@@ -94,7 +116,8 @@ def diagnose_acceptance_launches(store, project_id, definition):
                 continue
             path = f'/workflow/columns/{index}/acceptance_checks/{number}/arguments'
             if check.launch_validation == 'deferred':
-                deferred.append({'column':column.key,'check_key':check.key,'validation':'before Runtime execution'})
+                deferred.append(DeferredCommandCheck(column=column.key, check_key=check.key,
+                    validation='before Runtime execution'))
                 continue
             try:
                 cwd = files.resolve(check.arguments.get('cwd') or '.')
@@ -102,5 +125,6 @@ def diagnose_acceptance_launches(store, project_id, definition):
                     raise ValueError('Preflight cwd does not exist; declare deferred for a future generated directory')
                 resolve_command(check.arguments['argv'], cwd)
             except (KeyError,ValueError,OSError) as exc:
-                errors.append({'path':path,'message':str(exc)})
-    return {'diagnostics':errors,'deferred_command_checks':deferred}
+                errors.append(ValidationDiagnostic(path=path, message=str(exc)))
+    return AcceptanceLaunchDiagnostics(diagnostics=errors,
+        deferred_command_checks=deferred).model_dump(mode='json')

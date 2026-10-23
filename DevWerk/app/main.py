@@ -20,9 +20,9 @@ from app.core.restart import ManagedRestart
 from app.services.usage import init_usage_db
 from app.v1.api import router as v1_router
 from app.v1.capabilities import build_core_registry
-from app.v1.mcp_tools import MCPToolManager, load_mcp_servers
-from app.v1.conversation import ConversationGateway
-from app.v1.runtime import RuntimeSupervisor
+from app.v1.tooling.mcp_tools import MCPToolManager, load_mcp_servers
+from app.v1.conversations.conversation import ConversationGateway
+from app.v1.execution.runtime import RuntimeSupervisor
 from app.v1.store import V1Store
 from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, PlatformPolicyLoader
 

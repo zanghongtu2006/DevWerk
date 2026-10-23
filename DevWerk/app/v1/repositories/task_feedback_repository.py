@@ -1,8 +1,12 @@
 """Task feedback and verification evidence; Mailbox is not a routing participant."""
 import json
+from app.v1.protocols.conversation.feedback_context_contracts import (AgentFailureFact, FailedAcceptanceCheck,
+    PendingFeedback, TaskFailureDetail, TaskFeedbackRecord)
+from app.v1.protocols.tools.planning.capability_task_contracts import FeedbackCheckReference
 
 from app.v1.storage_support import new_id, utcnow
-from app.v1.states import FEEDBACK_STATE_MACHINE, FeedbackStatus
+from app.v1.execution.states import FEEDBACK_STATE_MACHINE, FeedbackStatus
+from app.v1.protocols.workflow.runtime_json_contracts import FeedbackVerificationPayload
 
 class TaskFeedbackRepository:
     def __init__(self, store):
@@ -30,8 +34,9 @@ class TaskFeedbackRepository:
     def list(self, project_id, task_id):
         self.store.get_project_task(project_id, task_id)
         with self.store.connect() as db:
-            return [self.store._decode(dict(row), 'checks_json', 'verification_json') for row in db.execute(
-                'SELECT * FROM v1_task_feedback WHERE task_id=? ORDER BY rowid', (task_id,))]
+            return [TaskFeedbackRecord.model_validate(
+                self.store._decode(dict(row), 'checks_json', 'verification_json')).model_dump(mode='json')
+                for row in db.execute('SELECT * FROM v1_task_feedback WHERE task_id=? ORDER BY rowid', (task_id,))]
 
     def record(self, ctx, args):
         task_id = args['task_id']
@@ -62,7 +67,8 @@ class TaskFeedbackRepository:
             if prior:
                 if (prior['responsible_column'], prior['description'], prior['checks_json']) != (responsible,args['description'],encoded):
                     raise ValueError('Feedback dedupe_key refers to different content')
-                return self.store._decode(dict(prior), 'checks_json', 'verification_json')
+                return TaskFeedbackRecord.model_validate(
+                    self.store._decode(dict(prior), 'checks_json', 'verification_json')).model_dump(mode='json')
             sequence = db.execute("SELECT COALESCE(MAX(sequence),0) FROM v1_column_runs WHERE task_id=? AND status!='pending'", (task_id,)).fetchone()[0]
             job = self.store.intents.job_for_run(ctx.agent_run_id, ctx.project_id)
             identity = new_id('feedback')
@@ -100,8 +106,9 @@ class TaskFeedbackRepository:
                 raise ValueError('A later independent Column must review the completed repair')
             FEEDBACK_STATE_MACHINE.require(FeedbackStatus.VERIFYING, FeedbackStatus.RESOLVED)
             db.execute('UPDATE v1_task_feedback SET state=?,verification_json=?,resolved_at=? WHERE id=?',
-                       (FeedbackStatus.RESOLVED.value,json.dumps({
-                           'review_run_id':ctx.column_run_id,'note':args['verification_note']},ensure_ascii=False),
+                       (FeedbackStatus.RESOLVED.value,FeedbackVerificationPayload(
+                           review_run_id=ctx.column_run_id, note=args['verification_note']
+                       ).model_dump_json(),
                         utcnow(),row['id']))
             self.store._event(db,ctx.project_id,task_id,ctx.column_run_id,'task.feedback_resolved',
                               {'feedback_id':row['id']})
@@ -168,9 +175,11 @@ class TaskFeedbackRepository:
         failures = []
         for row in rows:
             error = (json.loads(row['result_json']).get('error') or {})
-            failures.append({'check_key':row['check_key'], 'acceptance_result_id':row['id'],
-                'error_type':str(error.get('type') or 'CheckFailed')[:80],
-                'error_message':str(error.get('message') or 'Formal acceptance check failed')[:300]})
+            failures.append(FailedAcceptanceCheck(check_key=row['check_key'],
+                acceptance_result_id=row['id'],
+                error_type=str(error.get('type') or 'CheckFailed')[:80],
+                error_message=str(error.get('message') or 'Formal acceptance check failed')[:300]
+                ).model_dump(mode='json'))
         return failures
 
     def failure_detail(self, project_id, task_id):
@@ -191,11 +200,12 @@ class TaskFeedbackRepository:
                          if isinstance(value := output.get(key), str) and value.strip()), None)
         runtime_error = task.get('error') or (row['error'] if row else None) or ''
         agent_failure = self.latest_agent_failure(task_id, row['id']) if row else None
-        return {'column_key':row['column_key'] if row else task.get('current_column'),
-                'column_run_id':row['id'] if row else None,
-                'reported_reason':reported[:400] if reported else None,
-                'runtime_error':str(runtime_error)[:300],
-                'completion_rejection':agent_failure.get('completion_rejection') if agent_failure else None}
+        return TaskFailureDetail(column_key=row['column_key'] if row else task.get('current_column'),
+            column_run_id=row['id'] if row else None,
+            reported_reason=reported[:400] if reported else None,
+            runtime_error=str(runtime_error)[:300],
+            completion_rejection=agent_failure.get('completion_rejection') if agent_failure else None
+            ).model_dump(mode='json')
 
     def latest_agent_failure(self, task_id, column_run_id, *, exclude_agent_run_id=None):
         """Surface the last terminal attempt's bounded rejection on this Column visit."""
@@ -217,9 +227,9 @@ class TaskFeedbackRepository:
             except (TypeError, ValueError):
                 pass
         message = str(error.get('message') or '').strip() if isinstance(error, dict) else ''
-        return {'agent_run_id':run['id'],
-                'runtime_error':str(run['error'] or 'Agent Run failed')[:300],
-                'completion_rejection':message[:600] if message else None}
+        return AgentFailureFact(agent_run_id=run['id'],
+            runtime_error=str(run['error'] or 'Agent Run failed')[:300],
+            completion_rejection=message[:600] if message else None).model_dump(mode='json')
 
     def pending_for_column(self, task_id, column_key):
         """Current bounded repair obligations for one Worker, from durable feedback."""
@@ -232,14 +242,12 @@ class TaskFeedbackRepository:
                 ORDER BY CASE WHEN responsible_column=? THEN 0 ELSE 1 END,
                          feedback.rowid DESC LIMIT 8''',
                 (task_id,FeedbackStatus.RESOLVED.value,column_key,column_key,column_key)).fetchall()
-        return [{'feedback_id':row['id'], 'state':row['state'],
-                 'responsible_column':row['responsible_column'],
-                 'description':row['description'][:500],
-                 'verification_mode':'fixed_checks' if json.loads(row['checks_json']) else 'manual_review',
-                 'verification_checks':[
-                     {'column':check.get('column'), 'check_key':check.get('check_key')}
-                     for check in json.loads(row['checks_json'])[:8]]}
-                for row in rows]
+        return [PendingFeedback(feedback_id=row['id'], state=row['state'],
+            responsible_column=row['responsible_column'], description=row['description'][:500],
+            verification_mode='fixed_checks' if json.loads(row['checks_json']) else 'manual_review',
+            verification_checks=[FeedbackCheckReference.model_validate(check)
+                for check in json.loads(row['checks_json'])[:8]]).model_dump(mode='json')
+            for row in rows]
 
     def verified(self, db, task, column, key, *, after_sequence=0, current_run=None, after_check_rowid=0):
         # A later visit without a successful effect does not invalidate an

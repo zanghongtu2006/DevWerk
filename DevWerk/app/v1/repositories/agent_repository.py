@@ -9,8 +9,16 @@ import json
 import hashlib
 from typing import Any
 
-from app.v1.execution_control import ExecutionOwnershipLost, ExecutionBudgetExceeded
+from app.v1.execution.execution_control import ExecutionOwnershipLost, ExecutionBudgetExceeded
 from app.v1.storage_support import new_id, utcnow
+from app.v1.protocols.agent.worker_repository_contracts import (ConsumedWorkerMessages, WorkerContextMessagePage,
+    WorkerContextSourcePage, WorkerEvidencePage, WorkerInspectReceipt,
+    WorkerReplaceReceipt, WorkerSessionHandoff, WorkerSnapshotReceipt)
+from app.v1.protocols.workflow.runtime_json_contracts import (
+    ArchivedAgentMessage, ContextCheckpointPayload, WorkerInputPayload,
+    WorkerMessage, WorkerMessagesPayload, WorkerSuccessionSnapshot,
+    WorkerContextWindow, WorkerContextWindowPayload,
+)
 
 
 class AgentBusy(RuntimeError):
@@ -249,12 +257,14 @@ class AgentRepository:
             db.execute('INSERT INTO v1_agent_context_sessions(id,project_id,instance_id,session_key,created_at,updated_at) VALUES(?,?,?,?,?,?)', (session, ctx.project_id, identity, key, now, now))
             snapshot_id = new_id('snapshot')
             db.execute('INSERT INTO v1_agent_context_snapshots VALUES(?,?,1,0,?,?)',
-                       (snapshot_id, session, json.dumps({'summary': summary, 'predecessor_worker_id': worker_id}, ensure_ascii=False), now))
+                       (snapshot_id, session, WorkerSuccessionSnapshot(
+                           summary=summary, predecessor_worker_id=worker_id,
+                       ).model_dump_json(), now))
             db.execute('INSERT INTO v1_agent_worker_slots VALUES(?,?,?) ON CONFLICT(requirement_id,worker_key) DO UPDATE SET instance_id=excluded.instance_id', (requirement['id'], key, identity))
             self.store._event(db, ctx.project_id, None, None, 'agent.worker.replaced', {'predecessor_worker_id': worker_id, 'worker_id': identity, 'worker_key': key})
-            return {'worker': self.get_worker(ctx.project_id, identity),
-                    'predecessor_worker_id': worker_id, 'worker_key': key,
-                    'snapshot_id': snapshot_id}
+            return WorkerReplaceReceipt(worker=self.get_worker(ctx.project_id, identity),
+                predecessor_worker_id=worker_id, worker_key=key,
+                snapshot_id=snapshot_id).model_dump(mode='json')
 
     def planning_cause(self, ctx):
         if not ctx.agent_run_id or not ctx.requirement_id:
@@ -339,15 +349,16 @@ class AgentRepository:
             assignments = [self.store._decode(dict(row), 'input_json', 'contract_json', 'result_json', 'budget_json') for row in db.execute('SELECT * FROM v1_agent_assignments WHERE agent_instance_id=? ORDER BY created_at', (worker_id,))]
             legacy = [dict(row) for row in db.execute(
                 'SELECT id,state,payload_json,assignment_id,consumed_by_run_id FROM v1_project_mailbox WHERE project_id=? AND recipient_agent_id=? ORDER BY id', (project_id, worker_id))]
-        return {'worker': worker, 'assignments': assignments, 'messages': self.messages(project_id, worker_id),
-                'legacy_mailbox_inputs_read_only':legacy}
+        return WorkerInspectReceipt(worker=worker, assignments=assignments,
+            messages=self.messages(project_id, worker_id),
+            legacy_mailbox_inputs_read_only=legacy).model_dump(mode='json')
 
     def context_page(self, project_id, worker_id, *, after=0, limit=20):
         worker = self.get_worker(project_id, worker_id)
         with self.store.connect() as db:
             session = db.execute('SELECT legacy_session_id FROM v1_agent_context_sessions WHERE id=?', (worker['active_session_id'],)).fetchone()
             rows = db.execute("SELECT m.* FROM v1_agent_messages m JOIN v1_agent_runs r ON r.id=m.agent_run_id WHERE r.project_id=? AND r.agent_session_id IN (?,?) AND m.id>? AND m.role!='system' ORDER BY m.id LIMIT ?", (project_id, worker['active_session_id'], session[0] if session else None, after, min(max(limit, 1), 50))).fetchall()
-        from app.v1.context_manager import project_result, packed, bounded_value
+        from app.v1.context.context_manager import project_result, packed, bounded_value
         page, used = [], 0
         for row in rows:
             item = self.store._decode(dict(row), 'tool_calls_json')
@@ -357,7 +368,7 @@ class AgentRepository:
             size = len(packed(item).encode('utf8'))
             if page and used+size > 12000:
                 break
-            page.append(item)
+            page.append(WorkerContextMessagePage.model_validate(item).model_dump(mode='json'))
             used += size
         return page
 
@@ -373,15 +384,16 @@ class AgentRepository:
                        (session_id,project_id,project_id)).fetchone()
         if not row:
             return None
-        return {'id':row['id'], 'revision':row['revision'],
-                'through_message_id':row['through_message_id'],
-                'summary':json.loads(row['summary_json']),
-                'instance_id':row['instance_id'], 'requirement_id':row['requirement_id']}
+        return WorkerSessionHandoff(id=row['id'], revision=row['revision'],
+            through_message_id=row['through_message_id'],
+            summary=json.loads(row['summary_json']),
+            instance_id=row['instance_id'],
+            requirement_id=row['requirement_id']).model_dump(mode='json')
 
     def context_source_page(self, project_id, worker_id, *, snapshot_id=None,
                             source_message_id=None, offset=0, max_characters=4000,
                             expected_sha256=None):
-        from app.v1.context_projection import slice_source_text
+        from app.v1.context.context_projection import slice_source_text
 
         worker = self.get_worker(project_id, worker_id)
         if bool(snapshot_id) == bool(source_message_id):
@@ -406,9 +418,12 @@ class AgentRepository:
                     (source_message_id,project_id,project_id,worker_id,worker_id)).fetchone()
                 if not row:
                     raise ValueError('Message is outside this Worker context')
-                source_text = json.dumps({'role':row['role'],'content':row['content'],
-                    'tool_calls':json.loads(row['tool_calls_json'] or '[]')},
-                    ensure_ascii=False,sort_keys=True,separators=(',',':'))
+                source = ArchivedAgentMessage(
+                    role=row['role'], content=row['content'],
+                    tool_calls=json.loads(row['tool_calls_json'] or '[]'),
+                )
+                source_text = json.dumps(source.model_dump(mode="json"),
+                    ensure_ascii=False, sort_keys=True, separators=(',', ':'))
                 kind, identity = 'message', source_message_id
         sha = hashlib.sha256(source_text.encode('utf-8')).hexdigest()
         if expected_sha256 and expected_sha256 != sha:
@@ -416,15 +431,16 @@ class AgentRepository:
         byte_limit = max(256,min(1500,self.store.policy.context.tool_result_tokens//3))
         page, next_offset = slice_source_text(source_text,offset=int(offset),
             max_characters=min(max(int(max_characters),1),4000),max_bytes=byte_limit)
-        return {'source_kind':kind,'source_id':identity,'sha256':sha,'offset':offset,
-                'content':page,'next_offset':next_offset,'complete':next_offset is None,
-                'total_characters':len(source_text)}
+        return WorkerContextSourcePage(source_kind=kind, source_id=identity,
+            sha256=sha, offset=offset, content=page,
+            next_offset=next_offset, complete=next_offset is None,
+            total_characters=len(source_text)).model_dump(mode='json')
 
     def evidence_page(self, project_id, column_run_id, *, after=0, limit=20, worker_id=None):
         """Page receipt identities without returning archived tool payloads."""
-        from app.v1.context_projection import project_ledger
+        from app.v1.context.context_projection import project_ledger
         from app.v1.domain import ToolResult
-        from app.v1.execution_ledger import ledger_entry
+        from app.v1.execution.execution_ledger import ledger_entry
 
         page_limit = min(max(int(limit), 1), 50)
         with self.store.connect() as db:
@@ -460,8 +476,9 @@ class AgentRepository:
             entries.append(view)
             used += size
             last_id = row['id']
-        return {'entries': entries, 'next_cursor': last_id if entries else None,
-                'has_more': bool(rows) and (len(rows) > len(entries))}
+        return WorkerEvidencePage(entries=entries,
+            next_cursor=last_id if entries else None,
+            has_more=bool(rows) and (len(rows) > len(entries))).model_dump(mode='json')
 
     def assign(self, task, run, column, *, worker_key=None):
         now = utcnow()
@@ -604,7 +621,7 @@ class AgentRepository:
             db.execute("""INSERT INTO v1_worker_inputs
                 (id,project_id,recipient_agent_id,assignment_id,payload_json,dedupe_key,created_at)
                 VALUES(?,?,?,?,?,?,?)""", (identity, project_id, worker_id, assignment_id,
-                json.dumps({'content':str(content),'worker_id':worker_id}, ensure_ascii=False), dedupe_key, utcnow()))
+                WorkerInputPayload(content=str(content), worker_id=worker_id).model_dump_json(), dedupe_key, utcnow()))
             return dict(db.execute("SELECT * FROM v1_worker_inputs WHERE id=?", (identity,)).fetchone())
 
     def messages(self, project_id, worker_id):
@@ -618,12 +635,18 @@ class AgentRepository:
             rows = db.execute("SELECT * FROM v1_worker_inputs WHERE project_id=? AND recipient_agent_id=? AND state='pending' AND (assignment_id IS NULL OR assignment_id=?) ORDER BY created_at,rowid", (assignment["project_id"], assignment["agent_instance_id"], assignment["id"])).fetchall()
             if not rows:
                 return []
-            payload = [{"message_id": row["id"], "input": json.loads(row["payload_json"])} for row in rows]
-            stored = self.store.add_agent_message(agent_run_id, "user", json.dumps({"worker_messages": payload}), [], emit_progress=False)
+            payload = [WorkerMessage(
+                message_id=row["id"], input=WorkerInputPayload.model_validate_json(row["payload_json"]),
+            ) for row in rows]
+            stored = self.store.add_agent_message(
+                agent_run_id, "user", WorkerMessagesPayload(worker_messages=payload).model_dump_json(),
+                [], emit_progress=False,
+            )
             for row in rows:
                 now = utcnow()
                 db.execute("UPDATE v1_worker_inputs SET state='acknowledged',consumed_by_run_id=?,acknowledged_at=? WHERE id=? AND state='pending'", (agent_run_id, now, row["id"]))
-            return {'payload':payload, 'source_message_id':stored['id']}
+            return ConsumedWorkerMessages(payload=payload,
+                source_message_id=stored['id']).model_dump(mode='json')
 
     def set_lifecycle(self, project_id, worker_id, state):
         if state not in {"available", "suspended", "retired"}:
@@ -670,7 +693,7 @@ class AgentRepository:
             self.store._event(db, row['project_id'], task_id, row['column_run_id'], 'agent.assignment.'+status, {'assignment_id': row['id'], 'agent_instance_id': row['agent_instance_id']})
 
     def note_wait(self, assignment, operation_id, ledger):
-        from app.v1.execution_ledger import execution_progress
+        from app.v1.execution.execution_ledger import execution_progress
         marker = hashlib.sha256(json.dumps(execution_progress(ledger, excluded_capabilities={'column.await', 'column.complete'})).encode()).hexdigest()
         with self.store.tx(immediate=True) as db:
             self.assert_owner(assignment, db=db)
@@ -745,15 +768,19 @@ class AgentRepository:
             if assignment_id:
                 # Old prefix checkpoints did not record which intervening user
                 # messages they preserved. Rebuild conservatively from raw rows.
-                from app.v1.context_manager import covered_message_ids
+                from app.v1.context.context_manager import covered_message_ids
                 covered = covered_message_ids(snapshot['coverage_json']) if snapshot['coverage_json'] else None
                 if covered is not None:
-                    history.append({'role':'user','_checkpoint':True,'content':json.dumps({
-                        'context_checkpoint':json.loads(snapshot['summary_json']),
-                        'covered_message_count':len(covered)})})
+                    history.append({'role':'user','_checkpoint':True,'content':ContextCheckpointPayload(
+                        context_checkpoint=json.loads(snapshot['summary_json']),
+                        covered_message_count=len(covered),
+                    ).model_dump_json(exclude_none=True)})
                     rows = [row for row in rows if row['id'] not in covered]
             else:
-                history.append({"role": "user", "_checkpoint": True, "content": json.dumps({"context_checkpoint": json.loads(snapshot["summary_json"]), "covers_through_message_id": snapshot["through_message_id"]})})
+                history.append({"role": "user", "_checkpoint": True, "content": ContextCheckpointPayload(
+                    context_checkpoint=json.loads(snapshot["summary_json"]),
+                    covers_through_message_id=snapshot["through_message_id"],
+                ).model_dump_json(exclude_none=True)})
                 rows = [row for row in rows if row["id"] > snapshot["through_message_id"]]
         for row in rows:
             item = self.store._decode(dict(row), "tool_calls_json")
@@ -776,10 +803,12 @@ class AgentRepository:
             first_retained_id = retained[-1].get('id') if retained else None
             with self.store.connect() as db:
                 prior_work = [dict(row) for row in db.execute('SELECT id,task_id,status FROM v1_agent_assignments WHERE session_id=? ORDER BY created_at DESC LIMIT 8', (session_id,))]
-            checkpoint = {'context_window': {'older_messages_omitted': len(history)-len(retained), 'first_retained_message_id': first_retained_id,
-                          'prior_assignments': prior_work,
-                          'retrieve': 'Use agent.context.read to inspect older source messages; no source history has been deleted.'}}
-            history = checkpoint_prefix + [{'role': 'user', 'content': json.dumps(checkpoint)}] + list(reversed(retained))
+            checkpoint = WorkerContextWindowPayload(context_window=WorkerContextWindow(
+                older_messages_omitted=len(history)-len(retained),
+                first_retained_message_id=first_retained_id,
+                prior_assignments=prior_work,
+            ))
+            history = checkpoint_prefix + [{'role': 'user', 'content': checkpoint.model_dump_json()}] + list(reversed(retained))
         return history
 
     def load_context_checkpoint(self, project_id, scope_id, *, db=None):
@@ -817,5 +846,5 @@ class AgentRepository:
             db.execute("INSERT INTO v1_agent_context_snapshots VALUES(?,?,?,?,?,?)",
                        (snapshot_id, worker["active_session_id"], revision,
                         through_message_id, json.dumps(summary, ensure_ascii=False), utcnow()))
-        return {'snapshot_id':snapshot_id, 'revision':revision,
-                'through_message_id':through_message_id}
+        return WorkerSnapshotReceipt(snapshot_id=snapshot_id, revision=revision,
+            through_message_id=through_message_id).model_dump(mode='json')

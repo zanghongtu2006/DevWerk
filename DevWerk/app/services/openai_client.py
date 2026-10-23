@@ -12,6 +12,10 @@ from urllib3.util.retry import Retry
 
 from app.core.debug_trace import trace_json
 from app.services.provider_errors import provider_timeout_error, raise_for_provider_payload, raise_for_provider_response
+from app.services.provider_request_contracts import (
+    OpenAICompletionRequest, OpenAIRequiredFunction, OpenAIRequiredToolChoice,
+)
+from app.services.provider_response_contracts import ProviderCompletionResponse, ProviderToolCall, ProviderUsage
 
 
 _log = logging.getLogger("devwerk.llm.openai")
@@ -53,11 +57,10 @@ class OpenAIClient:
             raise ValueError(f"api_key is not set for LLM provider {self.api_name!r}.")
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, *, trace_id: str | None = None, require_tool: bool = False, required_tool_name: str | None = None) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
-        }
+        request = OpenAICompletionRequest(
+            model=self.model, messages=messages, temperature=self.temperature,
+            top_p=float(self.top_p) if self.top_p is not None else None,
+        )
         if tools:
             tool_choice: Any = "required" if require_tool else "auto"
             if required_tool_name:
@@ -65,13 +68,12 @@ class OpenAIClient:
                     str(item.get("function", {}).get("name") or "") for item in tools
                 }:
                     raise ValueError(f"required tool is not exposed: {required_tool_name}")
-                tool_choice = {
-                    "type": "function",
-                    "function": {"name": required_tool_name},
-                }
-            payload.update({"tools": tools, "tool_choice": tool_choice})
-        if self.top_p is not None:
-            payload["top_p"] = float(self.top_p)
+                tool_choice = OpenAIRequiredToolChoice(
+                    function=OpenAIRequiredFunction(name=required_tool_name),
+                )
+            request.tools = tools
+            request.tool_choice = tool_choice
+        payload = request.wire()
         trace_json(
             _trace_log,
             "llm.provider_request",
@@ -123,7 +125,7 @@ class OpenAIClient:
         message = choices[0].get("message")
         if not isinstance(message, dict):
             raise ValueError("OpenAI-compatible API returned no message")
-        calls: list[dict[str, Any]] = []
+        calls: list[ProviderToolCall] = []
         for raw in message.get("tool_calls") or []:
             function = raw.get("function") if isinstance(raw, dict) else None
             if not isinstance(function, dict):
@@ -133,18 +135,18 @@ class OpenAIClient:
                 arguments = json.loads(arguments)
             if not isinstance(arguments, dict):
                 raise ValueError("tool call arguments must be a JSON object")
-            calls.append({"id": str(raw.get("id") or ""), "name": str(function.get("name") or ""), "arguments": arguments})
+            calls.append(ProviderToolCall(id=str(raw.get("id") or ""),
+                name=str(function.get("name") or ""), arguments=arguments))
         content = message.get("content")
-        return {"text": content if isinstance(content, str) else "", "tool_calls": calls, "usage": self.last_usage}
+        return ProviderCompletionResponse(text=content if isinstance(content, str) else "",
+            tool_calls=calls, usage=ProviderUsage.model_validate(self.last_usage)).wire()
 
 
 def _usage(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     details = value.get("prompt_tokens_details") if isinstance(value.get("prompt_tokens_details"), dict) else {}
-    return {
-        "input_tokens": value.get("prompt_tokens") or value.get("input_tokens"),
-        "output_tokens": value.get("completion_tokens") or value.get("output_tokens"),
-        "total_tokens": value.get("total_tokens"),
-        "cached_input_tokens": details.get("cached_tokens"),
-    }
+    return ProviderUsage(input_tokens=value.get("prompt_tokens") or value.get("input_tokens"),
+        output_tokens=value.get("completion_tokens") or value.get("output_tokens"),
+        total_tokens=value.get("total_tokens"),
+        cached_input_tokens=details.get("cached_tokens")).wire()

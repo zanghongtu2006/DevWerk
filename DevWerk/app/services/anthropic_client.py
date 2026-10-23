@@ -12,7 +12,14 @@ from urllib3.util.retry import Retry
 
 from app.core.debug_trace import trace_json
 from app.services.provider_errors import provider_timeout_error, raise_for_provider_payload, raise_for_provider_response
+from app.services.provider_request_contracts import (
+    AnthropicCompletionRequest, AnthropicToolChoice, AnthropicToolDefinition,
+)
+from app.services.provider_message_contracts import (AnthropicMessage, AnthropicTextBlock,
+    AnthropicToolResultBlock, AnthropicToolUseBlock)
+from app.services.provider_response_contracts import ProviderCompletionResponse, ProviderToolCall, ProviderUsage
 from app.v1.contracts import canonicalize_contract_value, provider_contract_schema
+from app.v1.protocols.tools.core.provider_schema_contracts import ProviderSchemaNode
 
 
 _trace_log = logging.getLogger("devwerk.llm.provider.anthropic")
@@ -55,32 +62,29 @@ class AnthropicClient:
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, *, trace_id: str | None = None, require_tool: bool = False, required_tool_name: str | None = None) -> dict[str, Any]:
         system, provider_messages = self._to_provider_messages(messages)
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-            "system": system,
-            "messages": provider_messages,
-        }
-        if self.top_p is not None:
-            payload["top_p"] = float(self.top_p)
+        request = AnthropicCompletionRequest(
+            model=self.model, max_tokens=self.max_tokens, temperature=self.temperature,
+            system=system, messages=provider_messages,
+            top_p=float(self.top_p) if self.top_p is not None else None,
+        )
         if tools:
-            payload["tools"] = [
-                {
-                    "name": item["function"]["name"],
-                    "description": item["function"].get("description", ""),
-                    "input_schema": provider_contract_schema(
-                        item["function"].get("parameters") or {"type": "object"}
+            request.tools = [
+                AnthropicToolDefinition(
+                    name=item["function"]["name"],
+                    description=item["function"].get("description", ""),
+                    input_schema=provider_contract_schema(
+                        item["function"].get("parameters") or ProviderSchemaNode(schema_type="object").wire()
                     ),
-                }
+                )
                 for item in tools
             ]
             if required_tool_name:
-                if required_tool_name not in {item["name"] for item in payload["tools"]}:
+                if required_tool_name not in {item.name for item in request.tools}:
                     raise ValueError(f"required tool is not exposed: {required_tool_name}")
-                payload["tool_choice"] = {"type": "tool", "name": required_tool_name}
+                request.tool_choice = AnthropicToolChoice(type="tool", name=required_tool_name)
             elif require_tool:
-                payload["tool_choice"] = {"type": "any"}
+                request.tool_choice = AnthropicToolChoice(type="any")
+        payload = request.wire()
         headers = {
             "x-api-key": str(self.api_key),
             "authorization": f"Bearer {self.api_key}",
@@ -133,7 +137,7 @@ class AnthropicClient:
         )
         self.last_usage = _usage(data.get("usage"))
         text: list[str] = []
-        calls: list[dict[str, Any]] = []
+        calls: list[ProviderToolCall] = []
         tool_schemas = {
             str(item.get("function", {}).get("name") or ""): item.get("function", {}).get("parameters") or {}
             for item in tools or []
@@ -149,57 +153,52 @@ class AnthropicClient:
                     raise ValueError("tool_use input must be a JSON object")
                 name = str(item.get("name") or "")
                 arguments = canonicalize_contract_value(arguments, tool_schemas.get(name, {}))
-                calls.append({"id": str(item.get("id") or ""), "name": name, "arguments": arguments})
-        return {"text": "\n".join(text).strip(), "tool_calls": calls, "usage": self.last_usage}
+                calls.append(ProviderToolCall(id=str(item.get("id") or ""),
+                    name=name, arguments=arguments))
+        return ProviderCompletionResponse(text="\n".join(text).strip(), tool_calls=calls,
+            usage=ProviderUsage.model_validate(self.last_usage)).wire()
 
     @staticmethod
     def _to_provider_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
         systems: list[str] = []
-        converted: list[dict[str, Any]] = []
+        converted: list[AnthropicMessage] = []
         for message in messages:
             role = str(message.get("role") or "user")
             if role == "system":
                 systems.append(str(message.get("content") or ""))
                 continue
             if role == "assistant":
-                blocks: list[dict[str, Any]] = []
+                blocks = []
                 if message.get("content"):
-                    blocks.append({"type": "text", "text": str(message["content"])})
+                    blocks.append(AnthropicTextBlock(text=str(message["content"])))
                 for call in message.get("tool_calls") or []:
                     function = call.get("function") or {}
                     arguments = function.get("arguments") or {}
                     if isinstance(arguments, str):
                         arguments = json.loads(arguments)
-                    blocks.append(
-                        {
-                            "type": "tool_use",
-                            "id": str(call.get("id") or ""),
-                            "name": str(function.get("name") or ""),
-                            "input": arguments,
-                        }
-                    )
+                    blocks.append(AnthropicToolUseBlock(
+                        id=str(call.get("id") or ""),
+                        name=str(function.get("name") or ""), input=arguments))
                 if blocks:
-                    converted.append({"role": "assistant", "content": blocks})
+                    converted.append(AnthropicMessage(role="assistant", content=blocks))
                 continue
             if role == "tool":
-                block = {
-                    "type": "tool_result",
-                    "tool_use_id": str(message.get("tool_call_id") or ""),
-                    "content": str(message.get("content") or ""),
-                }
-                if converted and converted[-1]["role"] == "user" and isinstance(converted[-1]["content"], list):
-                    converted[-1]["content"].append(block)
+                block = AnthropicToolResultBlock(
+                    tool_use_id=str(message.get("tool_call_id") or ""),
+                    content=str(message.get("content") or ""))
+                if converted and converted[-1].role == "user" and isinstance(converted[-1].content, list):
+                    converted[-1].content.append(block)
                 else:
-                    converted.append({"role": "user", "content": [block]})
+                    converted.append(AnthropicMessage(role="user", content=[block]))
                 continue
             content = str(message.get("content") or "")
-            if converted and converted[-1]["role"] == "user" and isinstance(converted[-1]["content"], str):
-                converted[-1]["content"] += "\n\n" + content
+            if converted and converted[-1].role == "user" and isinstance(converted[-1].content, str):
+                converted[-1].content += "\n\n" + content
             else:
-                converted.append({"role": "user", "content": content})
+                converted.append(AnthropicMessage(role="user", content=content))
         if not converted:
-            converted.append({"role": "user", "content": ""})
-        return "\n\n".join(item for item in systems if item), converted
+            converted.append(AnthropicMessage(role="user", content=""))
+        return "\n\n".join(item for item in systems if item), [item.wire() for item in converted]
 
 
 def _usage(value: Any) -> dict[str, Any]:
@@ -208,10 +207,6 @@ def _usage(value: Any) -> dict[str, Any]:
     input_tokens = value.get("input_tokens")
     output_tokens = value.get("output_tokens")
     total = input_tokens + output_tokens if isinstance(input_tokens, int) and isinstance(output_tokens, int) else value.get("total_tokens")
-    return {
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "total_tokens": total,
-        "cached_input_tokens": value.get("cache_read_input_tokens"),
-        "cache_creation_input_tokens": value.get("cache_creation_input_tokens"),
-    }
+    return ProviderUsage(input_tokens=input_tokens, output_tokens=output_tokens,
+        total_tokens=total, cached_input_tokens=value.get("cache_read_input_tokens"),
+        cache_creation_input_tokens=value.get("cache_creation_input_tokens")).wire()

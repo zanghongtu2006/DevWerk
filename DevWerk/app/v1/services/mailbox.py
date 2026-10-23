@@ -5,7 +5,7 @@ import sqlite3
 from typing import Any
 
 from app.v1.repositories.base import StoreHost
-from app.v1.states import MAILBOX_STATE_MACHINE, MailboxStatus
+from app.v1.execution.states import MAILBOX_STATE_MACHINE, MailboxStatus
 from app.v1.storage_support import new_id, utcnow
 
 

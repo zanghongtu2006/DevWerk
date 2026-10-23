@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
 from typing import Any
 
 import requests as http_requests
+
+from app.services.provider_error_contracts import ProviderErrorDetails, UnexpectedProviderError
 
 
 ANTHROPIC_HTTP_ERROR_CODES = {
@@ -55,32 +56,6 @@ RECOVERABLE_LLM_ERROR_CODES = frozenset(
         "LLM_CONCURRENCY_LIMIT",
     }
 )
-
-
-@dataclass
-class ProviderErrorDetails:
-    provider: str
-    api_name: str
-    status_code: int | None
-    error_code: str
-    message: str
-    provider_code: int | None = None
-    provider_error_type: str | None = None
-    request_id: str | None = None
-    body_snippet: str | None = None
-
-    def log_payload(self) -> dict[str, Any]:
-        return {
-            "provider": self.provider,
-            "api_name": self.api_name,
-            "status_code": self.status_code,
-            "error_code": self.error_code,
-            "provider_code": self.provider_code,
-            "provider_error_type": self.provider_error_type,
-            "request_id": self.request_id,
-            "message": self.message,
-            "body_snippet": self.body_snippet,
-        }
 
 
 class LLMProviderError(RuntimeError):
@@ -298,7 +273,8 @@ def llm_error_message(exc: BaseException) -> str:
 def llm_error_log_payload(exc: BaseException) -> dict[str, Any]:
     if isinstance(exc, LLMProviderError):
         return exc.details.log_payload()
-    return {"error_type": type(exc).__name__, "message": str(exc)}
+    return UnexpectedProviderError(error_type=type(exc).__name__,
+        message=str(exc)).model_dump(mode="json")
 
 
 def is_recoverable_llm_error(exc: BaseException) -> bool:

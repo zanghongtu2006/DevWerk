@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import hashlib
-from app.v1.files import ProjectFiles
+from app.v1.workspace.files import ProjectFiles
+from app.v1.protocols.storage.repository_event_contracts import ArtifactRegisterReceipt, ArtifactWriteEvent
 from typing import Any
 
 from app.v1.repositories.base import StoreHost
@@ -27,8 +28,10 @@ class ArtifactRepository:
                 "INSERT INTO v1_artifacts(id,project_id,task_id,run_id,kind,path,sha256,size,meta_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(project_id,path) DO UPDATE SET id=excluded.id,task_id=excluded.task_id,run_id=excluded.run_id,kind=excluded.kind,sha256=excluded.sha256,size=excluded.size,meta_json=excluded.meta_json,created_at=excluded.created_at",
                 (artifact_id, project_id, task_id, run_id, kind, path, sha256, size, json.dumps(meta or {}, ensure_ascii=False), now),
             )
-            self.store._event(db, project_id, task_id, run_id, "artifact.written", {"path": path, "kind": kind, "size": size})
-        return {"id": artifact_id, "path": path, "kind": kind, "size": size, "sha256": sha256}
+            self.store._event(db, project_id, task_id, run_id, "artifact.written",
+                ArtifactWriteEvent(path=path, kind=kind, size=size).model_dump(mode='json'))
+        return ArtifactRegisterReceipt(id=artifact_id, path=path, kind=kind,
+            size=size, sha256=sha256).model_dump(mode='json')
 
     def snapshot_text(self, artifact):
         with self.store.connect() as db:

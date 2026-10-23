@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import hashlib
 import sqlite3
 import threading
@@ -16,18 +17,38 @@ from app.v1.domain import (
     WorkflowPlan,
     WorkflowDefinition,
 )
-from app.v1.contracts import canonicalize_contract_value, check_schema, validate_contract
+from app.v1.contracts import canonicalize_contract_value, check_schema, validate_contract, validate_optional_defaults
 from app.v1.capabilities import (
     CapabilityRegistry,
     task_binding_exact_strings,
     validate_task_capability_bindings,
     validate_workflow_capabilities,
 )
-from app.v1.files import ProjectFiles
-from app.v1.loops import LoopCatalog
-from app.v1.memory import MemoryIndex, MemoryManager, MemoryRecord, MemoryStore
+from app.v1.protocols.tools.core.capability_protocol import ExecutionReceiptStatus, GovernanceDecisionKind
+from app.v1.protocols.tools.planning.capability_contracts import MaterializedTaskRow, TaskMaterializationReceipt
+from app.v1.protocols.tools.planning.capability_loop_receipts import AppliedLoopIdentity, LoopApplyReceipt
+from app.v1.protocols.context.store_context_receipts import (ConversationHistoryFrame,
+    SessionRunIndex, SessionToolReceipt)
+from app.v1.protocols.storage.store_receipt_contracts import (AgentMessageRecord, BacklogRecord,
+    ColumnRunStartRecord, ConversationJobSummary, ConversationMessageRecord,
+    ConversationStateRecord, ExecutionReceiptView, GovernanceDecisionRecord,
+    KanbanProjectionRecord, ProjectQuiescenceRecord, QuiescenceBlockers,
+    ScheduledReviewRecord, ToolInvocationRecord, UnresolvedConversationFailure,
+    UnresolvedFailureCounts, UnresolvedFailures, UnresolvedTaskFailure)
+from app.v1.protocols.workflow.runtime_json_contracts import (
+    ConversationProgressDetails, ConversationProgressEvent,
+    KanbanProjectionPayload, ProjectionWorkflow, SupervisionTrigger,
+    SupervisionTurnContract, TaskInitialContext, TaskInitialPlanningContext,
+    TriggerConversationMeta,
+    PreparedTerminalEvidence, PriorRunContext, QueuedConversationMeta,
+    ReadinessDecisionPayload, TaskTerminalEvidence,
+)
+from app.v1.protocols.workflow.runtime_checkpoint_contracts import ExecutionCheckpoint
+from app.v1.workspace.files import ProjectFiles
+from app.v1.workflows.loops import LoopCatalog
+from app.v1.context.memory import MemoryIndex, MemoryManager, MemoryRecord, MemoryStore
 from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, PlatformPolicySnapshot, V1RuntimePolicy
-from app.v1.states import (
+from app.v1.execution.states import (
     AGENT_RUN_STATE_MACHINE,
     ATTEMPT_STATE_MACHINE,
     COLUMN_RUN_STATE_MACHINE,
@@ -38,7 +59,7 @@ from app.v1.states import (
     ToolInvocationStatus,
 )
 from app.v1.storage_support import new_id, utcnow
-from app.v1.task_identity import (
+from app.v1.workflows.task_identity import (
     logical_task_key,
     resolve_input_pointer,
 )
@@ -67,7 +88,7 @@ def _resolve_loop_parameters(value: Any, parameters: dict[str, Any]) -> Any:
             key = str(value["$param"])
             if key not in parameters:
                 raise ValueError(f"Loop parameter {key!r} is missing")
-            return json.loads(json.dumps(parameters[key], ensure_ascii=False))
+            return copy.deepcopy(parameters[key])
         return {key: _resolve_loop_parameters(item, parameters) for key, item in value.items()}
     if isinstance(value, list):
         return [_resolve_loop_parameters(item, parameters) for item in value]
@@ -121,35 +142,6 @@ def _validate_process_stage_alignment(
         pending.extend(item.target for item in workflow_columns[key].transitions)
     if not reaches_done:
         raise ValueError("Workflow entry has no declared path to done")
-
-    current = workflow.entry
-    terminal: str | None = None
-    for index, step in enumerate(plan.lifecycle_walkthrough):
-        if step.column_key != current:
-            raise ValueError(
-                "Representative Task walkthrough does not follow the Workflow graph: "
-                f"expected Column {current!r}, received {step.column_key!r} at step {index + 1}"
-            )
-        matches = [
-            transition
-            for transition in workflow_columns[current].transitions
-            if transition.outcome == step.outcome
-        ]
-        if len(matches) != 1:
-            raise ValueError(
-                f"Representative Task walkthrough outcome {step.outcome!r} is not a unique "
-                f"transition from Column {current!r}"
-            )
-        target = matches[0].target
-        if target in {workflow.terminals.success, workflow.terminals.failure}:
-            terminal = target
-            if index != len(plan.lifecycle_walkthrough) - 1:
-                raise ValueError("Lifecycle walkthrough continues after a terminal transition")
-        else:
-            current = target
-    if terminal != workflow.terminals.success:
-        raise ValueError("Lifecycle walkthrough must reach the Workflow success terminal")
-
 
 
 def _workspace_deliverable_path(value: Any) -> str | None:
@@ -337,7 +329,7 @@ class V1Store:
         if defaults:
             # Defaults may cover only optional parameters; required user input
             # is validated after merging bindings at application time.
-            validate_contract(defaults, {**parameter_schema, 'required': []}, label=f"Loop {loop_key} defaults")
+            validate_optional_defaults(defaults, parameter_schema, label=f"Loop {loop_key} defaults")
             materialized = _resolve_loop_parameters(bundle, defaults)
             workflow_plan = WorkflowPlan.model_validate(materialized["workflow_plan"])
             check_schema(workflow_plan.task_contract.input_schema, label=f"Loop {loop_key} task input_schema")
@@ -370,8 +362,9 @@ class V1Store:
             raise ValueError("a Loop can be applied only before the Project has a Workflow")
         loop = self.get_loop(loop_key)
         bundle = dict(loop["bundle"])
+        from app.v1.protocols.workflow.loop_bindings import LoopBindings, LoopPackageSnapshot
         parameters = canonicalize_contract_value(
-            {**dict(bundle.get("defaults") or {}), **bindings},
+            LoopBindings.combine(bundle.get("defaults") or {}, bindings).values,
             loop["parameter_schema"],
         )
         validate_contract(parameters, loop["parameter_schema"], label=f"Loop {loop_key} bindings")
@@ -398,11 +391,11 @@ class V1Store:
                     loop["loop_key"],
                     loop["version"],
                     loop["digest"],
-                    json.dumps(parameters, ensure_ascii=False),
+                    LoopBindings(values=parameters).json_text(),
                     plan_row["id"],
                     workflow_row["id"],
                     now,
-                    json.dumps(loop, ensure_ascii=False),
+                    LoopPackageSnapshot.model_validate(loop).json_text(),
                 ),
             )
             self._event(db, project_id, None, None, "workflow.loop.applied", {
@@ -414,18 +407,12 @@ class V1Store:
                 "workflow_plan_id": plan_row["id"],
             })
             self.scopes.bind_workflow(workflow_row['id'], application_id)
-        return {
-            "id": application_id,
-            "project_id": project_id,
-            "loop": {
-                key: loop[key]
-                for key in ("loop_key", "version", "digest", "name", "category", "directory")
-            },
-            "bindings": parameters,
-            "workflow_plan": plan_row,
-            "workflow": workflow_row,
-            "created_at": now,
-        }
+        return LoopApplyReceipt(id=application_id, project_id=project_id,
+            loop=AppliedLoopIdentity(loop_key=loop['loop_key'], version=loop['version'],
+                digest=loop['digest'], name=loop['name'], category=loop['category'],
+                directory=loop['directory']), bindings=parameters,
+            workflow_plan=plan_row, workflow=workflow_row,
+            created_at=now).model_dump(mode='json')
 
     def _ensure_column(self, db: sqlite3.Connection, table: str, column: str, definition: str) -> None:
         self.schema_repository._ensure_column(db, table, column, definition)
@@ -620,7 +607,8 @@ class V1Store:
         message_meta.setdefault("kind", "message" if role == "user" else "reply")
         with self.tx(immediate=True) as db:
             message_id = self._insert_message(db, project_id, role, content, message_meta, now)
-        return {"id": message_id, "project_id": project_id, "role": role, "content": content, "meta": message_meta, "created_at": now}
+        return ConversationMessageRecord(id=message_id, project_id=project_id, role=role,
+            content=content, meta=message_meta, created_at=now).model_dump(mode='json')
 
     def _insert_message(
         self,
@@ -692,23 +680,13 @@ class V1Store:
                 "FROM v1_conversation_jobs WHERE project_id=? ORDER BY created_at DESC,id DESC LIMIT 1",
                 (project_id,),
             ).fetchone()
-        job = None
-        if row:
-            job = {
-                "id": row[0],
-                "status": row[1],
-                "trigger_kind": row[2],
-                "created_at": row[3],
-                "updated_at": row[4],
-                "finished_at": row[5],
-                "has_error": bool(row[6]),
-            }
-        return {
-            "project_id": project_id,
-            "agent_state": agent["state"],
-            "job": job,
-            "work_intent": self.intents.context({'project_id': project_id, 'user_message_id': 9223372036854775807}),
-        }
+        job = ConversationJobSummary(id=row[0], status=row[1], trigger_kind=row[2],
+            created_at=row[3], updated_at=row[4], finished_at=row[5],
+            has_error=bool(row[6])) if row else None
+        return ConversationStateRecord(project_id=project_id, agent_state=agent["state"],
+            job=job,
+            work_intent=self.intents.context({'project_id': project_id,
+                'user_message_id': 9223372036854775807})).model_dump(mode='json')
 
     def create_conversation_job(self, project_id: str, message: str, start_task: bool,
                                 requested_mode: str = 'auto', user_action: dict | None = None) -> dict[str, Any]:
@@ -737,7 +715,7 @@ class V1Store:
                     project_id,
                     "user",
                     message,
-                    json.dumps({"status": "queued", "job_id": job_id, "kind": "message"}, ensure_ascii=False),
+                    QueuedConversationMeta(job_id=job_id).model_dump_json(),
                     now,
                 ),
             )
@@ -798,7 +776,9 @@ class V1Store:
                     (project_id, now),
                 ).fetchone()
                 trigger_kind = "mailbox" if mailbox_ids else "scheduled_review"
-                trigger = {"mailbox_ids": mailbox_ids, "review_reason": review[1] if review else None}
+                trigger = SupervisionTrigger(
+                    mailbox_ids=mailbox_ids, review_reason=review[1] if review else None,
+                )
                 job_id = new_id("cjob")
                 review_reason = review[1] if review else None
                 session = db.execute(
@@ -813,17 +793,16 @@ class V1Store:
                         project_id,
                         "system",
                         "",
-                        json.dumps(
-                            {"trigger": trigger_kind, "job_id": job_id, "reason": review_reason},
-                            ensure_ascii=False,
-                        ),
+                        TriggerConversationMeta(
+                            trigger=trigger_kind, job_id=job_id, reason=review_reason,
+                        ).model_dump_json(),
                         now,
                     ),
                 )
                 db.execute(
                     "INSERT INTO v1_conversation_jobs(id,project_id,conversation_session_id,user_message_id,message,start_task,status,trigger_kind,trigger_json,mailbox_ids_json,scheduled_review_id,created_at,updated_at) "
                     "VALUES(?,?,?,?,?,0,'queued',?,?,?,?,?,?)",
-                    (job_id, project_id, session[0], int(cursor.lastrowid), "", trigger_kind, json.dumps(trigger, ensure_ascii=False), json.dumps(mailbox_ids), review[0] if review else None, now, now),
+                    (job_id, project_id, session[0], int(cursor.lastrowid), "", trigger_kind, trigger.model_dump_json(), json.dumps(mailbox_ids), review[0] if review else None, now, now),
                 )
                 delivered_ids = self.mailbox_service.deliver_pending(
                     db,
@@ -834,12 +813,12 @@ class V1Store:
                 )
                 if delivered_ids != mailbox_ids:
                     mailbox_ids = delivered_ids
-                    trigger["mailbox_ids"] = mailbox_ids
+                    trigger.mailbox_ids = mailbox_ids
                     db.execute(
                         "UPDATE v1_conversation_jobs SET mailbox_ids_json=?,trigger_json=? WHERE id=?",
                         (
                             json.dumps(mailbox_ids),
-                            json.dumps(trigger, ensure_ascii=False),
+                            trigger.model_dump_json(),
                             job_id,
                         ),
                     )
@@ -1202,6 +1181,10 @@ class V1Store:
         initial_loop: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.get_project(project_id)
+        with self.connect() as db:
+            observed = db.execute('SELECT active_revision_id FROM v1_workflows WHERE project_id=?',
+                                  (project_id,)).fetchone()
+        observed_revision_id = observed[0] if observed else None
         # Callers may mutate a Pydantic Workflow after construction. Revalidate
         # the serialized graph so legacy global checks become edge conditions.
         workflow = WorkflowDefinition.model_validate(workflow.model_dump(mode="json"))
@@ -1212,6 +1195,10 @@ class V1Store:
         planned_columns = {item.key: item for item in plan.columns}
         if set(planned_columns) != {item.key for item in workflow.columns}:
             raise ValueError("Workflow columns must exactly match the referenced Workflow Plan")
+        from app.v1.services.task_plan_compiler import PlanAdmissionError, acceptance_diagnostics
+        feedback_errors = acceptance_diagnostics(workflow, plan)
+        if feedback_errors:
+            raise PlanAdmissionError(feedback_errors)
         for column in workflow.columns:
             check_schema(column.input_contract, label=f"Column {column.key} input_contract")
             check_schema(column.output_contract, label=f"Column {column.key} output_contract")
@@ -1221,6 +1208,37 @@ class V1Store:
         with self.tx(immediate=True) as db:
             identity = db.execute("SELECT id FROM v1_workflows WHERE project_id=?", (project_id,)).fetchone()
             previous = db.execute('SELECT active_revision_id FROM v1_workflows WHERE project_id=?', (project_id,)).fetchone()
+            if (previous[0] if previous else None) != observed_revision_id:
+                raise ValueError('WorkflowRevisionChanged: inspect the active Workflow before publishing')
+            if previous:
+                inflight = db.execute('''SELECT t.id,t.status,t.current_column FROM v1_tasks t
+                    WHERE t.project_id=? AND (t.status IN ('running','waiting','recovering')
+                    OR t.lease_owner IS NOT NULL OR t.failure_code='effect_outcome_unknown'
+                    OR EXISTS (SELECT 1 FROM v1_column_attempts a WHERE a.task_id=t.id AND a.status IN ('running','waiting'))
+                    OR EXISTS (SELECT 1 FROM v1_agent_assignments a WHERE a.task_id=t.id AND a.status IN ('running','waiting'))
+                    OR EXISTS (SELECT 1 FROM v1_await_handles h WHERE h.task_id=t.id AND h.status='pending'))''',
+                    (project_id,),
+                ).fetchall()
+                if inflight:
+                    detail = ', '.join(f"{row['id']}:{row['status']}@{row['current_column']}" for row in inflight[:8])
+                    raise ValueError('WorkflowRevisionBusy: settle or stop active Project Tasks before publishing: ' + detail)
+                prior = db.execute(
+                    'SELECT definition_json FROM v1_workflow_revisions WHERE id=? AND project_id=?',
+                    (previous[0], project_id),
+                ).fetchone()
+                prior_entry = WorkflowDefinition.model_validate_json(prior[0]).entry
+                blockers = db.execute('''SELECT t.id,t.status,t.current_column,
+                    (SELECT COUNT(*) FROM v1_column_attempts a WHERE a.task_id=t.id) AS attempt_count,
+                    (SELECT COUNT(*) FROM v1_agent_assignments a WHERE a.task_id=t.id) AS assignment_count
+                    FROM v1_tasks t WHERE t.project_id=? AND t.workflow_revision_id=?''',
+                    (project_id, previous[0]),
+                ).fetchall()
+                unsafe = [row for row in blockers if row['status'] not in ('done', 'failed') and not (
+                    row['status'] == 'pending' and row['current_column'] == prior_entry
+                    and not row['attempt_count'] and not row['assignment_count'])]
+                if unsafe:
+                    detail = ', '.join(f"{row['id']}:{row['status']}@{row['current_column']}" for row in unsafe[:8])
+                    raise ValueError('WorkflowRevisionBusy: settle or stop old Workflow Tasks before publishing: ' + detail)
             workflow_id = identity[0] if identity else new_id("workflow")
             if not identity:
                 db.execute(
@@ -1324,12 +1342,14 @@ class V1Store:
             ).fetchone()[0]
             if recoveries >= 2:
                 return None
-            contract = {'phase':'supervision','act':'supervise','source_message_id':job['user_message_id'],
-                        'execution_grant_id':grant['id'],'supervised_task_id':task_id}
+            contract = SupervisionTurnContract(
+                source_message_id=job['user_message_id'], execution_grant_id=grant['id'],
+                supervised_task_id=task_id,
+            )
             db.execute('UPDATE v1_conversation_jobs SET requirement_id=?,requirement_revision=?,execution_grant_id=?,turn_contract_json=? WHERE id=?',
                        (task['requirement_id'],task['requirement_revision'],grant['id'],
-                        json.dumps(contract,ensure_ascii=False),job_id))
-            return contract
+                        contract.model_dump_json(),job_id))
+            return contract.model_dump(mode='json')
 
     def get_project_loop_binding(self, project_id: str, workflow_revision_id: str | None = None) -> dict[str, Any] | None:
         with self.connect() as db:
@@ -1438,6 +1458,10 @@ class V1Store:
                     if existing_predecessor != rerun_of_task_id:
                         raise ValueError('The selected plan was already materialized without this predecessor')
             else:
+                active = db.execute('SELECT active_revision_id FROM v1_workflows WHERE project_id=?',
+                                    (project_id,)).fetchone()
+                if not active or active[0] != plan.workflow_revision_id:
+                    raise ValueError('WorkflowRevisionRetired: create Tasks against the active Workflow revision')
                 from app.v1.services.task_entry_admission import validate_entry_evidence
                 validate_entry_evidence(self, project_id, plan, workflow_plan)
                 for item in prepared:
@@ -1461,10 +1485,13 @@ class V1Store:
                 self._refresh_projection(db, project_id)
         if requested_task_id is None:
             raise RuntimeError("requested Task Plan item was not materialized")
-        return {**self.get_project_task(project_id, requested_task_id), 'materialization': {
-            'created_task_ids': created_task_ids,
-            'reused_task_ids': list(existing.values()) if not created_task_ids else [],
-        }}
+        return MaterializedTaskRow.from_task(
+            self.get_project_task(project_id, requested_task_id),
+            TaskMaterializationReceipt(
+                created_task_ids=created_task_ids,
+                reused_task_ids=list(existing.values()) if not created_task_ids else [],
+            ),
+        ).model_dump(mode="json", exclude_unset=True)
 
     def _prepare_task_materialization(
         self,
@@ -1604,16 +1631,11 @@ class V1Store:
         )
         task_id = new_id("tsk")
         conflict_domains = [item.canonical_key for item in proposed.conflict_domains]
-        initial_context = {
-            "planning": {
-                "task_plan_id": task_plan_id,
-                "workflow_plan_id": workflow["workflow_plan_id"],
-                "task_ref": proposed.proposed_task_ref,
-                "workflow_fit": proposed.workflow_fit,
-                "review_scope": proposed.review_scope,
-                "retry_scope": proposed.retry_scope,
-            }
-        }
+        initial_context = TaskInitialContext(planning=TaskInitialPlanningContext(
+            task_plan_id=task_plan_id, workflow_plan_id=workflow["workflow_plan_id"],
+            task_ref=proposed.proposed_task_ref, workflow_fit=proposed.workflow_fit,
+            review_scope=proposed.review_scope, retry_scope=proposed.retry_scope,
+        ))
         db.execute(
             "INSERT INTO v1_tasks(id,project_id,workflow_revision_id,task_plan_id,proposed_task_ref,logical_task_key,"
             "title,brief,input_json,context_json,readiness_json,conflict_domains_json,status,control_state,"
@@ -1623,7 +1645,7 @@ class V1Store:
                 task_id, project_id, workflow["id"], task_plan_id, proposed.proposed_task_ref,
                 task_logical_key,
                 proposed.title, proposed.brief, json.dumps(input_data, ensure_ascii=False),
-                json.dumps(initial_context, ensure_ascii=False), json.dumps(readiness, ensure_ascii=False),
+                initial_context.model_dump_json(), json.dumps(readiness, ensure_ascii=False),
                 json.dumps(conflict_domains, ensure_ascii=False), rerun_of_task_id, definition.entry, now, now,
             ),
         )
@@ -1671,7 +1693,9 @@ class V1Store:
             "VALUES(?,?,?,?,?,?,?)",
             (
                 new_id("gdec"), project_id, "readiness", task_id, schedule_state,
-                json.dumps({**readiness, "unresolved_dependencies": unresolved_dependencies}, ensure_ascii=False), now,
+                ReadinessDecisionPayload.model_validate(readiness).model_copy(
+                    update={"unresolved_dependencies": unresolved_dependencies}
+                ).model_dump_json(), now,
             ),
         )
         self._event(
@@ -1733,6 +1757,10 @@ class V1Store:
             rerun_of_task_id=rerun_of_task_id,
         )
         with self.tx(immediate=True) as db:
+            active = db.execute('SELECT active_revision_id FROM v1_workflows WHERE project_id=?',
+                                (project_id,)).fetchone()
+            if not active or active[0] != plan.workflow_revision_id:
+                raise ValueError('WorkflowRevisionRetired: create Tasks against the active Workflow revision')
             task_id = self._insert_prepared_task(db, prepared)
             self._refresh_projection(db, project_id)
         return self.get_task(task_id)
@@ -1786,7 +1814,9 @@ class V1Store:
         with self.tx(immediate=True) as db:
             db.execute("INSERT INTO v1_backlog_items(id,project_id,title,brief,readiness_json,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", (backlog_id, project_id, title, brief, json.dumps(readiness, ensure_ascii=False), decision, now, now))
             self._event(db, project_id, None, None, "backlog.recorded", {"backlog_id": backlog_id, "decision": decision})
-        return {"id": backlog_id, "project_id": project_id, "title": title, "brief": brief, "readiness": readiness, "state": decision, "created_at": now, "updated_at": now}
+        return BacklogRecord(id=backlog_id, project_id=project_id, title=title, brief=brief,
+            readiness=readiness, state=decision, created_at=now,
+            updated_at=now).model_dump(mode='json')
 
     def schedule_task(self, project_id: str, task_id: str, state: str, priority: int, wip_group: str | None, wip_limit: int | None, dependencies: list[str] | None, resources: list[str] | None) -> dict[str, Any]:
         return self.scheduler.schedule_task(project_id, task_id, state, priority, wip_group, wip_limit, dependencies, resources)
@@ -1881,10 +1911,12 @@ class V1Store:
             event_type = "column.started" if attempt_no == 1 else "column.retry_started"
             self._event(db, task["project_id"], task["id"], run_id, event_type, {"column": task["current_column"], "sequence": sequence, "attempt_id": attempt_id, "attempt_no": attempt_no})
             self._refresh_projection(db, task["project_id"])
-        return {"id": run_id, "attempt_id": attempt_id, "attempt_no": attempt_no, "sequence": sequence, "column_key": task["current_column"], "status": "running", "started_at": now}
+        return ColumnRunStartRecord(id=run_id, attempt_id=attempt_id, attempt_no=attempt_no,
+            sequence=sequence, column_key=task["current_column"],
+            started_at=now).model_dump(mode='json')
 
     def assert_execution_owner(self, task, *, db=None):
-        from app.v1.execution_control import ExecutionOwnershipLost
+        from app.v1.execution.execution_control import ExecutionOwnershipLost
         if (task["id"], task.get("lease_owner"), task["state_version"]) in self._revoked_owners:
             raise ExecutionOwnershipLost("Lease keeper revoked this execution after a renewal failure")
         if db is None:
@@ -1898,7 +1930,7 @@ class V1Store:
             raise ExecutionOwnershipLost("Task lease/generation no longer owns this execution")
 
     def assert_conversation_owner(self, job):
-        from app.v1.execution_control import ExecutionOwnershipLost
+        from app.v1.execution.execution_control import ExecutionOwnershipLost
         with self.connect() as db:
             row = db.execute(
                 "SELECT j.status,j.claim_owner,a.lease_owner,a.lease_until FROM v1_conversation_jobs j "
@@ -1908,20 +1940,19 @@ class V1Store:
             raise ExecutionOwnershipLost("Conversation no longer owns its Project lease")
 
     def prepare_terminal_evidence(self, task: dict[str, Any], run_id: str, terminal: str, output: dict[str, Any], error: str | None) -> dict[str, Any]:
-        payload = {
-            "schema": "devwerk.task-terminal.v1",
-            "project_id": task["project_id"], "task_id": task["id"], "column_run_id": run_id,
-            "terminal": terminal, "output": output, "error": error, "recorded_at": utcnow(),
-        }
+        payload = TaskTerminalEvidence(
+            project_id=task["project_id"], task_id=task["id"], column_run_id=run_id,
+            terminal=terminal, output=output, error=error, recorded_at=utcnow(),
+        )
         files = ProjectFiles(self.get_project(task["project_id"])["base_dir"], self.policy)
         with self.tx(immediate=True) as db:
             if task.get("lease_owner") or task["status"] == "running":
                 self.assert_execution_owner(task, db=db)
             info = files.write_text(
                 f".devwerk/terminal/{task['id']}/{run_id}-{task['state_version']}-{new_id('evidence')}.json",
-                json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
+                json.dumps(payload.model_dump(mode="json", by_alias=True), ensure_ascii=False, sort_keys=True, indent=2),
             )
-        return {**info, "kind": "task_terminal", "meta": {"terminal": terminal, "schema": payload["schema"]}}
+        return PreparedTerminalEvidence.from_file(info, terminal)
 
     @staticmethod
     def _resolve_failed_task_ancestors(
@@ -2092,15 +2123,15 @@ class V1Store:
             execution_key = str((checkpoint or {}).get("execution_key") or "")
             if execution_key:
                 changed = db.execute(
-                    "UPDATE v1_execution_receipts SET status='awaiting',result_json=?,error=NULL WHERE project_id=? AND execution_key=? AND status='started'",
-                    (self._pack_json((checkpoint or {}).get("capability_result") or {"status": "awaiting", "checkpoint": checkpoint or {}}), task["project_id"], execution_key),
+                    "UPDATE v1_execution_receipts SET status=?,result_json=?,error=NULL WHERE project_id=? AND execution_key=? AND status=?",
+                    (ExecutionReceiptStatus.AWAITING.value, self._pack_json((checkpoint or {}).get("capability_result") or {"status": ExecutionReceiptStatus.AWAITING.value, "checkpoint": checkpoint or {}}), task["project_id"], execution_key, ExecutionReceiptStatus.STARTED.value),
                 ).rowcount
                 if changed != 1:
                     existing = db.execute(
                         "SELECT status FROM v1_execution_receipts WHERE project_id=? AND execution_key=?",
                         (task["project_id"], execution_key),
                     ).fetchone()
-                    if not existing or existing[0] != "awaiting":
+                    if not existing or existing[0] != ExecutionReceiptStatus.AWAITING:
                         raise RuntimeError("awaiting execution receipt is not claimable")
             db.execute(
                 "INSERT INTO v1_await_handles(id,project_id,task_id,run_id,column_attempt_id,provider,token,status,next_check_at,progress_json,created_at,updated_at,column_key,poll_capability,poll_arguments_json,success_outcome,result_json,waiting_kind,resume_condition_json,cancel_capability,cancel_arguments_json,cleanup_capability,cleanup_arguments_json,idempotency_key,checkpoint_json,event_type,correlation_key,resume_at) "
@@ -2108,7 +2139,9 @@ class V1Store:
                 (handle_id, task["project_id"], task["id"], run_id, attempt[0], provider, token, next_check, "{}", now, now, task["current_column"], poll_capability, json.dumps(poll_arguments, ensure_ascii=False), success_outcome, "{}", waiting_kind, json.dumps(resume_condition or {}), cancel_capability, json.dumps(cancel_arguments or {}), cleanup_capability, json.dumps(cleanup_arguments or {}), idempotency_key, self._pack_json(checkpoint or {}), event_type, correlation_key, resume_at),
             )
             db.execute("UPDATE v1_column_runs SET status='waiting',last_progress_at=? WHERE id=?", (now, run_id))
-            db.execute("UPDATE v1_column_attempts SET status='waiting',checkpoint_json=? WHERE id=?", (self._pack_json({**(checkpoint or {}), "await_handle_id": handle_id}), attempt[0]))
+            attempt_checkpoint = ExecutionCheckpoint.read(checkpoint)
+            attempt_checkpoint.await_handle_id = handle_id
+            db.execute("UPDATE v1_column_attempts SET status='waiting',checkpoint_json=? WHERE id=?", (self._pack_json(attempt_checkpoint.wire()), attempt[0]))
             self.agents.settle_column(task, run_id, "waiting", {"await_handle_id": handle_id})
             db.execute("UPDATE v1_tasks SET status='waiting',lease_owner=NULL,lease_until=NULL,state_version=state_version+1,updated_at=? WHERE id=?", (now, task["id"]))
             self._event(db, task["project_id"], task["id"], run_id, "column.waiting", {"await_handle_id": handle_id, "next_check_at": next_check})
@@ -2374,7 +2407,8 @@ class V1Store:
             ):
                 continue
             if role in {"user", "assistant"}:
-                projected.append({"role": role, "content": str(row["content"] or "")})
+                projected.append(ConversationHistoryFrame(role=role,
+                    content=str(row["content"] or "")).model_dump(mode="json"))
         return projected
 
     def conversation_session_run_index(
@@ -2412,21 +2446,21 @@ class V1Store:
                 ).fetchall()
                 summary = []
                 for receipt in reversed(receipts):
-                    item = {'tool_call_id':receipt['tool_call_id'],
-                            'capability':receipt['capability'], 'ok':bool(receipt['ok'])}
+                    item = SessionToolReceipt(tool_call_id=receipt['tool_call_id'],
+                        capability=receipt['capability'], ok=bool(receipt['ok']))
                     if not receipt['ok']:
                         try:
                             result = json.loads(receipt['result_json'])
                             error = result.get('error') or {}
-                            item['error_type'] = str(error.get('type') or '')[:100]
-                            item['error_message'] = str(error.get('message') or '')[:300]
+                            item.error_type = str(error.get('type') or '')[:100]
+                            item.error_message = str(error.get('message') or '')[:300]
                         except (TypeError, ValueError, AttributeError):
-                            item['error_type'] = 'UnreadableReceipt'
+                            item.error_type = 'UnreadableReceipt'
                     summary.append(item)
-                index.append({'agent_run_id':run['id'],
-                              'conversation_job_id':run['conversation_job_id'],
-                              'status':run['status'], 'error':str(run['error'] or '')[:400],
-                              'recent_receipts':summary})
+                index.append(SessionRunIndex(agent_run_id=run['id'],
+                    conversation_job_id=run['conversation_job_id'],
+                    status=run['status'], error=str(run['error'] or '')[:400],
+                    recent_receipts=summary).model_dump(mode="json", exclude_unset=True))
         return index
 
     def agent_session_messages(self, project_id: str, agent_session_id: str) -> list[dict[str, Any]]:
@@ -2450,13 +2484,10 @@ class V1Store:
         return [
             {
                 "role": "prior_run",
-                "content": json.dumps({
-                    "prior_agent_run_id": row[0],
-                    "status": row[3],
-                    "final_text": row[1],
-                    "error": row[2],
-                    "instruction": "Continue the same logical assignment using current Task artifacts and review feedback.",
-                }, ensure_ascii=False),
+                "content": PriorRunContext(
+                    prior_agent_run_id=row[0], status=row[3],
+                    final_text=row[1], error=row[2],
+                ).model_dump_json(),
                 "tool_calls": [],
                 "tool_call_id": None,
             }
@@ -2579,13 +2610,13 @@ class V1Store:
                 conversation_progress = (
                     "model_output",
                     "\n\n".join(parts),
-                    {"sequence": sequence, **(progress_details or {})},
+                    ConversationProgressDetails.with_extra(sequence, progress_details),
                 )
             elif emit_progress and run["kind"] == "conversation" and role == "tool":
                 conversation_progress = (
                     "tool_result",
                     f"工具返回（{tool_call_id or 'unknown'}）\n{content}",
-                    {"sequence": sequence, "tool_call_id": tool_call_id, **(progress_details or {})},
+                    ConversationProgressDetails.with_extra(sequence, progress_details, tool_call_id),
                 )
         if conversation_progress:
             self.record_conversation_progress(
@@ -2594,7 +2625,9 @@ class V1Store:
                 content=conversation_progress[1],
                 details=conversation_progress[2],
             )
-        return {"id": message_id, "agent_run_id": agent_run_id, "sequence": sequence, "role": role, "content": content, "tool_calls": tool_calls or [], "tool_call_id": tool_call_id, "created_at": now}
+        return AgentMessageRecord(id=message_id, agent_run_id=agent_run_id, sequence=sequence,
+            role=role, content=content, tool_calls=tool_calls or [],
+            tool_call_id=tool_call_id, created_at=now).model_dump(mode='json')
 
     def record_conversation_progress(
         self,
@@ -2621,15 +2654,13 @@ class V1Store:
                     None,
                     None,
                     "conversation.progress",
-                    {
-                        "agent_run_id": agent_run_id,
-                        "conversation_job_id": run["conversation_job_id"],
-                        "kind": kind,
-                        "chunk_index": chunk_index,
-                        "chunk_count": len(chunks),
-                        "content": chunk,
-                        **(details or {}),
-                    },
+                    ConversationProgressEvent.with_details(
+                        details,
+                        agent_run_id=agent_run_id,
+                        conversation_job_id=run["conversation_job_id"],
+                        kind=kind, chunk_index=chunk_index,
+                        chunk_count=len(chunks), content=chunk,
+                    ),
                 )
 
     def agent_messages(self, project_id: str, agent_run_id: str, limit: int | None = None, after_sequence: int = 0) -> list[dict[str, Any]]:
@@ -2657,7 +2688,11 @@ class V1Store:
                 "INSERT INTO v1_tool_invocations(project_id,agent_run_id,sequence,tool_call_id,capability,arguments_json,result_json,ok,created_at) VALUES((SELECT project_id FROM v1_agent_runs WHERE id=?),?,?,?,?,?,?,?,?)",
                 (agent_run_id, agent_run_id, sequence, tool_call_id, capability, packed_arguments, packed_result, int(ok), now),
             )
-        return {"id": cursor.lastrowid, "agent_run_id": agent_run_id, "sequence": sequence, "tool_call_id": tool_call_id, "capability": capability, "arguments": arguments, "result": result, "ok": ok, "status": ToolInvocationStatus.SUCCEEDED.value if ok else ToolInvocationStatus.FAILED.value, "created_at": now}
+        return ToolInvocationRecord(id=cursor.lastrowid, agent_run_id=agent_run_id,
+            sequence=sequence, tool_call_id=tool_call_id, capability=capability,
+            arguments=arguments, result=result, ok=ok,
+            status=ToolInvocationStatus.SUCCEEDED.value if ok else ToolInvocationStatus.FAILED.value,
+            created_at=now).model_dump(mode='json')
 
     def tool_invocations(
         self,
@@ -2727,32 +2762,36 @@ class V1Store:
                 (review_id, project_id, reason, due_at, now),
             )
             self._event(db, project_id, None, None, "supervision.review_scheduled", {"review_id": review_id, "reason": reason, "due_at": due_at})
-        return {"id": review_id, "project_id": project_id, "reason": reason, "due_at": due_at, "state": "pending", "created_at": now}
+        return ScheduledReviewRecord(id=review_id, project_id=project_id, reason=reason,
+            due_at=due_at, created_at=now).model_dump(mode='json')
 
     def record_governance_decision(self, project_id: str, kind: str, subject_id: str | None, decision: str, data: dict[str, Any]) -> dict[str, Any]:
+        kind = GovernanceDecisionKind(kind).value
         decision_id, now = new_id("gdec"), utcnow()
         with self.tx(immediate=True) as db:
             db.execute(
                 "INSERT INTO v1_governance_decisions(id,project_id,kind,subject_id,decision,data_json,created_at) VALUES(?,?,?,?,?,?,?)",
                 (decision_id, project_id, kind, subject_id, decision, json.dumps(data, ensure_ascii=False), now),
             )
-            if subject_id and kind == "intervention":
+            if subject_id and kind == GovernanceDecisionKind.INTERVENTION:
                 db.execute("UPDATE v1_tasks SET supervision_action=? WHERE id=? AND project_id=?", (decision, subject_id, project_id))
-            if kind == "direct_execution":
+            if kind == GovernanceDecisionKind.DIRECT_EXECUTION:
                 db.execute(
                     "INSERT INTO v1_direct_runs(id,project_id,agent_run_id,capability,decision,data_json,created_at) VALUES(?,?,?,?,?,?,?)",
                     (new_id("direct"), project_id, data.get("agent_run_id"), str(data.get("capability") or "unknown"), decision, json.dumps(data, ensure_ascii=False), now),
                 )
-            elif kind == "intervention":
+            elif kind == GovernanceDecisionKind.INTERVENTION:
                 db.execute(
                     "INSERT INTO v1_intervention_runs(id,project_id,task_id,decision,data_json,created_at) VALUES(?,?,?,?,?,?)",
                     (new_id("intervention"), project_id, subject_id, decision, json.dumps(data, ensure_ascii=False), now),
                 )
-            self._event(db, project_id, subject_id if kind == "intervention" else None, None, f"governance.{kind}", {"decision_id": decision_id, "decision": decision})
-        return {"id": decision_id, "project_id": project_id, "kind": kind, "subject_id": subject_id, "decision": decision, "data": data, "created_at": now}
+            self._event(db, project_id, subject_id if kind == GovernanceDecisionKind.INTERVENTION else None, None, f"governance.{kind}", {"decision_id": decision_id, "decision": decision})
+        return GovernanceDecisionRecord(id=decision_id, project_id=project_id, kind=kind,
+            subject_id=subject_id, decision=decision, data=data,
+            created_at=now).model_dump(mode='json')
 
     def start_execution_receipt(self, project_id: str, execution_key: str, capability: str, arguments: dict[str, Any], *, retry_failed: bool = True) -> dict[str, Any]:
-        from app.v1.execution_ledger import normalized_operation_arguments
+        from app.v1.execution.execution_ledger import normalized_operation_arguments
         now = utcnow()
         packed = self._pack_json(arguments)
         with self.tx(immediate=True) as db:
@@ -2761,26 +2800,32 @@ class V1Store:
                 item = self._decode(dict(existing), "arguments_json", "result_json")
                 if item["capability"] != capability or normalized_operation_arguments(capability, item["arguments"]) != normalized_operation_arguments(capability, arguments):
                     raise ValueError("Execution key cannot be reused with different arguments")
-                if item["status"] == "failed" and retry_failed:
-                    db.execute("UPDATE v1_execution_receipts SET status='started',arguments_json=?,result_json=NULL,error=NULL,started_at=?,finished_at=NULL WHERE id=?", (packed, now, item["id"]))
-                    item.update({"status": "started", "arguments": arguments, "execution_key": execution_key, "claimed": True})
-                    return item
-                item["claimed"] = False
-                return item
+                if item["status"] == ExecutionReceiptStatus.FAILED and retry_failed:
+                    db.execute("UPDATE v1_execution_receipts SET status=?,arguments_json=?,result_json=NULL,error=NULL,started_at=?,finished_at=NULL WHERE id=?", (ExecutionReceiptStatus.STARTED.value, packed, now, item["id"]))
+                    receipt = ExecutionReceiptView.model_validate(item)
+                    receipt.status = ExecutionReceiptStatus.STARTED.value
+                    receipt.arguments = arguments
+                    receipt.execution_key = execution_key
+                    receipt.claimed = True
+                    return receipt.model_dump(mode='json')
+                return ExecutionReceiptView.model_validate(item).model_dump(mode='json')
             receipt_id = new_id("receipt")
-            db.execute("INSERT INTO v1_execution_receipts(id,project_id,execution_key,capability,status,arguments_json,started_at) VALUES(?,?,?,?, 'started',?,?)", (receipt_id, project_id, execution_key, capability, packed, now))
-        return {"id": receipt_id, "project_id": project_id, "execution_key": execution_key, "capability": capability, "status": "started", "arguments": arguments, "claimed": True}
+            db.execute("INSERT INTO v1_execution_receipts(id,project_id,execution_key,capability,status,arguments_json,started_at) VALUES(?,?,?,?,?,?,?)", (receipt_id, project_id, execution_key, capability, ExecutionReceiptStatus.STARTED.value, packed, now))
+        return ExecutionReceiptView(id=receipt_id, project_id=project_id,
+            execution_key=execution_key, capability=capability,
+            status=ExecutionReceiptStatus.STARTED.value, arguments=arguments,
+            claimed=True).model_dump(mode='json', exclude_unset=True)
 
     def finish_execution_receipt(self, project_id: str, execution_key: str, ok: bool, result: Any, error: str | None) -> None:
         packed = self._pack_json(result) if result is not None else None
         with self.tx(immediate=True) as db:
-            db.execute("UPDATE v1_execution_receipts SET status=?,result_json=?,error=?,finished_at=? WHERE project_id=? AND execution_key=? AND status='started'", ("completed" if ok else "failed", packed, error, utcnow(), project_id, execution_key))
+            db.execute("UPDATE v1_execution_receipts SET status=?,result_json=?,error=?,finished_at=? WHERE project_id=? AND execution_key=? AND status=?", (ExecutionReceiptStatus.COMPLETED.value if ok else ExecutionReceiptStatus.FAILED.value, packed, error, utcnow(), project_id, execution_key, ExecutionReceiptStatus.STARTED.value))
 
     def mark_execution_receipt_awaiting(self, project_id: str, execution_key: str, result: dict[str, Any]) -> None:
         with self.tx(immediate=True) as db:
             changed = db.execute(
-                "UPDATE v1_execution_receipts SET status='awaiting',result_json=?,error=NULL WHERE project_id=? AND execution_key=? AND status='started'",
-                (self._pack_json(result), project_id, execution_key),
+                "UPDATE v1_execution_receipts SET status=?,result_json=?,error=NULL WHERE project_id=? AND execution_key=? AND status=?",
+                (ExecutionReceiptStatus.AWAITING.value, self._pack_json(result), project_id, execution_key, ExecutionReceiptStatus.STARTED.value),
             ).rowcount
             if changed != 1:
                 raise RuntimeError("execution receipt changed before awaiting was persisted")
@@ -2788,8 +2833,8 @@ class V1Store:
     def complete_awaiting_receipt(self, project_id: str, execution_key: str, result: Any) -> None:
         with self.tx(immediate=True) as db:
             db.execute(
-                "UPDATE v1_execution_receipts SET status='completed',result_json=?,error=NULL,finished_at=? WHERE project_id=? AND execution_key=? AND status='awaiting'",
-                (self._pack_json(result), utcnow(), project_id, execution_key),
+                "UPDATE v1_execution_receipts SET status=?,result_json=?,error=NULL,finished_at=? WHERE project_id=? AND execution_key=? AND status=?",
+                (ExecutionReceiptStatus.COMPLETED.value, self._pack_json(result), utcnow(), project_id, execution_key, ExecutionReceiptStatus.AWAITING.value),
             )
 
     def governance_decisions(self, project_id: str, limit: int | None = None) -> list[dict[str, Any]]:
@@ -2806,7 +2851,8 @@ class V1Store:
                 self._refresh_projection(db, project_id)
                 row = db.execute("SELECT version,projection_json,updated_at FROM v1_kanban_projection WHERE project_id=?", (project_id,)).fetchone()
         assert row is not None
-        return {"project_id": project_id, "version": row[0], "projection": json.loads(row[1]), "updated_at": row[2]}
+        return KanbanProjectionRecord(project_id=project_id, version=row[0],
+            projection=json.loads(row[1]), updated_at=row[2]).model_dump(mode='json')
 
     def unresolved_failures(self, project_id: str) -> dict[str, list[dict[str, Any]]]:
         self.get_project(project_id)
@@ -2823,27 +2869,10 @@ class V1Store:
                 "ORDER BY created_at",
                 (project_id,),
             ).fetchall()
-        return {
-            "tasks": [
-                {
-                    "id": row[0],
-                    "title": row[1],
-                    "error": row[2],
-                    "rerun_of_task_id": row[3],
-                    "finished_at": row[4],
-                }
-                for row in task_rows
-            ],
-            "conversation_jobs": [
-                {
-                    "id": row[0],
-                    "trigger_kind": row[1],
-                    "error": row[2],
-                    "finished_at": row[3],
-                }
-                for row in job_rows
-            ],
-        }
+        return UnresolvedFailures(tasks=[UnresolvedTaskFailure(id=row[0], title=row[1],
+            error=row[2], rerun_of_task_id=row[3], finished_at=row[4]) for row in task_rows],
+            conversation_jobs=[UnresolvedConversationFailure(id=row[0], trigger_kind=row[1],
+                error=row[2], finished_at=row[3]) for row in job_rows]).model_dump(mode='json')
 
     def project_quiescence(self, project_id: str) -> dict[str, Any]:
         project = self.get_project(project_id)
@@ -2891,13 +2920,10 @@ class V1Store:
         latest_activity_at = max(activity_values)
         stable_seconds = max(0.0, (now - datetime.fromisoformat(latest_activity_at)).total_seconds())
         remaining = max(0.0, self.policy.scheduling.quiescence_observation_seconds - stable_seconds)
-        blockers = {
-            "conversation_jobs": conversation_jobs,
-            "nonterminal_tasks": active_tasks,
-            "unacknowledged_mailbox": pending_mailbox,
-            "due_scheduled_reviews": due_reviews,
-            "stability_window_remaining_seconds": remaining,
-        }
+        blockers = QuiescenceBlockers(conversation_jobs=conversation_jobs,
+            nonterminal_tasks=active_tasks, unacknowledged_mailbox=pending_mailbox,
+            due_scheduled_reviews=due_reviews,
+            stability_window_remaining_seconds=remaining)
         physically_quiescent = (
             conversation_jobs == 0
             and active_tasks == 0
@@ -2907,25 +2933,16 @@ class V1Store:
         )
         attention = bool(agent_state_row and agent_state_row[0] == "attention")
         unresolved = unresolved_task_failures + unresolved_conversation_failures
-        return {
-            "project_id": project_id,
-            "quiescent": physically_quiescent,
-            "observed_at": now.isoformat(timespec="milliseconds"),
-            "latest_activity_at": latest_activity_at,
-            "required_stability_seconds": self.policy.scheduling.quiescence_observation_seconds,
-            "governance_outcome": (
-                "attention_required"
-                if attention or (physically_quiescent and unresolved)
-                else "settled"
-                if physically_quiescent
-                else "active"
-            ),
-            "blockers": blockers,
-            "unresolved_failures": {
-                "tasks": unresolved_task_failures,
-                "conversation_jobs": unresolved_conversation_failures,
-            },
-        }
+        return ProjectQuiescenceRecord(project_id=project_id,
+            quiescent=physically_quiescent, observed_at=now.isoformat(timespec="milliseconds"),
+            latest_activity_at=latest_activity_at,
+            required_stability_seconds=self.policy.scheduling.quiescence_observation_seconds,
+            governance_outcome=("attention_required" if attention or (physically_quiescent and unresolved)
+                else "settled" if physically_quiescent else "active"),
+            blockers=blockers,
+            unresolved_failures=UnresolvedFailureCounts(
+                tasks=unresolved_task_failures,
+                conversation_jobs=unresolved_conversation_failures)).model_dump(mode='json')
 
     def observe_mailbox(self, project_id: str, message_id: int) -> bool:
         return self.mailbox_service.acknowledge_pending_noop(project_id, message_id)
@@ -2979,15 +2996,18 @@ class V1Store:
             str(task["updated_at"]),
             str(task["id"]),
         ))
-        projection = {
-            "workflow": ({"id": workflow_row[0], "revision": workflow_row[1], "definition": json.loads(workflow_row[2])} if workflow_row else None),
-            "tasks": tasks,
-        }
+        projection = KanbanProjectionPayload(
+            workflow=ProjectionWorkflow(
+                id=workflow_row[0], revision=workflow_row[1],
+                definition=json.loads(workflow_row[2]),
+            ) if workflow_row else None,
+            tasks=tasks,
+        )
         now = utcnow()
         db.execute(
             "INSERT INTO v1_kanban_projection(project_id,version,projection_json,updated_at) VALUES(?,?,?,?) "
             "ON CONFLICT(project_id) DO UPDATE SET version=excluded.version,projection_json=excluded.projection_json,updated_at=excluded.updated_at",
-            (project_id, int(version_row[0]), json.dumps(projection, ensure_ascii=False), now),
+            (project_id, int(version_row[0]), projection.model_dump_json(), now),
         )
 
     def _mailbox(

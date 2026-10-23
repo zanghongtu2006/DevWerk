@@ -2,8 +2,8 @@
 import hashlib
 import json
 
-from app.v1.files import ProjectFiles
-from app.v1.task_identity import resolve_input_pointer
+from app.v1.workspace.files import ProjectFiles
+from app.v1.workflows.task_identity import resolve_input_pointer
 
 
 def validate_entry_evidence(store, project_id, plan, method):
