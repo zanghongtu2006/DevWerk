@@ -46,6 +46,32 @@ def test_provider_usage_calibrates_oversized_tool_schema_budget(store, tmp_path)
     assert manager.last_metrics['estimated_tokens'] < before
 
 
+def test_conversation_usage_calibration_survives_a_new_run_without_checkpoint(store, tmp_path):
+    project = store.create_project('conversation budget', '', str(tmp_path / 'project'))
+    def manager(session, run, model='same-model'):
+        spec = AgentRunSpec(kind='conversation', project=project, instruction='',
+            instruction_revision=1, context={}, capability_ids=[], agent_session_id=session)
+        def complete(*args, **kwargs):
+            return None
+        complete.context_limits = lambda kind: {'window': 160_000, 'output': 16_000,
+            'protocol': 'openai', 'model': model}
+        return ContextManager(store, spec, run, complete)
+
+    tools = [{'type': 'function', 'function': {'name': 'large_tool',
+        'description': 'schema ' * 26_000, 'parameters': {'type': 'object'}}}]
+    messages = [{'role': 'system', 'content': 'Agent'},
+        {'role': 'user', 'content': 'Start the agreed work.'}]
+    first = manager('session-a', 'run-a')
+    first.prepare(messages, tools)
+    first.observe(AgentModelResponse(usage={'input_tokens': first.last_bytes // 5}))
+    with store.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM v1_context_checkpoints').fetchone()[0] == 0
+    second = manager('session-a', 'run-b')
+    assert second.ratio == pytest.approx(first.ratio)
+    assert second.estimate(messages, tools) < manager('session-b', 'run-c').estimate(messages, tools)
+    assert manager('session-a', 'run-d', model='other-model').ratio == first.policy.cold_start_tokens_per_byte
+
+
 def test_current_task_contract_survives_compaction_and_revision_change(store, tmp_path):
     from app.v1.protocols.tools.planning.capability_contracts import TaskPlanContractReceipt
 

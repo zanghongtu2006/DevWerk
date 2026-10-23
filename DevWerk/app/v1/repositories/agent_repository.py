@@ -42,6 +42,11 @@ class AgentRepository:
                     agent_run_id TEXT NOT NULL, revision INTEGER NOT NULL, through_message_id INTEGER NOT NULL,
                     summary_json TEXT NOT NULL, source_hash TEXT NOT NULL, metrics_json TEXT NOT NULL,
                     created_at TEXT NOT NULL, UNIQUE(scope_id,revision))""",
+                """CREATE TABLE IF NOT EXISTS v1_context_usage_calibrations (
+                    project_id TEXT NOT NULL REFERENCES v1_projects(id) ON DELETE CASCADE,
+                    scope_id TEXT NOT NULL, model TEXT NOT NULL, protocol TEXT NOT NULL,
+                    ratio REAL NOT NULL, updated_at TEXT NOT NULL,
+                    PRIMARY KEY(project_id,scope_id,model,protocol))""",
                 """CREATE TABLE IF NOT EXISTS v1_worker_inputs (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES v1_projects(id) ON DELETE CASCADE,
                     recipient_agent_id TEXT NOT NULL, assignment_id TEXT, payload_json TEXT NOT NULL,

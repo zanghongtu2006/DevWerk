@@ -296,11 +296,16 @@ class ContextManager:
         # A conservative cold start; Provider usage calibrates subsequent turns.
         self.ratio = self.policy.cold_start_tokens_per_byte
         self.last_bytes = 0
-        self.scope = (spec.assignment or {}).get('id') or run_id
+        self.scope = (spec.assignment or {}).get('id') or spec.agent_session_id or run_id
         self.last_metrics = {}
         with self.store.connect() as db:
+            usage = db.execute('''SELECT ratio FROM v1_context_usage_calibrations
+                WHERE project_id=? AND scope_id=? AND model=? AND protocol=?''',
+                (spec.project['id'], self.scope, self.limits['model'], self.limits['protocol'])).fetchone()
             row = db.execute('SELECT metrics_json FROM v1_context_checkpoints WHERE scope_id=? ORDER BY revision DESC LIMIT 1',(self.scope,)).fetchone()
-        if row:
+        if usage:
+            self.ratio = max(self.policy.observed_tokens_per_byte_floor, float(usage['ratio']))
+        elif row:
             metrics = json.loads(row[0])
             if metrics.get('model') == self.limits['model'] and metrics.get('protocol') == self.limits['protocol']:
                 self.ratio = max(self.policy.observed_tokens_per_byte_floor,
@@ -320,6 +325,13 @@ class ContextManager:
             # Retain a margin and the existing Provider overflow retry path.
             self.ratio = max(self.policy.observed_tokens_per_byte_floor,
                 actual / self.last_bytes * self.policy.observed_usage_margin)
+            with self.store.tx(immediate=True) as db:
+                db.execute('''INSERT INTO v1_context_usage_calibrations
+                    (project_id,scope_id,model,protocol,ratio,updated_at) VALUES(?,?,?,?,?,?)
+                    ON CONFLICT(project_id,scope_id,model,protocol)
+                    DO UPDATE SET ratio=excluded.ratio,updated_at=excluded.updated_at''',
+                    (self.spec.project['id'], self.scope, self.limits['model'],
+                     self.limits['protocol'], self.ratio, utcnow()))
         self.last_metrics['context_input_tokens'] = actual
 
     @staticmethod
