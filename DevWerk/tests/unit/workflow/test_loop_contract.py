@@ -327,6 +327,24 @@ def test_novel_task_plan_requires_and_materializes_strict_chapter_dependencies(s
     assert tasks["chapter_02"]["status"] == "pending"
 
 
+def test_task_plan_preflight_uses_canonical_chapter_number_for_graph_admission(store, tmp_path):
+    from app.v1.capabilities import CapabilityContext, build_core_registry
+    from app.v1.tooling.capability_handlers import _task_plan_validate
+
+    project = store.create_project("novel preflight", "", str(tmp_path / "novel-preflight"))
+    store.apply_loop(project["id"], "novel.production", NOVEL_BINDINGS)
+    active = store.get_workflow(project["id"])
+    workflow = WorkflowDefinition.model_validate(active["definition"])
+    payload = task_plan(active["id"], workflow, task_ref="chapter_01",
+        title="chapter 1", input_data=novel_task_input(1)).model_dump(mode="json")
+    payload["tasks"][0]["input"]["chapter_number"] = "1"
+    context = CapabilityContext(project_id=project["id"], project=project, store=store)
+    result = _task_plan_validate({"plan": payload}, context, build_core_registry())
+    assert result["valid"], result["diagnostics"]
+    saved = store.create_task_plan(project["id"], TaskPlan.model_validate(payload))
+    assert saved["plan"]["tasks"][0]["input"]["chapter_number"] == 1
+
+
 def test_linear_task_plan_extends_project_graph_without_recreating_predecessor(store, tmp_path):
     project = store.create_project("incremental novel", "", str(tmp_path / "incremental-novel"))
     store.apply_loop(project["id"], "novel.production", NOVEL_BINDINGS)

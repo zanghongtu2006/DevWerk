@@ -100,9 +100,12 @@ class AgentToolBatchExecutor:
             call.name in exclusive for call in tool_calls
         ):
             protocol_error = 'Submit an execution/control authorization or conversation.reply alone; read its receipt before choosing the next action. This batch had no effects.'
+        same_plan_creates = (bool(tool_calls) and all(call.name == 'task.create' for call in tool_calls)
+            and len({call.arguments.get('task_plan_id') for call in tool_calls}) == 1
+            and bool(tool_calls[0].arguments.get('task_plan_id')))
         if self.spec.kind == 'conversation' and len(tool_calls) > 1 and any(
             call.name in QUEUED_TASK_CAPABILITIES for call in tool_calls
-        ):
+        ) and not same_plan_creates:
             protocol_error = 'Queue one Task action alone, then finish this turn with conversation.reply so Workers can start.'
         if self.spec.kind == 'conversation' and any(
             entry['ok'] and entry['capability'] in QUEUED_TASK_CAPABILITIES

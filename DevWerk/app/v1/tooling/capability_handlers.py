@@ -874,23 +874,25 @@ def _task_plan_save(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, A
 def _task_plan_validate(args, ctx, registry):
     # The compiler imports capability validation at call time; retain this lazy
     # import to avoid a cycle between plan diagnostics and Tool handlers.
-    from app.v1.services.task_plan_compiler import diagnose_task_plan, diagnose_acceptance_launches
+    from app.v1.services.task_plan_compiler import compile_task_plan, diagnose_task_plan, diagnose_acceptance_launches
     plan = TaskPlanValidateInput.model_validate(args).plan
     revision = ctx.store.get_workflow_revision(ctx.project_id, plan.workflow_revision_id)
     method = WorkflowPlan.model_validate(ctx.store.get_workflow_plan(ctx.project_id, revision['workflow_plan_id'])['plan'])
     result = ValidationReceipt.model_validate(diagnose_task_plan(
         plan, WorkflowDefinition.model_validate(revision['definition']), method, registry,
     ))
+    if result.valid:
+        plan = compile_task_plan(plan, WorkflowDefinition.model_validate(revision['definition']), method, registry)
     launches = diagnose_acceptance_launches(ctx.store,ctx.project_id,WorkflowDefinition.model_validate(revision['definition']))
     result.diagnostics.extend(ValidationDiagnostic.model_validate(item) for item in launches['diagnostics'])
     result.deferred_command_checks = [DeferredCommandCheck.model_validate(item) for item in launches['deferred_command_checks']]
     binding = ctx.store.get_project_loop_binding(ctx.project_id, plan.workflow_revision_id)
-    for check in (
+    for check in (() if result.diagnostics else (
         lambda: validate_entry_evidence(ctx.store, ctx.project_id, plan, method),
         lambda: validate_task_graph_admission(plan,method.task_contract.dependency_contract,method.task_contract.admission_constraints,
             loop_bindings=dict(binding.get('bindings') or {}) if binding else {},
             existing_orders=existing_task_orders(ctx.store,ctx.project_id,method.task_contract.dependency_contract)),
-    ):
+    )):
         try:
             check()
         except ValueError as exc:

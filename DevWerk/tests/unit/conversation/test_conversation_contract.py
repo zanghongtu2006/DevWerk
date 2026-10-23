@@ -3,6 +3,7 @@ from __future__ import annotations
 from tests.support.paths import REPO_ROOT
 
 import asyncio
+import copy
 import json
 import threading
 from pathlib import Path
@@ -149,6 +150,59 @@ def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text
     assert not receipts['premature-cancel']['ok']
     assert receipts['premature-cancel']['result']['error']['type'] == 'ConversationTurnProtocolError'
     assert store.claim_task(job['result']['task_ids'][0], 'runtime-after-reply') is not None
+
+
+def test_same_plan_task_create_batch_materializes_one_ordered_graph(store, tmp_path):
+    from tests.helpers import resolve_execution_before
+
+    project = store.create_project('batch plan', '', str(tmp_path / 'batch-plan'))
+    store.apply_loop(project['id'], 'novel.production', {
+        'project_title': 'Two chapters', 'premise': 'One continuous story',
+        'chapter_count': 2, 'chapter_target_characters': 800,
+        'chapter_max_characters': 1500,
+    })
+    active = store.get_workflow(project['id'])
+    definition = WorkflowDefinition.model_validate(active['definition'])
+    plan = task_plan(active['id'], definition, task_ref='chapter_01', title='Chapter 1',
+        input_data={'chapter_number': 1, 'summary_path': 'summaries/01.md',
+                    'body_path': 'chapters/01.md', 'review_path': 'reviews/01.md'}).model_dump(mode='json')
+    second = copy.deepcopy(plan['tasks'][0])
+    second['proposed_task_ref'] = 'chapter_02'
+    second['title'] = 'Chapter 2'
+    second['input'] = {'chapter_number': 2, 'summary_path': 'summaries/02.md',
+                       'body_path': 'chapters/02.md', 'review_path': 'reviews/02.md'}
+    second['dependencies'] = ['chapter_01']
+    second['readiness']['decision'] = 'queue'
+    plan['tasks'].append(second)
+    calls = 0
+
+    def model(_messages, _tools, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return AgentModelResponse(tool_calls=[AgentToolCall(id='save',
+                name='task.plan.save', arguments={'plan': plan})])
+        if calls == 2:
+            plan_id = store.list_task_plans(project['id'])[0]['id']
+            return AgentModelResponse(tool_calls=[AgentToolCall(id=f'create-{ref}',
+                name='task.create', arguments={'task_plan_id': plan_id,
+                    'proposed_task_ref': ref}) for ref in ('chapter_01', 'chapter_02')])
+        return AgentModelResponse(tool_calls=[AgentToolCall(id='reply',
+            name='conversation.reply', arguments={'mode': 'work_result',
+                'tool_call_ids': ['save', 'create-chapter_01', 'create-chapter_02']})])
+
+    registry = build_core_registry()
+    gateway = ConversationGateway(store, registry,
+        agent_core=AgentCore(store, registry, resolve_execution_before(model)))
+    accepted = run_turn(gateway, project['id'], 'Write the agreed two chapters.', True)
+    job = store.get_conversation_job(accepted['job']['id'])
+    assert job['status'] == 'succeeded'
+    assert {item['proposed_task_ref'] for item in store.list_tasks(project['id'])} == {
+        'chapter_01', 'chapter_02'}
+    invocations = {item['tool_call_id']: item for item in store.tool_invocations(
+        project['id'], job['agent_run_id'])}
+    assert invocations['create-chapter_01']['ok']
+    assert invocations['create-chapter_02']['ok']
 
 
 def test_conversation_with_loop_workflow_can_revise_but_cannot_reapply_loop(store, tmp_path):
