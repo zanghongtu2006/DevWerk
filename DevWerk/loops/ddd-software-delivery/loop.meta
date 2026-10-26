@@ -1,41 +1,40 @@
 # DDD Software Delivery
 
-## Description: <br>
-Deliver a confirmed client-server software requirement through requirement validation, domain-driven design, separate backend and frontend implementation, integration review, independent testing, operable packaging, and final acceptance. <br>
+## Description
+针对已讨论清楚的前后端软件需求，提供从需求确认、设计、实现到验证和交付的协作方法建议。
 
-## Publisher: <br>
-DevWerk <br>
+## Publisher
+DevWerk
 
-## Category: <br>
-software_delivery <br>
+## Category
+software_delivery
 
-## Tags: <br>
-- software-development <br>
-- domain-driven-design <br>
-- pair-programming <br>
-- frontend-backend-collaboration <br>
-- automated-testing <br>
-- devops <br>
-- release-readiness <br>
+## Tags
+- software-development
+- domain-driven-design
+- frontend-backend-collaboration
+- testing
 
-## Use Case: <br>
-Use for a client-server software delivery scope whose user-visible requirement and acceptance criteria have been confirmed. Backend, frontend, and integration review are separate observable Workflow Columns; implementation Columns can retain their own logical sessions across directed rework. The delivery may target a local package, container, source repository, or an external CI/CD platform. <br>
+## Use Case
+适合需要交付可运行软件、且前后端与集成工作可以分工的项目。
 
-## Selection Guide: <br>
-Select when the work must produce runnable software and verifiable engineering evidence. Continue user conversation instead when product behavior, acceptance criteria, or delivery target remains materially ambiguous. <br>
+## Selection Guide
+先确认用户目标、边界和交付方式；若需求尚不明确，继续讨论。此卡片不是现成工作流，应按当前项目决定阶段、顺序、返工边和验收方式。
 
-## Loop Input: <br>
-Project name and delivery target are Project bindings. Each Task is one independently accepted delivery scope traversing every Column, not a Column-sized stage. Before TaskPlan save, write the accepted requirement baseline and supply Task.entry_evidence: confirmed_scope = current execution grant ID; requirements_file = successful project.files.write execution_key. Keep exact_input_strings empty for these agent Tasks. <br>
+## Loop Input
+用户确认的功能、约束、技术偏好、现有项目和交付目标。
 
-## Loop Output: <br>
-Traceable requirements, domain and interface design, reviewed source code, automated test evidence, operable delivery assets, and final acceptance. <br>
+## Loop Output
+可运行实现以及能够支持交付判断的设计、集成、测试和使用说明。
 
-## Loop Version(s): <br>
-1.4.10 <br>
+## Loop Version(s)
+2.0.0
 
-## Loop Key: <br>
-software.ddd_delivery <br>
+## Loop Key
+software.ddd_delivery
 
-## Reference(s): <br>
-- [Executable bundle](loop.json) <br>
-- [Software acceptance guidance](assets/acceptance-report.md) <br>
+## Suggested stages
+根据实际需求考虑需求梳理、领域与接口设计、后端实现、前端实现、联调、验证和交付。每个阶段由单个负责者执行；需协作时通过相邻阶段及明确反馈交接。若项目不涉及某一部分，省略相应阶段。按当前需求决定哪些问题应退回设计或实现，不预设固定返工路径。
+
+## Evidence and completion
+由 Conversation Agent 与用户确定什么结果可证明每个阶段完成。验证结论应引用实际执行证据；出现缺陷时，反馈到能够处理该缺陷的阶段。最终交付应能由用户运行、检查或继续开发。

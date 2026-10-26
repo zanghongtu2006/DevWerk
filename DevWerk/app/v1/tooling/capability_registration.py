@@ -4,15 +4,20 @@ from __future__ import annotations
 from typing import Any
 from app.v1.domain import TaskCreate
 from app.v1.protocols.tools.core.capability_protocol import StructuredObjectParameter
+from app.v1.protocols.tools.core.tool_catalog_contracts import (
+    ToolCatalogSearchInput, ToolCatalogSearchReceipt, ToolCatalogSelectInput,
+    ToolCatalogSelectReceipt, ToolCatalogDescribeInput, ToolCatalogDescribeReceipt,
+    ToolCatalogCallInput, ToolCatalogCallReceipt, ToolExposure,
+)
 from app.v1.protocols.tools.planning.capability_contracts import TaskPlanListReceipt, TaskPlanSaveInput, TaskPlanSaveReceipt, TaskPlanValidateInput, TaskPlanContractReceipt, TaskReceipt, ValidationReceipt, WorkflowAcceptanceConfigureReceipt, WorkflowCreateInput, WorkflowPlanSaveInput, WorkflowPlanListReceipt, WorkflowPlanSaveReceipt, WorkflowPublishInput, WorkflowReceipt
 from app.v1.protocols.tools.agent.capability_memory_contracts import MemoryAppendInput, MemoryReadInput, MemoryReadReceipt, MemoryRecordReceipt, MemorySearchReceipt, MemorySearchInput, MemorySupersedeInput, MemoryWriteInput
 from app.v1.protocols.tools.workspace.capability_file_contracts import FilePathInput, FileReadInput, FileVerifyInput, FileVerifyOutput, FileWriteInput
 from app.v1.protocols.tools.workspace.capability_workspace_contracts import CommandRunInput, ProjectFileListInput, ProjectFileSearchInput, SystemFileListInput, SystemFileReadInput, SystemFileSearchInput, SystemFileWriteInput, with_maximum_limit
-from app.v1.protocols.tools.core.capability_misc_contracts import EventListInput, GovernanceDecisionInput, InstructionUpdateInput, LoopApplyInput, LoopInspectInput, LoopListInput, PageLimitInput, SupervisionScheduleInput, with_maximum_page_limit
+from app.v1.protocols.tools.core.capability_misc_contracts import EventListInput, GovernanceDecisionInput, InstructionUpdateInput, LoopInspectInput, LoopListInput, PageLimitInput, SupervisionScheduleInput, with_maximum_page_limit
 from app.v1.protocols.tools.workspace.capability_workspace_receipts import CommandReceipt, FileListReceipt, FileMeasureReceipt, FilePageReceipt, FileReadReceipt, FileSearchReceipt, ProjectFileWriteReceipt, SystemFileWriteReceipt
 from app.v1.protocols.tools.core.capability_misc_receipts import EventListReceipt, GovernanceDecisionReceipt, NoopReceipt, SupervisionScheduleReceipt
 from app.v1.protocols.tools.planning.capability_project_receipts import ConversationAgentRecord, OptionalWorkflowRevisionReceipt, ProjectInspectReceipt
-from app.v1.protocols.tools.planning.capability_loop_receipts import LoopApplyReceipt, LoopInspectReceipt, LoopListReceipt
+from app.v1.protocols.tools.planning.capability_loop_receipts import LoopInspectReceipt, LoopListReceipt
 from app.v1.protocols.tools.planning.capability_task_receipts import TaskInspectReceipt, TaskListReceipt, TaskRecord, TaskSuccessorReceipt
 from app.v1.protocols.workflow.scheduler_receipt_contracts import SchedulingDecisionReceipt
 from app.v1.protocols.storage.store_receipt_contracts import BacklogRecord
@@ -29,7 +34,8 @@ from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, V1RuntimePolicy
 from app.v1.workflows.workflow_acceptance_editor import WorkflowAcceptanceEdit
 from app.v1.protocols.tools.agent.capability_conversation_contracts import ConversationHistoryInput, ConversationTurnResolutionInput, EmptyInput, ExecutionAuthorizeInput, TaskControlAuthorizeInput
 
-from app.v1.tooling.builtin_tool_catalog import BuiltinTool
+from app.v1.tooling.builtin_tool_catalog import BuiltinTool, DIRECT_CONVERSATION_TOOLS, WORKFLOW_GOVERNED_TOOLS
+from app.v1.tooling.tool_presentation import ToolPresentation
 from app.v1.tooling.capability_registry import (
     ArgumentPreflight, CapabilityContext, CapabilityEntry, CapabilityHandler, CapabilityRegistry,
 )
@@ -54,7 +60,6 @@ from app.v1.tooling.capability_handlers import (
     _files_write,
     _inspect_conversation_turn,
     _instruction_update,
-    _loop_apply,
     _loop_list,
     _memory_append,
     _memory_read,
@@ -74,6 +79,7 @@ from app.v1.tooling.capability_handlers import (
     _system_files_search,
     _system_files_write,
     _task_create,
+    _task_cancel,
     _task_fail,
     _task_inspect,
     _task_list,
@@ -102,9 +108,14 @@ PLAN_OBJECT_PARAMETER = StructuredObjectParameter("plan")
 WORKFLOW_OBJECT_PARAMETER = StructuredObjectParameter("workflow")
 
 
+def _catalog_call_requires_agent_boundary(_args: dict[str, Any], _ctx: CapabilityContext) -> dict[str, Any]:
+    raise ValueError("tool.catalog.call requires the Agent operation boundary")
+
+
 def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegistry:
     policy = policy or DEFAULT_V1_RUNTIME_POLICY
     registry = CapabilityRegistry(policy)
+    presentation = ToolPresentation(registry)
     registry._bulk_registration = True
     # Defer Workflow schema refresh until every delegable Tool has been registered.
     workflow_publish_input_schema = WorkflowPublishInput.model_json_schema()
@@ -140,11 +151,29 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
                 handler=handler,
                 side_effect_kind=definition.side_effect_kind,
                 delegable_to_column=definition.delegable_to_column,
+                exposure=(definition.exposure or
+                          (ToolExposure.DIRECT if tool in DIRECT_CONVERSATION_TOOLS else ToolExposure.ON_DEMAND)),
+                workflow_governed=tool in WORKFLOW_GOVERNED_TOOLS,
                 argument_preflight=argument_preflight,
                 workflow_reference_fields=workflow_reference_fields,
                 structured_object_parameters=structured_object_parameters,
             )
         )
+
+    # Run-local Tool discovery does not change the durable capability snapshot.
+    register_builtin(BuiltinTool.TOOL_CATALOG_SEARCH,
+        ToolCatalogSearchInput.model_json_schema(), presentation.search,
+        output_schema=ToolCatalogSearchReceipt.model_json_schema())
+    register_builtin(BuiltinTool.TOOL_CATALOG_SELECT,
+        ToolCatalogSelectInput.model_json_schema(), presentation.select,
+        output_schema=ToolCatalogSelectReceipt.model_json_schema())
+    register_builtin(BuiltinTool.TOOL_CATALOG_DESCRIBE,
+        ToolCatalogDescribeInput.model_json_schema(), presentation.describe,
+        output_schema=ToolCatalogDescribeReceipt.model_json_schema())
+    register_builtin(BuiltinTool.TOOL_CATALOG_CALL,
+        ToolCatalogCallInput.model_json_schema(),
+        _catalog_call_requires_agent_boundary,
+        output_schema=ToolCatalogCallReceipt.model_json_schema())
 
     # Conversation turn and user authorization tools.
     register_builtin(BuiltinTool.CONVERSATION_REPLY,
@@ -288,7 +317,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         _command_run,
         output_schema=CommandReceipt.model_json_schema(),
     )
-    # Optional Loop templates and Workflow/Task planning contracts.
+    # Optional descriptive Loop guides and Workflow/Task planning contracts.
     register_builtin(
         BuiltinTool.LOOP_LIST,
         with_maximum_page_limit(LoopListInput, policy.service_limits.max_page_size).model_json_schema(),
@@ -300,12 +329,6 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         LoopInspectInput.model_json_schema(),
         lambda args, ctx: ctx.store.get_loop(LoopInspectInput.model_validate(args).loop_key),
         output_schema=LoopInspectReceipt.model_json_schema(),
-    )
-    register_builtin(
-        BuiltinTool.LOOP_APPLY,
-        LoopApplyInput.model_json_schema(),
-        _loop_apply,
-        output_schema=LoopApplyReceipt.model_json_schema(),
     )
     register_builtin(
         BuiltinTool.WORKFLOW_PLAN_SAVE,
@@ -323,7 +346,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     register_builtin(
         BuiltinTool.TASK_PLAN_SAVE,
         task_plan_save_input_schema,
-        _task_plan_save,
+        lambda args, ctx: _task_plan_save(args, ctx, registry),
         output_schema=TaskPlanSaveReceipt.model_json_schema(),
         structured_object_parameters=(PLAN_OBJECT_PARAMETER,),
     )
@@ -344,7 +367,6 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
         workflow_create_input_schema,
         lambda args, ctx: _workflow_create(args, ctx, registry),
         output_schema=workflow_receipt,
-        structured_object_parameters=(WORKFLOW_OBJECT_PARAMETER,),
     )
     register_builtin(
         BuiltinTool.WORKFLOW_PUBLISH,
@@ -450,7 +472,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     register_builtin(
         BuiltinTool.TASK_CANCEL,
         TaskFailureInput.model_json_schema(),
-        _task_fail,
+        _task_cancel,
         output_schema=TaskRecord.model_json_schema(),
     )
     register_builtin(

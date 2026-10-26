@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Literal
 
@@ -43,6 +44,7 @@ class LLMModelConfig(BaseModel):
     provider: str = Field(min_length=1)
     model: str = Field(min_length=1)
     request_timeout_seconds: float = Field(gt=0)
+    stream_response: bool = False
     thinking_mode: str = Field(min_length=1)
     temperature: float
     top_p: float | None = Field(default=None, ge=0, le=1)
@@ -99,6 +101,7 @@ class ApiProfile:
     trust_env_proxy: bool = False
     connect_max_attempts: int = 3
     request_timeout_seconds: float = 600.0
+    stream_response: bool = False
 
 
 @dataclass(frozen=True)
@@ -120,6 +123,7 @@ class AgentModelConfig:
             trust_env_proxy=self.api.trust_env_proxy,
             connect_max_attempts=self.api.connect_max_attempts,
             request_timeout_seconds=self.api.request_timeout_seconds,
+            stream_response=self.api.stream_response,
             thinking_mode=self.thinking_mode, temperature=self.temperature,
             top_p=self.top_p, max_tokens=self.max_tokens,
             context_window=self.context_window).model_dump(mode="json")
@@ -163,6 +167,11 @@ class Settings(BaseSettings):
         return self.app_env.lower() in {"dev", "development", "local"}
 
     def llm_config(self) -> LLMCatalog:
+        """Return the process-local validated model configuration snapshot."""
+        return self._validated_llm_config.model_copy(deep=True)
+
+    @cached_property
+    def _validated_llm_config(self) -> LLMCatalog:
         path = _resolve_config_path(self.devwerk_llm_config_path)
         source = None
         label = ""
@@ -261,6 +270,7 @@ def _api_profile(
         trust_env_proxy=runtime.trust_env_proxy,
         connect_max_attempts=runtime.connect_max_attempts,
         request_timeout_seconds=model.request_timeout_seconds,
+        stream_response=model.stream_response,
     )
 
 

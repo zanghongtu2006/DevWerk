@@ -12,6 +12,7 @@ class WorkflowGlobalSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     auto_resume_previous_tasks: bool = False
+    require_task_plan_preview: bool = True
 
 
 class GlobalSettings(BaseModel):
@@ -27,6 +28,12 @@ GLOBAL_SETTINGS_FIELDS: tuple[GlobalSettingField, ...] = (
         label="启动后自动继续未完成任务",
         description="开启后，DevWerk 启动时会自动恢复上一次未完成的 Workflow；关闭时等待用户通过 Conversation Agent 恢复。",
         restart_required=True,
+    ),
+    GlobalSettingField(
+        key="workflow.require_task_plan_preview", group="workflow",
+        label="保存任务计划前要求显式预览",
+        description="开启时，Conversation Agent 必须先以相同计划取得 task.plan.validate 的有效回执；关闭时可直接保存，保存时仍执行全部校验。",
+        restart_required=False,
     ),
 )
 

@@ -309,20 +309,41 @@ class ConversationIntentRepository:
             return 'EventMutationDisabled: notifications cannot authorize planning, execution or Task control; Runtime follows the frozen Workflow'
         if not job['start_task'] or job['requested_mode'] == 'discuss':
             return 'ConversationMutationDisabled: this user turn explicitly permits discussion only'
+        if contract['phase'] == 'discussion':
+            return 'ConversationMutationDisabled: this turn was settled as discussion'
+        if not self.store.registry.is_workflow_governed(capability):
+            # A user-facing Conversation Agent is a general Agent. Requirement
+            # grants govern Kanban state, not files, commands, Memory or MCP.
+            return None
         if contract['phase'] == 'targeted_control':
             return None if (capability == contract['control_capability'] and arguments.get('task_id') == contract['control_task_id']) else 'TurnControlScopeMismatch: only the requested Task control is allowed'
         if contract['phase'] != 'execution':
             if contract['phase'] == 'unresolved' and capability in {'task.retry', 'task.reopen', 'agent.worker.send'}:
                 return ('RecoveryRequiresExecutionAuthorization: call conversation.execution.authorize '
                         'with request=continue before Worker input, task.retry or task.reopen')
-            return 'TurnUnresolved: call conversation.execution.authorize or conversation.task.control.authorize before business mutations' if contract['phase'] == 'unresolved' else 'ConversationMutationDisabled: continue discussing; no work was authorized'
+            return 'TurnUnresolved: call conversation.execution.authorize before business mutations' if contract['phase'] == 'unresolved' else 'ConversationMutationDisabled: continue discussing; no work was authorized'
         with self.store.connect() as db:
             grant = db.execute('SELECT * FROM v1_execution_grants WHERE id=? AND project_id=?',
                                (job['execution_grant_id'],ctx.project_id)).fetchone()
         if not grant:
             return 'ExecutionGrantMissing'
         if grant['state'] == 'pending_scope_revision':
-            return None if capability == 'project.scope.revise' and arguments.get('requirement_id') == grant['requirement_id'] else 'ScopeRevisionPending: revise the requested scope before creating work'
+            if capability == 'project.scope.revise' and arguments.get('requirement_id') == grant['requirement_id']:
+                return None
+            if grant['kind'] == 'extend' and capability in {'task.pause', 'task.cancel'}:
+                task_id = arguments.get('task_id')
+                if isinstance(task_id, str):
+                    try:
+                        task = self.store.get_project_task(ctx.project_id, task_id)
+                        active = self.store.get_workflow(ctx.project_id)
+                    except KeyError:
+                        task = None
+                        active = None
+                    if (task and active and task['workflow_revision_id'] == active['id']
+                            and (task['requirement_id'], task['requirement_revision']) ==
+                            (grant['requirement_id'], grant['requirement_revision'])):
+                        return None
+            return 'ScopeRevisionPending: settle or stop blocking Tasks in this Requirement, then revise scope before creating new work'
         req = self.store.agents.get_requirement(ctx.project_id, grant['requirement_id'])
         if grant['state'] != 'active' or req['status'] != 'active' or req['revision'] != grant['requirement_revision']:
             return 'ExecutionScopeClosed: the current grant is closed or superseded'

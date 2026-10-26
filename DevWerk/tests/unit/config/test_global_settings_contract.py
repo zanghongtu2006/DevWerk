@@ -21,6 +21,8 @@ from app.core.global_settings import (
 from app.core.logging import _daily_archive_name, configure_logging
 from app.core.restart import ManagedRestart
 from app.v1.capabilities import CapabilityContext, _task_resume
+from app.v1.agents.agent_models import AgentRunSpec
+from app.v1.agents.agent_run_preparation import AgentRunPreparer
 from app.v1.domain import TaskPlan
 from tests.helpers import (
     create_planned_task,
@@ -39,6 +41,7 @@ def test_global_settings_default_disables_previous_task_auto_resume(tmp_path):
     loaded = load_global_settings(path)
 
     assert loaded.workflow.auto_resume_previous_tasks is False
+    assert loaded.workflow.require_task_plan_preview is True
 
 
 def test_global_settings_reject_unknown_fields(tmp_path):
@@ -67,6 +70,7 @@ def test_global_settings_save_round_trip_and_publish_edit_metadata(tmp_path):
     assert not path.with_name("global-settings.yaml.tmp").exists()
     payload = global_settings_payload(settings)
     assert payload["values"]["workflow"]["auto_resume_previous_tasks"] is True
+    assert payload["values"]["workflow"]["require_task_plan_preview"] is True
     assert payload["fields"] == [
         {
             "key": "workflow.auto_resume_previous_tasks",
@@ -75,7 +79,15 @@ def test_global_settings_save_round_trip_and_publish_edit_metadata(tmp_path):
             "description": "开启后，DevWerk 启动时会自动恢复上一次未完成的 Workflow；关闭时等待用户通过 Conversation Agent 恢复。",
             "type": "boolean",
             "restart_required": True,
-        }
+        },
+        {
+            "key": "workflow.require_task_plan_preview",
+            "group": "workflow",
+            "label": "保存任务计划前要求显式预览",
+            "description": "开启时，Conversation Agent 必须先以相同计划取得 task.plan.validate 的有效回执；关闭时可直接保存，保存时仍执行全部校验。",
+            "type": "boolean",
+            "restart_required": False,
+        },
     ]
 
 
@@ -89,6 +101,21 @@ def test_restart_is_requested_only_for_changed_startup_setting(tmp_path):
     assert restart_required_changes(disabled, enabled) == [
         "workflow.auto_resume_previous_tasks"
     ]
+    preview_disabled = GlobalSettings(workflow=WorkflowGlobalSettings(require_task_plan_preview=False))
+    assert restart_required_changes(disabled, preview_disabled) == []
+
+
+def test_task_plan_preview_setting_is_snapshotted_per_conversation_run(store, tmp_path):
+    project = store.create_project('planning setting', '', str(tmp_path / 'project'))
+    preparer = AgentRunPreparer(store=store, registry=store.registry,
+        runtime_policy=store.policy, platform_policy=None)
+    for required in (True, False):
+        settings = GlobalSettings(workflow=WorkflowGlobalSettings(
+            require_task_plan_preview=required))
+        spec = AgentRunSpec(kind='conversation', project=project, instruction='',
+            instruction_revision=1, context={'global_settings': settings.model_dump(mode='json')},
+            capability_ids=[])
+        assert preparer._capability_context(spec).require_task_plan_preview is required
 
     marker = tmp_path / "restart.request"
     restart = ManagedRestart(marker, enabled=False)

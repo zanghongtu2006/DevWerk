@@ -17,7 +17,7 @@ export function renderSettings(state) {
   return `<div class="settings-page">
     <header class="page-heading"><div><span class="eyebrow">GLOBAL SETTINGS</span><h1>全局设置</h1><p>设置保存在 config/global-settings.yaml。仅展示 DevWerk 已声明并验证的配置项。</p></div></header>
     <form id="global-settings-form" class="card settings-card">
-      <div class="settings-section-head"><div><span class="eyebrow">WORKFLOW</span><h2>Workflow 启动行为</h2></div><span class="read-only-label">YAML BACKED</span></div>
+      <div class="settings-section-head"><div><span class="eyebrow">WORKFLOW</span><h2>Workflow 设置</h2></div><span class="read-only-label">YAML BACKED</span></div>
       <div class="settings-list">${fields}</div>
       <footer class="settings-actions"><span>需要重启的变更会先保存，再由 startup.bat 使用项目 venv 自动拉起服务。</span><button class="button primary" type="submit">保存设置</button></footer>
     </form>

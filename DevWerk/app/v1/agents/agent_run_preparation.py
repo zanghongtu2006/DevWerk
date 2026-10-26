@@ -18,8 +18,11 @@ from app.v1.context.context_projection import project_handoff, project_ledger
 from app.v1.capabilities import CapabilityContext, CapabilityRegistry
 from app.v1.tooling.completion_protocol import CompletionContract, completion_tool_schema
 from app.v1.policy import PlatformPolicySnapshot, V1RuntimePolicy
+from app.core.global_settings import GlobalSettings
 from app.v1.context.session_replay import replayable_session_messages
 from app.v1.tooling.tool_protocol import await_tool_schema
+from app.v1.protocols.tools.core.tool_catalog_contracts import ToolExposure
+from app.v1.tooling.builtin_tool_catalog import BuiltinTool
 
 
 @dataclass(frozen=True)
@@ -78,7 +81,14 @@ class AgentRunPreparer:
                     allowed.append(capability_id)
         capabilities = self.registry.resolve(allowed, pre_run_context)
         effect_kinds = {item.id: item.side_effect_kind.value for item in capabilities}
-        tools = [item.tool_schema() for item in capabilities]
+        progressive_tools = (spec.kind == 'conversation' and bool(spec.conversation_job_id)
+            and {BuiltinTool.TOOL_CATALOG_SEARCH.value.id,
+                 BuiltinTool.TOOL_CATALOG_DESCRIBE.value.id,
+                 BuiltinTool.TOOL_CATALOG_CALL.value.id}
+                <= {item.id for item in capabilities})
+        tools = [item.tool_schema() for item in capabilities
+                 if item.exposure != ToolExposure.INTERNAL
+                 and (not progressive_tools or item.exposure == ToolExposure.DIRECT)]
         if spec.kind == "column":
             assert completion_contract is not None
             tools.append(completion_tool_schema(completion_contract))
@@ -141,13 +151,14 @@ class AgentRunPreparer:
             if isinstance(spec.context, dict)
             else None
         )
-        self._append_session_history(spec, run["id"], messages, current_request)
+        prior_run_evidence = self._append_session_history(spec, run["id"], messages, current_request)
         self._append_explicit_history(spec, run["id"], messages)
         self._append_current_request(
             spec,
             run["id"],
             messages,
             current_request,
+            prior_run_evidence,
         )
         if spec.assignment:
             provider_context = {key: value for key, value in spec.context.items() if key != 'action_ledger'}
@@ -190,6 +201,9 @@ class AgentRunPreparer:
         *,
         agent_run_id: str | None = None,
     ) -> CapabilityContext:
+        settings_snapshot = spec.context.get("global_settings") if spec.kind == 'conversation' else None
+        require_preview = (GlobalSettings.model_validate(settings_snapshot).workflow.require_task_plan_preview
+                           if settings_snapshot else False)
         return CapabilityContext(
             project_id=spec.project["id"],
             project=spec.project,
@@ -208,6 +222,7 @@ class AgentRunPreparer:
             workflow_revision_id=(self.store.get_project_task(spec.project['id'], spec.task_id)['workflow_revision_id']
                                   if spec.task_id else None),
             conversation_session_id=(spec.agent_session_id if spec.kind == 'conversation' else None),
+            require_task_plan_preview=require_preview,
         )
 
     def _append_session_history(
@@ -216,7 +231,7 @@ class AgentRunPreparer:
         run_id: str,
         messages: list[dict[str, Any]],
         current_request: Any,
-    ) -> None:
+    ) -> PriorRunEvidenceFrame | None:
         if not spec.agent_session_id:
             return
         if spec.kind == "conversation":
@@ -249,9 +264,11 @@ class AgentRunPreparer:
             prior_runs = self.store.conversation_session_run_index(
                 spec.project['id'], spec.agent_session_id, before_run_id=run_id)
             if prior_runs:
-                messages.append({'role':'user','content':stable_json(
-                    PriorRunEvidenceFrame(prior_run_evidence_index=prior_runs).model_dump(mode='json'))})
-            return
+                frame = PriorRunEvidenceFrame(prior_run_evidence_index=prior_runs)
+                if isinstance(current_request, dict):
+                    return frame
+                messages.append({'role':'user','content':stable_json(frame.model_dump(mode='json'))})
+            return None
         if spec.assignment:
             handoff = self.store.agents.session_handoff(spec.project['id'], spec.agent_session_id)
             if handoff:
@@ -328,6 +345,7 @@ class AgentRunPreparer:
         run_id: str,
         messages: list[dict[str, Any]],
         current_request: Any,
+        prior_run_evidence: PriorRunEvidenceFrame | None,
     ) -> None:
         if not isinstance(current_request, dict):
             return
@@ -338,12 +356,8 @@ class AgentRunPreparer:
         turn_payload: dict[str, Any] = CurrentTurnPayload(
             authoritative_current_request=current_request,
             authoritative_project_state=AuthoritativeProjectState.from_context(spec.project, turn_context),
-        ).model_dump(mode="json", exclude_unset=True)
-        if messages and messages[-1].get("role") == "user":
-            prior = messages.pop()
-            turn_payload["unanswered_prior_user_message"] = str(
-                prior.get("content") or ""
-            )
+            prior_run_evidence=prior_run_evidence,
+        ).model_dump(mode="json", exclude_unset=True, exclude_none=True)
         if spec.kind == 'conversation' and spec.conversation_job_id:
             intent = spec.context.get('work_intent') or {}
             hold_source = None

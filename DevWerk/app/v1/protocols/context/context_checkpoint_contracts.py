@@ -3,6 +3,7 @@
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from app.v1.protocols.tools.planning.capability_contracts import TaskCreateNextAction
 
 
 class CheckpointCoverage(BaseModel):
@@ -94,6 +95,11 @@ class PendingWorkflowPublication(BaseModel):
     id: str
     published: Literal[False] = False
     next_action: PublicationNextAction
+
+
+class PendingTaskPlanActivation(BaseModel):
+    id: str
+    next_action: TaskCreateNextAction
 
 
 class PreviousCheckpointFact(BaseModel):

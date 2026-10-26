@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from tests.support.paths import REPO_ROOT
+from tests.support.legacy_loop_fixture import apply_legacy_fixture
 
 import asyncio
 import copy
@@ -67,31 +68,46 @@ def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text
         current = next(json.loads(item['content']) for item in reversed(_messages)
             if item['role'] == 'user' and 'authoritative_current_request' in item['content'])
         state = current['authoritative_project_state']
-        assert 'Workers cannot start while this Conversation turn holds the Project planning lease' in state['turn_authority']['instruction']
-        if calls <= 2:
+        assert 'Decide whether to answer, use ordinary tools directly, or manage a Kanban Workflow' in state['turn_authority']['instruction']
+        if calls <= 3:
             assert state['active_workflow'] is None
         exposed = {item["function"]["name"] for item in tools}
-        if calls <= 4:
-            assert "loop.apply" in exposed
-            assert "workflow.create" in exposed
+        if calls <= 5:
+            assert "loop.inspect" in exposed
+            assert "loop.apply" not in exposed
             assert "workflow.plan.save" not in exposed
-            assert "task.plan.save" in exposed
-            assert "task.create" in exposed
+            assert "workflow.create" not in exposed
+            assert "task.plan.save" not in exposed
+            assert "task.create" not in exposed
+            assert "tool.catalog.call" in exposed
         if calls == 1:
-            return AgentModelResponse(tool_calls=[AgentToolCall(id="loops", name="loop.list", arguments={"query": "GitLab software delivery"})])
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id="loop-guide", name="loop.inspect",
+                arguments={"loop_key": "software.gitlab_devops"},
+            )])
         if calls == 2:
             return AgentModelResponse(tool_calls=[AgentToolCall(
-                id="apply",
-                name="loop.apply",
+                id="describe-workflow", name="tool.catalog.describe",
+                arguments={"tool_id": "workflow.create"},
+            )])
+        if calls == 3:
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id="apply", name="tool.catalog.call",
                 arguments={
-                    "loop_key": "software.gitlab_devops",
-                    "bindings": {
-                        "product_name": "Managed delivery",
-                        "gitlab_repository": "group/project",
+                    "tool_id": "workflow.create", "arguments": {
+                    "name": "Managed delivery", "flow_unit": "One deliverable", "entry": "deliver",
+                    "expected_outputs": ["deliverable"],
+                    "completion_conditions": ["deliverable is ready"],
+                    "columns": [{"key": "deliver", "name": "Deliver",
+                                 "instruction": "Deliver the requested result.",
+                                 "executor": {"kind": "capability_sequence",
+                                              "steps": [{"capability": "system.noop"}]},
+                                 "transitions": [{"outcome": "success", "target":
+                                                  {"kind": "terminal", "status": "done"}}]}],
                     },
                 },
             )])
-        if calls == 3:
+        if calls == 4:
             active = store.get_workflow(project["id"])
             assert state['active_workflow']['id'] == active['id']
             assert state['task_plans'] == []
@@ -100,28 +116,27 @@ def test_conversation_selects_loop_creates_workflow_and_finishes_with_plain_text
                 active["id"],
                 definition,
                 title="Deliver the managed product",
-                input_data={
-                    "requirements_path": "docs/requirements.md",
-                    "requirements_confirmed": True,
-                },
+                input_data={},
             )
             return AgentModelResponse(tool_calls=[AgentToolCall(
                 id="task-plan",
-                name="task.plan.save",
-                arguments={"plan": planned.model_dump(mode="json")},
+                name="tool.catalog.call",
+                arguments={"tool_id": "task.plan.save",
+                           "arguments": {"plan": planned.model_dump(mode="json")}},
             )])
-        if calls == 4:
+        if calls == 5:
             planned = store.list_task_plans(project["id"])[0]
             assert state['task_plans'][0]['id'] == planned['id']
             assert state['task_plans'][0]['proposed_task_refs'] == ['primary']
             return AgentModelResponse(tool_calls=[AgentToolCall(
                 id="task",
-                name="task.create",
-                arguments={"task_plan_id": planned["id"], "proposed_task_ref": "primary"},
+                name="tool.catalog.call",
+                arguments={"tool_id": "task.create", "arguments":
+                           {"task_plan_id": planned["id"], "proposed_task_ref": "primary"}},
             )])
         assert exposed == {'conversation.reply'}
         assert _kwargs['required_tool_name'] == 'conversation.reply'
-        if calls == 5:
+        if calls == 6:
             # A Provider that ignores its required tool selection still cannot
             # cancel queued work while the planning lease is held.
             return AgentModelResponse(tool_calls=[AgentToolCall(
@@ -156,7 +171,7 @@ def test_same_plan_task_create_batch_materializes_one_ordered_graph(store, tmp_p
     from tests.helpers import resolve_execution_before
 
     project = store.create_project('batch plan', '', str(tmp_path / 'batch-plan'))
-    store.apply_loop(project['id'], 'novel.production', {
+    apply_legacy_fixture(store, project['id'], 'novel.production', {
         'project_title': 'Two chapters', 'premise': 'One continuous story',
         'chapter_count': 2, 'chapter_target_characters': 800,
         'chapter_max_characters': 1500,
@@ -181,12 +196,14 @@ def test_same_plan_task_create_batch_materializes_one_ordered_graph(store, tmp_p
         calls += 1
         if calls == 1:
             return AgentModelResponse(tool_calls=[AgentToolCall(id='save',
-                name='task.plan.save', arguments={'plan': plan})])
+                name='tool.catalog.call', arguments={'tool_id':'task.plan.save',
+                    'arguments':{'plan': plan}})])
         if calls == 2:
             plan_id = store.list_task_plans(project['id'])[0]['id']
             return AgentModelResponse(tool_calls=[AgentToolCall(id=f'create-{ref}',
-                name='task.create', arguments={'task_plan_id': plan_id,
-                    'proposed_task_ref': ref}) for ref in ('chapter_01', 'chapter_02')])
+                name='tool.catalog.call', arguments={'tool_id':'task.create',
+                    'arguments':{'task_plan_id': plan_id,
+                    'proposed_task_ref': ref}}) for ref in ('chapter_01', 'chapter_02')])
         return AgentModelResponse(tool_calls=[AgentToolCall(id='reply',
             name='conversation.reply', arguments={'mode': 'work_result',
                 'tool_call_ids': ['save', 'create-chapter_01', 'create-chapter_02']})])
@@ -207,8 +224,8 @@ def test_same_plan_task_create_batch_materializes_one_ordered_graph(store, tmp_p
 
 def test_conversation_with_loop_workflow_can_revise_but_cannot_reapply_loop(store, tmp_path):
     project = store.create_project("revision", "", str(tmp_path / "revision"))
-    store.apply_loop(
-        project["id"],
+    apply_legacy_fixture(
+        store, project["id"],
         "software.gitlab_devops",
         {
             "product_name": "Managed delivery",
@@ -305,11 +322,10 @@ def test_committed_authorization_replay_in_batch_cannot_upgrade_scope_or_stall_d
     assert job['status'] == 'succeeded'
     receipts = {item['tool_call_id']:item for item in store.tool_invocations(
         project['id'], job['agent_run_id'], hydrate_payloads=True)}
-    assert all(receipts[key]['ok'] for key in ('first-grant','replayed-grant','inspect',
-        'same-requirement','write'))
-    assert receipts['replayed-grant']['result']['output']['already_authorized']
-    assert receipts['first-grant']['result']['output']['turn_contract']['execution_grant_id'] == (
-        receipts['replayed-grant']['result']['output']['turn_contract']['execution_grant_id'])
+    assert all(receipts[key]['ok'] for key in ('first-grant','write'))
+    assert all(not receipts[key]['ok'] for key in ('replayed-grant','inspect',
+        'same-requirement'))
+    assert receipts['replayed-grant']['result']['error']['type'] == 'ToolNotPresented'
     assert store.agents.list_requirements(project['id'])[0]['objective'] == 'original demo'
     with store.connect() as db:
         assert db.execute('SELECT COUNT(*) FROM v1_execution_grants WHERE project_id=?',
@@ -378,7 +394,7 @@ def test_start_task_false_hides_mutations_and_rejects_injected_calls(store, tmp_
                 arguments={"path": str(tmp_path / "blocked.txt"), "content": "blocked"},
             )])
         tool_result = json.loads(messages[-1]["content"])
-        assert tool_result["error"]["type"] == "ConversationMutationDisabled"
+        assert tool_result["error"]["type"] == "ToolNotPresented"
         return AgentModelResponse(text=json.dumps({'mode': 'discussion', 'message': "Discussion complete."}))
 
     registry = build_core_registry()
@@ -388,8 +404,8 @@ def test_start_task_false_hides_mutations_and_rejects_injected_calls(store, tmp_
     assert calls == 2
     assert "conversation.execution.authorize" in exposed[0]
     assert "conversation.turn.resolve" not in exposed[0]
-    assert "system.files.write" in exposed[0]
-    assert "system.command.run" in exposed[0]
+    assert "system.files.write" not in exposed[0]
+    assert "system.command.run" not in exposed[0]
     assert exposed[0] == exposed[1]
     assert not (tmp_path / "blocked.txt").exists()
 
@@ -403,18 +419,25 @@ def test_conversation_has_generic_system_file_authority_without_delegating_it_to
         nonlocal calls
         calls += 1
         exposed = {item["function"]["name"] for item in tools}
-        assert {
+        system_tools = {
             "system.files.list",
             "system.files.read",
             "system.files.write",
             "system.files.search",
             "system.command.run",
-        } <= exposed
+        }
         if calls == 1:
+            assert not system_tools & exposed
             return AgentModelResponse(tool_calls=[AgentToolCall(
-                id="write-loop-card",
-                name="system.files.write",
-                arguments={"path": str(loop_card), "content": "name: reusable-loop\n"},
+                id="describe-system-tool", name="tool.catalog.describe",
+                arguments={"tool_id": "system.files.write"},
+            )])
+        assert not system_tools & exposed
+        if calls == 2:
+            return AgentModelResponse(tool_calls=[AgentToolCall(
+                id="write-loop-card", name="tool.catalog.call",
+                arguments={"tool_id": "system.files.write", "arguments":
+                           {"path": str(loop_card), "content": "name: reusable-loop\n"}},
             )])
         return AgentModelResponse(text=json.dumps({'mode': 'work_result', 'tool_call_ids': ['write-loop-card']}))
 
@@ -814,7 +837,7 @@ def test_repeated_failed_operation_is_reported_without_business_claims(store, tm
         if item["role"] == "assistant"
     ]
     assert '本轮新建 0 个任务，其中 0 个已启动' in assistant[-1]['content']
-    assert 'TurnUnresolved' in assistant[-1]['content']
+    assert 'test.mutate: invalid' in assistant[-1]['content']
     assert '重复失败调用已停止' in assistant[-1]['content']
 
 
@@ -984,7 +1007,7 @@ def test_unavailable_capability_is_returned_for_model_repair(store, tmp_path):
             ])
         rejection = json.loads(messages[-1]["content"])
         assert rejection["ok"] is False
-        assert rejection["error"]["type"] == "CapabilityUnavailable"
+        assert rejection["error"]["type"] == "ToolNotPresented"
         assert rejection["capability"] == "mailbox"
         return AgentModelResponse(text="The unavailable tool was observed and corrected.")
 
@@ -1002,7 +1025,7 @@ def test_unavailable_capability_is_returned_for_model_repair(store, tmp_path):
     invocation = store.tool_invocations(project["id"], run["id"])[0]
     assert invocation["capability"] == "mailbox"
     assert invocation["ok"] is False
-    assert invocation["result"]["error"]["type"] == "CapabilityUnavailable"
+    assert invocation["result"]["error"]["type"] == "ToolNotPresented"
 
 
 def test_missing_capability_entity_is_returned_for_model_repair(store, tmp_path):
@@ -1172,8 +1195,8 @@ def test_project_session_replays_human_dialogue_without_raw_tool_evidence(store,
         if model_calls == 1:
             return AgentModelResponse(tool_calls=[AgentToolCall(
                 id="inspect-session",
-                name="test.session.inspect",
-                arguments={},
+                name="tool.catalog.call",
+                arguments={"tool_id": "test.session.inspect", "arguments": {}},
             )])
         if model_calls == 2:
             return AgentModelResponse(text=json.dumps({'mode': 'work_result', 'tool_call_ids': ['inspect-session']}))
@@ -1370,6 +1393,29 @@ def test_project_session_resumes_with_bounded_prior_failure_evidence(store, tmp_
     again = reopened.conversation_session_run_index(
         project['id'], spec.agent_session_id, before_run_id=prepared.run['id'])
     assert again[0]['agent_run_id'] == old['id']
+
+
+def test_current_turn_keeps_prior_run_evidence_distinct_from_user_history(store, tmp_path):
+    project = store.create_project('evidence frame', '', str(tmp_path / 'project'))
+    old = begin_conversation_run(store, project)
+    store.finish_agent_run(old['id'], 'failed', '', 'Earlier Tool failed', 1, 0)
+    spec = AgentRunSpec(
+        kind='conversation', project=project, instruction='', instruction_revision=1,
+        context={'current_request': {'message_id': 1, 'content': 'Please continue',
+                                     'job_id': 'current', 'trigger_kind': 'user', 'trigger': {}}},
+        capability_ids=['agent.result.read'],
+        agent_session_id=store.conversation_agent(project['id'])['logical_id'],
+        history=[{'role': 'user', 'content': 'A real unanswered user message'}],
+    )
+    prepared = AgentRunPreparer(
+        store=store, registry=store.registry, runtime_policy=store.policy,
+        platform_policy=store.latest_platform_policy(),
+    ).prepare(spec)
+    current = json.loads(prepared.messages[-1]['content'])
+    assert prepared.messages[-2]['content'] == 'A real unanswered user message'
+    assert 'unanswered_prior_user_message' not in current
+    assert current['prior_run_evidence']['prior_run_evidence_index'][0]['agent_run_id'] == old['id']
+    assert current['prior_run_evidence']['prior_run_evidence_index'][0]['status'] == 'failed'
 
 
 def test_project_session_run_index_is_ordered_bounded_and_isolated(store, tmp_path):

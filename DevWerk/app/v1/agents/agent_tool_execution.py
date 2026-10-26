@@ -21,11 +21,23 @@ from app.v1.execution.execution_ledger import evidence_id, ledger_entry, repeats
 from app.v1.services.completion_admission import CompletionAdmissionService
 from app.v1.tooling.tool_protocol import column_tool_batch_error, parse_await_submission
 from app.v1.protocols.workflow.runtime_checkpoint_contracts import ExecutionCheckpoint, WaitRequestPayload
+from app.v1.protocols.agent.resolved_tool_operation import ResolvedToolOperation
+from app.v1.tooling.tool_call_resolution import CATALOG_CALL_ID, schema_digest, target_provider_schema
 
 
 QUEUED_TASK_CAPABILITIES = frozenset({
     'task.create', 'task.successor', 'task.retry', 'task.reopen', 'task.rerun', 'task.resume',
 })
+
+
+def queued_task_entry(entry: dict[str, Any]) -> bool:
+    if not entry['ok']:
+        return False
+    if entry['capability'] in QUEUED_TASK_CAPABILITIES:
+        return True
+    if entry['capability'] == 'task.plan.save':
+        return bool((entry.get('facts', {}).get('result', {}).get('output') or {}).get('started_task_id'))
+    return False
 
 
 @dataclass(frozen=True)
@@ -72,6 +84,7 @@ class AgentToolBatchExecutor:
         *,
         iteration: int,
         operation_ids: list[str] | None = None,
+        resolutions: list[ResolvedToolOperation] | None = None,
     ) -> ToolBatchResult:
         completion: dict[str, Any] | None = None
         wait_request: dict[str, Any] | None = None
@@ -104,11 +117,12 @@ class AgentToolBatchExecutor:
             and len({call.arguments.get('task_plan_id') for call in tool_calls}) == 1
             and bool(tool_calls[0].arguments.get('task_plan_id')))
         if self.spec.kind == 'conversation' and len(tool_calls) > 1 and any(
-            call.name in QUEUED_TASK_CAPABILITIES for call in tool_calls
+            call.name in QUEUED_TASK_CAPABILITIES or
+            (call.name == 'task.plan.save' and call.arguments.get('start_tasks')) for call in tool_calls
         ) and not same_plan_creates:
             protocol_error = 'Queue one Task action alone, then finish this turn with conversation.reply so Workers can start.'
         if self.spec.kind == 'conversation' and any(
-            entry['ok'] and entry['capability'] in QUEUED_TASK_CAPABILITIES
+            queued_task_entry(entry)
             for entry in self.logical_ledger
         ) and any(call.name != 'conversation.reply' for call in tool_calls):
             protocol_error = 'Task work is queued. Call conversation.reply alone now to release the Project planning lease.'
@@ -132,10 +146,13 @@ class AgentToolBatchExecutor:
                         f'Conversation Agent repeated an identical failed tool operation without changing its arguments: {call.name}')
 
         for index, call in enumerate(tool_calls):
+            resolution = resolutions[index] if resolutions is not None else None
             operation_id = operation_ids[index] if operation_ids else None
             operation = self.store.agents.operation(operation_id) if operation_id else None
             if self.spec.execution_control:
                 self.spec.execution_control.check()
+                if self.spec.kind == 'conversation':
+                    self.spec.execution_control.check_preempt()
             if operation and operation['result_json']:
                 result = ToolResult.model_validate_json(operation['result_json'])
                 completion = json.loads(operation['completion_json']) if operation['completion_json'] else None
@@ -161,6 +178,21 @@ class AgentToolBatchExecutor:
                     },
                     checkpoint={"failure_disposition": "rejected_before_effect"},
                 )
+            elif resolution and resolution.rejection_type:
+                result = ToolResult(ok=False, capability=call.name,
+                    error={"type": resolution.rejection_type,
+                           "message": resolution.rejection_message or resolution.rejection_type},
+                    checkpoint={"failure_disposition": "rejected_before_effect"})
+            elif resolution and resolution.provider_name == CATALOG_CALL_ID and (
+                not self.registry.contains(call.name) or
+                not (entries := self.registry.resolve([call.name], self.capability_context)) or
+                schema_digest(target_provider_schema(entries[0]))
+                    != resolution.schema_digest
+            ):
+                result = ToolResult(ok=False, capability=call.name,
+                    error={"type": "ToolSchemaChanged",
+                           "message": f"Schema for {call.name} changed; describe the Tool again."},
+                    checkpoint={"failure_disposition": "rejected_before_effect"})
             elif call.name == completion_tool_name:
                 result, completion = self._complete(call.arguments)
             elif call.name == "column.await":
@@ -276,14 +308,16 @@ class AgentToolBatchExecutor:
                     if self.spec.assignment:
                         self.store.agents.note_wait(self.spec.assignment, operation_id, self.logical_ledger)
                 self.store.agents.answer_operation(operation_id, result.model_dump(mode="json"), completion, wait_request)
-            self.store.record_tool_invocation(
-                agent_run_id=self.run_id,
-                tool_call_id=call.id,
-                capability=call.name,
-                arguments=call.arguments,
-                result=result.model_dump(mode="json"),
-                ok=result.ok,
-            )
+            if not (operation and operation['result_json'] and
+                    self.store.agents.has_tool_invocation(self.run_id, call.id)):
+                self.store.record_tool_invocation(
+                    agent_run_id=self.run_id,
+                    tool_call_id=call.id,
+                    capability=call.name,
+                    arguments=call.arguments,
+                    result=result.model_dump(mode="json"),
+                    ok=result.ok,
+                )
             item = ledger_entry(
                 self.run_id,
                 call.id,
@@ -296,7 +330,7 @@ class AgentToolBatchExecutor:
             tool_message = {
                 "role": "tool",
                 "tool_call_id": call.id,
-                "name": call.name,
+                "name": resolution.provider_name if resolution else call.name,
                 "content": tool_result_json(
                     result,
                     None,

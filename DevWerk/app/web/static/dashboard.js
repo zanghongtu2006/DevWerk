@@ -140,6 +140,14 @@ function bindPageActions() {
   const form = document.getElementById("conversation-form");
   if (form) form.addEventListener("submit", sendConversation);
   document.querySelector("[data-load-older-messages]")?.addEventListener("click", loadOlderConversation);
+  document.querySelector("[data-copy-project-directory]")?.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(state.project.base_dir);
+      showToast("完整路径已复制", "success");
+    } catch {
+      showToast("复制失败，请手动选择路径", "error");
+    }
+  });
   const conversationMessages = document.getElementById("conversation-messages");
   conversationMessages?.addEventListener("scroll", () => {
     if (conversationMessages.scrollTop <= 24 && state.conversationHasOlder) loadOlderConversation();

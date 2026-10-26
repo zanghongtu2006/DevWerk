@@ -14,12 +14,13 @@ from typing import Any
 
 from app.v1.storage_support import new_id, utcnow
 from app.v1.domain import ToolResult
+from app.v1.tooling.builtin_tool_catalog import BuiltinTool
 from app.v1.protocols.conversation.conversation_context_contracts import CurrentTaskPlanContractContext
-from app.v1.protocols.tools.planning.capability_contracts import TaskPlanContractReceipt
+from app.v1.protocols.tools.planning.capability_contracts import TaskPlanContractReceipt, TaskPlanSaveReceipt
 from app.v1.protocols.context.context_result_contracts import (
-    AgentResultReducedView, AppliedWorkflowPlanReference, AppliedWorkflowReference,
+    AgentResultReducedView,
     ArchivedValueReference,
-    LoopApplyPlanningProjection, LoopColumnProjection, LoopInspectPlanningProjection,
+    LoopInspectPlanningProjection,
     MemoryReadReducedView, PagedTextView, PlanningTruncationProjection, ToolResultView,
     WorkflowColumnProjection, WorkflowEdgeProjection, WorkflowInspectPlanningProjection,
 )
@@ -27,7 +28,7 @@ from app.v1.protocols.context.context_state_contracts import CompactContextSumma
 from app.v1.protocols.context.context_checkpoint_contracts import (CheckpointCoverage, CheckpointMetrics,
     AssistantMessageFact, ContextCheckpointMessage, ContextCheckpointPayload,
     ContextMaintenanceMessage, ContextRunMetrics, DeterministicContextSummary,
-    MinimalToolResultProjection, PendingWorkflowPublication, PublicationArguments,
+    MinimalToolResultProjection, PendingTaskPlanActivation, PendingWorkflowPublication, PublicationArguments,
     PublicationNextAction, PreviousCheckpointFact, ProviderBudgetEnvelope,
     RequiredOverflowMetrics, SummaryToolCallFact, ToolMessageFact, TruncationProjection)
 
@@ -242,26 +243,10 @@ def planning_projection(result):
     capability, output = result.get('capability'), result.get('output')
     if not result.get('ok') or not isinstance(output,dict):
         return None
-    if result.get('projection') and capability in {'loop.inspect','loop.apply','workflow.inspect'}:
+    if result.get('projection') and capability in {'loop.inspect','workflow.inspect'}:
         return copy.deepcopy(result)
     if capability == 'loop.inspect':
-        bundle = output.get('bundle') or {}
-        method = bundle.get('workflow_plan') or {}
-        workflow = bundle.get('workflow') or {}
         view = LoopInspectPlanningProjection.model_validate(output)
-        view.flow_unit = method.get('flow_unit')
-        view.task_contract = method.get('task_contract',{})
-        view.columns = [LoopColumnProjection(key=c['key'],
-            writable_paths=c.get('metadata',{}).get('writable_paths',[]))
-            for c in workflow.get('columns',[])]
-    elif capability == 'loop.apply':
-        workflow = output.get('workflow') or {}
-        method = output.get('workflow_plan') or {}
-        view = LoopApplyPlanningProjection(
-            workflow=AppliedWorkflowReference.model_validate(workflow),
-            workflow_plan=AppliedWorkflowPlanReference(
-                id=method.get('id'), flow_unit=method.get('plan',{}).get('flow_unit'),
-                task_contract=method.get('plan',{}).get('task_contract',{})))
     elif capability == 'workflow.inspect':
         definition = output.get('definition') or {}
         view = WorkflowInspectPlanningProjection.model_validate(output)
@@ -361,22 +346,42 @@ class ContextManager:
         projected = copy.deepcopy(messages)
         self._refresh_conversation_authority(projected)
         self._refresh_runtime_failures(projected)
-        for item in projected:
+        latest_user = max((index for index, item in enumerate(projected)
+            if item.get('role') == 'user'), default=-1)
+        latest_bridge_call = max((index for index, item in enumerate(projected)
+            if item.get('role') == 'tool'
+            and item.get('name') == BuiltinTool.TOOL_CATALOG_CALL.value.id), default=-1)
+        latest_description = next((index for index in range(len(projected) - 1, latest_user, -1)
+            if index > latest_bridge_call and projected[index].get('role') == 'tool'
+            and projected[index].get('name') == BuiltinTool.TOOL_CATALOG_DESCRIBE.value.id), None)
+        for index, item in enumerate(projected):
             if item.get('role') == 'tool':
+                if index == latest_description:
+                    continue
                 item['content'] = project_result(str(item.get('content') or ''),
                     max(512, int(self.policy.tool_result_tokens / (self.ratio*1.15))))
         self._project_memory(projected, tools, force=force)
         self._project_reference_dialogue(projected, tools, force=force)
         self._project_execution_references(projected, tools, force=force)
         estimate = self.estimate(projected, tools)
-        compact = force or estimate >= self.hard*self.policy.soft_fraction
+        reserve = min(self.policy.next_step_reserve_tokens, int(self.hard * 0.15))
+        compact = force or estimate + reserve >= self.hard*self.policy.soft_fraction
         removed = []
         if compact:
+            uncompacted = projected
+            uncompacted_estimate = estimate
             target = self.hard * (0.4 if force else self.policy.target_fraction)
             # Whole groups, including bulky code-writing arguments, are replaced.
             groups = self.groups(projected)
             remove_indices = set()
             for start, end in groups:
+                # A large fixed Tool schema can make the target fraction impossible.
+                # Keep the latest complete exchange when it still fits the hard limit;
+                # it may contain the exact arguments for the next operation.
+                if (not force and (start, end) == groups[-1] and
+                        self.estimate([m for j, m in enumerate(projected)
+                                       if j not in remove_indices], tools) <= self.hard - reserve):
+                    break
                 if (start, end) == groups[-1] and removed and self.estimate(
                     [m for j, m in enumerate(projected) if j not in remove_indices], tools) <= target:
                     break  # Keep the most recent complete batch when it fits.
@@ -395,9 +400,24 @@ class ContextManager:
                 projected = retained[:1] + [checkpoint] + retained[1:]
                 estimate = self.estimate(projected, tools)
                 if estimate > self.hard:
-                    raise self._required_overflow(projected, tools)
-                self._save(removed, summary, before, estimate)
-                messages[:] = projected
+                    # Persist the full summary, but send a compact retrieval
+                    # reference if its provider view would overflow.
+                    reference = CompactContextSummary.from_bounded(
+                        summary, 'Prior context archived; use available context or result read tools for exact sources.')
+                    checkpoint = ContextCheckpointMessage(content=ContextCheckpointPayload(
+                        context_checkpoint=reference).model_dump_json()).model_dump(mode='json', by_alias=True)
+                    projected = retained[:1] + [checkpoint] + retained[1:]
+                    estimate = self.estimate(projected, tools)
+                if estimate > self.hard:
+                    if force or uncompacted_estimate > self.hard:
+                        raise self._required_overflow(projected, tools)
+                    # A checkpoint can cost more than the groups it replaces
+                    # when the fixed schema dominates. Keep the viable view.
+                    projected = uncompacted
+                    removed = []
+                else:
+                    self._save(removed, summary, before, estimate)
+                    messages[:] = projected
         estimate = self.estimate(projected, tools)
         if estimate > self.hard:
             raise self._required_overflow(projected, tools)
@@ -463,6 +483,11 @@ class ContextManager:
                 state['pending_workflow_plan'] = pending_plan
             else:
                 state.pop('pending_workflow_plan', None)
+            pending_task_plan = self._pending_task_plan(job['project_id'], workflow['id'] if workflow else None)
+            if pending_task_plan:
+                state['pending_task_plan'] = pending_task_plan.model_dump(mode='json')
+            else:
+                state.pop('pending_task_plan', None)
             state['task_plans'] = [TaskPlanContextSummary.from_plan(plan).model_dump(mode='json')
                 for plan in self.store.list_task_plans(job['project_id'], 5)]
             state['tasks'] = [
@@ -511,6 +536,27 @@ class ContextManager:
         return PendingWorkflowPublication(id=plan_id,
             next_action=PublicationNextAction(arguments=PublicationArguments(
                 workflow_plan_id=plan_id))).model_dump(mode='json')
+
+    def _pending_task_plan(self, project_id: str,
+                           workflow_revision_id: str | None) -> PendingTaskPlanActivation | None:
+        if not workflow_revision_id:
+            return None
+        with self.store.connect() as db:
+            row = db.execute('''SELECT result_json FROM v1_tool_invocations
+                WHERE project_id=? AND agent_run_id=? AND capability='task.plan.save' AND ok=1
+                ORDER BY sequence DESC LIMIT 1''', (project_id, self.run_id)).fetchone()
+            if not row:
+                return None
+            result = ToolResult.model_validate_json(row['result_json'])
+            receipt = TaskPlanSaveReceipt.model_validate(result.output)
+            if (receipt.workflow_revision_id != workflow_revision_id or
+                    receipt.next_action is None):
+                return None
+            materialized = db.execute('''SELECT 1 FROM v1_tasks WHERE project_id=?
+                AND task_plan_id=? LIMIT 1''', (project_id, receipt.id)).fetchone()
+        if materialized:
+            return None
+        return PendingTaskPlanActivation(id=receipt.id, next_action=receipt.next_action)
 
     def _refresh_runtime_failures(self, messages):
         if not (self.spec.kind == 'column' and self.spec.assignment and

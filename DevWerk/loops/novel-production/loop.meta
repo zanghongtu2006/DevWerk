@@ -1,39 +1,43 @@
 # Long-form Novel Production
 
-## Description: <br>
-Create a continuous multi-chapter novel through a reusable directed lifecycle. Versioned Loop assets supply fixed writing methods; the Project stores only its story baseline; each chapter reads accepted history, produces a recap, writes or revises in one logical authoring Column session, passes through an independent review Column, and delivers an accepted version. <br>
+## Description
+长篇连载写作的参考方法：控制故事连续性，在分章写作、独立审查与定向返工之间保留清晰交接。
 
-## Publisher: <br>
-DevWerk <br>
+## Publisher
+DevWerk
 
-## Category: <br>
-creative_writing <br>
+## Category
+creative_writing
 
-## Tags: <br>
-- novel <br>
-- long-form-writing <br>
-- chapter-series <br>
-- historical-recap <br>
-- independent-review <br>
-- directed-rework <br>
+## Tags
+- novel
+- long-form-writing
+- continuity
+- independent-review
 
-## Use Case: <br>
-Use when the user needs a continuous chapter-based novel whose chapters must read prior accepted material, preserve auditable recaps, receive independent review, and return targeted feedback through explicit Workflow transitions. <br>
+## Use Case
+适合需要连续章节、稳定世界设定和分章交付的创作需求。
 
-## Selection Guide: <br>
-Select for a managed long-form fiction project with repeated chapter Tasks and explicit review/rework. Do not select for a short standalone passage, a single unreviewed response, or non-fiction software delivery. <br>
+## Selection Guide
+先与用户确认题材、范围、长度、连载还是完结，以及希望如何审查。短篇或一次性写作无需照搬分章流程。Conversation Agent 可以采用、裁剪或重排这里建议的阶段。
 
-## Loop Input: <br>
-Project title, confirmed premise, chapter count, target chapter length, and permissive maximum chapter length. <br>
+## Loop Input
+用户确认的创作目标、人物与世界约束、章节范围、风格和交付偏好。
 
-## Loop Output: <br>
-Versioned writing-method assets, a Project-specific story baseline, serial chapter summaries and bodies, review evidence, index, final acceptance evidence, and explicit Task terminal states. <br>
+## Loop Output
+符合当前范围的章节及必要的连续性和审查说明。
 
-## Loop Version(s): <br>
-1.5.0 <br>
+## Loop Version(s)
+2.0.1
 
-## Loop Key: <br>
-novel.production <br>
+## Loop Key
+novel.production
 
-## Reference(s): <br>
-- [Executable bundle](loop.json) <br>
+## Suggested stages
+可考虑先建立跨章稳定事实，再对当前章节整理前情、撰写正文、独立审查和交付。前情提要宜从已交付的最近材料滚动生成，以控制上下文；写作阶段使用当前提要和本章返工意见。具体阶段、依赖与返工方向由 Conversation Agent 为项目建立实际 Workflow。
+
+## Planning boundary
+多章写作时，章节是可以分别交付、审查和返工的重复工作单位；每章应作为独立 Task，依次经过同一组可复用的写作、审查与交付职责。章号和篇名属于 Task，不应变成分别命名的 Column；也不要把一组章节合并成一个无法分别返工的 Task。跨章设定可作为先行工作或后续章节共享的输入，其具体组织方式由 Conversation Agent 根据项目决定。
+
+## Evidence and completion
+审查应区分已发生的故事事实与未来计划，指出矛盾位置并交回能够处理的阶段。每章完成意味着用户要求的正文和连续性标准均已满足。文件组织、命名和产物位置由当前 Project 与 Task 决定，本卡片不规定。

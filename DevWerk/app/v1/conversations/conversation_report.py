@@ -25,7 +25,8 @@ class ConversationReport(ConversationReply):
 REPORT_INSTRUCTION = (
     'You may answer ordinary discussion or status questions in natural language. '
     'No question-status update or boundary tool is required for a tool-free reply. '
-    'Before business mutations, bind the current user execution request with conversation.execution.authorize. '
+    'Use ordinary tools directly for a user-requested action. Only managed Workflow/Task changes '
+    'need conversation.execution.authorize. '
     'For completed work call conversation.reply alone with mode=work_result and real tool_call_ids/task_ids; '
     'Runtime renders committed facts. For a blocker use mode=blocked and actual failed receipts. '
     'Never claim a Workflow, Task or delivery was created merely because you proposed it.'
@@ -116,10 +117,15 @@ def render_report(store, project_id, run_id, text, *, execution_control=None):
         if job and job['trigger_kind'] == 'user' and store.intents.contract(job)['phase'] == 'execution':
             created_ids = set()
             for item in invocations.values():
-                if not item['ok'] or item['capability'] not in {'task.create', 'task.rerun', 'task.successor'}:
+                if not item['ok'] or item['capability'] not in {'task.create', 'task.rerun', 'task.successor', 'task.plan.save'}:
                     continue
                 output = item['result'].get('output')
                 if isinstance(output, dict):
+                    if item['capability'] == 'task.plan.save' and not output.get('started_task_id'):
+                        continue
+                    if item['capability'] == 'task.plan.save':
+                        created_ids.update(t['id'] for t in store.list_tasks(project_id)
+                                           if t.get('task_plan_id') == output.get('id'))
                     if output.get('id'):
                         created_ids.add(output['id'])
                     if output.get('task_plan_id'):
@@ -133,14 +139,17 @@ def render_report(store, project_id, run_id, text, *, execution_control=None):
             output = item['result'].get('output')
             if item['capability'] == 'task.successor' and isinstance(output, dict) and output.get('id'):
                 tasks.append(store.get_project_task(project_id, output['id']))
-            if item['capability'] == 'task.create' and isinstance(output, dict) and output.get('task_plan_id'):
-                tasks.extend(t for t in store.list_tasks(project_id) if t.get('task_plan_id') == output['task_plan_id'])
+            if item['capability'] in {'task.create', 'task.plan.save'} and isinstance(output, dict):
+                plan_id = output.get('task_plan_id') if item['capability'] == 'task.create' else (
+                    output.get('id') if output.get('started_task_id') else None)
+                if plan_id:
+                    tasks.extend(t for t in store.list_tasks(project_id) if t.get('task_plan_id') == plan_id)
         tasks = list({t['id']: t for t in tasks}.values())
         labels = {'pending': '待执行', 'running': '执行中', 'waiting': '等待外部结果', 'done': '已交付', 'failed': '失败', 'recovering': '恢复中'}
         rendered_parts = []
         actions = {'project.scope.revise': '需求范围已修订', 'task.plan.save': '任务计划已保存', 'workflow.publish': '工作流已更新',
                    'workflow.create': '工作流已建立或更新',
-                   'loop.apply': '工作流已建立', 'requirement.create': '需求已建立', 'requirement.close': '需求已关闭',
+                   'requirement.create': '需求已建立', 'requirement.close': '需求已关闭',
                    'agent.worker.replace': '执行代理已完成交接', 'agent.worker.send': 'Worker 输入已排队',
                    'project.files.write': '项目文件已写入', 'system.files.write': '文件已写入'}
         for item in selected:

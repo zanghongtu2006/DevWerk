@@ -1,9 +1,6 @@
 """Filesystem Loop discovery output contracts."""
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, RootModel
-
-from app.v1.protocols.tools.planning.capability_contracts import WorkflowPlanRecord
-from app.v1.protocols.tools.planning.capability_project_receipts import WorkflowRevisionReceipt
+from pydantic import BaseModel, ConfigDict, Field, RootModel
 
 
 class LoopSummaryReceipt(BaseModel):
@@ -44,16 +41,13 @@ class LoopAssetReceipt(BaseModel):
 
 
 class LoopInspectReceipt(LoopSummaryReceipt):
-    digest: str = Field(pattern=r"^[0-9a-f]{64}$", description="Digest of the Loop card, bundle and assets")
-    parameter_schema: dict[str, JsonValue] = Field(description="Externally authored JSON Schema for Loop bindings")
-    bundle: dict[str, JsonValue] = Field(description="Externally authored reusable Workflow template")
-    meta: str = Field(description="Original Loop metadata text")
-    assets: list[LoopAssetReceipt] = Field(description="Referenced Loop assets")
+    digest: str = Field(pattern=r"^[0-9a-f]{64}$", description="Digest of the method guide and resources")
+    guide: str = Field(description="Complete descriptive Loop guide; adapt it to the user's Project before authoring a Workflow")
+    assets: list[LoopAssetReceipt] = Field(description="Optional descriptive method resources")
 
     @classmethod
     def from_parts(
-        cls, record: dict, digest: str, parameter_schema: dict,
-        bundle: dict, assets: list[LoopAssetReceipt],
+        cls, record: dict, digest: str, assets: list[LoopAssetReceipt],
     ) -> "LoopInspectReceipt":
         summary = LoopSummaryReceipt.from_record(record)
         return cls(
@@ -62,27 +56,5 @@ class LoopInspectReceipt(LoopSummaryReceipt):
             category=summary.category, tags=summary.tags, use_case=summary.use_case,
             selection_guide=summary.selection_guide, input=summary.input,
             output=summary.output, directory=summary.directory,
-            digest=digest, parameter_schema=parameter_schema, bundle=bundle,
-            meta=record["meta"], assets=assets,
+            digest=digest, guide=record["meta"], assets=assets,
         )
-
-
-class AppliedLoopIdentity(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    loop_key: str = Field(description="Applied Loop key")
-    version: str = Field(description="Applied Loop version")
-    digest: str = Field(description="Exact Loop package digest")
-    name: str = Field(description="Loop name")
-    category: str = Field(description="Loop category")
-    directory: str = Field(description="Loop directory")
-
-
-class LoopApplyReceipt(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    id: str = Field(description="Application ID")
-    project_id: str = Field(description="Owning Project ID")
-    loop: AppliedLoopIdentity = Field(description="Applied Loop identity")
-    bindings: dict[str, JsonValue] = Field(description="Validated Loop parameter values")
-    workflow_plan: WorkflowPlanRecord = Field(description="Created Workflow Plan")
-    workflow: WorkflowRevisionReceipt = Field(description="Published Workflow revision")
-    created_at: str = Field(description="Application timestamp")

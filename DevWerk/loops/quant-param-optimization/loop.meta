@@ -1,37 +1,39 @@
 # 量化策略参数优化
 
-## Description: <br>
-通过 LLM 引导的参数搜索，对量化策略进行多轮回测优化，找到最优参数配置并生成对比报告。覆盖范围：参数调整 + 回测记录 + 智能搜索 + 最优解交付。不覆盖：代码重构、性能优化、交易执行。 <br>
+## Description
+对已有量化策略做参数搜索与回测比较的参考方法，不预设交易执行或策略代码重构。
 
-## Publisher: <br>
-DevWerk <br>
+## Publisher
+DevWerk
 
-## Category: <br>
-quantitative_optimization <br>
+## Category
+quantitative_optimization
 
-## Tags: <br>
-- quantitative <br>
-- parameter-optimization <br>
-- backtest <br>
-- llm-guided-search <br>
+## Tags
+- quantitative
+- parameter-optimization
+- backtest
 
-## Use Case: <br>
-用于有明确策略脚本和参数配置文件的量化策略优化项目。用户已确认优化目标（年化收益率为主）和最大迭代次数。 <br>
+## Use Case
+适合用户已有可运行策略和明确的优化目标、数据范围及停止条件。
 
-## Selection Guide: <br>
-选择此 Loop 当你需要：对量化策略进行参数优化、通过回测历史数据引导参数调整、找到最优参数配置并生成对比报告。不要选择此 Loop 当：需要修改策略代码本身、目标不明确且需要大量探索性分析、已有确定的参数范围需要暴力枚举。 <br>
+## Selection Guide
+先核对历史数据、可调整参数、评价指标和回测可重复性。目标或环境不明确时继续讨论；这里的步骤仅供制定实际 Workflow。
 
-## Loop Input: <br>
-strategy_script: 策略入口脚本路径 | config_file: 参数配置文件路径 | output_dir: 回测输出目录 | optimization_params: 优化参数配置（目标指标、最大迭代次数、耐心阈值等） <br>
+## Loop Input
+用户提供的策略、可调整参数、数据来源、评价指标和资源边界。
 
-## Loop Output: <br>
-最优配置文件 best_config.yaml | 所有轮次历史记录 run_history.json | 对比分析报告 comparison_report.md | 汇总指标表 metrics_summary.csv <br>
+## Loop Output
+可复核的参数比较、回测证据、最佳候选与局限说明。
 
-## Loop Version(s): <br>
-1.0.0 <br>
+## Loop Version(s)
+2.0.0
 
-## Loop Key: <br>
-quant.param_optimization <br>
+## Loop Key
+quant.param_optimization
 
-## Reference(s): <br>
-- [Executable bundle](loop.json) <br>
+## Suggested stages
+可参考分析现状、提出候选、运行回测、比较与决定是否继续、整理结果。循环次数、终止条件、工具与产物位置由 Conversation Agent 结合用户目标在实际 Workflow 和 Task 中定义。
+
+## Evidence and completion
+不能把模型预测当成已执行回测。比较结论应链接到可复核的实际结果，并说明选择标准；若结果不足，应按项目规则继续或明确停止。

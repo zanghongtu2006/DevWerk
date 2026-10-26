@@ -8,6 +8,9 @@ import requests
 
 from app.core.config import reload_settings
 from app.services.anthropic_client import AnthropicClient
+from app.v1.agents.agent_prompt import assistant_message
+from app.v1.domain import AgentModelResponse
+from app.v1.context.session_replay import replayable_session_messages
 from app.services.llm_factory import UsageTrackedClient
 from app.services.openai_client import OpenAIClient
 from app.services.provider_errors import LLMProviderError, raise_for_provider_payload, raise_for_provider_response
@@ -39,6 +42,130 @@ class Response:
             raise RuntimeError(self.status_code)
 
 
+class SSEMockResponse:
+    def __init__(self, events, *, status_code=200):
+        self.events = events
+        self.status_code = status_code
+        self.headers = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def iter_lines(self, **_kwargs):
+        for event in self.events:
+            if isinstance(event, BaseException):
+                raise event
+            yield event.encode('utf-8')
+
+
+def sse(event, payload):
+    return [f'event: {event}', f'data: {json.dumps(payload)}', '']
+
+
+def test_anthropic_stream_assembles_complete_text_thinking_and_tool_use():
+    client = AnthropicClient({'api_name': 'test', 'base_url': 'https://provider.invalid',
+        'api_key': 'token', 'model': 'm', 'temperature': 0.2, 'max_tokens': 100,
+        'stream_response': True})
+    events = [
+        *sse('message_start', {'type': 'message_start', 'message': {
+            'role': 'assistant', 'usage': {'input_tokens': 12, 'output_tokens': 0}}}),
+        *sse('content_block_start', {'type': 'content_block_start', 'index': 0,
+            'content_block': {'type': 'thinking', 'thinking': ''}}),
+        *sse('content_block_delta', {'type': 'content_block_delta', 'index': 0,
+            'delta': {'type': 'thinking_delta', 'thinking': 'consider'}}),
+        *sse('content_block_delta', {'type': 'content_block_delta', 'index': 0,
+            'delta': {'type': 'signature_delta', 'signature': 'signed'}}),
+        *sse('content_block_stop', {'type': 'content_block_stop', 'index': 0}),
+        *sse('content_block_start', {'type': 'content_block_start', 'index': 1,
+            'content_block': {'type': 'text', 'text': ''}}),
+        *sse('content_block_delta', {'type': 'content_block_delta', 'index': 1,
+            'delta': {'type': 'text_delta', 'text': 'ready'}}),
+        *sse('content_block_stop', {'type': 'content_block_stop', 'index': 1}),
+        *sse('content_block_start', {'type': 'content_block_start', 'index': 2,
+            'content_block': {'type': 'tool_use', 'id': 'call-1', 'name': 'project.inspect', 'input': {}}}),
+        *sse('content_block_delta', {'type': 'content_block_delta', 'index': 2,
+            'delta': {'type': 'input_json_delta', 'partial_json': '{"limit":'}}),
+        *sse('content_block_delta', {'type': 'content_block_delta', 'index': 2,
+            'delta': {'type': 'input_json_delta', 'partial_json': '2}'}}),
+        *sse('content_block_stop', {'type': 'content_block_stop', 'index': 2}),
+        *sse('message_delta', {'type': 'message_delta', 'delta': {'stop_reason': 'tool_use'},
+            'usage': {'output_tokens': 8}}),
+        *sse('message_stop', {'type': 'message_stop'}),
+    ]
+    sent = []
+    client.session.post = lambda _url, **kwargs: sent.append(kwargs) or SSEMockResponse(events)
+    tool = {'type': 'function', 'function': {'name': 'project.inspect', 'description': '',
+        'parameters': {'type': 'object', 'properties': {'limit': {'type': 'integer'}}}}}
+
+    result = client.complete([{'role': 'user', 'content': 'go'}], [tool])
+
+    assert sent[0]['stream'] is True and sent[0]['json']['stream'] is True
+    assert result['text'] == 'ready'
+    assert result['tool_calls'][0]['arguments'] == {'limit': 2}
+    assert result['usage']['input_tokens'] == 12
+    assert result['usage']['output_tokens'] == 8
+    assert result['provider_content']['blocks'][0]['signature'] == 'signed'
+
+
+def test_anthropic_stream_never_returns_partial_tool_call_without_message_stop():
+    client = AnthropicClient({'api_name': 'test', 'base_url': 'https://provider.invalid',
+        'api_key': 'token', 'model': 'm', 'temperature': 0.2, 'max_tokens': 100,
+        'stream_response': True})
+    events = [
+        *sse('message_start', {'type': 'message_start', 'message': {'role': 'assistant'}}),
+        *sse('content_block_start', {'type': 'content_block_start', 'index': 0,
+            'content_block': {'type': 'tool_use', 'id': 'partial', 'name': 'project.inspect', 'input': {}}}),
+        *sse('content_block_delta', {'type': 'content_block_delta', 'index': 0,
+            'delta': {'type': 'input_json_delta', 'partial_json': '{"limit":2}'}}),
+        *sse('content_block_stop', {'type': 'content_block_stop', 'index': 0}),
+    ]
+    client.session.post = lambda _url, **_kwargs: SSEMockResponse(events)
+    with pytest.raises(requests.ConnectionError, match='before message_stop'):
+        client.complete([{'role': 'user', 'content': 'go'}], [])
+
+
+def test_anthropic_stream_provider_error_and_timeout_are_not_partial_success():
+    client = AnthropicClient({'api_name': 'test', 'base_url': 'https://provider.invalid',
+        'api_key': 'token', 'model': 'm', 'temperature': 0.2, 'max_tokens': 100,
+        'stream_response': True, 'request_timeout_seconds': 17})
+    client.session.post = lambda _url, **_kwargs: SSEMockResponse([
+        *sse('message_start', {'type': 'message_start', 'message': {'role': 'assistant'}}),
+        *sse('error', {'type': 'error', 'error': {'type': 'overloaded_error', 'message': 'busy'}}),
+    ])
+    with pytest.raises(LLMProviderError) as failed:
+        client.complete([{'role': 'user', 'content': 'go'}], [])
+    assert failed.value.error_code == 'LLM_OVERLOADED'
+
+    client.session.post = lambda _url, **_kwargs: SSEMockResponse([
+        *sse('message_start', {'type': 'message_start', 'message': {'role': 'assistant'}}),
+        requests.Timeout('idle stream'),
+    ])
+    with pytest.raises(LLMProviderError) as timed_out:
+        client.complete([{'role': 'user', 'content': 'go'}], [])
+    assert timed_out.value.error_code == 'LLM_TIMEOUT'
+
+
+def test_llm_config_is_frozen_for_running_settings_instance(tmp_path, monkeypatch):
+    original = reload_settings().llm_config().model_dump(mode='json')
+    original['models']['main']['stream_response'] = False
+    path = tmp_path / 'llm.json'
+    path.write_text(json.dumps(original), encoding='utf-8')
+    monkeypatch.setenv('DEVWERK_LLM_CONFIG_PATH', str(path))
+    running = reload_settings()
+    assert running.llm_config().models['main'].stream_response is False
+
+    original['models']['main']['stream_response'] = True
+    path.write_text(json.dumps(original), encoding='utf-8')
+    assert running.llm_config().models['main'].stream_response is False
+    detached = running.llm_config()
+    detached.models['main'].stream_response = True
+    assert running.llm_config().models['main'].stream_response is False
+    assert reload_settings().llm_config().models['main'].stream_response is True
+
+
 def test_anthropic_skips_empty_assistant_records_without_losing_tool_history():
     _, messages = AnthropicClient._to_provider_messages([
         {'role':'user','content':'Discuss'},
@@ -52,6 +179,91 @@ def test_anthropic_skips_empty_assistant_records_without_losing_tool_history():
     assert len(messages) == 3
     assert messages[1]['content'][0]['type'] == 'tool_use'
     assert messages[2]['content'][0]['tool_use_id'] == 'read'
+
+
+def test_anthropic_replays_signed_thinking_in_original_block_order():
+    client = AnthropicClient({"api_name": "test", "base_url": "https://provider.invalid",
+        "api_key": "token", "model": "m", "temperature": 0.2, "max_tokens": 1024})
+    response_blocks = [
+        {"type": "thinking", "thinking": "check the result", "signature": "signed"},
+        {"type": "text", "text": "working"},
+        {"type": "redacted_thinking", "data": "redacted"},
+        {"type": "tool_use", "id": "call-1", "name": "system.noop", "input": {}},
+    ]
+    client.session.post = lambda _url, **_kwargs: Response(
+        {"content": response_blocks, "usage": {}})
+    tool = {"type": "function", "function": {"name": "system.noop", "parameters": {"type": "object"}}}
+    completion = AgentModelResponse.model_validate(client.complete(
+        [{"role": "user", "content": "go"}], [tool]))
+    assistant = assistant_message(completion)
+    replay = replayable_session_messages([
+        assistant,
+        {"role": "tool", "tool_call_id": "call-1", "content": '{"ok":true}'},
+    ])
+    _, provider_messages = client._to_provider_messages(replay)
+
+    assert provider_messages[0]["content"] == response_blocks
+    assert provider_messages[1]["content"] == [
+        {"type": "tool_result", "tool_use_id": "call-1", "content": '{"ok":true}'}]
+    assert completion.text == "working"
+    assert completion.tool_calls[0].name == "system.noop"
+
+
+def test_anthropic_rejects_unsigned_thinking_instead_of_silently_dropping_it():
+    client = AnthropicClient({"api_name": "test", "base_url": "https://provider.invalid",
+        "api_key": "token", "model": "m", "temperature": 0.2, "max_tokens": 1024})
+    client.session.post = lambda _url, **_kwargs: Response(
+        {"content": [{"type": "thinking", "thinking": "unsigned"}], "usage": {}})
+    with pytest.raises(ValueError):
+        client.complete([{"role": "user", "content": "go"}])
+
+
+def test_anthropic_replay_uses_executed_tool_id_after_runner_normalization():
+    completion = AgentModelResponse.model_validate({
+        "tool_calls": [{"id": "original", "name": "system.noop", "arguments": {}}],
+        "provider_content": {"protocol": "anthropic", "blocks": [
+            {"type": "thinking", "thinking": "private", "signature": "signed"},
+            {"type": "tool_use", "id": "original", "name": "system.noop", "input": {}},
+        ]},
+    })
+    completion.tool_calls[0].id = "normalized"
+    assistant = assistant_message(completion)
+    _, messages = AnthropicClient._to_provider_messages([assistant,
+        {"role": "tool", "tool_call_id": "normalized", "content": "done"}])
+    assert messages[0]["content"][0]["signature"] == "signed"
+    assert messages[0]["content"][1]["id"] == "normalized"
+    assert messages[1]["content"][0]["tool_use_id"] == "normalized"
+
+
+def test_signed_thinking_is_durable_but_absent_from_public_agent_messages(store, tmp_path):
+    project = store.create_project("thinking replay", "", str(tmp_path / "project"))
+    run = store.begin_agent_run(project_id=project["id"], kind="column",
+        instruction_revision=1, instruction_snapshot="", context_snapshot={},
+        capabilities=[], platform_policy=store.latest_platform_policy(),
+        runtime_policy=store.policy)
+    completion = AgentModelResponse.model_validate({
+        "tool_calls": [{"id": "call-1", "name": "system.noop", "arguments": {}}],
+        "provider_content": {"protocol": "anthropic", "blocks": [
+            {"type": "thinking", "thinking": "private", "signature": "signed"},
+            {"type": "tool_use", "id": "call-1", "name": "system.noop", "input": {}},
+        ]},
+    })
+    assistant = assistant_message(completion)
+    saved = store.add_agent_message(run["id"], "assistant", "",
+        assistant["tool_calls"], provider_content=assistant["provider_content"])
+    store.add_agent_message(run["id"], "tool", '{"ok":true}', [], "call-1")
+    with store.connect() as db:
+        rows = db.execute("SELECT role,content,tool_calls_json,tool_call_id,provider_content_json "
+            "FROM v1_agent_messages WHERE agent_run_id=? ORDER BY sequence", (run["id"],)).fetchall()
+    history = [{"role": row["role"], "content": row["content"],
+        "tool_calls": json.loads(row["tool_calls_json"]), "tool_call_id": row["tool_call_id"],
+        "provider_content": json.loads(row["provider_content_json"]) if row["provider_content_json"] else None}
+        for row in rows]
+    replay = replayable_session_messages(history)
+
+    assert replay[0]["provider_content"]["blocks"][0]["signature"] == "signed"
+    assert saved["provider_content"]["blocks"][0]["thinking"] == "private"
+    assert "provider_content_json" not in store.agent_messages(project["id"], run["id"])[0]
 
 
 def test_contract_error_explains_nested_discriminator_branch_failure():
@@ -257,6 +469,10 @@ def test_anthropic_adapter_canonicalizes_schema_shaped_array_and_boolean_wrapper
     result = client.complete([{"role": "user", "content": "go"}], [tool])
 
     assert result["tool_calls"][0]["arguments"] == {
+        "plan": {"evidence": {"item": ["first", "second"]}, "self_check": "true"}
+    }
+    assert canonicalize_contract_value(result["tool_calls"][0]["arguments"],
+                                       tool["function"]["parameters"]) == {
         "plan": {"evidence": ["first", "second"], "self_check": True}
     }
 
@@ -386,6 +602,12 @@ def test_anthropic_adapter_materializes_provider_schema_and_scalar_wrappers():
     assert "When kind='agent'" in executor_schema["description"]
     assert "When kind='sequence'" in executor_schema["description"]
     assert result["tool_calls"][0]["arguments"] == {
+        "items": "one", "empty_items": "", "confirmed": "true",
+        "executor": {"kind": "agent", "capabilities": {"item": "project.files.write"}},
+        "wait_policy": "",
+    }
+    assert canonicalize_contract_value(result["tool_calls"][0]["arguments"],
+                                       tool["function"]["parameters"]) == {
         "items": ["one"],
         "empty_items": [],
         "confirmed": True,
@@ -461,6 +683,10 @@ def test_anthropic_adapter_round_trips_the_second_discriminated_object_variant()
     result = client.complete([{"role": "user", "content": "go"}], [tool])
 
     assert result["tool_calls"][0]["arguments"] == {
+        "executor": {"kind": "sequence", "steps": {"item": {"capability": "system.noop"}}}
+    }
+    assert canonicalize_contract_value(result["tool_calls"][0]["arguments"],
+                                       tool["function"]["parameters"]) == {
         "executor": {
             "kind": "sequence",
             "steps": [{"capability": "system.noop"}],

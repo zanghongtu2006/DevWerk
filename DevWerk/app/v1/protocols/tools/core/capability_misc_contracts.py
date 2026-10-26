@@ -24,16 +24,6 @@ class LoopInspectInput(ToolInput):
     loop_key: str = Field(min_length=1, description="Key returned by loop.list")
 
 
-class LoopApplyInput(ToolInput):
-    loop_key: str = Field(min_length=1, description="Loop key to apply")
-    bindings: dict[str, Any] = Field(description="Values required by the selected Loop parameter contract")
-
-    @field_validator("bindings")
-    @classmethod
-    def valid_bindings(cls, value: dict[str, Any]) -> dict[str, JsonValue]:
-        return DYNAMIC_JSON_OBJECT.validate_python(value)
-
-
 class PageLimitInput(ToolInput):
     limit: int | None = Field(default=None, ge=1, description="Maximum returned records")
 

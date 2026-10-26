@@ -388,7 +388,7 @@ def test_completion_recovery_rechecks_workspace_after_interrupted_task_commit(st
     assert store.get_task(task['id'])['status'] != 'done'
 
 
-def test_unknown_effect_blocks_new_task_and_main_direct_write(store, tmp_path):
+def test_unknown_effect_blocks_new_task_but_not_independent_main_work(store, tmp_path):
     wf = agent_workflow()
     project, first, _ = setup(store, tmp_path, wf, [])
     second = create_planned_task(store, project['id'], 'second')
@@ -396,11 +396,12 @@ def test_unknown_effect_blocks_new_task_and_main_direct_write(store, tmp_path):
         db.execute("UPDATE v1_tasks SET status='recovering',control_state='paused',failure_code='effect_outcome_unknown' WHERE id=?", (first['id'],))
         db.execute("UPDATE v1_scheduling_entries SET resources_json='[]' WHERE project_id=?", (project['id'],))
     assert store.claim_task(second['id'], 'new-worker') is None
-    result = store.registry.dispatch('project.command.run', command("print('must not execute')"),
+    result = store.registry.dispatch('project.command.run', command("print('independent action')"),
         CapabilityContext(project['id'], project, store, agent_run_id='main'))
-    assert not result.ok
+    assert result.ok
+    assert 'independent action' in result.output['stdout']
     with store.connect() as db:
-        assert db.execute("SELECT COUNT(*) FROM v1_execution_receipts WHERE capability='project.command.run'").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM v1_execution_receipts WHERE capability='project.command.run'").fetchone()[0] == 1
 
 
 def test_repeated_await_without_progress_stops_before_model_budget(store, tmp_path):
@@ -689,6 +690,20 @@ def test_worker_idle_then_new_assignment_preserves_identity_and_context(store, t
     assert first["id"] != second["id"]
     assert first["agent_instance_id"] == second["agent_instance_id"]
     assert first["session_id"] == second["session_id"]
+
+
+def test_default_worker_session_does_not_carry_context_to_another_task(store, tmp_path):
+    project = store.create_project("task-local writer", "", str(tmp_path / "project"))
+    workflow = agent_workflow()
+    publish_planned_workflow(store, project["id"], workflow)
+    task, run, first = assignment(store, project, workflow, worker_key=None)
+    store.agents.finish(first, "completed", {"summary": "first output"})
+    evidence = store.prepare_terminal_evidence(task, run["id"], "done", {}, None)
+    store.finish_run(task, run["id"], {}, "success", "done", terminal="done", terminal_artifact=evidence)
+
+    _, _, second = assignment(store, project, workflow, worker_key=None)
+    assert first["agent_instance_id"] != second["agent_instance_id"]
+    assert first["session_id"] != second["session_id"]
 
 
 def test_one_worker_has_only_one_active_assignment(store, tmp_path):

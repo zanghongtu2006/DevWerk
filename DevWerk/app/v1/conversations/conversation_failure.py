@@ -38,7 +38,7 @@ def failure_summary(store, project_id, ledger, error):
             if detail:
                 failures.append(f'{capability}: {detail}')
             continue
-        if capability in {'loop.apply', 'workflow.publish', 'workflow.create'}:
+        if capability in {'workflow.publish', 'workflow.create'}:
             workflows.append(capability)
         if capability == 'task.plan.save':
             plans.append(capability)

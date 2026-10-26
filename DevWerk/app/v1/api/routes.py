@@ -17,7 +17,7 @@ from app.core.global_settings import (
     restart_required_changes,
     save_global_settings,
 )
-from app.v1.domain import ConversationRequest, ExternalEventSignal, LoopApplyRequest, ProjectCreate, TaskCreate, TaskPlanCreate, WorkflowPlanCreate, WorkflowRevisionPublishRequest
+from app.v1.domain import ConversationRequest, ExternalEventSignal, ProjectCreate, TaskCreate, TaskPlanCreate, WorkflowPlanCreate, WorkflowRevisionPublishRequest
 from app.v1.context.memory import MemoryRecord
 from app.v1.capabilities import (
     CapabilityContext,
@@ -27,7 +27,7 @@ from app.v1.execution.states import runtime_status_catalog
 from app.v1.protocols.transport.api_response_contracts import (AgentRunDetailResponse, BoardResponse,
     ConversationJobRecord, ConversationSubmitReceipt, HealthResponse, TaskDetailResponse)
 from app.v1.protocols.tools.planning.capability_project_receipts import ProjectRecord, WorkflowRevisionReceipt
-from app.v1.protocols.tools.planning.capability_loop_receipts import LoopApplyReceipt, LoopInspectReceipt, LoopSummaryReceipt
+from app.v1.protocols.tools.planning.capability_loop_receipts import LoopInspectReceipt, LoopSummaryReceipt
 from app.v1.protocols.tools.planning.capability_contracts import TaskPlanRecord, WorkflowPlanRecord
 from app.v1.protocols.tools.planning.capability_task_receipts import TaskRecord, TaskSuccessorReceipt
 from app.v1.protocols.tools.planning.capability_task_receipts import ArtifactProjection
@@ -297,19 +297,6 @@ def loop(loop_key: str, request: Request) -> dict[str, Any]:
         return store(request).get_loop(loop_key)
     except KeyError as exc:
         raise not_found(exc) from exc
-
-
-@router.post("/projects/{project_id}/automation/loop", status_code=201,
-             response_model=LoopApplyReceipt)
-def apply_loop(project_id: str, payload: LoopApplyRequest, request: Request) -> dict[str, Any]:
-    try:
-        result = store(request).apply_loop(project_id, payload.loop_key, payload.bindings)
-        supervisor(request).wake()
-        return result
-    except KeyError as exc:
-        raise not_found(exc) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.post("/projects/{project_id}/automation/workflow-plans", status_code=201,

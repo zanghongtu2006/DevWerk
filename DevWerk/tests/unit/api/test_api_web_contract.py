@@ -226,7 +226,7 @@ def test_global_settings_api_saves_and_requests_managed_restart(tmp_path):
         assert restart.calls == 1
 
 
-def test_loop_and_direct_api_can_create_initial_workflows(tmp_path):
+def test_loop_api_is_read_only_and_direct_api_can_publish_workflows(tmp_path):
     with client() as web:
         loops = web.get("/v1/loops")
         assert loops.status_code == 200
@@ -240,25 +240,11 @@ def test_loop_and_direct_api_can_create_initial_workflows(tmp_path):
             "/v1/projects",
             json={"name": "loop-api", "description": "", "base_dir": str(tmp_path / "loop-api")},
         ).json()
-        applied = web.post(
-            f"/v1/projects/{project['id']}/automation/loop",
-            json={
-                "loop_key": "software.gitlab_devops",
-                "bindings": {
-                    "product_name": "API product",
-                    "gitlab_repository": "group/project",
-                },
-            },
-        )
-        assert applied.status_code == 201
-        assert applied.json()["loop"]["loop_key"] == "software.gitlab_devops"
-
-        second = web.post(
-            f"/v1/projects/{project['id']}/automation/loop",
-            json={"loop_key": "software.gitlab_devops", "bindings": {}},
-        )
-        assert second.status_code == 422
-        assert "only before the Project has a Workflow" in second.json()["detail"]
+        guide = web.get("/v1/loops/software.gitlab_devops")
+        assert guide.status_code == 200
+        assert "guide" in guide.json()
+        assert "bundle" not in guide.json()
+        assert web.post(f"/v1/projects/{project['id']}/automation/loop", json={}).status_code == 404
 
         fresh = web.post(
             "/v1/projects",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import Enum
 from typing import Any, Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -13,7 +14,8 @@ from app.v1.execution.states import (
     ToolInvocationStatus,
 )
 from app.v1.protocols.tools.core.capability_protocol import ToolError
-from app.v1.protocols.tools.core.provider_schema_contracts import ProviderSchemaNode
+from app.v1.protocols.workflow.task_input_schema import WorkflowTaskInputSchema
+from app.v1.protocols.agent.provider_content import AnthropicAssistantContent
 
 KEY_PATTERN = r"^[a-z][a-z0-9_.-]{0,127}$"
 
@@ -86,6 +88,13 @@ WaitPolicy = Annotated[
 ]
 
 
+class AcceptedDependencyScope(str, Enum):
+    """How far accepted Task artifacts may be selected through dependencies."""
+
+    DIRECT = "direct"
+    TRANSITIVE = "transitive"
+
+
 class ContextSelection(BaseModel):
     model_config = ConfigDict(extra="forbid")
     include_project: bool = True
@@ -97,7 +106,15 @@ class ContextSelection(BaseModel):
     include_task_context: bool = True
     upstream_outputs: list[str] = Field(default_factory=list)
     accepted_artifact_globs: list[str] = Field(default_factory=list)
+    accepted_dependency_scope: AcceptedDependencyScope = Field(
+        default=AcceptedDependencyScope.TRANSITIVE,
+        description="Select accepted artifacts from direct done dependencies or all transitive done dependencies.",
+    )
     working_artifact_globs: list[str] = Field(default_factory=list)
+    root_working_artifact_globs: list[str] = Field(
+        default_factory=list,
+        description="Select current-Task registered artifacts only when the Task has no direct dependencies.",
+    )
     artifact_globs: list[str] = Field(default_factory=list)
     memory: list["MemorySelector"] = Field(default_factory=list)
 
@@ -187,7 +204,8 @@ class AcceptanceCheck(BaseModel):
     capability: str = Field(pattern=KEY_PATTERN)
     arguments: dict[str, Any] = Field(description=(
         "Use the selected capability's declared input schema exactly; field types are required, "
-        "including integer versus string. The live Workflow Tool schema binds this field to its capability."
+        "including integer versus string. Select the Tool to read its direct schema; Workflow publication "
+        "validates these arguments against that exact registered schema."
     ))
     purpose: str = Field(default='', max_length=4000)
     launch_validation: Literal['preflight', 'deferred'] = Field(default='deferred',
@@ -268,7 +286,7 @@ class ColumnDefinition(BaseModel):
                 available_roots.add("upstream_outputs")
             if self.context.accepted_artifact_globs:
                 available_roots.add("accepted_artifacts")
-            if self.context.working_artifact_globs:
+            if self.context.working_artifact_globs or self.context.root_working_artifact_globs:
                 available_roots.add("working_artifacts")
             if self.context.artifact_globs:
                 available_roots.add("reference_artifacts")
@@ -505,7 +523,10 @@ class WorkflowAuthoringColumn(BaseModel):
     )
     name: str = Field(min_length=1, max_length=200)
     instruction: str = Field(min_length=1, max_length=60_000)
-    executor: ColumnExecutor
+    executor: ColumnExecutor = Field(description=(
+        "Required execution strategy for this Column. For an agent executor, put kind, capabilities, "
+        "and optional worker_key/worker_role inside this executor object, never beside the Column key."
+    ))
     transitions: list[WorkflowAuthoringTransition] = Field(
         min_length=1,
         description=(
@@ -548,9 +569,13 @@ class WorkflowAuthoringRequest(BaseModel):
             "transition targets. The last executable Column still needs a transition to a terminal."
         ),
     )
-    task_input_schema: dict[str, Any] = Field(
-        default_factory=lambda: ProviderSchemaNode(schema_type="object").wire(),
-        description="JSON Schema for Task input; omit to accept any object-shaped Task input.",
+    task_input_schema: WorkflowTaskInputSchema = Field(
+        default_factory=lambda: WorkflowTaskInputSchema(schema_type="object"),
+        description=(
+            "Optional JSON Schema describing Task input fields, not the Task values. Omit to accept any "
+            "object-shaped Task input. If provided, properties maps field names to schemas and required "
+            "is an array of field names; put actual values in each Task Plan item input."
+        ),
     )
     expected_outputs: list[str] = Field(min_length=1, max_length=200)
     completion_conditions: list[str] = Field(min_length=1, max_length=200)
@@ -1142,11 +1167,6 @@ class WorkflowRevisionPublishRequest(BaseModel):
     workflow: WorkflowDefinition
 
 
-class LoopApplyRequest(BaseModel):
-    loop_key: str = Field(pattern=KEY_PATTERN)
-    bindings: dict[str, Any] = Field(default_factory=dict)
-
-
 class TaskCreate(BaseModel):
     task_plan_id: str = Field(min_length=1)
     proposed_task_ref: str = Field(pattern=KEY_PATTERN)
@@ -1162,6 +1182,7 @@ class AgentModelResponse(BaseModel):
     text: str = ""
     tool_calls: list[AgentToolCall] = Field(default_factory=list)
     usage: dict[str, Any] = Field(default_factory=dict)
+    provider_content: AnthropicAssistantContent | None = None
 
 
 class ToolResult(BaseModel):

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 import logging
 from pathlib import Path
@@ -17,7 +16,7 @@ _TITLE = re.compile(r"^#\s+(.+?)\s*$")
 _BREAK = re.compile(r"\s*<br\s*/?>\s*", re.IGNORECASE)
 _KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _VERSION = re.compile(r"^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$")
-_ASSET_SUFFIXES = {".json", ".md", ".txt", ".yaml", ".yml"}
+_ASSET_SUFFIXES = {".md", ".txt"}
 
 
 def _field_key(value: str) -> str:
@@ -100,7 +99,7 @@ def _parse_loop_meta(path: Path) -> dict[str, Any]:
 
 
 class LoopCatalog:
-    """Discovers Loop cards and executable bundles directly from one directory."""
+    """Discover descriptive Loop guides and method resources."""
 
     def __init__(self, root: str | Path | None = None):
         self.root = Path(root or Path(__file__).resolve().parents[3] / "loops").resolve()
@@ -130,7 +129,6 @@ class LoopCatalog:
             keys.add(record["loop_key"])
             record["directory"] = directory.name
             record["meta_path"] = meta_path
-            record["bundle_path"] = directory / "loop.json"
             records.append(record)
         return records
 
@@ -171,29 +169,23 @@ class LoopCatalog:
             if loop_key in self.errors:
                 raise ValueError(self.errors[loop_key])
             raise KeyError(f"Loop {loop_key!r} was not found")
-        bundle_path = Path(record["bundle_path"])
-        if not bundle_path.is_file():
-            raise ValueError(f"Loop {loop_key!r} is missing loop.json")
-        bundle_bytes = bundle_path.read_bytes()
-        executable = json.loads(bundle_bytes.decode("utf-8"))
-        if executable.get("schema_version") != "devwerk.loop.bundle.v1":
-            raise ValueError(f"Loop {loop_key!r} has an unsupported bundle schema")
-        if not isinstance(executable.get("parameter_schema"), dict) or not isinstance(executable.get("bundle"), dict):
-            raise ValueError(f"Loop {loop_key!r} must declare parameter_schema and bundle objects")
+        directory = Path(record["meta_path"]).parent
+        if (directory / "loop.json").exists():
+            raise ValueError(f"Loop {loop_key!r} contains an executable bundle; only descriptive guides are supported")
         assets: list[LoopAssetReceipt] = []
         asset_digest_parts: list[bytes] = []
         assets_root = Path(record["meta_path"]).parent / "assets"
         if assets_root.is_dir():
             for asset_path in sorted(path for path in assets_root.rglob("*") if path.is_file()):
                 if asset_path.suffix.casefold() not in _ASSET_SUFFIXES:
-                    continue
+                    raise ValueError(f"Loop {loop_key!r} contains a non-text method resource")
                 relative_path = asset_path.relative_to(assets_root).as_posix()
                 content = asset_path.read_text(encoding="utf-8")
                 assets.append(LoopAssetReceipt(path=relative_path, content=content))
                 asset_digest_parts.extend((relative_path.encode("utf-8"), b"\0", content.encode("utf-8"), b"\0"))
         digest = hashlib.sha256(
-            record["meta"].encode("utf-8") + b"\0" + bundle_bytes + b"\0" + b"".join(asset_digest_parts)
+            record["meta"].encode("utf-8") + b"\0" + b"".join(asset_digest_parts)
         ).hexdigest()
         return LoopInspectReceipt.from_parts(
-            record, digest, executable["parameter_schema"], executable["bundle"], assets,
+            record, digest, assets,
         ).model_dump(mode="json")

@@ -183,6 +183,7 @@ class SchemaRepository:
                     id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, agent_run_id TEXT NOT NULL,
                     sequence INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
                     tool_calls_json TEXT NOT NULL DEFAULT '[]', tool_call_id TEXT,
+                    provider_content_json TEXT,
                     created_at TEXT NOT NULL,
                     UNIQUE(agent_run_id, sequence),
                     FOREIGN KEY(project_id) REFERENCES v1_projects(id) ON DELETE CASCADE,
@@ -406,6 +407,7 @@ class SchemaRepository:
             )
             for table in ("v1_column_runs", "v1_agent_messages", "v1_tool_invocations", "v1_await_handles"):
                 self._ensure_column(db, table, "project_id", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(db, "v1_agent_messages", "provider_content_json", "TEXT")
             self._ensure_column(db, "v1_await_handles", "waiting_kind", "TEXT NOT NULL DEFAULT 'external'")
             self._ensure_column(db, "v1_await_handles", "health", "TEXT NOT NULL DEFAULT 'healthy'")
             self._ensure_column(db, "v1_await_handles", "resume_condition_json", "TEXT NOT NULL DEFAULT '{}'")

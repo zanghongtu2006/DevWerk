@@ -43,6 +43,7 @@ class ContextPolicy(_PolicyModel):
     soft_fraction: float = Field(default=0.8, gt=0, lt=1)
     target_fraction: float = Field(default=0.55, gt=0, lt=0.8)
     safety_fraction: float = Field(default=0.05, gt=0, lt=0.3)
+    next_step_reserve_tokens: int = Field(default=4_096, ge=0)
     conversation_history_max_characters: int = Field(default=40_000, ge=1024)
     worker_context_max_characters: int = Field(default=80_000, ge=1024)
     task_summary_limit: int = Field(default=100, ge=1)

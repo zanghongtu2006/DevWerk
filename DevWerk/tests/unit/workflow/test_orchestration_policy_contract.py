@@ -423,11 +423,11 @@ def test_mailbox_observation_does_not_invalidate_running_task_state(store, tmp_p
     assert observed["state_version"] == state_version
 
 
-def test_platform_policy_is_compact_project_manager_identity(store):
+def test_platform_policy_is_compact_general_agent_with_optional_project_management(store):
     content = store.latest_platform_policy().content
     assert len(content) < 3_000
-    assert "professional project manager and agile coach" in content
-    assert "Discover and inspect Loops" in content
-    assert "create an initial Workflow" in content
-    assert "supervise them to `done` or `failed`" in content
-    assert "Never describe an intended state change as completed" in content
+    assert "persistent, general-purpose Agent" in content
+    assert "a Workflow is available but is not required" in content
+    assert "ordinary Agent work" in content
+    assert "Requirement, Workflow, Task and Worker state changes" in content
+    assert "A successful Tool receipt is evidence" in content

@@ -156,7 +156,7 @@ def materialize_workflow(draft: WorkflowAuthoringRequest) -> tuple[WorkflowDefin
         entry_meaning=f"Task enters {draft.entry}",
         terminal_meaning="Follow declared transitions to done or failed",
         task_contract=TaskContract(
-            input_schema=draft.task_input_schema,
+            input_schema=draft.task_input_schema.wire(),
             expected_outputs=draft.expected_outputs,
             acceptance_contract=draft.completion_conditions,
         ),

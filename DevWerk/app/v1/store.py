@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import copy
 import hashlib
 import sqlite3
 import threading
@@ -17,7 +16,7 @@ from app.v1.domain import (
     WorkflowPlan,
     WorkflowDefinition,
 )
-from app.v1.contracts import canonicalize_contract_value, check_schema, validate_contract, validate_optional_defaults
+from app.v1.contracts import check_schema
 from app.v1.capabilities import (
     CapabilityRegistry,
     task_binding_exact_strings,
@@ -26,7 +25,6 @@ from app.v1.capabilities import (
 )
 from app.v1.protocols.tools.core.capability_protocol import ExecutionReceiptStatus, GovernanceDecisionKind
 from app.v1.protocols.tools.planning.capability_contracts import MaterializedTaskRow, TaskMaterializationReceipt
-from app.v1.protocols.tools.planning.capability_loop_receipts import AppliedLoopIdentity, LoopApplyReceipt
 from app.v1.protocols.context.store_context_receipts import (ConversationHistoryFrame,
     SessionRunIndex, SessionToolReceipt)
 from app.v1.protocols.storage.store_receipt_contracts import (AgentMessageRecord, BacklogRecord,
@@ -44,6 +42,7 @@ from app.v1.protocols.workflow.runtime_json_contracts import (
     ReadinessDecisionPayload, TaskTerminalEvidence,
 )
 from app.v1.protocols.workflow.runtime_checkpoint_contracts import ExecutionCheckpoint
+from app.v1.protocols.workflow.revision_readiness import WorkflowRevisionBlocker
 from app.v1.workspace.files import ProjectFiles
 from app.v1.workflows.loops import LoopCatalog
 from app.v1.context.memory import MemoryIndex, MemoryManager, MemoryRecord, MemoryStore
@@ -79,34 +78,6 @@ from app.v1.services.task_graph_admission import (
     immediate_predecessor,
     validate_task_scope,
 )
-
-
-def _resolve_loop_parameters(value: Any, parameters: dict[str, Any]) -> Any:
-    """Resolve exact Loop parameters without evaluating code or free-form expressions."""
-    if isinstance(value, dict):
-        if set(value) == {"$param"}:
-            key = str(value["$param"])
-            if key not in parameters:
-                raise ValueError(f"Loop parameter {key!r} is missing")
-            return copy.deepcopy(parameters[key])
-        return {key: _resolve_loop_parameters(item, parameters) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_resolve_loop_parameters(item, parameters) for item in value]
-    return value
-
-
-def _validate_loop_parameter_ownership(
-    loop_key: str,
-    parameter_schema: dict[str, Any],
-    workflow_plan: WorkflowPlan,
-) -> None:
-    project_fields = set((parameter_schema.get("properties") or {}).keys())
-    task_fields = set((workflow_plan.task_contract.input_schema.get("properties") or {}).keys())
-    overlap = sorted(project_fields & task_fields)
-    if overlap:
-        raise ValueError(
-            f"Loop {loop_key} declares fields in both Project bindings and Task input: {overlap}"
-        )
 
 
 def _validate_process_stage_alignment(
@@ -315,104 +286,8 @@ class V1Store:
         return self.loops.list(category=category, tag=tag, query=query, limit=page_limit)
 
     def get_loop(self, loop_key: str) -> dict[str, Any]:
-        loop = self.loops.get(loop_key)
-        parameter_schema = dict(loop["parameter_schema"])
-        bundle = dict(loop["bundle"])
-        check_schema(parameter_schema, label=f"Loop {loop_key} parameters")
-        defaults = dict(bundle.get("defaults") or {})
-        expected_bundle_keys = {"defaults", "workflow_plan", "workflow"}
-        if set(bundle) != expected_bundle_keys:
-            raise ValueError(
-                f"Loop {loop_key} bundle must contain exactly "
-                "defaults, workflow_plan, and workflow"
-            )
-        if defaults:
-            # Defaults may cover only optional parameters; required user input
-            # is validated after merging bindings at application time.
-            validate_optional_defaults(defaults, parameter_schema, label=f"Loop {loop_key} defaults")
-            materialized = _resolve_loop_parameters(bundle, defaults)
-            workflow_plan = WorkflowPlan.model_validate(materialized["workflow_plan"])
-            check_schema(workflow_plan.task_contract.input_schema, label=f"Loop {loop_key} task input_schema")
-            WorkflowDefinition.model_validate(materialized["workflow"])
-        else:
-            workflow_plan = WorkflowPlan.model_validate(bundle["workflow_plan"])
-            check_schema(workflow_plan.task_contract.input_schema, label=f"Loop {loop_key} task input_schema")
-            WorkflowDefinition.model_validate(bundle["workflow"])
-        _validate_loop_parameter_ownership(loop_key, parameter_schema, workflow_plan)
-        return loop
-
-    def apply_loop(
-        self, project_id: str, loop_key: str, bindings: dict[str, Any],
-    ) -> dict[str, Any]:
-        with self.tx(immediate=True):
-            return self._apply_loop(project_id, loop_key, bindings)
-
-    def _apply_loop(
-        self,
-        project_id: str,
-        loop_key: str,
-        bindings: dict[str, Any],
-    ) -> dict[str, Any]:
-        self.get_project(project_id)
-        try:
-            self.get_workflow(project_id)
-        except KeyError:
-            pass
-        else:
-            raise ValueError("a Loop can be applied only before the Project has a Workflow")
-        loop = self.get_loop(loop_key)
-        bundle = dict(loop["bundle"])
-        from app.v1.protocols.workflow.loop_bindings import LoopBindings, LoopPackageSnapshot
-        parameters = canonicalize_contract_value(
-            LoopBindings.combine(bundle.get("defaults") or {}, bindings).values,
-            loop["parameter_schema"],
-        )
-        validate_contract(parameters, loop["parameter_schema"], label=f"Loop {loop_key} bindings")
-        materialized = _resolve_loop_parameters(bundle, parameters)
-        plan = WorkflowPlan.model_validate(materialized["workflow_plan"])
-        workflow = WorkflowDefinition.model_validate(materialized["workflow"])
-        plan_row = self.create_workflow_plan(project_id, plan)
-        workflow_row = self._publish_workflow_revision(
-            project_id,
-            workflow,
-            plan_row["id"],
-            initial_loop=loop,
-        )
-        application_id, now = new_id("loopapp"), utcnow()
-        with self.tx(immediate=True) as db:
-            db.execute(
-                "INSERT INTO v1_project_loop_bindings("
-                "id,project_id,loop_key,loop_version,loop_digest,bindings_json,"
-                "workflow_plan_id,workflow_revision_id,created_at,package_json"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (
-                    application_id,
-                    project_id,
-                    loop["loop_key"],
-                    loop["version"],
-                    loop["digest"],
-                    LoopBindings(values=parameters).json_text(),
-                    plan_row["id"],
-                    workflow_row["id"],
-                    now,
-                    LoopPackageSnapshot.model_validate(loop).json_text(),
-                ),
-            )
-            self._event(db, project_id, None, None, "workflow.loop.applied", {
-                "application_id": application_id,
-                "loop_key": loop["loop_key"],
-                "loop_version": loop["version"],
-                "loop_digest": loop["digest"],
-                "workflow_revision_id": workflow_row["id"],
-                "workflow_plan_id": plan_row["id"],
-            })
-            self.scopes.bind_workflow(workflow_row['id'], application_id)
-        return LoopApplyReceipt(id=application_id, project_id=project_id,
-            loop=AppliedLoopIdentity(loop_key=loop['loop_key'], version=loop['version'],
-                digest=loop['digest'], name=loop['name'], category=loop['category'],
-                directory=loop['directory']), bindings=parameters,
-            workflow_plan=plan_row, workflow=workflow_row,
-            created_at=now).model_dump(mode='json')
+        """Read a descriptive method guide without changing Project state."""
+        return self.loops.get(loop_key)
 
     def _ensure_column(self, db: sqlite3.Connection, table: str, column: str, definition: str) -> None:
         self.schema_repository._ensure_column(db, table, column, definition)
@@ -1172,13 +1047,48 @@ class V1Store:
     def publish_workflow(self, project_id: str, workflow: WorkflowDefinition, workflow_plan_id: str) -> dict[str, Any]:
         return self._publish_workflow_revision(project_id, workflow, workflow_plan_id)
 
+    def workflow_revision_blockers(self, db: sqlite3.Connection, project_id: str,
+                                   active_revision_id: str | None) -> list[WorkflowRevisionBlocker]:
+        """Report the same Task quiescence boundary used by revision publication."""
+        if active_revision_id is None:
+            return []
+        inflight = db.execute('''SELECT t.id,t.status,t.current_column FROM v1_tasks t
+            WHERE t.project_id=? AND (t.status IN ('running','waiting','recovering')
+            OR t.lease_owner IS NOT NULL OR t.failure_code='effect_outcome_unknown'
+            OR EXISTS (SELECT 1 FROM v1_column_attempts a WHERE a.task_id=t.id AND a.status IN ('running','waiting'))
+            OR EXISTS (SELECT 1 FROM v1_agent_assignments a WHERE a.task_id=t.id AND a.status IN ('running','waiting'))
+            OR EXISTS (SELECT 1 FROM v1_await_handles h WHERE h.task_id=t.id AND h.status='pending'))''',
+            (project_id,),
+        ).fetchall()
+        blockers = [WorkflowRevisionBlocker(task_id=row['id'], status=row['status'],
+            current_column=row['current_column'], reason='active_effect') for row in inflight]
+        seen = {item.task_id for item in blockers}
+        prior = db.execute(
+            'SELECT definition_json FROM v1_workflow_revisions WHERE id=? AND project_id=?',
+            (active_revision_id, project_id),
+        ).fetchone()
+        prior_entry = WorkflowDefinition.model_validate_json(prior[0]).entry
+        rows = db.execute('''SELECT t.id,t.status,t.current_column,
+            (SELECT COUNT(*) FROM v1_column_attempts a WHERE a.task_id=t.id) AS attempt_count,
+            (SELECT COUNT(*) FROM v1_agent_assignments a WHERE a.task_id=t.id) AS assignment_count
+            FROM v1_tasks t WHERE t.project_id=? AND t.workflow_revision_id=?''',
+            (project_id, active_revision_id),
+        ).fetchall()
+        for row in rows:
+            if row['id'] in seen or row['status'] in ('done', 'failed'):
+                continue
+            never_started_entry = (row['status'] == 'pending' and row['current_column'] == prior_entry
+                                   and not row['attempt_count'] and not row['assignment_count'])
+            if not never_started_entry:
+                blockers.append(WorkflowRevisionBlocker(task_id=row['id'], status=row['status'],
+                    current_column=row['current_column'], reason='started_nonterminal'))
+        return blockers
+
     def _publish_workflow_revision(
         self,
         project_id: str,
         workflow: WorkflowDefinition,
         workflow_plan_id: str,
-        *,
-        initial_loop: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.get_project(project_id)
         with self.connect() as db:
@@ -1211,53 +1121,20 @@ class V1Store:
             if (previous[0] if previous else None) != observed_revision_id:
                 raise ValueError('WorkflowRevisionChanged: inspect the active Workflow before publishing')
             if previous:
-                inflight = db.execute('''SELECT t.id,t.status,t.current_column FROM v1_tasks t
-                    WHERE t.project_id=? AND (t.status IN ('running','waiting','recovering')
-                    OR t.lease_owner IS NOT NULL OR t.failure_code='effect_outcome_unknown'
-                    OR EXISTS (SELECT 1 FROM v1_column_attempts a WHERE a.task_id=t.id AND a.status IN ('running','waiting'))
-                    OR EXISTS (SELECT 1 FROM v1_agent_assignments a WHERE a.task_id=t.id AND a.status IN ('running','waiting'))
-                    OR EXISTS (SELECT 1 FROM v1_await_handles h WHERE h.task_id=t.id AND h.status='pending'))''',
-                    (project_id,),
-                ).fetchall()
-                if inflight:
-                    detail = ', '.join(f"{row['id']}:{row['status']}@{row['current_column']}" for row in inflight[:8])
-                    raise ValueError('WorkflowRevisionBusy: settle or stop active Project Tasks before publishing: ' + detail)
-                prior = db.execute(
-                    'SELECT definition_json FROM v1_workflow_revisions WHERE id=? AND project_id=?',
-                    (previous[0], project_id),
-                ).fetchone()
-                prior_entry = WorkflowDefinition.model_validate_json(prior[0]).entry
-                blockers = db.execute('''SELECT t.id,t.status,t.current_column,
-                    (SELECT COUNT(*) FROM v1_column_attempts a WHERE a.task_id=t.id) AS attempt_count,
-                    (SELECT COUNT(*) FROM v1_agent_assignments a WHERE a.task_id=t.id) AS assignment_count
-                    FROM v1_tasks t WHERE t.project_id=? AND t.workflow_revision_id=?''',
-                    (project_id, previous[0]),
-                ).fetchall()
-                unsafe = [row for row in blockers if row['status'] not in ('done', 'failed') and not (
-                    row['status'] == 'pending' and row['current_column'] == prior_entry
-                    and not row['attempt_count'] and not row['assignment_count'])]
-                if unsafe:
-                    detail = ', '.join(f"{row['id']}:{row['status']}@{row['current_column']}" for row in unsafe[:8])
-                    raise ValueError('WorkflowRevisionBusy: settle or stop old Workflow Tasks before publishing: ' + detail)
+                blockers = self.workflow_revision_blockers(db, project_id, previous[0])
+                if blockers:
+                    detail = ', '.join(f"{item.task_id}:{item.status}@{item.current_column}"
+                                       for item in blockers[:8])
+                    message = ('settle or stop active Project Tasks' if blockers[0].reason == 'active_effect'
+                               else 'settle or stop old Workflow Tasks')
+                    raise ValueError(f'WorkflowRevisionBusy: {message} before publishing: {detail}')
             workflow_id = identity[0] if identity else new_id("workflow")
             if not identity:
                 db.execute(
-                    "INSERT INTO v1_workflows("
-                    "id,project_id,name,state_version,source_loop_key,source_loop_version,"
-                    "source_loop_digest,created_at,updated_at) VALUES(?,?,?,0,?,?,?,?,?)",
-                    (
-                        workflow_id,
-                        project_id,
-                        workflow.name,
-                        str(initial_loop["loop_key"]) if initial_loop else None,
-                        str(initial_loop["version"]) if initial_loop else None,
-                        str(initial_loop["digest"]) if initial_loop else None,
-                        now,
-                        now,
-                    ),
+                    "INSERT INTO v1_workflows(id,project_id,name,state_version,created_at,updated_at) "
+                    "VALUES(?,?,?,0,?,?)",
+                    (workflow_id, project_id, workflow.name, now, now),
                 )
-            elif initial_loop is not None:
-                raise ValueError("a Loop cannot replace an existing Project Workflow")
             current = int(db.execute(
                 "SELECT COALESCE(MAX(revision_no),0) FROM v1_workflow_revisions WHERE workflow_id=?", (workflow_id,)
             ).fetchone()[0])
@@ -1276,7 +1153,7 @@ class V1Store:
                 "revision_id": revision_id,
                 "revision": current + 1,
                 "workflow_plan_id": workflow_plan_id,
-                "source_loop_key": initial_loop["loop_key"] if initial_loop else None,
+                "source_loop_key": None,
             })
             self._refresh_projection(db, project_id)
             self.scopes.inherit(revision_id, previous[0] if previous else None)
@@ -1372,15 +1249,10 @@ class V1Store:
             return []
         if binding.get("package_json"):
             return [dict(asset) for asset in json.loads(binding["package_json"]).get("assets", [])]
-        loop = self.get_loop(binding["loop_key"])
-        if loop["digest"] != binding["loop_digest"]:
-            raise ValueError(
-                f"Loop assets for {binding['loop_key']!r} no longer match the Project binding digest"
-            )
-        with self.tx(immediate=True) as db:
-            db.execute("UPDATE v1_project_loop_bindings SET package_json=? WHERE id=? AND package_json IS NULL",
-                       (json.dumps(loop, ensure_ascii=False), binding["id"]))
-        return [dict(asset) for asset in loop.get("assets", [])]
+        raise ValueError(
+            f"Frozen legacy Loop resources for {binding['loop_key']!r} are unavailable; "
+            "a descriptive Loop guide cannot replace an executable Project snapshot"
+        )
 
     def workflow_by_id(self, project_id: str, workflow_id: str) -> WorkflowDefinition:
         with self.connect() as db:
@@ -2579,9 +2451,14 @@ class V1Store:
         tool_call_id: str | None = None,
         progress_details: dict[str, Any] | None = None,
         emit_progress: bool = True,
+        provider_content: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         now = utcnow()
         packed_content, packed_calls = self._pack_text(content), self._pack_json(tool_calls or [])
+        if provider_content is not None:
+            from app.v1.protocols.agent.provider_content import AnthropicAssistantContent
+            provider_content = AnthropicAssistantContent.model_validate(provider_content).model_dump(mode="json")
+        packed_provider_content = self._pack_json(provider_content) if provider_content is not None else None
         conversation_progress: tuple[str, str, dict[str, Any]] | None = None
         with self.tx(immediate=True) as db:
             run = db.execute(
@@ -2592,8 +2469,8 @@ class V1Store:
                 raise KeyError(agent_run_id)
             sequence = db.execute("SELECT COALESCE(MAX(sequence),0)+1 FROM v1_agent_messages WHERE agent_run_id=?", (agent_run_id,)).fetchone()[0]
             db.execute(
-                "INSERT INTO v1_agent_messages(project_id,agent_run_id,sequence,role,content,tool_calls_json,tool_call_id,created_at) VALUES((SELECT project_id FROM v1_agent_runs WHERE id=?),?,?,?,?,?,?,?)",
-                (agent_run_id, agent_run_id, sequence, role, packed_content, packed_calls, tool_call_id, now),
+                "INSERT INTO v1_agent_messages(project_id,agent_run_id,sequence,role,content,tool_calls_json,tool_call_id,provider_content_json,created_at) VALUES((SELECT project_id FROM v1_agent_runs WHERE id=?),?,?,?,?,?,?,?,?)",
+                (agent_run_id, agent_run_id, sequence, role, packed_content, packed_calls, tool_call_id, packed_provider_content, now),
             )
             message_id = db.execute('SELECT last_insert_rowid()').fetchone()[0]
             if emit_progress and run["kind"] == "conversation" and role == "assistant" and (content.strip() or tool_calls):
@@ -2625,9 +2502,13 @@ class V1Store:
                 content=conversation_progress[1],
                 details=conversation_progress[2],
             )
-        return AgentMessageRecord(id=message_id, agent_run_id=agent_run_id, sequence=sequence,
+        record = AgentMessageRecord(id=message_id, agent_run_id=agent_run_id, sequence=sequence,
             role=role, content=content, tool_calls=tool_calls or [],
-            tool_call_id=tool_call_id, created_at=now).model_dump(mode='json')
+            tool_call_id=tool_call_id, provider_content=provider_content,
+            created_at=now).model_dump(mode='json')
+        if provider_content is None:
+            record.pop("provider_content")
+        return record
 
     def record_conversation_progress(
         self,
@@ -2668,7 +2549,10 @@ class V1Store:
         self.get_agent_run(project_id, agent_run_id)
         with self.connect() as db:
             rows = db.execute("SELECT * FROM v1_agent_messages WHERE project_id=? AND agent_run_id=? AND sequence>? ORDER BY sequence LIMIT ?", (project_id, agent_run_id, after_sequence, min(max(limit, 1), self.policy.service_limits.max_page_size))).fetchall()
-        return [self._decode(dict(row), "tool_calls_json") for row in rows]  # type: ignore[misc]
+        records = [self._decode(dict(row), "tool_calls_json") for row in rows]
+        for record in records:
+            record.pop("provider_content_json", None)
+        return records  # type: ignore[misc]
 
     def record_tool_invocation(
         self,
@@ -2715,14 +2599,25 @@ class V1Store:
             result.append(item)
         return result
 
+    def latest_successful_tool_invocation(
+        self, project_id: str, agent_run_id: str, capability: str,
+    ) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM v1_tool_invocations WHERE project_id=? AND agent_run_id=? "
+                "AND capability=? AND ok=1 ORDER BY sequence DESC LIMIT 1",
+                (project_id, agent_run_id, capability),
+            ).fetchone()
+        return self._decode(dict(row), "arguments_json", "result_json") if row else None
+
     def register_artifact(self, project_id: str, task_id: str | None, run_id: str | None, kind: str, path: str, sha256: str, size: int, meta: dict[str, Any] | None = None) -> dict[str, Any]:
         return self.artifact_repository.register_artifact(project_id, task_id, run_id, kind, path, sha256, size, meta)
 
     def artifacts(self, project_id: str, task_id: str, limit: int | None = None, after: str = "") -> list[dict[str, Any]]:
         return self.artifact_repository.artifacts(project_id, task_id, limit, after)
 
-    def accepted_dependency_artifacts(self, project_id: str, task_id: str) -> list[dict[str, Any]]:
-        return self.artifact_repository.accepted_dependency_artifacts(project_id, task_id)
+    def accepted_dependency_artifacts(self, project_id: str, task_id: str, *, transitive: bool = True) -> list[dict[str, Any]]:
+        return self.artifact_repository.accepted_dependency_artifacts(project_id, task_id, transitive=transitive)
 
     def current_task_artifacts(self, project_id: str, task_id: str) -> list[dict[str, Any]]:
         return self.artifact_repository.current_task_artifacts(project_id, task_id)

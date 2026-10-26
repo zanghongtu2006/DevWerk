@@ -92,6 +92,10 @@ def build_conversation_system_envelope(
 
 def assistant_message(response: AgentModelResponse) -> dict[str, Any]:
     message: dict[str, Any] = {"role": "assistant", "content": response.text or ""}
+    if response.provider_content is not None:
+        message["provider_content"] = response.provider_content.with_tool_ids(
+            [call.id for call in response.tool_calls]
+        ).model_dump(mode="json")
     if response.tool_calls:
         message["tool_calls"] = [
             {

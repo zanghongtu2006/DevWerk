@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, field_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
 
 from app.v1.domain import EdgeCheck
 from app.v1.protocols.context.context_checkpoint_contracts import TruncationProjection
@@ -44,57 +44,14 @@ class PlanningTruncationProjection(TruncationProjection):
     )
 
 
-class LoopWritablePathReference(BaseModel):
-    model_config = ConfigDict(extra="forbid", serialize_by_alias=True)
-    reference: str = Field(alias="$ref", min_length=1)
-
-
-class LoopColumnProjection(BaseModel):
-    key: str
-    writable_paths: list[str | LoopWritablePathReference]
-
-
 class LoopInspectPlanningProjection(BaseModel):
-    loop_key: str | None = None
-    version: str | None = None
-    digest: str | None = None
-    parameter_schema: dict[str, JsonValue] | None = None
-    use_case: str | None = None
-    selection_guide: str | None = None
-    input: JsonValue = None
-    output: JsonValue = None
-    flow_unit: JsonValue = None
-    task_contract: dict[str, JsonValue] = Field(default_factory=dict)
-    columns: list[LoopColumnProjection] = Field(default_factory=list)
-    assets: list[str] = Field(default_factory=list)
-
-    @field_validator("assets", mode="before")
-    @classmethod
-    def asset_paths(cls, value):
-        return [item if isinstance(item, str) else LoopAssetReceipt.model_validate(item).path
-                for item in value]
-
-
-class AppliedWorkflowReference(BaseModel):
-    id: str | None = None
-    definition_hash: str | None = None
-    workflow_plan_id: str | None = None
-
-
-class AppliedWorkflowPlanReference(BaseModel):
-    id: str | None = None
-    flow_unit: JsonValue = None
-    task_contract: dict[str, JsonValue]
-
-
-class LoopApplyPlanningProjection(BaseModel):
-    workflow: AppliedWorkflowReference
-    workflow_plan: AppliedWorkflowPlanReference
-    next: str = (
-        "Revise this template when needed. Each Task is one independently accepted flow unit and traverses "
-        "every Column; use task.plan.contract, task.plan.validate, task.plan.save, then task.create. "
-        "Acceptance checks are optional."
-    )
+    model_config = ConfigDict(extra="ignore")
+    loop_key: str
+    version: str
+    digest: str
+    name: str
+    guide: str
+    assets: list[LoopAssetReceipt] = Field(default_factory=list)
 
 
 class WorkflowEdgeProjection(BaseModel):

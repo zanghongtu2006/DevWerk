@@ -49,11 +49,13 @@ class ArtifactRepository:
         self,
         project_id: str,
         task_id: str,
+        *,
+        transitive: bool = True,
     ) -> list[dict[str, Any]]:
-        """Return immutable versions owned by canonical transitive done dependencies."""
+        """Return immutable versions owned by canonical done dependencies."""
         with self.store.connect() as db:
             rows = []
-            for task in dependency_tasks(db, project_id, task_id, transitive=True):
+            for task in dependency_tasks(db, project_id, task_id, transitive=transitive):
                 if task["status"] == "done":
                     rows.extend(db.execute(
                         "SELECT * FROM v1_artifact_versions WHERE project_id=? AND task_id=? ORDER BY created_at DESC,rowid DESC",

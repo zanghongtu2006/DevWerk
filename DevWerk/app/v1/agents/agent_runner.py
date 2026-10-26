@@ -8,14 +8,19 @@ import threading
 import json
 from app.v1.domain import AgentModelResponse, AgentToolCall
 from app.v1.execution.execution_recovery import adopt_legacy_intents
-from app.v1.execution.execution_control import ExecutionControl, ExecutionBudgetExceeded, ExecutionReplayUncertain
+from app.v1.execution.execution_control import (
+    ConversationTurnPreempted, ExecutionControl, ExecutionBudgetExceeded,
+    ExecutionReplayUncertain,
+)
 
 from app.v1.agents.agent_models import AgentRunResult, AgentRunSpec, ModelComplete
 from app.v1.protocols.agent.agent_context_frames import CompletionResultFrame, WorkerMessagesFrame
 from app.v1.agents.agent_prompt import assistant_message, run_checkpoint, stable_json
 from app.v1.agents.agent_provider import ProviderTurnRequester
 from app.v1.agents.agent_run_preparation import AgentRunPreparer
-from app.v1.agents.agent_tool_execution import AgentToolBatchExecutor, QUEUED_TASK_CAPABILITIES
+from app.v1.agents.agent_tool_execution import AgentToolBatchExecutor, queued_task_entry
+from app.v1.protocols.agent.resolved_tool_operation import ResolvedToolOperation
+from app.v1.tooling.tool_call_resolution import resolve_tool_call, schema_digest
 from app.v1.capabilities import CapabilityRegistry
 from app.v1.policy import PlatformPolicySnapshot, V1RuntimePolicy
 from app.v1.protocols.workflow.runtime_json_contracts import WorkResultNotice
@@ -74,6 +79,7 @@ class AgentExecutionRunner:
             spec=spec,
             run_id=run["id"],
             registry=self.registry,
+            capability_context=prepared.capability_context,
         )
         try:
             iteration = 0
@@ -81,7 +87,7 @@ class AgentExecutionRunner:
             empty_responses = 0
             column_text_responses = 0
             force_reply_tool = spec.kind == 'conversation' and (
-                any(entry['ok'] and entry['capability'] in QUEUED_TASK_CAPABILITIES
+                any(queued_task_entry(entry)
                     for entry in prepared.logical_ledger)
                 or self._active_worker_handoff(spec, prepared.logical_ledger)
             )
@@ -92,6 +98,8 @@ class AgentExecutionRunner:
                 self.store.agents.charge(spec.assignment, resumes=1)
             while True:
                 control.check()
+                if spec.kind == 'conversation':
+                    control.check_preempt()
                 if spec.column_run_id:
                     # Runtime checks are deliberately rerun to validate current
                     # output, but an earlier unsettled check is not a safe retry.
@@ -126,13 +134,30 @@ class AgentExecutionRunner:
                     replay = [op for op in pending if (op['source_run_id'], op['source_sequence']) == source]
                     pending = pending[len(replay):]
                     operation_ids = [op['id'] for op in replay]
-                    response = AgentModelResponse(tool_calls=[AgentToolCall(id=op['tool_call_id'], name=op['capability'], arguments=json.loads(op['arguments_json'])) for op in replay])
+                    resolutions = [ResolvedToolOperation.model_validate_json(op['resolution_json'])
+                        if op.get('resolution_json') else ResolvedToolOperation(
+                            provider_name=op['capability'], provider_arguments=json.loads(op['arguments_json']),
+                            capability=op['capability'], arguments=json.loads(op['arguments_json']))
+                        for op in replay]
+                    response = AgentModelResponse(tool_calls=[AgentToolCall(
+                        id=op['tool_call_id'], name=resolution.provider_name,
+                        arguments=resolution.provider_arguments)
+                        for op, resolution in zip(replay, resolutions)])
                 else:
                     response = self._bounded_request(control, provider.request,
                         messages, prepared.tools, iteration=iteration,
                         require_tool=force_reply_tool,
                         required_tool_name='conversation.reply' if force_reply_tool else None,
                     )
+                    resolutions = [resolve_tool_call(
+                        call.name, call.arguments,
+                        presented_schemas=provider.last_presented_schemas,
+                        allowed=prepared.allowed, registry=self.registry,
+                        context=prepared.capability_context).model_copy(update={
+                            'presentation_digest': schema_digest(provider.last_presented_schemas)})
+                        for call in response.tool_calls]
+                if spec.kind == 'conversation':
+                    control.check_preempt()
                 if response.text.strip():
                     latest_text = response.text.strip()
                 self._normalize_tool_call_ids(
@@ -141,6 +166,10 @@ class AgentExecutionRunner:
                     iteration=iteration,
                     seen=seen_tool_call_ids,
                 )
+                effective_calls = [AgentToolCall(
+                    id=call.id, name=resolution.capability,
+                    arguments=resolution.arguments)
+                    for call, resolution in zip(response.tool_calls, resolutions)]
                 provider_message = assistant_message(response)
                 messages.append(provider_message)
                 with self.store.tx(immediate=True):
@@ -151,10 +180,12 @@ class AgentExecutionRunner:
                         run["id"], "assistant", response.text,
                         provider_message.get("tool_calls") or [],
                         progress_details={"iteration": iteration},
+                        provider_content=provider_message.get("provider_content"),
                     )
                     provider_message['_source_message_id'] = source_message['id']
                     if operation_ids is None:
-                        operation_ids = self.store.agents.prepare_operations(spec.project["id"], scope_id, run["id"], source_message['sequence'], response.tool_calls)
+                        operation_ids = self.store.agents.prepare_operations(spec.project["id"], scope_id,
+                            run["id"], source_message['sequence'], effective_calls, resolutions)
 
                 if response.tool_calls:
                     column_text_responses = 0
@@ -163,12 +194,15 @@ class AgentExecutionRunner:
                         raise ExecutionBudgetExceeded("Agent tool-call ceiling reached")
                     calls_used += len(response.tool_calls)
                     batch = tool_batch_executor.execute(
-                        response.tool_calls,
+                        effective_calls,
                         messages,
                         iteration=iteration,
                         operation_ids=operation_ids,
+                        resolutions=resolutions,
                     )
                     direct_effect_calls += batch.direct_effect_calls
+                    if spec.kind == 'conversation':
+                        control.check_preempt()
                     if batch.completion is not None:
                         if spec.kind == 'conversation':
                             result = self._finish_text(run['id'], batch.completion['rendered'], iteration, calls_used)
@@ -183,7 +217,7 @@ class AgentExecutionRunner:
                             iteration, calls_used,
                         )
                     if spec.kind == 'conversation' and any(
-                        entry['ok'] and entry['capability'] in QUEUED_TASK_CAPABILITIES
+                        queued_task_entry(entry)
                         for entry in batch.ledger_entries
                     ):
                         force_reply_tool = True
@@ -259,6 +293,15 @@ class AgentExecutionRunner:
                     result = self._finish_text(run['id'], text, iteration, calls_used)
                     return replace(result, completion={'conversation_report': evidence})
                 return self._finish_text(run["id"], text, iteration, calls_used)
+        except ConversationTurnPreempted:
+            # Completed Tool receipts remain durable. The next queued user turn
+            # observes that state; a late Provider answer cannot execute tools.
+            result = self._finish_text(
+                run['id'],
+                '已收到新的用户消息，本轮在安全边界结束；已提交的操作保留，后续消息将基于当前状态处理。',
+                current_iteration, calls_used,
+            )
+            return replace(result, completion={'turn_interrupted': True})
         except Exception as exc:  # noqa: BLE001
             checkpoint = run_checkpoint(
                 current_iteration,
@@ -311,11 +354,13 @@ class AgentExecutionRunner:
         threading.Thread(target=invoke, name="bounded-provider", daemon=True).start()
         while True:
             control.check()
+            control.check_preempt()
             try:
                 ok, value = result.get(timeout=min(0.2, max(0.001, control.deadline-time.monotonic())))
             except queue.Empty:
                 continue
             control.check()
+            control.check_preempt()
             if not ok:
                 raise value
             return value

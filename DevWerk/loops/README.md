@@ -1,94 +1,16 @@
-# DevWerk Loop Authoring Guide
+# DevWerk Loop guides
 
-A Loop is a reusable filesystem method package stored in the service `loops/` directory.
+A Loop is an optional, descriptive method guide for the Conversation Agent. It is comparable to a Skill: the Agent reads it, adapts its ideas to the current user request, then calls the ordinary Workflow and Task tools to create the actual graph and work items. Reading a Loop never creates or changes a Workflow.
 
-## Package layout
+## Package
 
-Create one directory directly below the service `loops/` directory:
+Each direct child directory contains one Markdown `loop.meta` card and may contain additional UTF-8 Markdown guides under `assets/`. The card includes a title and the sections `Description`, `Publisher`, `Category`, `Tags`, `Use Case`, `Selection Guide`, `Loop Input`, `Loop Output`, `Loop Version(s)`, and `Loop Key`. Add natural-language sections for suggested stages, decisions, evidence, and handoffs as needed.
 
-```text
-loops/<directory>/
-├── loop.meta
-├── loop.json
-└── assets/          # optional UTF-8 method files
-```
+Do not include an executable Workflow, JSON Schema, Tool invocation, script, fixed artifact path, or output filename in a Loop. The guide may suggest roles and the order in which to consider them; it must leave actual Columns, transitions, context selection, Task inputs, file organization, and completion checks to the Conversation Agent and the published Workflow. Method resources explain how to do work and are not automatically injected into Column sessions.
 
-Use `system.files.write` for authoring, then call `loop.inspect` with the
-declared Loop Key. After validation, apply it to a Project with `loop.apply`.
+## Use
 
-## `loop.meta`
-
-`loop.meta` uses Markdown with this section structure:
-
-```markdown
-# Human-readable Loop name
-
-## Description: <br>
-What reusable method this Loop provides. <br>
-
-## Publisher: <br>
-Publisher name <br>
-
-## Category: <br>
-category_key <br>
-
-## Tags: <br>
-- tag-one <br>
-- tag-two <br>
-
-## Use Case: <br>
-When this Loop should be selected. <br>
-
-## Selection Guide: <br>
-When to select it and when not to select it. <br>
-
-## Loop Input: <br>
-Project-level binding inputs. <br>
-
-## Loop Output: <br>
-Expected reusable outputs and terminal evidence. <br>
-
-## Loop Version(s): <br>
-0.1.0 <br>
-
-## Loop Key: <br>
-example.loop <br>
-
-## Reference(s): <br>
-- [Executable bundle](loop.json) <br>
-```
-
-The Loop Key must contain only letters, digits, `.`, `_`, or `-`. The version
-must be semantic version syntax. At least one tag is required.
-
-## `loop.json`
-
-The root object must contain exactly:
-
-```json
-{
-  "schema_version": "devwerk.loop.bundle.v1",
-  "parameter_schema": {},
-  "bundle": {
-    "defaults": {},
-    "workflow_plan": {},
-    "workflow": {}
-  }
-}
-```
-
-Use an installed Loop such as `ddd-software-delivery` as the structural
-reference. Keep Project-level facts in `parameter_schema`/Loop bindings and
-Task-level facts in the Workflow Plan Task Contract. Columns form a directed
-graph and each Column has exactly one executor. A Task Plan supplies concrete
-Tasks and Project-specific deliverables when the Loop is applied.
-
-## Validation sequence
-
-1. Write `loop.meta`, `loop.json`, and optional assets.
-2. Call `loop.inspect` using the declared Loop Key.
-3. Correct the exact validation error if inspection fails.
-4. Call `loop.apply` only after inspection succeeds and the user wants the
-   method applied to the current Project.
-
-Use the successful tool receipt as the source of truth for Loop and Workflow creation.
+1. Discover a relevant card with `loop.list` and read it with `loop.inspect`.
+2. Discuss the current goal and adapt or discard the guide.
+3. Use `workflow.plan.save` and `workflow.publish` (or `workflow.create`) to publish a Project-specific graph, then use the Task planning tools for concrete work.
+4. Judge publication and completion from committed Tool receipts and Task state, not from the guide or an Agent's promise.

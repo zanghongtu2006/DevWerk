@@ -21,7 +21,7 @@ from app.v1.policy import ContextPolicy
 from app.v1.execution.runtime import WorkflowRuntime, _column_completion_contract
 from app.v1.context.session_replay import replayable_session_messages
 from app.v1.store import V1Store
-from tests.helpers import agent_workflow, create_planned_task, publish_planned_workflow
+from tests.helpers import agent_workflow, create_planned_task, publish_planned_workflow, task_plan
 from tests.unit.conversation.test_conversation_intent_contract import resolve, turn
 from tests.unit.agent.test_p0_assignment_regressions import assignment, begin_agent
 from tests.unit.conversation.test_scope_extension import invoke, turn as scope_turn
@@ -70,6 +70,124 @@ def test_conversation_usage_calibration_survives_a_new_run_without_checkpoint(st
     assert second.ratio == pytest.approx(first.ratio)
     assert second.estimate(messages, tools) < manager('session-b', 'run-c').estimate(messages, tools)
     assert manager('session-a', 'run-d', model='other-model').ratio == first.policy.cold_start_tokens_per_byte
+
+
+def test_compaction_keeps_latest_complete_exchange_when_schema_exceeds_target(store, tmp_path):
+    project = store.create_project('recent exchange', '', str(tmp_path / 'project'))
+    spec = AgentRunSpec(kind='conversation', project=project, instruction='',
+        instruction_revision=1, context={}, capability_ids=[])
+    manager = ContextManager(store, spec, 'recent-exchange-run', lambda *a, **kw: None)
+    tools = [{'type': 'function', 'function': {
+        'name': 'large_schema', 'description': 'schema ' * 12000,
+        'parameters': {'type': 'object', 'properties': {}}}}]
+    latest = [
+        {'role': 'assistant', 'content': '', 'tool_calls': [{
+            'id': 'validated-plan', 'type': 'function',
+            'function': {'name': 'task.plan.validate', 'arguments': '{"plan":"exact"}'},
+        }]},
+        {'role': 'tool', 'tool_call_id': 'validated-plan', 'content':
+            '{"ok":true,"output":{"valid":true,"next_action":"task.plan.save"}}'},
+    ]
+    old = [
+        {'role': 'assistant', 'content': '', 'tool_calls': [{
+            'id': 'old-read', 'type': 'function',
+            'function': {'name': 'project.files.read', 'arguments': '{}'},
+        }]},
+        {'role': 'tool', 'tool_call_id': 'old-read', 'content': 'x' * 150000},
+    ]
+    manager.hard = int(manager.estimate([{'role': 'system', 'content': 'agent'}, *latest], tools) * 1.1)
+    messages = [{'role': 'system', 'content': 'agent'}, *old, *latest]
+    prepared = manager.prepare(messages, tools)
+    assert any(item.get('tool_call_id') == 'validated-plan' for item in prepared)
+    assert any(item.get('tool_calls', [{}])[0].get('id') == 'validated-plan'
+               for item in prepared if item.get('tool_calls'))
+    assert not any(item.get('tool_call_id') == 'old-read' for item in prepared)
+    assert manager.estimate(messages, tools) <= manager.hard
+
+
+def test_latest_catalog_description_stays_complete_until_bridge_call(store, tmp_path):
+    project = store.create_project('tool description', '', str(tmp_path / 'project'))
+    spec = AgentRunSpec(kind='conversation', project=project, instruction='',
+        instruction_revision=1, context={}, capability_ids=[])
+    manager = ContextManager(store, spec, 'catalog-description-run', lambda *a, **kw: None)
+    description = json.dumps({'capability': 'tool.catalog.describe',
+        'output': {'parameters': {'description': 'schema-marker-' + 'x' * 12_000}}})
+    messages = [{'role': 'system', 'content': 'Agent'},
+        {'role': 'user', 'content': 'Create a Workflow.'},
+        {'role': 'assistant', 'content': '', 'tool_calls': [{'id': 'describe'}]},
+        {'role': 'tool', 'tool_call_id': 'describe', 'name': 'tool.catalog.describe',
+         'content': description}]
+    prepared = manager.prepare(messages, [])
+    assert next(item for item in prepared if item.get('tool_call_id') == 'describe')['content'] == description
+
+    messages.extend([
+        {'role': 'assistant', 'content': '', 'tool_calls': [{'id': 'call'}]},
+        {'role': 'tool', 'tool_call_id': 'call', 'name': 'tool.catalog.call',
+         'content': '{"ok":true}'},
+    ])
+    after_call = manager.prepare(messages, [])
+    assert len(next(item for item in after_call if item.get('tool_call_id') == 'describe')['content']) < len(description)
+
+
+def test_next_step_reserve_compacts_before_soft_threshold(store, tmp_path):
+    project = store.create_project('next step reserve', '', str(tmp_path / 'project'))
+    spec = AgentRunSpec(kind='conversation', project=project, instruction='',
+        instruction_revision=1, context={}, capability_ids=[])
+    manager = ContextManager(store, spec, 'reserve-run', lambda *a, **kw: None)
+    old = [
+        {'role': 'assistant', 'content': '', 'tool_calls': [{
+            'id': 'old-tool', 'type': 'function',
+            'function': {'name': 'project.files.read', 'arguments': json.dumps({'path': 'x' * 4000})},
+        }]},
+        {'role': 'tool', 'tool_call_id': 'old-tool', 'content': '{}'},
+    ]
+    latest = [
+        {'role': 'assistant', 'content': '', 'tool_calls': [{
+            'id': 'latest-tool', 'type': 'function',
+            'function': {'name': 'task.plan.validate', 'arguments': '{}'},
+        }]},
+        {'role': 'tool', 'tool_call_id': 'latest-tool', 'content': '{}'},
+    ]
+    messages = [{'role': 'system', 'content': 'agent'}, *old, *latest,
+        {'role': 'user', 'content': 'Proceed with the current request'}]
+    before = manager.estimate(messages, [])
+    manager.hard = int(before / manager.policy.soft_fraction) + 100
+    assert before < manager.hard * manager.policy.soft_fraction
+    prepared = manager.prepare(messages, [])
+    assert not any(item.get('tool_call_id') == 'old-tool' for item in prepared)
+    assert any(item.get('tool_call_id') == 'latest-tool' for item in prepared)
+    assert manager.last_metrics['compacted_messages'] == 2
+
+
+def test_saved_task_plan_action_survives_context_compaction(store, tmp_path):
+    from app.v1.protocols.tools.planning.capability_contracts import TaskPlanSaveReceipt
+
+    project = store.create_project('pending Task Plan', '', str(tmp_path / 'project'))
+    definition = agent_workflow()
+    _, workflow = publish_planned_workflow(store, project['id'], definition)
+    job, ctx = turn(store, project, 'Start the planned Task')
+    saved = store.create_task_plan(project['id'], task_plan(workflow['id'], definition))
+    receipt = TaskPlanSaveReceipt.from_saved_plan(saved, 'primary')
+    result = {'ok': True, 'status': 'completed', 'capability': 'task.plan.save',
+        'output': receipt.model_dump(mode='json', exclude_none=True)}
+    store.record_tool_invocation(agent_run_id=ctx.agent_run_id,
+        tool_call_id='saved-plan', capability='task.plan.save',
+        arguments={}, result=result, ok=True)
+    spec = AgentRunSpec(kind='conversation', project=project, instruction='',
+        instruction_revision=1, context={}, capability_ids=[], conversation_job_id=job['id'])
+    manager = ContextManager(store, spec, ctx.agent_run_id, lambda *a, **kw: None)
+    messages = [{'role': 'system', 'content': 'Agent'}, {'role': 'user', 'content': json.dumps({
+        'authoritative_current_request': {'message_id': job['user_message_id']},
+        'authoritative_project_state': {'conversation_job': {}, 'turn_authority': {}},
+    })}]
+    prepared = manager.prepare(messages, [], force=True)
+    state = json.loads(prepared[-1]['content'])['authoritative_project_state']
+    assert state['pending_task_plan']['id'] == saved['id']
+    assert state['pending_task_plan']['next_action']['arguments']['proposed_task_ref'] == 'primary'
+    store.materialize_task_plan(project['id'], task_plan_id=saved['id'], proposed_task_ref='primary')
+    prepared = manager.prepare(messages, [])
+    state = json.loads(prepared[-1]['content'])['authoritative_project_state']
+    assert 'pending_task_plan' not in state
 
 
 def test_current_task_contract_survives_compaction_and_revision_change(store, tmp_path):

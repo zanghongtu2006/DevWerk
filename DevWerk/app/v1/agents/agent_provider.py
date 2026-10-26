@@ -9,6 +9,7 @@ from app.v1.domain import AgentModelResponse
 from app.v1.context.context_manager import ContextManager, ContextExhausted, digest
 from app.services.provider_errors import LLMProviderError
 from app.v1.protocols.agent.agent_runtime_receipts import AgentTraceContext
+from app.v1.tooling.capability_registry import CapabilityContext
 
 
 trace_log = logging.getLogger("devwerk.agent.trace")
@@ -25,12 +26,15 @@ class ProviderTurnRequester:
         spec: AgentRunSpec,
         run_id: str,
         registry: Any = None,
+        capability_context: CapabilityContext | None = None,
     ) -> None:
         self.store = store
         self.model_complete = model_complete
         self.spec = spec
         self.run_id = run_id
         self.registry = registry or store.registry
+        self.capability_context = capability_context
+        self.last_presented_schemas: dict[str, dict[str, Any]] = {}
         self.context = None
 
     def request(
@@ -49,6 +53,11 @@ class ProviderTurnRequester:
         if self.spec.kind == 'conversation' and required_tool_name == 'conversation.reply':
             tools = [tool for tool in tools
                      if tool.get('function', {}).get('name') == 'conversation.reply']
+        self.last_presented_schemas = {
+            str(tool.get('function', {}).get('name') or ''):
+                tool.get('function', {}).get('parameters') or {}
+            for tool in tools
+        }
         if self.context is None:
             self.context = ContextManager(self.store, self.spec, self.run_id, self.model_complete)
         working_messages = messages

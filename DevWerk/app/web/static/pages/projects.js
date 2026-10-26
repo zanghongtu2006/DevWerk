@@ -1,5 +1,5 @@
 import { escapeHtml, formatDate } from "../core/format.js?v=20260804-debug1";
-import { eventRow, noProjectState } from "../ui/components.js?v=20260804-debug1";
+import { eventRow, icon, noProjectState } from "../ui/components.js?v=20260804-debug1";
 
 export function renderProjects(state) {
   if (!state.project) return noProjectState();
@@ -14,7 +14,7 @@ export function renderProjects(state) {
       <form id="conversation-form" class="conversation-composer"><label for="message-input" class="sr-only">向 Conversation Agent 发送消息</label><textarea id="message-input" rows="3" ${state.sending ? "disabled" : ""} placeholder="描述目标、约束、优先级，或需要诊断与恢复的问题…">${escapeHtml(state.draftMessage || "")}</textarea><div class="composer-footer"><span>Workflow 与 Column 由 Conversation Agent 在对话中生成并监督</span><button class="button primary send-button" type="submit" ${state.sending ? "disabled" : ""}>${state.sending ? '<span class="button-spinner"></span>处理中' : "发送"}</button></div></form>
     </section>
     <aside class="project-side">
-      <section class="card info-card"><span class="eyebrow">PROJECT BOUNDARY</span><h2>Context</h2><dl><div><dt>Project ID</dt><dd><code>${escapeHtml(state.project.id)}</code></dd></div><div><dt>Base directory</dt><dd title="${escapeHtml(state.project.base_dir)}">${escapeHtml(state.project.base_dir)}</dd></div><div><dt>Created</dt><dd>${formatDate(state.project.created_at)}</dd></div></dl></section>
+      <section class="card info-card"><span class="eyebrow">PROJECT BOUNDARY</span><h2>Context</h2><dl><div><dt>Project ID</dt><dd><code>${escapeHtml(state.project.id)}</code></dd></div><div><dt>Base directory</dt><dd class="project-directory"><span class="project-directory-path" title="${escapeHtml(state.project.base_dir)}">${escapeHtml(state.project.base_dir)}</span><button class="directory-copy-button" type="button" data-copy-project-directory title="复制完整路径" aria-label="复制完整路径">${icon("copy")}</button></dd></div><div><dt>Created</dt><dd>${formatDate(state.project.created_at)}</dd></div></dl></section>
       <section class="card info-card"><div class="section-head"><div><span class="eyebrow">WORKFLOW</span><h2>${escapeHtml(workflow?.definition?.name || "Not published")}</h2></div><span class="read-only-label">Read-only</span></div><p>${escapeHtml(workflow?.definition?.description || "在对话中说明正式交付目标，Conversation Agent 会发布声明式 Workflow。")}</p><div class="workflow-summary"><span><b>${workflow?.definition?.columns?.length || 0}</b> columns</span><span><b>${tasks.length}</b> tasks</span><span><b>${tasks.filter((task) => task.status === "done").length}</b> done</span></div></section>
       <section class="card info-card live-card"><span class="eyebrow">LIVE ACTIVITY</span><h2>Runtime events</h2><div class="event-list compact">${state.events.length ? state.events.slice(-4).reverse().map(eventRow).join("") : '<p class="muted-copy">暂无 Runtime 事件。</p>'}</div></section>
     </aside>

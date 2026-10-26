@@ -15,7 +15,7 @@ def replayable_session_messages(history: list[dict[str, Any]]) -> list[dict[str,
             if role in {"user", "assistant"}:
                 projected = {
                     key: item[key]
-                    for key in ("role", "content", "tool_calls", "tool_call_id", "_source_message_id", "_source_message_ids", "_checkpoint")
+                    for key in ("role", "content", "tool_calls", "tool_call_id", "provider_content", "_source_message_id", "_source_message_ids", "_checkpoint")
                     if key in item and item[key] not in (None, [])
                 }
                 if (
@@ -23,6 +23,8 @@ def replayable_session_messages(history: list[dict[str, Any]]) -> list[dict[str,
                     and replay
                     and replay[-1].get("role") == role
                     and not replay[-1].get("tool_calls")
+                    and not projected.get("provider_content")
+                    and not replay[-1].get("provider_content")
                     and not item.get('_checkpoint') and not replay[-1].get('_checkpoint')
                 ):
                     replay[-1]["content"] = (
@@ -48,12 +50,15 @@ def replayable_session_messages(history: list[dict[str, Any]]) -> list[dict[str,
             cursor += 1
         returned_ids = {str(tool.get("tool_call_id") or "") for tool in tool_messages}
         if expected_ids and expected_ids.issubset(returned_ids):
-            replay.append({
+            assistant = {
                 "role": "assistant",
                 "content": str(item.get("content") or ""),
                 "tool_calls": calls,
                 "_source_message_id": item.get('_source_message_id', item.get('id', 0)),
-            })
+            }
+            if item.get("provider_content"):
+                assistant["provider_content"] = item["provider_content"]
+            replay.append(assistant)
             replay.extend({
                 "role": "tool",
                 "content": str(tool.get("content") or ""),

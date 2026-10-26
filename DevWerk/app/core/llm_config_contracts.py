@@ -15,6 +15,7 @@ class ProviderClientConfig(BaseModel):
     trust_env_proxy: bool
     connect_max_attempts: int = Field(ge=1)
     request_timeout_seconds: float = Field(gt=0)
+    stream_response: bool = False
     thinking_mode: str
     temperature: float
     top_p: float | None

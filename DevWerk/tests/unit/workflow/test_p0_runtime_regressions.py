@@ -32,6 +32,7 @@ from app.v1.services.completion_admission import CompletionAdmissionService
 from app.v1.services.dependency_resolver import canonical_task
 from tests.helpers import agent_workflow, sequence_workflow, publish_planned_workflow, create_planned_task
 from tests.unit.workflow.test_loop_contract import NOVEL_BINDINGS
+from tests.support.legacy_loop_fixture import apply_legacy_fixture
 from tests.unit.workflow.test_orchestration_policy_contract import _waiting_poll_task
 from app.v1.workflows.loops import LoopCatalog
 
@@ -252,16 +253,10 @@ def test_failed_direct_dependency_resolves_successor(store, tmp_path):
         assert canonical_task(db, project["id"], predecessor["id"])["id"] == successor["id"]
 
 
-def test_loop_apply_rolls_back_when_binding_event_fails(store, tmp_path, monkeypatch):
-    project = store.create_project("atomic", "", str(tmp_path / "project"))
-    original = store._event
-    def fail(db, project_id, task_id, run_id, kind, data):
-        if kind == "workflow.loop.applied":
-            raise RuntimeError("injected apply failure")
-        return original(db, project_id, task_id, run_id, kind, data)
-    monkeypatch.setattr(store, "_event", fail)
-    with pytest.raises(RuntimeError, match="injected"):
-        store.apply_loop(project["id"], "novel.production", NOVEL_BINDINGS)
+def test_loop_inspection_has_no_project_side_effects(store, tmp_path):
+    project = store.create_project("read-only-loop", "", str(tmp_path / "project"))
+    guide = store.get_loop("novel.production")
+    assert "前情" in guide["guide"]
     with store.connect() as db:
         assert db.execute("SELECT COUNT(*) FROM v1_workflows WHERE project_id=?", (project["id"],)).fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM v1_workflow_plans WHERE project_id=?", (project["id"],)).fetchone()[0] == 0
@@ -269,7 +264,7 @@ def test_loop_apply_rolls_back_when_binding_event_fails(store, tmp_path, monkeyp
 
 def test_loop_assets_survive_catalog_removal(store, tmp_path, monkeypatch):
     project = store.create_project("durable-loop", "", str(tmp_path / "project"))
-    store.apply_loop(project["id"], "novel.production", NOVEL_BINDINGS)
+    apply_legacy_fixture(store, project["id"], "novel.production", NOVEL_BINDINGS)
     before = store.get_project_loop_assets(project["id"])
     assert before
     monkeypatch.setattr(store.loops, "get", lambda key: (_ for _ in ()).throw(KeyError(key)))
@@ -309,7 +304,7 @@ def test_await_claim_is_exclusive_and_waiting_keeps_resource(store, tmp_path):
         store.settle_await_handle(handle["id"], "pending", {}, next_check_seconds=1, expected_task=first)
 
 
-def test_conversation_lease_and_workflow_claim_do_not_overlap(store, tmp_path):
+def test_conversation_lease_and_workflow_claim_do_not_overlap_but_direct_work_remains_available(store, tmp_path):
     project, task = setup_task(store, tmp_path)
     job = store.create_conversation_job(project["id"], "discuss", True)
     job = store.claim_conversation_job(job["id"], "conversation-owner")
@@ -317,9 +312,9 @@ def test_conversation_lease_and_workflow_claim_do_not_overlap(store, tmp_path):
     store.fail_conversation_job(job["id"], "test turn ended")
     owned = store.claim_task(task["id"], "worker")
     assert owned is not None
-    result = store.registry.dispatch("project.files.write", {"path": "conflict.txt", "content": "bad"}, CapabilityContext(project["id"], project, store, agent_run_id="direct-agent"))
-    assert not result.ok and "active Workflow" in result.error["message"]
-    assert not (tmp_path / "project" / "conflict.txt").exists()
+    result = store.registry.dispatch("project.files.write", {"path": "independent.txt", "content": "saved"}, CapabilityContext(project["id"], project, store, agent_run_id="direct-agent"))
+    assert result.ok
+    assert (tmp_path / "project" / "independent.txt").read_text(encoding='utf-8') == 'saved'
 
 
 def test_neither_mailbox_nor_discussion_can_reopen_task(store, tmp_path):

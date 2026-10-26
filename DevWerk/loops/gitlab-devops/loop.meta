@@ -1,39 +1,40 @@
 # GitLab Software Delivery
 
-## Description: <br>
-Deliver a confirmed product requirement through architecture and documentation, implementation, build and test, independent review, GitLab merge-request and CI work, and final acceptance with directed feedback to the original development context. <br>
+## Description
+针对需要通过 GitLab 协作交付的软件项目，提供设计、实现、验证、审查与远程集成交付的参考方法。
 
-## Publisher: <br>
-DevWerk <br>
+## Publisher
+DevWerk
 
-## Category: <br>
-software_delivery <br>
+## Category
+software_delivery
 
-## Tags: <br>
-- software-development <br>
-- devops <br>
-- gitlab <br>
-- continuous-integration <br>
-- requirement-baseline <br>
-- code-review <br>
+## Tags
+- software-development
+- gitlab
+- continuous-integration
+- code-review
 
-## Use Case: <br>
-Use after the Conversation Agent has completed requirement discovery with the user and the product baseline, acceptance criteria, and GitLab repository are explicitly confirmed. <br>
+## Use Case
+适合用户已指定 GitLab 作为协作和交付平台的项目。
 
-## Selection Guide: <br>
-Select only for a software delivery project with a frozen requirement baseline and GitLab delivery target. Continue requirement conversation instead when material questions remain open. <br>
+## Selection Guide
+先确认产品目标、仓库权限、交付边界与用户期望的远程操作。没有 GitLab 需求时无需选择此卡片；也无需机械复制其阶段。
 
-## Loop Input: <br>
-Product name and GitLab repository identity. Each Task Plan supplies its own confirmed requirement document. <br>
+## Loop Input
+已确认的需求、仓库与协作方式、运行环境和交付标准。
 
-## Loop Output: <br>
-Versioned design documents, implementation, build and test evidence, independent review, GitLab merge-request and CI evidence, and final acceptance. <br>
+## Loop Output
+经过实现、验证和审查的结果，以及用户要求的 GitLab 交付证据。
 
-## Loop Version(s): <br>
-1.2.0 <br>
+## Loop Version(s)
+2.0.0
 
-## Loop Key: <br>
-software.gitlab_devops <br>
+## Loop Key
+software.gitlab_devops
 
-## Reference(s): <br>
-- [Executable bundle](loop.json) <br>
+## Suggested stages
+可参考设计、开发、验证、独立审查、远程集成和交付。Conversation Agent 应根据当前仓库和用户要求决定阶段及有向返工关系；每一列只承担一项主要职责。
+
+## Evidence and completion
+实际构建或测试回执、审查意见、远程合并请求和持续集成结果只在用户目标需要时纳入交付判断。失败反馈应指向能够修复的工作阶段。

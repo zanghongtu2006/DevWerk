@@ -22,11 +22,23 @@ class ExecutionReplayUncertain(RuntimeError):
     error_category = "runtime_consistency"
 
 
+class ConversationTurnPreempted(RuntimeError):
+    """A newer user message superseded a Conversation turn at a safe boundary."""
+
+    error_code = "conversation_turn_preempted"
+    error_category = "user_steering"
+
+
 @dataclass
 class ExecutionControl:
     deadline: float
     validate_owner: Callable[[], None] | None = None
     cancelled: threading.Event = field(default_factory=threading.Event)
+    preempted: threading.Event = field(default_factory=threading.Event)
+
+    def check_preempt(self) -> None:
+        if self.preempted.is_set():
+            raise ConversationTurnPreempted("A newer user message is ready for this Project Session")
 
     def check(self) -> None:
         if self.cancelled.is_set():

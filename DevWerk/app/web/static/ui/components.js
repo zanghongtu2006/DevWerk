@@ -8,6 +8,7 @@ export function icon(name) {
     tasks: '<path d="m5 7 2 2 4-4M13 7h6M5 13l2 2 4-4M13 13h6M5 19l2 2 4-4M13 19h6"/>',
     events: '<path d="M12 8v5l3 2M4.9 4.9a10 10 0 1 1-1.8 11.4M3 4v5h5"/>',
     arrow: '<path d="m9 18 6-6-6-6"/>',
+    copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
   };
   return `<svg class="icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${paths[name] || paths.overview}</svg>`;
 }

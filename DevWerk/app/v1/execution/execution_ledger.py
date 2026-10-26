@@ -6,9 +6,14 @@ from typing import Any, Iterable
 
 from app.v1.domain import ToolResult
 from app.v1.protocols.workflow.runtime_json_contracts import OperationFingerprintPayload
+from app.v1.tooling.builtin_tool_catalog import BuiltinTool
 
 
 ACTION_EFFECT_KINDS = {"write", "process", "control"}
+AUTHORIZATION_PROGRESS_TOOLS = frozenset({
+    BuiltinTool.CONVERSATION_EXECUTION_AUTHORIZE.value.id,
+    BuiltinTool.CONVERSATION_TASK_CONTROL_AUTHORIZE.value.id,
+})
 
 
 def evidence_id(agent_run_id: str, tool_call_id: str) -> str:
@@ -177,7 +182,8 @@ def repeated_no_progress_result(
     repeats = 0
     for item in reversed(list(ledger)):
         if (item.get('ok') and item.get('status') == 'completed'
-                and item.get('effect_kind') in ACTION_EFFECT_KINDS):
+                and (item.get('effect_kind') in ACTION_EFFECT_KINDS
+                     or item.get('capability') in AUTHORIZATION_PROGRESS_TOOLS)):
             break
         if (item.get('capability') == capability
                 and item.get('operation_sha256') == operation_hash

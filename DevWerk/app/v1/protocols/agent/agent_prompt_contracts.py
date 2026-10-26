@@ -4,6 +4,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
 from app.v1.domain import AcceptanceCheck
+from app.v1.protocols.agent.agent_context_frames import PriorRunEvidenceFrame
 
 
 class AgentPromptIdentity(BaseModel):
@@ -107,5 +108,5 @@ class CurrentTurnPayload(BaseModel):
         "not revoke those constraints; only an explicit user change does. Assistant promises "
         "never broaden the user's authorization. Use tools for inspection or state changes."
     )
-    unanswered_prior_user_message: str | None = None
+    prior_run_evidence: PriorRunEvidenceFrame | None = None
     current_turn_boundary: JsonValue = None

@@ -8,15 +8,14 @@ import fnmatch
 import re
 from typing import Any
 from app.v1.domain import AgentExecutor, CapabilitySequenceExecutor, PollWaitPolicy, TaskPlan, ToolResult, WorkflowDefinition, WorkflowPlan
-from app.v1.protocols.tools.core.capability_protocol import MemoryScope, READ_LIMITS, SideEffectKind
-from app.v1.protocols.tools.planning.capability_contracts import TaskPlanSaveInput, TaskPlanSaveReceipt, TaskPlanValidateInput, AuthorizedScopeRecord, EntryEvidenceCandidate, EntryEvidenceDirectory, TaskMaterializationReceipt, TaskPlanContractReceipt, TaskReceipt, ValidationDiagnostic, ValidationReceipt, DeferredCommandCheck, WorkflowAcceptanceConfigureReceipt, WorkflowCreateInput, WorkflowPlanSaveInput, WorkflowPlanSaveReceipt, WorkflowPublishInput
+from app.v1.protocols.tools.core.capability_protocol import MemoryScope, READ_LIMITS, SideEffectKind, StructuredObjectParameter
+from app.v1.protocols.tools.planning.capability_contracts import TaskPlanSaveInput, TaskPlanSaveReceipt, TaskPlanSubmissionError, TaskPlanValidateInput, AuthorizedScopeRecord, EntryEvidenceCandidate, EntryEvidenceDirectory, TaskMaterializationReceipt, TaskPlanContractReceipt, TaskReceipt, ValidationDiagnostic, ValidationReceipt, DeferredCommandCheck, WorkflowAcceptanceConfigureReceipt, WorkflowCreateInput, WorkflowPlanSaveInput, WorkflowPlanSaveReceipt, WorkflowPublishInput
 from app.v1.protocols.tools.agent.capability_memory_contracts import MemoryAppendInput, MemoryReadInput, MemorySearchHit, MemorySearchMetadata, MemorySearchReceipt, MemorySearchInput, MemorySupersedeInput, MemoryWriteInput
 from app.v1.protocols.tools.workspace.capability_file_contracts import FilePathInput, FileReadInput, FileVerifyInput, FileWriteInput
 from app.v1.protocols.tools.workspace.capability_workspace_contracts import CommandRunInput, MAX_SEARCH_FILE_BYTES, MAX_SEARCH_LINE_CHARACTERS, ProjectFileListInput, ProjectFileSearchInput, SUCCESS_EXIT_CODE, SystemFileListInput, SystemFileReadInput, SystemFileSearchInput, SystemFileWriteInput
-from app.v1.protocols.tools.core.capability_misc_contracts import EventListInput, GovernanceDecisionInput, InstructionUpdateInput, LoopApplyInput, LoopListInput, SupervisionScheduleInput
+from app.v1.protocols.tools.core.capability_misc_contracts import EventListInput, GovernanceDecisionInput, InstructionUpdateInput, LoopListInput, SupervisionScheduleInput
 from app.v1.protocols.tools.workspace.capability_workspace_receipts import FileListReceipt, FileMeasureReceipt, FilePageReceipt, FileReadReceipt, FileSearchMatch, FileSearchReceipt, ProjectFileWriteReceipt, SystemFileWriteReceipt
 from app.v1.protocols.tools.planning.capability_project_receipts import ProjectInspectReceipt, WorkflowRevisionReceipt
-from app.v1.protocols.tools.planning.capability_loop_receipts import LoopApplyReceipt
 from app.v1.protocols.tools.planning.capability_task_receipts import ArtifactProjection, ColumnAttemptProjection, ColumnRunProjection, SchedulingProjection, TaskInspectReceipt, TaskProjection
 from app.v1.protocols.tools.planning.capability_requirement_contracts import RequirementCreateInput, RequirementCloseInput
 from app.v1.protocols.workflow.runtime_json_contracts import TaskFingerprint
@@ -821,20 +820,6 @@ def _inspect_conversation_turn(ctx):
     ).model_dump(mode="json")
 
 
-def _loop_apply(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
-    _require_user_planning_turn(ctx, "loop.apply")
-    request = LoopApplyInput.model_validate(args)
-    result = ctx.store.apply_loop(
-        ctx.project_id,
-        request.loop_key,
-        request.bindings,
-    )
-    _bind_requirement(ctx, 'v1_workflow_plans', result['workflow_plan']['id'])
-    scope = ctx.store.scopes.for_workflow(result['workflow']['id'])
-    ctx.store.scopes.bind_workflow(result['workflow']['id'], scope['binding_id'], ctx.requirement_id, ctx.requirement_revision)
-    return LoopApplyReceipt.model_validate(result).model_dump(mode="json")
-
-
 def _loop_list(args: dict[str, Any], ctx: CapabilityContext) -> list[dict[str, Any]]:
     request = LoopListInput.model_validate(args)
     return ctx.store.list_loops(
@@ -862,13 +847,95 @@ def _workflow_plan_save(args: dict[str, Any], ctx: CapabilityContext) -> dict[st
     return WorkflowPlanSaveReceipt.from_saved_plan(result).model_dump(mode="json")
 
 
-def _task_plan_save(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
+def _valid_task_plan_previews(ctx: CapabilityContext) -> list[tuple[TaskPlan, ValidationReceipt]]:
+    if not ctx.agent_run_id:
+        return []
+    with ctx.store.connect() as db:
+        rows = db.execute('''SELECT arguments_json,result_json FROM v1_tool_invocations
+            WHERE project_id=? AND agent_run_id=? AND capability='task.plan.validate' AND ok=1
+            ORDER BY sequence DESC''', (ctx.project_id, ctx.agent_run_id)).fetchall()
+    previews = []
+    for row in rows:
+        try:
+            recorded_arguments = StructuredObjectParameter('plan').normalize(
+                json.loads(row['arguments_json']))
+            candidate = TaskPlanValidateInput.model_validate(recorded_arguments).plan
+            result = ToolResult.model_validate_json(row['result_json'])
+            receipt = ValidationReceipt.model_validate(result.output)
+        except (ValueError, KeyError):
+            continue
+        if receipt.valid:
+            previews.append((candidate, receipt))
+    return previews
+
+
+def _matching_task_plan_preview(ctx: CapabilityContext, plan: TaskPlan) -> bool:
+    return any(candidate == plan for candidate, _ in _valid_task_plan_previews(ctx))
+
+
+def _task_plan_from_preview_ref(ctx: CapabilityContext, preview_ref: str) -> TaskPlan | None:
+    for candidate, receipt in _valid_task_plan_previews(ctx):
+        digest = hashlib.sha256(candidate.model_dump_json().encode('utf-8')).hexdigest()
+        if receipt.validated_plan_ref == preview_ref == digest:
+            return candidate
+    return None
+
+
+def _task_plan_submission_failure(code: str, diagnostics: list[ValidationDiagnostic]) -> ToolResult:
+    error = TaskPlanSubmissionError(
+        code=code,
+        message='; '.join(item.message for item in diagnostics),
+        diagnostics=diagnostics,
+    )
+    return ToolResult(ok=False, capability='task.plan.save', error=error.model_dump(mode='json'))
+
+
+def _task_plan_save(args: dict[str, Any], ctx: CapabilityContext,
+                    registry: CapabilityRegistry) -> dict[str, Any] | ToolResult:
     _require_user_planning_turn(ctx, "task.plan.save")
     request = TaskPlanSaveInput.model_validate(args)
-    _check_workflow_scope(ctx, request.plan.workflow_revision_id)
-    result = ctx.store.create_task_plan(ctx.project_id, request.plan)
-    _bind_requirement(ctx, 'v1_task_plans', result['id'])
-    return TaskPlanSaveReceipt.from_saved_plan(result, request.plan.tasks[0].proposed_task_ref).model_dump(mode="json")
+    if request.validated_plan_ref is not None:
+        plan = _task_plan_from_preview_ref(ctx, request.validated_plan_ref)
+        if plan is None:
+            return _task_plan_submission_failure('TASK_PLAN_PREVIEW_REQUIRED', [
+                ValidationDiagnostic(path='/validated_plan_ref',
+                    message='No matching valid Task Plan preview in this Agent Run')])
+    else:
+        plan = request.plan
+        assert plan is not None  # TaskPlanSaveInput requires one of plan or validated_plan_ref.
+    try:
+        _check_workflow_scope(ctx, plan.workflow_revision_id)
+    except ValueError as exc:
+        return _task_plan_submission_failure('TASK_PLAN_INVALID', [
+            ValidationDiagnostic(path='/plan/workflow_revision_id', message=str(exc))])
+    if (request.validated_plan_ref is None and ctx.require_task_plan_preview and
+            not _matching_task_plan_preview(ctx, plan)):
+        return _task_plan_submission_failure('TASK_PLAN_PREVIEW_REQUIRED', [
+            ValidationDiagnostic(path='/plan', message='No matching valid task.plan.validate receipt in this Agent Run')])
+    if request.start_tasks and request.proposed_task_ref is not None and not any(
+            task.proposed_task_ref == request.proposed_task_ref for task in plan.tasks):
+        return _task_plan_submission_failure('TASK_PLAN_INVALID', [
+            ValidationDiagnostic(path='/proposed_task_ref', message='Task ref does not belong to the validated plan')])
+    validation = ValidationReceipt.model_validate(_task_plan_validate(
+        TaskPlanValidateInput(plan=plan).model_dump(mode='json'), ctx, registry))
+    if not validation.valid:
+        return _task_plan_submission_failure('TASK_PLAN_INVALID', validation.diagnostics)
+    try:
+        result = ctx.store.create_task_plan(ctx.project_id, plan)
+        _bind_requirement(ctx, 'v1_task_plans', result['id'])
+        selected_ref = request.proposed_task_ref or plan.tasks[0].proposed_task_ref
+        receipt = TaskPlanSaveReceipt.from_saved_plan(result, selected_ref)
+        if request.start_tasks:
+            task = TaskReceipt.model_validate(_task_create(
+                {'task_plan_id': result['id'], 'proposed_task_ref': selected_ref},
+                ctx, registry, planning_authorized=True))
+            receipt.next_action = None
+            receipt.materialization = task.materialization
+            receipt.started_task_id = task.id
+        return receipt.model_dump(mode="json", exclude_none=True)
+    except ValueError as exc:
+        return _task_plan_submission_failure('TASK_PLAN_INVALID', [
+            ValidationDiagnostic(path='/plan', message=str(exc))])
 
 
 def _task_plan_validate(args, ctx, registry):
@@ -876,11 +943,17 @@ def _task_plan_validate(args, ctx, registry):
     # import to avoid a cycle between plan diagnostics and Tool handlers.
     from app.v1.services.task_plan_compiler import compile_task_plan, diagnose_task_plan, diagnose_acceptance_launches
     plan = TaskPlanValidateInput.model_validate(args).plan
+    submitted_plan_ref = hashlib.sha256(plan.model_dump_json().encode('utf-8')).hexdigest()
     revision = ctx.store.get_workflow_revision(ctx.project_id, plan.workflow_revision_id)
     method = WorkflowPlan.model_validate(ctx.store.get_workflow_plan(ctx.project_id, revision['workflow_plan_id'])['plan'])
     result = ValidationReceipt.model_validate(diagnose_task_plan(
         plan, WorkflowDefinition.model_validate(revision['definition']), method, registry,
     ))
+    if not revision['active']:
+        result.diagnostics.append(ValidationDiagnostic(
+            path='/workflow_revision_id',
+            message='Workflow revision is retired; use the active revision',
+        ))
     if result.valid:
         plan = compile_task_plan(plan, WorkflowDefinition.model_validate(revision['definition']), method, registry)
     launches = diagnose_acceptance_launches(ctx.store,ctx.project_id,WorkflowDefinition.model_validate(revision['definition']))
@@ -898,6 +971,11 @@ def _task_plan_validate(args, ctx, registry):
         except ValueError as exc:
             result.diagnostics.append(ValidationDiagnostic(path='/tasks', message=str(exc)))
     if not result.diagnostics:
+        existing_plan_hash = hashlib.sha256(plan.model_dump_json().encode('utf-8')).hexdigest()
+        with ctx.store.connect() as db:
+            saved_same_plan = db.execute('''SELECT 1 FROM v1_task_plans
+                WHERE project_id=? AND plan_hash=? LIMIT 1''',
+                (ctx.project_id, existing_plan_hash)).fetchone() is not None
         if plan.repair_of_task_id:
             try:
                 predecessor = ctx.store.get_project_task(ctx.project_id,plan.repair_of_task_id)
@@ -912,7 +990,7 @@ def _task_plan_validate(args, ctx, registry):
                 prior = db.execute('''SELECT id,status,proposed_task_ref FROM v1_tasks
                     WHERE project_id=? AND logical_task_key=? ORDER BY created_at DESC LIMIT 1''',
                     (ctx.project_id,identity)).fetchone() if identity else None
-                if prior and not (plan.repair_of_task_id == prior['id'] and prior['status'] in {'done','failed'}
+                if prior and not saved_same_plan and not (plan.repair_of_task_id == prior['id'] and prior['status'] in {'done','failed'}
                                   and item.proposed_task_ref == prior['proposed_task_ref']):
                     result.diagnostics.append(ValidationDiagnostic(
                         path='/repair_of_task_id',
@@ -920,6 +998,9 @@ def _task_plan_validate(args, ctx, registry):
                                 'repair_of_task_id must name this latest terminal predecessor',
                     ))
     result.valid = not result.diagnostics
+    if result.valid:
+        result.next_action = 'task.plan.save'
+        result.validated_plan_ref = submitted_plan_ref
     return result.model_dump(mode='json', exclude_none=True, exclude_unset=True)
 
 
@@ -992,7 +1073,14 @@ def _task_plan_contract(ctx):
         workflow_revision_id=workflow['id'], flow_unit=method.flow_unit,
         input_schema=contract.input_schema, identity_pointer=contract.identity_pointer,
         entry_evidence=evidence, authorized_scope=authorized_scope,
-        next_action='Build Tasks from independent accepted flow units, not Column stages. Match each declared entry requirement to its exact Task input and current grant; validate the complete plan, save it, then call task.create with the returned plan ID.',
+        next_action=(
+            'Build Tasks from independent accepted flow units, not Column stages. Match each declared entry '
+            'requirement to its exact Task input and current grant. '
+            + ('Validate the complete plan, then save with validated_plan_ref and no plan. '
+               if ctx.require_task_plan_preview else
+               'Preview is optional; save a plan directly or commit a valid preview by validated_plan_ref. ')
+            + 'Save with start_tasks=true to atomically create the Task graph, or save and then call task.create.'
+        ),
     ).model_dump(mode='json', exclude_none=True)
 
 
@@ -1031,11 +1119,11 @@ def _workflow_acceptance_configure(args, ctx, registry):
 def _workflow_create(args: dict[str, Any], ctx: CapabilityContext, registry: CapabilityRegistry) -> dict[str, Any]:
     """Materialize one author-owned graph and derive its non-routing Plan facts."""
     _require_user_planning_turn(ctx, "workflow.create")
-    draft = WorkflowCreateInput.model_validate(args).workflow
+    draft = WorkflowCreateInput.model_validate(args)
     workflow, plan = materialize_workflow(draft)
     workflow = canonicalize_workflow_model(workflow, registry)
     validate_workflow_capabilities(workflow, registry)
-    check_schema(draft.task_input_schema, label="Workflow Task input_schema")
+    check_schema(draft.task_input_schema.wire(), label="Workflow Task input_schema")
     for column in workflow.columns:
         check_schema(column.input_contract, label=f"Column {column.key} input_contract")
         check_schema(column.output_contract, label=f"Column {column.key} output_contract")
@@ -1064,8 +1152,11 @@ def _task_create(
     args: dict[str, Any],
     ctx: CapabilityContext,
     registry: CapabilityRegistry,
+    *,
+    planning_authorized: bool = False,
 ) -> dict[str, Any]:
-    _require_user_planning_turn(ctx, "task.create")
+    if not planning_authorized:
+        _require_user_planning_turn(ctx, "task.create")
     _bind_requirement(ctx, 'v1_task_plans', str(args['task_plan_id']))
     cause = ctx.store.agents.planning_cause(ctx)
     plan = ctx.store.get_task_plan(ctx.project_id, str(args['task_plan_id']))['plan']
@@ -1376,6 +1467,18 @@ def _task_pause(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
 
 def _task_resume(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
     task = ctx.store.get_project_task(ctx.project_id, TaskIdInput.model_validate(args).task_id)
+    if ctx.agent_run_id is not None:
+        job = ctx.store.intents.job_for_run(ctx.agent_run_id, ctx.project_id)
+        contract = ctx.store.intents.contract(job) if job else {}
+        targeted = (contract.get('phase') == 'targeted_control'
+                    and contract.get('control_capability') == 'task.resume'
+                    and contract.get('control_task_id') == task['id'])
+        same_scope_execution = (contract.get('phase') == 'execution'
+                                and (ctx.requirement_id, ctx.requirement_revision) ==
+                                (task['requirement_id'], task['requirement_revision']))
+        if not (ctx.user_initiated and job and job['trigger_kind'] == 'user'
+                and (targeted or same_scope_execution)):
+            raise PermissionError('TaskResumeRequiresAuthorization: authorize the owning Requirement first')
     if task.get("supervision_action") == "startup_hold" and not ctx.user_initiated:
         raise ValueError(
             "A startup-held Task can only be resumed from a user-initiated Conversation turn"
@@ -1389,6 +1492,24 @@ def _task_fail(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
     if task["project_id"] != ctx.project_id:
         raise PermissionError("task is outside the current Project")
     return ctx.store.route_task_to_failed(task["id"], request.reason)
+
+
+def _task_cancel(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any]:
+    request = TaskFailureInput.model_validate(args)
+    task = ctx.store.get_project_task(ctx.project_id, request.task_id)
+    if ctx.agent_run_id is not None:
+        job = ctx.store.intents.job_for_run(ctx.agent_run_id, ctx.project_id)
+        contract = ctx.store.intents.contract(job) if job else {}
+        targeted = (contract.get('phase') == 'targeted_control'
+                    and contract.get('control_capability') == 'task.cancel'
+                    and contract.get('control_task_id') == task['id'])
+        same_scope_execution = (contract.get('phase') == 'execution'
+                                and (ctx.requirement_id, ctx.requirement_revision) ==
+                                (task['requirement_id'], task['requirement_revision']))
+        if not (ctx.user_initiated and job and job['trigger_kind'] == 'user'
+                and (targeted or same_scope_execution)):
+            raise PermissionError('TaskCancelRequiresAuthorization: select this Task or its owning Requirement')
+    return ctx.store.route_task_to_failed(task['id'], request.reason)
 
 
 def _event_list(args: dict[str, Any], ctx: CapabilityContext) -> list[dict[str, Any]]:

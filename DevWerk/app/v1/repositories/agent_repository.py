@@ -111,6 +111,7 @@ class AgentRepository:
             self.store.schema_repository._ensure_column(db, "v1_conversation_jobs", "claim_token", "TEXT")
             self.store.schema_repository._ensure_column(db, 'v1_conversation_jobs', 'requirement_revision', 'INTEGER')
             self.store.schema_repository._ensure_column(db, 'v1_agent_runs', 'operation_protocol', 'INTEGER NOT NULL DEFAULT 0')
+            self.store.schema_repository._ensure_column(db, 'v1_agent_operations', 'resolution_json', 'TEXT')
             self.store.schema_repository._ensure_column(db, 'v1_context_checkpoints', 'coverage_json', 'TEXT')
             # Additive migration: legacy task-scoped sessions remain untouched.
             # New Worker sessions have explicit ownership; legacy_session_id can
@@ -367,6 +368,7 @@ class AgentRepository:
         page, used = [], 0
         for row in rows:
             item = self.store._decode(dict(row), 'tool_calls_json')
+            item.pop('provider_content_json', None)
             item['content'] = project_result(item['content'], 3000)
             item['tool_calls'] = bounded_value(item.get('tool_calls',[]), 400)
             item['source_message_id'] = item['id']
@@ -725,13 +727,15 @@ class AgentRepository:
             db.execute('UPDATE v1_agent_assignments SET model_calls=model_calls+?,tool_calls=tool_calls+?,resumes=resumes+?,updated_at=? WHERE id=?',
                        (models, tools, resumes, utcnow(), assignment['id']))
 
-    def prepare_operations(self, project_id, scope_id, run_id, sequence, calls):
+    def prepare_operations(self, project_id, scope_id, run_id, sequence, calls, resolutions=None):
         with self.store.tx(immediate=True) as db:
             ids = []
             for index, call in enumerate(calls):
                 identity = f'op:{run_id}:{sequence}:{index}'
-                db.execute('INSERT INTO v1_agent_operations(id,project_id,scope_id,source_run_id,source_sequence,call_index,tool_call_id,capability,arguments_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
-                           (identity, project_id, scope_id, run_id, sequence, index, call.id, call.name, json.dumps(call.arguments), utcnow()))
+                resolution = resolutions[index] if resolutions is not None else None
+                db.execute('INSERT INTO v1_agent_operations(id,project_id,scope_id,source_run_id,source_sequence,call_index,tool_call_id,capability,arguments_json,resolution_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                           (identity, project_id, scope_id, run_id, sequence, index, call.id, call.name,
+                            json.dumps(call.arguments), resolution.model_dump_json() if resolution else None, utcnow()))
                 ids.append(identity)
             return ids
 
@@ -747,6 +751,11 @@ class AgentRepository:
     def operation(self, identity):
         with self.store.connect() as db:
             return dict(db.execute('SELECT * FROM v1_agent_operations WHERE id=?', (identity,)).fetchone())
+
+    def has_tool_invocation(self, run_id: str, tool_call_id: str) -> bool:
+        with self.store.connect() as db:
+            return db.execute('SELECT 1 FROM v1_tool_invocations WHERE agent_run_id=? AND tool_call_id=?',
+                              (run_id, tool_call_id)).fetchone() is not None
 
     def answer_operation(self, identity, result, completion, wait):
         with self.store.tx(immediate=True) as db:
@@ -788,7 +797,7 @@ class AgentRepository:
                 ).model_dump_json(exclude_none=True)})
                 rows = [row for row in rows if row["id"] > snapshot["through_message_id"]]
         for row in rows:
-            item = self.store._decode(dict(row), "tool_calls_json")
+            item = self.store._decode(dict(row), "tool_calls_json", "provider_content_json")
             item['_source_message_id'] = item['id']
             history.append(item)
         if assignment_id:

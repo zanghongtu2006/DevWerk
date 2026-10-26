@@ -22,7 +22,7 @@ from app.v1.capabilities import (
     validate_workflow_capabilities,
 )
 from app.v1.protocols.tools.planning.capability_requirement_contracts import ScopeReviseInput
-from app.v1.protocols.tools.planning.capability_contracts import TaskPlanSaveInput, TaskPlanValidateInput
+from app.v1.protocols.tools.planning.capability_contracts import WorkflowCreateInput, TaskPlanSaveInput, TaskPlanValidateInput
 from app.v1.protocols.tools.core.capability_protocol import CapabilityToolset
 from app.v1.contracts import ContractError, provider_contract_schema, validate_contract
 from app.v1.protocols.tools.planning.capability_workflow_models import workflow_tool_models
@@ -61,10 +61,11 @@ def test_scope_revision_schema_and_handler_share_one_input_model():
     schema = ScopeReviseInput.model_json_schema()
     assert set(schema["required"]) == {
         "requirement_id", "expected_revision", "expected_workflow_revision_id",
-        "objective", "binding_patch", "reason",
+        "objective", "reason",
     }
     assert schema["properties"]["expected_revision"]["minimum"] == 1
-    assert schema["properties"]["loop_digest"]["default"] is None
+    assert "loop_digest" not in schema["properties"]
+    assert "binding_patch" not in schema["properties"]
     with pytest.raises(ValueError):
         ScopeReviseInput.model_validate({
             "requirement_id": "req", "expected_revision": 0,
@@ -318,7 +319,7 @@ def test_workflow_create_publishes_from_one_authoritative_graph(store, tmp_path)
              "transitions": [{"outcome": "success", "target": {"kind": "terminal", "status": "done"}}]},
         ],
     }
-    created = registry.dispatch("workflow.create", {"workflow": request}, context)
+    created = registry.dispatch("workflow.create", request, context)
     assert created.ok, created.error
     assert store.get_workflow(project["id"])["id"] == created.output["id"]
     assert created.output["definition"]["columns"][1]["context"]["upstream_outputs"] == ["collect"]
@@ -333,24 +334,24 @@ def test_workflow_create_rejects_invalid_graph_without_publishing(store, tmp_pat
     registry = build_core_registry()
     context = CapabilityContext(project_id=project["id"], project=project, store=store, start_task=True)
     with pytest.raises(ValueError, match="targets unknown Column 'missing'"):
-        registry.dispatch("workflow.create", {"workflow": {
+        registry.dispatch("workflow.create", {
             "name": "Invalid", "flow_unit": "One result", "entry": "begin",
             "expected_outputs": ["result"], "completion_conditions": ["ready"],
             "columns": [{"key": "begin", "name": "Begin", "instruction": "Begin.",
                          "executor": {"kind": "capability_sequence", "steps": [{"capability": "system.noop"}]},
                          "transitions": [{"outcome": "success", "target": {"kind": "column", "key": "missing"}}]}],
-        }}, context)
+        }, context)
     with pytest.raises(KeyError):
         store.get_workflow(project["id"])
     assert store.list_workflow_plans(project["id"]) == []
     with pytest.raises(ValueError, match="no declared path to done"):
-        registry.dispatch("workflow.create", {"workflow": {
+        registry.dispatch("workflow.create", {
             "name": "No success", "flow_unit": "One result", "entry": "begin",
             "expected_outputs": ["result"], "completion_conditions": ["ready"],
             "columns": [{"key": "begin", "name": "Begin", "instruction": "Begin.",
                          "executor": {"kind": "capability_sequence", "steps": [{"capability": "system.noop"}]},
                          "transitions": [{"outcome": "success", "target": {"kind": "terminal", "status": "failed"}}]}],
-        }}, context)
+        }, context)
     assert store.list_workflow_plans(project["id"]) == []
 
 
@@ -367,13 +368,13 @@ def test_workflow_create_rejects_reserved_column_and_untyped_target_before_effec
             "transitions": [],
         }],
     }
-    with pytest.raises(ContractError, match="workflow/columns/0/key"):
-        registry.dispatch("workflow.create", {"workflow": request}, context)
+    with pytest.raises(ContractError, match="columns/0/key"):
+        registry.dispatch("workflow.create", request, context)
     request["entry"] = "finish"
     request["columns"][0]["key"] = "finish"
     request["columns"][0]["transitions"] = [{"outcome": "success", "target": "terminal"}]
-    with pytest.raises(ContractError, match="workflow/columns/0/transitions/0/target"):
-        registry.dispatch("workflow.create", {"workflow": request}, context)
+    with pytest.raises(ContractError, match="columns/0/transitions/0/target"):
+        registry.dispatch("workflow.create", request, context)
     with pytest.raises(KeyError):
         store.get_workflow(project["id"])
     assert store.list_workflow_plans(project["id"]) == []
@@ -385,11 +386,10 @@ def test_workflow_create_rejects_malformed_serialized_object_without_echo_or_eff
     context = CapabilityContext(project_id=project["id"], project=project, store=store, start_task=True)
     malformed = '{"name":"example","columns">[]}' + "private-content-" * 100
     with pytest.raises(ValueError) as error:
-        registry.dispatch("workflow.create", {"workflow": malformed}, context)
+        registry.dispatch("workflow.create", {"columns": malformed}, context)
     message = str(error.value)
-    assert "workflow must be an object" in message
-    assert "line 1, column" in message
-    assert len(message) < 160
+    assert "columns" in message
+    assert len(message) < 300
     assert "private-content" not in message
     assert store.list_workflow_plans(project["id"]) == []
 
@@ -439,35 +439,26 @@ def test_workflow_publish_rejects_missing_declared_feedback_capability(store, tm
     assert published.ok, published.error
 
 
-def test_loop_apply_capability_creates_initial_workflow(store, tmp_path):
+def test_loop_guide_is_read_only_and_cannot_publish_workflow(store, tmp_path):
     project = store.create_project("loop", "", str(tmp_path / "loop-project"))
     registry = build_core_registry()
     context = CapabilityContext(project_id=project["id"], project=project, store=store, start_task=True)
 
-    result = registry.dispatch(
-        "loop.apply",
-        {
-            "loop_key": "software.gitlab_devops",
-            "bindings": {
-                "product_name": "Loop delivery",
-                "gitlab_repository": "group/project",
-            },
-        },
-        context,
-    )
-
-    assert result.ok
-    assert result.output["loop"]["loop_key"] == "software.gitlab_devops"
-    assert store.get_workflow(project["id"])["source_loop_key"] == "software.gitlab_devops"
+    inspected = registry.dispatch("loop.inspect", {"loop_key": "software.gitlab_devops"}, context)
+    assert inspected.ok, inspected.error
+    assert "guide" in inspected.output
+    assert "bundle" not in inspected.output
+    assert not registry.contains("loop.apply")
+    with pytest.raises(KeyError):
+        store.get_workflow(project["id"])
 
 
-def test_loop_template_can_be_replaced_by_a_smaller_workflow_in_same_project(store, tmp_path):
-    project = store.create_project("editable loop", "", str(tmp_path / "editable-loop"))
+def test_guide_can_inform_explicit_workflow_publication(store, tmp_path):
+    project = store.create_project("editable guide", "", str(tmp_path / "editable-guide"))
     registry = build_core_registry()
     context = CapabilityContext(project_id=project["id"], project=project, store=store, start_task=True)
-    applied = registry.dispatch("loop.apply", {"loop_key": "software.gitlab_devops",
-        "bindings": {"product_name": "demo", "gitlab_repository": "group/project"}}, context)
-    assert applied.ok, applied.error
+    inspected = registry.dispatch("loop.inspect", {"loop_key": "software.gitlab_devops"}, context)
+    assert inspected.ok, inspected.error
     smaller = sequence_workflow(name="small delivery")
     planned = registry.dispatch("workflow.plan.save",
         {"plan": workflow_plan(smaller).model_dump(mode="json")}, context)
@@ -476,36 +467,27 @@ def test_loop_template_can_be_replaced_by_a_smaller_workflow_in_same_project(sto
         "workflow_plan_id": planned.output["id"], "workflow": smaller.model_dump(mode="json")}, context)
     assert published.ok, published.error
     assert [column["key"] for column in published.output["definition"]["columns"]] == ["execute"]
-    assert published.output["source_loop_key"] == "software.gitlab_devops"
+    assert published.output["source_loop_key"] is None
 
 
-def test_mailbox_agent_cannot_apply_loop_or_expand_task_graph(store, tmp_path):
+def test_mailbox_agent_cannot_publish_workflow_after_reading_loop(store, tmp_path):
     project = store.create_project("mailbox authority", "", str(tmp_path / "mailbox-authority"))
     registry = build_core_registry()
     context = CapabilityContext(
-        project_id=project["id"],
-        project=project,
-        store=store,
-        agent_run_id="arun_mailbox",
-        start_task=False,
-        user_initiated=False,
+        project_id=project["id"], project=project, store=store,
+        agent_run_id="arun_mailbox", start_task=False, user_initiated=False,
     )
-
-    result = registry.dispatch(
-        "loop.apply",
-        {
-            "loop_key": "novel.production",
-            "bindings": {
-                "project_title": "mailbox must not create this",
-                "premise": "none",
-                "chapter_count": 1,
-                "chapter_target_characters": 1000,
-                "chapter_max_characters": 2000,
-            },
-        },
-        context,
-    )
-    assert result.ok is False
+    assert registry.dispatch("loop.inspect", {"loop_key": "novel.production"}, context).ok
+    result = registry.dispatch("workflow.create", {
+        "name": "Unapproved graph", "flow_unit": "One result", "entry": "produce",
+        "expected_outputs": ["result"], "completion_conditions": ["result is ready"],
+        "columns": [{
+            "key": "produce", "name": "Produce", "instruction": "Produce the result.",
+            "executor": {"kind": "capability_sequence", "steps": [{"capability": "system.noop"}]},
+            "transitions": [{"outcome": "success", "target": {"kind": "terminal", "status": "done"}}],
+        }],
+    }, context)
+    assert not result.ok
     assert result.error['type'] == 'ConversationMutationDisabled'
 
 
@@ -594,10 +576,11 @@ def test_workflow_publish_schema_exposes_live_capability_catalog(store, tmp_path
     assert "root-level contract" in input_contract_description
 
 
-def test_workflow_create_schema_uses_one_graph_and_live_capability_catalog(store, tmp_path):
+def test_workflow_create_uses_flat_typed_command_and_separate_tool_catalog(store, tmp_path):
     project = store.create_project("compact catalog", "", str(tmp_path / "compact-catalog"))
     registry = build_core_registry()
     context = CapabilityContext(project_id=project["id"], project=project, store=store)
+    initial = registry.schemas(["workflow.create"], context)[0]["function"]["parameters"]
     registry.register(CapabilityEntry(
         id="example.inspect", description="Inspect a source", input_schema={
             "type": "object", "properties": {"limit": {"type": "integer"}},
@@ -606,19 +589,14 @@ def test_workflow_create_schema_uses_one_graph_and_live_capability_catalog(store
         output_schema={"type": "object"}, handler=lambda _args, _ctx: {},
     ))
     schema = registry.schemas(["workflow.create"], context)[0]["function"]["parameters"]
-    assert schema["properties"]["workflow"]["$ref"] == "#/$defs/WorkflowAuthoringRequest"
-    draft = schema["$defs"]["WorkflowAuthoringRequest"]
-    assert "columns" in draft["required"]
+    assert schema == initial
+    assert "columns" in schema["required"]
+    assert "workflow" not in schema["properties"]
     assert "workflow_plan_id" not in schema["properties"]
-    assert "lifecycle_walkthrough" not in draft["properties"]
-    capabilities = schema["$defs"]["AgentExecutor"]["properties"]["capabilities"]["items"]["enum"]
-    assert "example.inspect" in capabilities
-    assert "task.create" not in capabilities
-    external = next(value for key, value in schema["$defs"].items()
-                    if key.startswith("WorkflowAcceptanceCheck")
-                    and value["properties"]["capability"].get("const") == "example.inspect")
-    assert external["properties"]["arguments"]["properties"]["limit"]["type"] == "integer"
-    assert "Do not add done or failed as Columns" in draft["properties"]["columns"]["description"]
+    assert "lifecycle_walkthrough" not in schema["properties"]
+    assert "Do not add done or failed as Columns" in schema["properties"]["columns"]["description"]
+    direct = registry.schemas(["example.inspect"], context)[0]["function"]["parameters"]
+    assert direct["properties"]["limit"]["type"] == "integer"
     column = schema["$defs"]["WorkflowAuthoringColumn"]
     assert "last executable Column" in column["properties"]["transitions"]["description"]
     assert column["properties"]["key"]["not"] == {"enum": ["done", "failed"]}
@@ -626,43 +604,80 @@ def test_workflow_create_schema_uses_one_graph_and_live_capability_catalog(store
     assert "There is no generic terminal status" in target["description"]
     assert target["discriminator"]["propertyName"] == "kind"
     provider = provider_contract_schema(schema)
-    target = provider["properties"]["workflow"]["properties"]["columns"]["items"]["properties"]["transitions"]["items"]["properties"]["target"]
+    assert len(json.dumps(provider, ensure_ascii=False).encode()) < 15_000
+    target = provider["properties"]["columns"]["items"]["properties"]["transitions"]["items"]["properties"]["target"]
     assert target["properties"]["kind"]["enum"] == ["column", "terminal"]
     assert "When kind='terminal', required fields are status" in target["description"]
+
+
+def test_workflow_create_explains_optional_task_schema_and_executor_nesting(store, tmp_path):
+    project = store.create_project("workflow authoring schema", "", str(tmp_path / "project"))
+    registry = build_core_registry()
+    context = CapabilityContext(project_id=project["id"], project=project, store=store)
+    tool = registry.schemas(["workflow.create"], context)[0]["function"]
+    strict = tool["parameters"]
+    Draft202012Validator.check_schema(strict)
+
+    task_schema = strict["$defs"]["WorkflowTaskInputSchema"]
+    required_field = task_schema["properties"]["required"]
+    assert any(option.get("type") == "array" for option in required_field["anyOf"])
+    assert "array of required Task input field names" in required_field["description"]
+    assert "Omit optional task_input_schema" in tool["description"]
+
+    provider = provider_contract_schema(strict)
+    column = provider["properties"]["columns"]["items"]
+    provider_task_schema = provider["properties"]["task_input_schema"]
+    assert provider_task_schema["properties"]["required"]["type"] == "array"
+    assert "Omit to accept any object-shaped Task input" in provider_task_schema["description"]
+    assert "worker_key/worker_role inside this executor object" in column["properties"]["executor"]["description"]
+    assert "transitions" in column["required"]
+
+    from app.v1.protocols.workflow.task_input_schema import WorkflowTaskInputSchema
+    assert WorkflowTaskInputSchema(schema_type="object").wire() == {"type": "object"}
+    with pytest.raises(ValueError, match="required"):
+        WorkflowTaskInputSchema.model_validate({"type": "object", "required": {"item": "output_path"}})
+
+    minimal = {
+        "name": "One step", "flow_unit": "One work item", "entry": "write",
+        "expected_outputs": ["one result"], "completion_conditions": ["result exists"],
+        "columns": [{"key": "write", "name": "Write", "instruction": "Produce the result.",
+                     "executor": {"kind": "agent", "capabilities": ["project.files.write"]},
+                     "transitions": [{"target": {"kind": "terminal", "status": "done"}}]}],
+    }
+    assert WorkflowCreateInput.model_validate(minimal).task_input_schema.wire() == {
+        "type": "object",
+    }
+    minimal["task_input_schema"] = {"type": "object", "required": {"item": "output_path"}}
+    with pytest.raises(ValueError, match="required"):
+        WorkflowCreateInput.model_validate(minimal)
 
 
 def test_task_plan_validation_and_save_advertise_one_plan_shape():
     validation = TaskPlanValidateInput.model_json_schema()
     saving = TaskPlanSaveInput.model_json_schema()
-    assert validation["properties"]["plan"]["$ref"] == saving["properties"]["plan"]["$ref"]
+    assert {"$ref": validation["properties"]["plan"]["$ref"]} in saving["properties"]["plan"]["anyOf"]
     assert validation["$defs"]["TaskPlan"] == saving["$defs"]["TaskPlan"]
     assert validation["$defs"]["TaskPlan"]["properties"]["tasks"]["type"] == "array"
+    assert saving["properties"]["validated_plan_ref"]["anyOf"][0]["pattern"] == "^[0-9a-f]{64}$"
+    with pytest.raises(ValueError, match="exactly one"):
+        TaskPlanSaveInput.model_validate({})
     with pytest.raises(ContractError, match="plan/tasks"):
         validate_contract({"plan": {"objective": "Example", "workflow_revision_id": "wf", "tasks": {}}},
                           validation, label="task.plan.validate input")
 
 
-def test_workflow_create_binds_nested_tool_types_and_reports_full_path(store, tmp_path):
+def test_workflow_create_validates_dynamic_tool_arguments_at_publication(store, tmp_path):
     project = store.create_project("nested contract", "", str(tmp_path / "nested-contract"))
     registry = build_core_registry()
     context = CapabilityContext(project_id=project["id"], project=project, store=store, start_task=True)
     schema = registry.schemas(["workflow.create"], context)[0]["function"]["parameters"]
-    check = next(value for key, value in schema["$defs"].items()
-                 if key.startswith("WorkflowAcceptanceCheck")
-                 and value["properties"]["capability"].get("const") == "project.files.verify")
-    assert check["properties"]["arguments"]["properties"]["minimum_non_whitespace_characters"]["type"] == "integer"
     Draft202012Validator.check_schema(schema)
     provider = provider_contract_schema(schema)
-    provider_checks = provider["properties"]["workflow"]["properties"]["columns"]["items"]["properties"]["acceptance_checks"]["items"]
-    selected_arguments = next(value for value in provider_checks["properties"]["arguments"]["anyOf"]
-                              if "project.files.verify" in value.get("description", ""))
-    assert selected_arguments["properties"]["minimum_non_whitespace_characters"]["type"] == "integer"
-    step = next(value for key, value in schema["$defs"].items()
-                if key.startswith("WorkflowCapabilityStep")
-                and value["properties"]["capability"].get("const") == "project.files.read")
-    Draft202012Validator(step["properties"]["arguments"]).validate({
-        "path": {"$ref": "/input/task/input/source_path"},
-    })
+    provider_checks = provider["properties"]["columns"]["items"]["properties"]["acceptance_checks"]["items"]
+    assert provider_checks["properties"]["arguments"]["type"] == "object"
+    assert "Select the Tool to read its direct schema" in provider_checks["properties"]["arguments"]["description"]
+    direct_schema = registry.schemas(["project.files.verify"], context)[0]["function"]["parameters"]
+    assert direct_schema["properties"]["minimum_non_whitespace_characters"]["type"] == "integer"
 
     request = {
         "name": "One check", "flow_unit": "One result", "entry": "review",
@@ -675,15 +690,15 @@ def test_workflow_create_binds_nested_tool_types_and_reports_full_path(store, tm
             "transitions": [{"outcome": "success", "target": {"kind": "terminal", "status": "done"}}],
         }],
     }
-    assert list(Draft202012Validator(schema).iter_errors({"workflow": request}))
+    assert not list(Draft202012Validator(schema).iter_errors(request))
     with pytest.raises(ContractError) as rejected:
-        registry.dispatch("workflow.create", {"workflow": request}, context)
+        registry.dispatch("workflow.create", request, context)
     assert "workflow.columns[review].acceptance_checks[body-length].arguments/minimum_non_whitespace_characters" in str(rejected.value)
     assert "expected integer, received string" in str(rejected.value)
     assert store.list_workflow_plans(project["id"]) == []
     request["columns"][0]["acceptance_checks"][0]["arguments"]["minimum_non_whitespace_characters"] = 900
-    assert not list(Draft202012Validator(schema).iter_errors({"workflow": request}))
-    created = registry.dispatch("workflow.create", {"workflow": request}, context)
+    assert not list(Draft202012Validator(schema).iter_errors(request))
+    created = registry.dispatch("workflow.create", request, context)
     assert created.ok, created.error
     assert created.output["definition"]["columns"][0]["acceptance_checks"][0]["arguments"]["minimum_non_whitespace_characters"] == 900
 
@@ -712,10 +727,9 @@ def test_workflow_create_groups_external_mcp_schema_without_weakening_runtime_va
         registry._bulk_registration = False
     registry._refresh_workflow_tool_models()
     schema = registry.schemas(["workflow.create"], context)[0]["function"]["parameters"]
-    assert len(json.dumps(schema, ensure_ascii=False).encode()) - initial_bytes < 30_000
-    external = schema["$defs"]["WorkflowExternalAcceptanceCheck"]
-    assert len(external["properties"]["capability"]["enum"]) == 32
-    assert external["properties"]["arguments"]["type"] == "object"
+    assert schema == initial
+    assert len(json.dumps(schema, ensure_ascii=False).encode()) == initial_bytes
+    assert registry.schemas(["mcp__fixture__inspect_0"], context)[0]["function"]["parameters"]["properties"]["count"]["type"] == "integer"
     request = {
         "name": "External check", "flow_unit": "One result", "entry": "review",
         "expected_outputs": ["result"], "completion_conditions": ["ready"],
@@ -728,7 +742,7 @@ def test_workflow_create_groups_external_mcp_schema_without_weakening_runtime_va
         }],
     }
     with pytest.raises(ContractError) as rejected:
-        registry.dispatch("workflow.create", {"workflow": request}, context)
+        registry.dispatch("workflow.create", request, context)
     assert "workflow.columns[review].acceptance_checks[evidence].arguments/count" in str(rejected.value)
     assert "expected integer, received string" in str(rejected.value)
     assert store.list_workflow_plans(project["id"]) == []

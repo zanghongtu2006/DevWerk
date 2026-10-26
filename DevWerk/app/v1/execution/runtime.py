@@ -43,6 +43,7 @@ from app.v1.tooling.completion_protocol import (
 )
 from app.v1.protocols.tools.core.capability_protocol import ToolError
 from app.v1.domain import (
+    AcceptedDependencyScope,
     AgentExecutor,
     CapabilitySequenceExecutor,
     ColumnDefinition,
@@ -444,9 +445,19 @@ class WorkflowRuntime:
                 "working_artifacts",
                 "current_task",
             )
+        if selection.root_working_artifact_globs and not data["dependencies"]:
+            preload_registered(
+                self.store.current_task_artifacts(task["project_id"], task["id"]),
+                selection.root_working_artifact_globs,
+                "working_artifacts",
+                "current_task",
+            )
         if selection.accepted_artifact_globs:
             preload_registered(
-                self.store.accepted_dependency_artifacts(task["project_id"], task["id"]),
+                self.store.accepted_dependency_artifacts(
+                    task["project_id"], task["id"],
+                    transitive=selection.accepted_dependency_scope == AcceptedDependencyScope.TRANSITIVE,
+                ),
                 selection.accepted_artifact_globs,
                 "accepted_artifacts",
                 "accepted_dependency",
@@ -506,7 +517,11 @@ class WorkflowRuntime:
             "preloaded_project_artifacts": preloaded_artifacts,
             "preloaded_loop_assets": preloaded_loop_assets,
             "artifact_channels": {
-                "accepted_artifacts": "transitive done Task dependency facts",
+                "accepted_artifacts": (
+                    "direct done Task dependency facts"
+                    if selection.accepted_dependency_scope == AcceptedDependencyScope.DIRECT
+                    else "transitive done Task dependency facts"
+                ),
                 "working_artifacts": "mutable current Task work",
                 "reference_artifacts": "unverified Project workspace reference",
             },

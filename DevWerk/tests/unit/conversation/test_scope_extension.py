@@ -7,6 +7,7 @@ from app.v1.capabilities import CapabilityContext
 from app.v1.agents.agent_models import AgentRunSpec
 from app.v1.context.context_manager import ContextManager
 from app.v1.domain import WorkflowDefinition
+from tests.support.legacy_loop_fixture import apply_legacy_fixture
 from tests.helpers import task_plan, agent_workflow, publish_planned_workflow, workflow_plan
 from tests.unit.agent.test_p0_assignment_regressions import begin_agent
 from tests.unit.workflow.test_loop_contract import novel_task_input
@@ -45,16 +46,17 @@ def invoke(ctx, name, args):
 def novel(store, tmp_path):
     project = store.create_project('Six chapters', '', str(tmp_path / 'novel'))
     ctx, req = turn(store, project)
-    result = invoke(ctx, 'loop.apply', {'loop_key': 'novel.production', 'bindings': {
+    result = apply_legacy_fixture(store, project['id'], 'novel.production', {
         'project_title': 'Six chapters', 'premise': 'The photograph remains unclaimed.', 'chapter_count': 6,
-        'chapter_target_characters': 3000, 'chapter_max_characters': 4000}})
+        'chapter_target_characters': 3000, 'chapter_max_characters': 4000})
+    store.scopes.bind_workflow(result['workflow']['id'], result['id'], req['id'], req['revision'])
     return project, ctx, req, result['workflow']['id']
 
 
 def revision_args(req, workflow):
     return {'requirement_id': req['id'], 'expected_revision': req['revision'], 'expected_workflow_revision_id': workflow,
             'objective': 'Continue chapters seven through twelve; leave the story open',
-            'binding_patch': {'chapter_count': 12, 'ending_policy': 'continue'}, 'reason': 'User requested continuation'}
+            'reason': 'User requested continuation'}
 
 
 def save_chapters(ctx, workflow, chapters):
@@ -79,7 +81,7 @@ def test_scope_extension_before_first_workflow_allows_initial_publication(store,
     revised = invoke(ctx, 'project.scope.revise', {
         'requirement_id': requirement['id'], 'expected_revision': requirement['revision'],
         'expected_workflow_revision_id': None, 'objective': 'Research and deliver verified results',
-        'binding_patch': {}, 'reason': 'The user expanded source discussion into delivery',
+        'reason': 'The user expanded source discussion into delivery',
     })
     assert revised['requirement']['revision'] == requirement['revision'] + 1
     assert revised['workflow_revision_id'] is None
@@ -101,7 +103,7 @@ def test_scope_extension_before_first_workflow_allows_initial_publication(store,
 def test_conversation_grant_creates_initial_workflow_in_one_call(store, tmp_path):
     project = store.create_project('One graph', '', str(tmp_path / 'one-graph'))
     ctx, _ = turn(store, project)
-    created = invoke(ctx, 'workflow.create', {'workflow': {
+    created = invoke(ctx, 'workflow.create', {
         'name': 'One graph', 'flow_unit': 'One requested result', 'entry': 'produce',
         'expected_outputs': ['result'], 'completion_conditions': ['result is ready'],
         'columns': [{
@@ -110,7 +112,7 @@ def test_conversation_grant_creates_initial_workflow_in_one_call(store, tmp_path
                          'steps': [{'capability': 'system.noop'}]},
             'transitions': [{'outcome': 'success', 'target': {'kind': 'terminal', 'status': 'done'}}],
         }],
-    }})
+    })
     assert store.get_workflow(project['id'])['id'] == created['id']
     assert store.get_workflow_plan(project['id'], created['workflow_plan_id'])['plan']['columns'][0]['key'] == 'produce'
 
@@ -164,7 +166,7 @@ def test_same_requirement_column_revision_requires_explicit_publish(store, tmp_p
     wrong_tool = store.registry.dispatch('project.scope.revise', {
         'requirement_id': requirement['id'], 'expected_revision': requirement['revision'],
         'expected_workflow_revision_id': original['id'], 'objective': requirement['objective'],
-        'binding_patch': {}, 'reason': 'Only the Workflow graph changes',
+        'reason': 'Only the Workflow graph changes',
     }, ctx)
     assert not wrong_tool.ok
     assert 'workflow.create instead' in wrong_tool.error['message']
@@ -206,8 +208,7 @@ def test_scope_extension_without_loop_keeps_workflow_and_requirement_history(sto
     revised = invoke(replace(ctx, start_task=False), 'project.scope.revise', {
         'requirement_id': req['id'], 'expected_revision': req['revision'],
         'expected_workflow_revision_id': original['id'],
-        'objective': 'Extend the direct workflow goal', 'binding_patch': {},
-        'reason': 'User requested continuation',
+        'objective': 'Extend the direct workflow goal', 'reason': 'User requested continuation',
     })
     assert revised['requirement']['revision'] == req['revision'] + 1
     assert revised['workflow_revision_id'] != original['id']
@@ -238,7 +239,7 @@ def test_new_requirement_handover_and_task_creation_in_one_turn(store, tmp_path,
     assert new_req['id'] != old_req['id']
     args = {'requirement_id': new_req['id'], 'expected_revision': new_req['revision'],
             'expected_workflow_revision_id': old_workflow['id'], 'objective': 'Independent repair',
-            'binding_patch': {}, 'reason': 'User requested separate repair work'}
+            'reason': 'User requested separate repair work'}
     if prior_status == 'pending':
         denied = store.registry.dispatch('project.scope.revise', args, ctx)
         assert not denied.ok and denied.error['code'] == 'scope_revision_conflict'
@@ -280,7 +281,7 @@ def test_new_requirement_can_take_over_only_after_previous_tasks_finish(store, t
     assert store.intents.job_for_run(ctx.agent_run_id, project['id'])['requirement_id'] == new_req['id']
     args = {'requirement_id': new_req['id'], 'expected_revision': new_req['revision'],
             'expected_workflow_revision_id': original['id'], 'objective': 'Redesign and deliver again',
-            'binding_patch': {}, 'reason': 'User requested a new delivery in this project'}
+            'reason': 'User requested a new delivery in this project'}
     if prior_status == 'pending':
         rejected = store.registry.dispatch('project.scope.revise', args, ctx)
         assert not rejected.ok and rejected.error['code'] == 'scope_revision_conflict'
@@ -314,42 +315,30 @@ def test_new_requirement_can_take_over_only_after_previous_tasks_finish(store, t
     assert new_task['requirement_id'] == new_req['id']
 
 
-def test_scope_extension_closed_six_to_twelve_same_conversation_and_frozen_history(store, tmp_path):
+def test_scope_extension_does_not_silently_rewrite_frozen_legacy_graph(store, tmp_path):
     project, ctx, req, old_workflow = novel(store, tmp_path)
     old_plan = save_chapters(ctx, old_workflow, range(1, 7))
     invoke(ctx, 'task.create', {'task_plan_id': old_plan['id'], 'proposed_task_ref': 'chapter01'})
     old_tasks = store.list_tasks(project['id'])
     assert len(old_tasks) == 6
-    assert all(t['requirement_revision'] == 1 for t in old_tasks)
-    # Historical terminal fixture: this test verifies planning/ownership, not prose acceptance.
     with store.tx(immediate=True) as db:
         db.execute("UPDATE v1_tasks SET status='done' WHERE project_id=?", (project['id'],))
     store.agents.close_requirement(project['id'], req['id'], 'cancelled')
-    rejected = store.registry.dispatch('requirement.create', {'scope_key': 'default', 'objective': 'Twelve'}, ctx)
-    assert not rejected.ok
-    assert 'Main Agent' not in rejected.error['message']
     ctx, _ = turn(store, project, req)
     revised = invoke(replace(ctx, start_task=False), 'project.scope.revise', revision_args(req, old_workflow))
-    assert revised['requirement']['id'] == req['id'] and revised['requirement']['revision'] == 2
-    assert revised['bindings']['chapter_max_characters'] == 4000
-    assert revised['task_ids'] == [] and len(store.list_tasks(project['id'])) == 6
-    # The original cached context is deliberately reused after the revision.
-    new_plan = save_chapters(replace(ctx, start_task=False), revised['workflow_revision_id'], range(7, 13))
-    invoke(ctx, 'task.create', {'task_plan_id': new_plan['id'], 'proposed_task_ref': 'chapter07'})
-    tasks = store.list_tasks(project['id'])
-    assert len(tasks) == 12
-    new_tasks = [t for t in tasks if t['requirement_revision'] == 2]
-    assert len(new_tasks) == 6 and all(t['requirement_id'] == req['id'] for t in tasks)
-    seven = next(t for t in tasks if t['input']['chapter_number'] == 7)
-    six = next(t for t in tasks if t['input']['chapter_number'] == 6)
-    with store.connect() as db:
-        assert db.execute('SELECT 1 FROM v1_task_dependencies WHERE task_id=? AND depends_on_task_id=?', (seven['id'], six['id'])).fetchone()
+    assert revised['requirement']['revision'] == req['revision'] + 1
+    assert revised['task_ids'] == []
+    assert len(store.list_tasks(project['id'])) == 6
     assert store.get_project_loop_binding(project['id'], old_workflow)['bindings']['chapter_count'] == 6
-    assert store.get_project_loop_binding(project['id'])['bindings']['ending_policy'] == 'continue'
-    assert all(store.get_task(t['id'])['workflow_revision_id'] == old_workflow for t in old_tasks)
-    assert [w['id'] for w in store.agents.list_workers(project['id']) if w['role'] == 'main'] == [ctx.agent_instance_id]
-    old_rejected = store.registry.dispatch('task.create', {'task_plan_id': old_plan['id'], 'proposed_task_ref': 'chapter02'}, ctx)
-    assert not old_rejected.ok
+    assert store.get_project_loop_binding(project['id'], revised['workflow_revision_id'])['bindings']['chapter_count'] == 6
+    assert all(store.get_task(task['id'])['workflow_revision_id'] == old_workflow for task in old_tasks)
+    # A descriptive guide cannot widen the frozen legacy admission contract.
+    # The Agent must publish a Project-specific Workflow before planning more chapters.
+    future = task_plan(revised['workflow_revision_id'],
+        store.workflow_by_id(project['id'], revised['workflow_revision_id']),
+        task_ref='chapter07', title='Chapter 7', input_data=novel_task_input(7))
+    rejected = store.registry.dispatch('task.plan.save', {'plan': future.model_dump(mode='json')}, ctx)
+    assert not rejected.ok
 
 
 def test_scope_revision_atomic_rollback_and_compare_and_swap(store, tmp_path, monkeypatch):
@@ -390,6 +379,58 @@ def test_old_assignment_remains_valid_when_scope_revision_waits(store, tmp_path)
     store.agents.finish(active, 'completed', {'summary': 'Original six chapter scope'})
     assert active['requirement_revision'] == 1
     assert store.get_project_loop_binding(project['id'], task['workflow_revision_id'])['bindings']['chapter_count'] == 6
+
+
+def test_extend_grant_can_cancel_blocking_old_task_then_revise_scope(store, tmp_path):
+    project, ctx, requirement, workflow_id = novel(store, tmp_path)
+    saved = save_chapters(ctx, workflow_id, [1])
+    task = invoke(ctx, 'task.create', {
+        'task_plan_id': saved['id'], 'proposed_task_ref': 'chapter01'})
+    with store.tx(immediate=True) as db:
+        db.execute("UPDATE v1_tasks SET status='pending',current_column='reviewing' WHERE id=?", (task['id'],))
+    prior = store.agents.conversation_job(ctx)
+    store.finish_conversation_job(prior['id'], task['id'], ctx.agent_run_id, {})
+
+    inspection = store.scopes.inspect(project['id'])
+    assert inspection['can_publish_revision'] is False
+    assert inspection['revision_blockers'] == [{
+        'task_id': task['id'], 'status': 'pending', 'current_column': 'reviewing',
+        'reason': 'started_nonterminal',
+    }]
+
+    ctx, _ = turn(store, project, requirement)
+    args = revision_args(requirement, workflow_id)
+    blocked = store.registry.dispatch('project.scope.revise', args, ctx)
+    assert not blocked.ok and 'WorkflowRevisionBusy' in blocked.error['message']
+    assert store.agents.get_requirement(project['id'], requirement['id'])['revision'] == 1
+    denied = store.registry.dispatch('task.retry', {'task_id': task['id']}, ctx)
+    assert not denied.ok and 'ScopeRevisionPending' in denied.error['message']
+
+    cancelled = invoke(ctx, 'task.cancel', {
+        'task_id': task['id'], 'reason': 'Superseded by the user-requested scope extension'})
+    assert cancelled['status'] == 'failed'
+    assert store.scopes.inspect(project['id'])['can_publish_revision'] is True
+    revised = invoke(ctx, 'project.scope.revise', args)
+    assert revised['requirement']['revision'] == 2
+    assert revised['workflow_revision_id'] != workflow_id
+    assert revised['task_ids'] == []
+
+
+def test_execution_grant_cannot_cancel_task_from_another_requirement(store, tmp_path):
+    project, ctx, old_requirement, workflow_id = novel(store, tmp_path)
+    saved = save_chapters(ctx, workflow_id, [1])
+    task = invoke(ctx, 'task.create', {
+        'task_plan_id': saved['id'], 'proposed_task_ref': 'chapter01'})
+    prior = store.agents.conversation_job(ctx)
+    store.finish_conversation_job(prior['id'], task['id'], ctx.agent_run_id, {})
+
+    ctx, new_requirement = turn(store, project, request='begin', focus='new_scope')
+    assert new_requirement['id'] != old_requirement['id']
+    denied = store.registry.dispatch('task.cancel', {
+        'task_id': task['id'], 'reason': 'Not in this Requirement'}, ctx)
+    assert not denied.ok
+    assert 'TaskCancelRequiresAuthorization' in denied.error['message']
+    assert store.get_task(task['id'])['status'] != 'failed'
 
 
 def test_late_event_cannot_select_or_revise_new_scope(store, tmp_path):
@@ -478,70 +519,11 @@ def test_report_uses_actual_pending_state_not_model_claim(store, tmp_path):
     assert evidence['tasks'][0]['status'] == 'pending'
 
 
-def test_continue_policy_and_frozen_loop_assets_survive_catalog_change(store, tmp_path, monkeypatch):
+def test_frozen_legacy_loop_resources_survive_catalog_change(store, tmp_path, monkeypatch):
     project, ctx, req, workflow = novel(store, tmp_path)
     frozen_assets = store.get_project_loop_assets(project['id'], workflow)
     ctx, _ = turn(store, project, req)
-    invoke(ctx, 'project.scope.revise', revision_args(req, workflow))
-    current = store.get_workflow(project['id'])
-    assert current['loop_bindings']['ending_policy'] == 'continue'
-    instructions = [c.get('instruction', '') for c in current['definition']['columns']]
-    assert any('continue' in instruction and '不得强行完结' in instruction for instruction in instructions)
+    revised = invoke(ctx, 'project.scope.revise', revision_args(req, workflow))
+    assert revised['bindings']['ending_policy'] == 'conclude'
     monkeypatch.setattr(store, 'get_loop', lambda *_: (_ for _ in ()).throw(ValueError('catalog unavailable')))
     assert store.get_project_loop_assets(project['id'], workflow) == frozen_assets
-
-
-def test_scope_revision_preserves_custom_method_and_rejects_conflicting_upgrade(store, tmp_path):
-    from app.v1.repositories.scope_repository import _apply_delta, ScopeConflict
-    assert _apply_delta({'fixed': 1, 'rule': 1}, {'fixed': 1, 'rule': 2}, {'fixed': 'custom', 'rule': 1}) == {'fixed': 'custom', 'rule': 2}
-    with pytest.raises(ScopeConflict):
-        _apply_delta({'rule': 1}, {'rule': 2}, {'rule': 'custom'})
-
-
-def test_gateway_continues_cancelled_requirement_and_reports_six_created_tasks(store, tmp_path):
-    from app.v1.agent import AgentCore
-    from app.v1.domain import AgentModelResponse, AgentToolCall
-    from app.v1.conversations.conversation import ConversationGateway
-    from tests.unit.conversation.test_conversation_contract import run_turn
-    project, ctx, req, workflow = novel(store, tmp_path)
-    planned = save_chapters(ctx, workflow, range(1, 7))
-    invoke(ctx, 'task.create', {'task_plan_id': planned['id'], 'proposed_task_ref': 'chapter01'})
-    with store.tx(immediate=True) as db:
-        db.execute("UPDATE v1_tasks SET status='done' WHERE project_id=?", (project['id'],))
-    store.agents.close_requirement(project['id'], req['id'], 'cancelled')
-    store.finish_conversation_job(store.agents.conversation_job(ctx)['id'], None, ctx.agent_run_id, {})
-    step = 0
-    def call(name, args, identity):
-        return AgentModelResponse(tool_calls=[AgentToolCall(id=identity, name=name, arguments=args)])
-    def model(*args, **kwargs):
-        nonlocal step
-        step += 1
-        if step == 1:
-            return call('project.scope.inspect', {}, 'inspect')
-        if step == 2:
-            return call('project.scope.revise', revision_args(req, workflow), 'revise')
-        if step == 3:
-            active = store.get_workflow(project['id'])
-            definition = WorkflowDefinition.model_validate(active['definition'])
-            items = []
-            for n in range(7, 13):
-                item = task_plan(active['id'], definition, task_ref=f'chapter{n:02}', title=f'Chapter {n}', input_data=novel_task_input(n)).tasks[0]
-                item.dependencies = [f'chapter{n-1:02}'] if n > 7 else []
-                items.append(item)
-            plan = task_plan(active['id'], definition).model_copy(update={'tasks': items})
-            return call('task.plan.save', {'plan': plan.model_dump(mode='json')}, 'plan')
-        if step == 4:
-            plan = next(p for p in store.list_task_plans(project['id']) if p['plan']['tasks'][0]['proposed_task_ref'] == 'chapter07')
-            return call('task.create', {'task_plan_id': plan['id'], 'proposed_task_ref': 'chapter07'}, 'create')
-        return AgentModelResponse(text=json.dumps({'mode': 'work_result', 'message': 'Chapter seven is running', 'tool_call_ids': ['revise', 'create']}))
-    from tests.helpers import resolve_execution_before
-    gateway = ConversationGateway(store, store.registry, agent_core=AgentCore(store, store.registry,
-        resolve_execution_before(model, request='extend', requirement_id=req['id'])))
-    queued = run_turn(gateway, project['id'], 'Continue chapters seven through twelve without concluding', True)
-    job = store.get_conversation_job(queued['job']['id'])
-    assert job['status'] == 'succeeded' and step == 5
-    assert len(job['result']['task_ids']) == 6
-    assert len(job['result']['workflow_revision_ids']) == 1
-    assert 'Chapter 7：待执行' in job['result']['reply'].splitlines()[0]
-    assert 'Agent 说明（未作为完成依据）' in job['result']['reply']
-    assert job['requirement_id'] == req['id'] and job['requirement_revision'] == 2

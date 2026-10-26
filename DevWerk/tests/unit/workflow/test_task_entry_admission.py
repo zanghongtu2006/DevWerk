@@ -11,6 +11,7 @@ from app.v1.domain import (
     WorkflowDefinition,
 )
 from tests.helpers import agent_workflow, publish_initial_workflow, task_plan, workflow_plan
+from tests.support.legacy_loop_fixture import apply_legacy_fixture
 from tests.unit.conversation.test_conversation_intent_contract import resolve, turn
 
 def software_plan(store, tmp_path):
@@ -19,9 +20,11 @@ def software_plan(store, tmp_path):
     resolution = resolve(ctx, job, act='execute', execution_request='begin', scope_summary='local login demo',
         user_evidence=[{'message_id':job['user_message_id'],'quote':job['message']}])
     assert resolution.ok, resolution.error
-    applied = store.registry.dispatch('loop.apply', {'loop_key':'software.ddd_delivery',
-        'bindings':{'product_name':'login demo','delivery_target':'local'}}, ctx)
-    assert applied.ok, applied.error
+    applied = apply_legacy_fixture(store, project['id'], 'software.ddd_delivery',
+        {'product_name':'login demo','delivery_target':'local'})
+    current_job = store.agents.conversation_job(ctx)
+    store.scopes.bind_workflow(applied['workflow']['id'], applied['id'],
+        current_job['requirement_id'], current_job['requirement_revision'])
     workflow = store.get_workflow(project['id'])
     definition = WorkflowDefinition.model_validate(workflow['definition'])
     for key in ('backend_development','frontend_development','system_test','delivery','accept'):
@@ -51,6 +54,141 @@ def test_software_receipts_save_and_materialize_one_task(store, tmp_path):
     assert created.output['materialization']['created_task_ids'] == [created.output['id']]
     replay = store.materialize_task_plan(project['id'], task_plan_id=saved['id'], proposed_task_ref='primary')
     assert replay['materialization'] == {'created_task_ids':[], 'reused_task_ids':[created.output['id']]}
+
+
+def test_task_plan_preview_setting_enforces_matching_successful_receipt(store, tmp_path):
+    project, plan, ctx = software_plan(store, tmp_path)
+    required = replace(ctx, require_task_plan_preview=True)
+    payload = {'plan': plan.model_dump(mode='json')}
+    rejected = store.registry.dispatch('task.plan.save', payload, required)
+    assert not rejected.ok
+    assert rejected.error['code'] == 'TASK_PLAN_PREVIEW_REQUIRED'
+    assert rejected.error['diagnostics'][0]['path'] == '/plan'
+    assert not store.list_task_plans(project['id'])
+
+    checked = store.registry.dispatch('task.plan.validate', payload, required)
+    assert checked.ok and checked.output['valid'] is True
+    store.record_tool_invocation(agent_run_id=ctx.agent_run_id, tool_call_id='preview-plan',
+        capability='task.plan.validate', arguments={'plan': json.dumps(payload['plan'])},
+        result=checked.model_dump(mode='json'), ok=True)
+    saved = store.registry.dispatch('task.plan.save', payload, required)
+    assert saved.ok, saved.error
+    assert saved.output['next_action']['capability'] == 'task.create'
+    assert not store.list_tasks(project['id'])
+
+
+def test_validated_task_plan_ref_saves_and_starts_exact_preview(store, tmp_path):
+    from app.v1.tooling.capability_handlers import _task_plan_from_preview_ref
+    from app.v1.protocols.tools.planning.capability_contracts import TaskPlanSaveInput
+
+    project, plan, ctx = software_plan(store, tmp_path)
+    with pytest.raises(ValueError, match='exactly one'):
+        TaskPlanSaveInput.model_validate({'plan': plan.model_dump(mode='json'),
+            'validated_plan_ref': '0' * 64})
+    required = replace(ctx, require_task_plan_preview=True)
+    payload = {'plan': plan.model_dump(mode='json')}
+    checked = store.registry.dispatch('task.plan.validate', payload, required)
+    assert checked.ok and checked.output['valid'] is True
+    preview_ref = checked.output['validated_plan_ref']
+    store.record_tool_invocation(agent_run_id=ctx.agent_run_id, tool_call_id='preview-ref',
+        capability='task.plan.validate', arguments=payload,
+        result=checked.model_dump(mode='json'), ok=True)
+
+    assert _task_plan_from_preview_ref(replace(required, agent_run_id='different-run'), preview_ref) is None
+    rejected = store.registry.dispatch('task.plan.save',
+        {'validated_plan_ref': '0' * 64, 'start_tasks': True}, required)
+    assert not rejected.ok and rejected.error['code'] == 'TASK_PLAN_PREVIEW_REQUIRED'
+    assert store.list_task_plans(project['id']) == []
+
+    saved = store.registry.dispatch('task.plan.save',
+        {'validated_plan_ref': preview_ref, 'start_tasks': True}, required)
+    assert saved.ok, saved.error
+    assert saved.output['started_task_id'] in saved.output['materialization']['created_task_ids']
+    assert len(store.list_tasks(project['id'])) == 1
+
+
+def test_validated_task_plan_ref_rechecks_active_workflow(store, tmp_path):
+    project, plan, ctx = software_plan(store, tmp_path)
+    required = replace(ctx, require_task_plan_preview=True)
+    payload = {'plan': plan.model_dump(mode='json')}
+    checked = store.registry.dispatch('task.plan.validate', payload, required)
+    assert checked.ok and checked.output['valid'] is True
+    store.record_tool_invocation(agent_run_id=ctx.agent_run_id, tool_call_id='stale-preview',
+        capability='task.plan.validate', arguments=payload,
+        result=checked.model_dump(mode='json'), ok=True)
+
+    current = store.get_workflow(project['id'])
+    store.publish_workflow(project['id'], WorkflowDefinition.model_validate(current['definition']),
+        current['workflow_plan_id'])
+    rejected = store.registry.dispatch('task.plan.save',
+        {'validated_plan_ref': checked.output['validated_plan_ref'], 'start_tasks': True}, required)
+    assert not rejected.ok and rejected.error['code'] == 'TASK_PLAN_INVALID'
+    assert store.list_task_plans(project['id']) == []
+    assert store.list_tasks(project['id']) == []
+
+
+def test_task_plan_direct_atomic_submission_is_idempotent(store, tmp_path):
+    project, plan, ctx = software_plan(store, tmp_path)
+    request = {'plan': plan.model_dump(mode='json'), 'start_tasks': True}
+    first = store.registry.dispatch('task.plan.save', request, ctx)
+    assert first.ok, first.error
+    assert first.output.get('next_action') is None
+    assert len(first.output['materialization']['created_task_ids']) == 1
+    assert first.output['started_task_id'] == first.output['materialization']['created_task_ids'][0]
+    assert len(store.list_task_plans(project['id'])) == 1
+    assert len(store.list_tasks(project['id'])) == 1
+    again = store.registry.dispatch('task.plan.save', request, replace(ctx, execution_key='atomic-repeat'))
+    assert again.ok, again.error
+    assert again.output['materialization']['reused_task_ids'] == [first.output['started_task_id']]
+    assert len(store.list_task_plans(project['id'])) == 1
+    assert len(store.list_tasks(project['id'])) == 1
+
+
+def test_atomic_plan_receipt_queues_reply_only_when_tasks_start():
+    from app.v1.agents.agent_tool_execution import queued_task_entry
+
+    base = {'ok': True, 'capability': 'task.plan.save', 'facts': {'result': {'output': {}}}}
+    assert not queued_task_entry(base)
+    started = {'ok': True, 'capability': 'task.plan.save',
+        'facts': {'result': {'output': {'started_task_id': 'tsk_1'}}}}
+    assert queued_task_entry(started)
+
+
+def test_atomic_task_plan_report_uses_created_task_receipt(store, tmp_path):
+    from app.v1.conversations.conversation_report import render_report
+
+    project, plan, ctx = software_plan(store, tmp_path)
+    arguments = {'plan': plan.model_dump(mode='json'), 'start_tasks': True}
+    result = store.registry.dispatch('task.plan.save', arguments, ctx)
+    assert result.ok, result.error
+    store.record_tool_invocation(agent_run_id=ctx.agent_run_id,
+        tool_call_id='atomic-plan', capability='task.plan.save',
+        arguments=arguments, result=result.model_dump(mode='json'), ok=True)
+    rendered, evidence = render_report(store, project['id'], ctx.agent_run_id,
+        json.dumps({'mode': 'work_result', 'tool_call_ids': ['atomic-plan']}))
+    assert result.output['started_task_id'] in [item['id'] for item in evidence['tasks']]
+    assert '待执行' in rendered
+
+
+def test_atomic_task_plan_rolls_back_if_materialization_fails(store, tmp_path, monkeypatch):
+    project, plan, ctx = software_plan(store, tmp_path)
+    request = {'plan': plan.model_dump(mode='json'), 'start_tasks': True}
+    original = store.materialize_task_plan
+
+    def fail_after_plan(*args, **kwargs):
+        raise ValueError('Task materialization rejected')
+
+    monkeypatch.setattr(store, 'materialize_task_plan', fail_after_plan)
+    rejected = store.registry.dispatch('task.plan.save', request, ctx)
+    assert not rejected.ok
+    assert store.list_task_plans(project['id']) == []
+    assert store.list_tasks(project['id']) == []
+
+    monkeypatch.setattr(store, 'materialize_task_plan', original)
+    accepted = store.registry.dispatch('task.plan.save', request,
+        replace(ctx, execution_key='atomic-after-rejection'))
+    assert accepted.ok, accepted.error
+    assert len(store.list_tasks(project['id'])) == 1
 
 
 def test_plan_contract_exposes_only_real_entry_evidence(store, tmp_path):
@@ -146,6 +284,7 @@ def test_unsaved_plan_is_not_misdiagnosed_as_requirement_conflict(store, tmp_pat
     before = store.get_project(project['id'])
     validation = store.registry.dispatch('task.plan.validate',{'plan':plan.model_dump(mode='json')},ctx)
     assert validation.ok and validation.output['valid'], validation.error
+    assert validation.output['next_action'] == 'task.plan.save'
     result = store.registry.dispatch('task.create',{'task_plan_id':'tpln_invented','proposed_task_ref':'primary'},ctx)
     assert not result.ok
     assert 'TaskPlanNotFound' in str(result.error) and 'task.plan.save' in str(result.error)
@@ -205,6 +344,7 @@ def test_plan_validate_rejects_stale_terminal_repair_predecessor(store, tmp_path
     candidate.repair_of_task_id = first['id']
     stale = store.registry.dispatch('task.plan.validate',{'plan':candidate.model_dump(mode='json')},ctx)
     assert stale.ok and not stale.output['valid']
+    assert 'next_action' not in stale.output
     assert any('DuplicateTaskIdentity' in issue['message'] and second['id'] in issue['message']
                for issue in stale.output['diagnostics'])
     rejected = store.registry.dispatch('task.plan.save',{'plan':candidate.model_dump(mode='json')},ctx)

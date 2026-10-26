@@ -1,12 +1,9 @@
 """Versioned project goals and Loop bindings; revisions never rewrite old work."""
 from __future__ import annotations
 
-import json
-from copy import deepcopy
-
-from app.v1.contracts import canonicalize_contract_value, validate_contract
 from app.v1.domain import WorkflowDefinition, WorkflowPlan
 from app.v1.protocols.storage.repository_event_contracts import ScopeRevisionReceipt
+from app.v1.protocols.workflow.legacy_loop_snapshot import LegacyLoopBindingSnapshot
 from app.v1.storage_support import new_id, utcnow
 
 
@@ -96,13 +93,14 @@ class ScopeRepository:
                 workflow=None, requirements=self.store.agents.list_requirements(project_id),
             ).model_dump(mode='json', exclude_unset=True)
         scope = self.for_workflow(workflow['id']) or {}
+        with self.store.connect() as db:
+            blockers = self.store.workflow_revision_blockers(db, project_id, workflow['id'])
         return ScopeInspectReceipt.current(
-            workflow, scope, self.store.agents.list_requirements(project_id),
+            workflow, scope, self.store.agents.list_requirements(project_id), blockers,
         )
 
     def revise(self, ctx, *, requirement_id, expected_revision, expected_workflow_revision_id,
-               objective, binding_patch, reason, loop_digest=None):
-        from app.v1.store import _resolve_loop_parameters
+               objective, reason):
         self.store.agents.assert_conversation(ctx)
         if not ctx.user_initiated or not ctx.start_task:
             raise ValueError('scope_revision_requires_user_request: continue the existing scope for event turns')
@@ -117,8 +115,6 @@ class ScopeRepository:
             if active is None:
                 if current['revision'] != expected_revision or expected_workflow_revision_id is not None:
                     raise ScopeConflict('Scope changed; inspect the current Requirement and Workflow revisions before revising')
-                if binding_patch or loop_digest:
-                    raise ScopeConflict('A Workflow must exist before revising Loop bindings')
                 self.remember(current)
                 changed = db.execute('UPDATE v1_requirements SET revision=revision+1,objective=?,status=\'active\',updated_at=? WHERE id=? AND revision=?',
                                      (objective, utcnow(), requirement_id, expected_revision)).rowcount
@@ -148,34 +144,14 @@ class ScopeRepository:
             binding = self.store.get_project_loop_binding(ctx.project_id, active['id'])
             current_method = self.store.get_workflow_plan(ctx.project_id, active['workflow_plan_id'])['plan']
             if binding:
-                if not binding.get('package_json'):
-                    raise ScopeConflict('Scope revision requires the frozen Loop package for this Workflow')
-                old_package = json.loads(binding['package_json'])
-                package = old_package
-                if loop_digest and loop_digest != binding['loop_digest']:
-                    package = self.store.get_loop(binding['loop_key'])
-                    if package['digest'] != loop_digest:
-                        raise ScopeConflict('The selected Loop digest is no longer available')
-                from app.v1.protocols.workflow.loop_bindings import LoopBindings, LoopPackageSnapshot
-                parameters = canonicalize_contract_value(
-                    LoopBindings.combine(package['bundle'].get('defaults') or {}, binding['bindings'], binding_patch).values,
-                    package['parameter_schema'],
-                )
-                validate_contract(parameters, package['parameter_schema'], label='Revised scope bindings')
-                old_material = _resolve_loop_parameters(old_package['bundle'], binding['bindings'])
-                new_material = _resolve_loop_parameters(package['bundle'], parameters)
-                old_method = WorkflowPlan.model_validate(old_material['workflow_plan']).model_dump(mode='json')
-                old_workflow = WorkflowDefinition.model_validate(old_material['workflow']).model_dump(mode='json')
-                new_method = WorkflowPlan.model_validate(new_material['workflow_plan']).model_dump(mode='json')
-                new_workflow = WorkflowDefinition.model_validate(new_material['workflow']).model_dump(mode='json')
-                method = WorkflowPlan.model_validate(_apply_delta(old_method, new_method, current_method))
-                workflow = WorkflowDefinition.model_validate(_apply_delta(old_workflow, new_workflow, active['definition']))
+                # A historical package remains frozen evidence. Scope revision
+                # carries its active Workflow forward; descriptive Loop cards
+                # never supply the graph for this revision.
+                parameters = dict(binding['bindings'])
             else:
-                if binding_patch or loop_digest:
-                    raise ScopeConflict('This Workflow has no Loop binding; revise its Workflow directly')
                 parameters = {}
-                method = WorkflowPlan.model_validate(current_method)
-                workflow = WorkflowDefinition.model_validate(active['definition'])
+            method = WorkflowPlan.model_validate(current_method)
+            workflow = WorkflowDefinition.model_validate(active['definition'])
             plan = self.store.create_workflow_plan(ctx.project_id, method)
             published = self.store.publish_workflow(ctx.project_id, workflow, plan['id'])
             binding_id = None
@@ -184,8 +160,9 @@ class ScopeRepository:
                 db.execute('''INSERT INTO v1_project_loop_bindings
                     (id,project_id,loop_key,loop_version,loop_digest,bindings_json,workflow_plan_id,workflow_revision_id,created_at,package_json)
                     VALUES(?,?,?,?,?,?,?,?,?,?)''',
-                    (binding_id, ctx.project_id, package['loop_key'], package['version'], package['digest'], LoopBindings(values=parameters).json_text(),
-                     plan['id'], published['id'], utcnow(), LoopPackageSnapshot.model_validate(package).json_text()))
+                    (binding_id, ctx.project_id, binding['loop_key'], binding['loop_version'],
+                     binding['loop_digest'], LegacyLoopBindingSnapshot.model_validate(parameters).model_dump_json(),
+                     plan['id'], published['id'], utcnow(), binding.get('package_json')))
             changed = db.execute('UPDATE v1_requirements SET revision=revision+1,objective=?,status=\'active\',updated_at=? WHERE id=? AND revision=?',
                                  (objective, utcnow(), requirement_id, expected_revision)).rowcount
             if changed != 1:
@@ -201,30 +178,3 @@ class ScopeRepository:
                 workflow_definition_changed=published['definition_hash'] != active['definition_hash']).model_dump(mode='json')
             self.store._event(db, ctx.project_id, None, None, 'project.scope.revised', result)
             return result
-
-
-def _apply_delta(old, new, current):
-    """Preserve project customizations; never silently replace conflicting edits."""
-    if old == new:
-        return deepcopy(current)
-    if current == old:
-        return deepcopy(new)
-    if isinstance(old, dict) and isinstance(new, dict) and isinstance(current, dict):
-        result = deepcopy(current)
-        for key in old.keys() | new.keys():
-            if old.get(key) == new.get(key) and (key in old) == (key in new):
-                continue
-            if key not in old:
-                if key in current and current[key] != new[key]:
-                    raise ScopeConflict('Loop update conflicts with customized field: '+key)
-                result[key] = deepcopy(new[key])
-            elif key not in new:
-                if current.get(key) != old[key]:
-                    raise ScopeConflict('Loop update removes customized field: '+key)
-                result.pop(key, None)
-            else:
-                result[key] = _apply_delta(old[key], new[key], current.get(key))
-        return result
-    if isinstance(old, list) and isinstance(new, list) and isinstance(current, list) and len(old) == len(new) == len(current):
-        return [_apply_delta(a, b, c) for a, b, c in zip(old, new, current)]
-    raise ScopeConflict('Loop update conflicts with a customized Workflow; revise the method explicitly first')

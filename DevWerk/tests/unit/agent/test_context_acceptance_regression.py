@@ -302,34 +302,27 @@ def test_task_plan_validation_accepts_worker_selected_checks_without_writes(stor
     assert not store.list_task_plans(project['id'])
 
 
-def test_planning_projection_preserves_required_schema_and_revision(store, tmp_path):
+def test_loop_inspect_projection_preserves_descriptive_guide_and_resources(store):
     from app.v1.context.context_manager import packed, project_result
-    project = store.create_project('planning projection','',str(tmp_path/'project'))
+
     loop = store.get_loop('software.ddd_delivery')
-    view = json.loads(project_result(packed({'ok':True,'capability':'loop.inspect','output':loop}),6900))
-    assert view['output']['parameter_schema'] == loop['parameter_schema']
-    assert view['output']['task_contract'] == loop['bundle']['workflow_plan']['task_contract']
-    assert view['output']['flow_unit'] == loop['bundle']['workflow_plan']['flow_unit']
-    assert view['output']['input'] == loop['input']
-    assert view['output']['selection_guide'] == loop['selection_guide']
-    assert 'acceptance-report.md' in view['output']['assets']
-    repeated = json.loads(project_result(packed(view), max(3000,len(packed(view).encode('utf8'))-50)))
-    assert repeated['ok'] is True
-    applied = store.apply_loop(project['id'],'software.ddd_delivery',{'product_name':'demo','delivery_target':'local'})
-    view = json.loads(project_result(packed({'ok':True,'capability':'loop.apply','output':applied}),6900))
-    assert view['output']['workflow']['definition_hash'] == applied['workflow']['definition_hash']
-    assert view['output']['workflow_plan']['flow_unit'] == applied['workflow_plan']['plan']['flow_unit']
-    assert len(packed(view)) < 5000
+    assert 'bundle' not in loop and 'parameter_schema' not in loop
+    view = json.loads(project_result(packed({'ok': True, 'capability': 'loop.inspect', 'output': loop}), 12000))
+    assert view['output']['guide'] == loop['guide']
+    assert view['output']['assets'] == loop['assets']
+    assert view['output']['digest'] == loop['digest']
 
 
-def test_loop_inspect_projection_preserves_unresolved_writable_path_references(store):
+def test_novel_loop_projection_contains_guidance_without_workflow_parameters(store):
     from app.v1.context.context_manager import packed, project_result
 
     loop = store.get_loop('novel.production')
-    source = {'ok': True, 'capability': 'loop.inspect', 'output': loop}
-    projected = json.loads(project_result(packed(source), 6900))
-    expected = loop['bundle']['workflow']['columns'][0]['metadata']['writable_paths']
-    assert projected['output']['columns'][0]['writable_paths'] == expected
+    projected = json.loads(project_result(
+        packed({'ok': True, 'capability': 'loop.inspect', 'output': loop}), 20000))
+    assert projected['output']['guide'] == loop['guide']
+    assert len(projected['output']['assets']) == 10
+    assert 'columns' not in projected['output']
+    assert 'bundle' not in projected['output']
 
 
 def test_old_receipt_cannot_resolve_new_feedback_in_same_visit(store, tmp_path):

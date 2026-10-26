@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from app.v1.protocols.tools.core.capability_protocol import SideEffectKind
+from app.v1.protocols.tools.core.tool_catalog_contracts import ToolExposure
 
 
 @dataclass(frozen=True)
@@ -14,10 +15,40 @@ class BuiltinToolDefinition:
     description: str
     side_effect_kind: SideEffectKind
     delegable_to_column: bool
+    exposure: ToolExposure | None = None
 
 
 class BuiltinTool(Enum):
     """One immutable declaration per built-in Tool; schemas and handlers bind separately."""
+
+    TOOL_CATALOG_SEARCH = BuiltinToolDefinition(
+        id='tool.catalog.search',
+        description='Find available Tool IDs by name or description. For an on-demand Tool, call tool.catalog.describe, then tool.catalog.call.',
+        side_effect_kind=SideEffectKind.READ,
+        delegable_to_column=False,
+    )
+
+    TOOL_CATALOG_SELECT = BuiltinToolDefinition(
+        id='tool.catalog.select',
+        description='Present selected available Tool schemas on the next model request. This is Tool discovery, not execution permission. Choose exact IDs; no prior search is required when you already know them.',
+        side_effect_kind=SideEffectKind.READ,
+        delegable_to_column=False,
+        exposure=ToolExposure.INTERNAL,
+    )
+
+    TOOL_CATALOG_DESCRIBE = BuiltinToolDefinition(
+        id='tool.catalog.describe',
+        description='Read the complete parameter schema for one available on-demand Tool before calling it.',
+        side_effect_kind=SideEffectKind.READ,
+        delegable_to_column=False,
+    )
+
+    TOOL_CATALOG_CALL = BuiltinToolDefinition(
+        id='tool.catalog.call',
+        description='Call one described on-demand Tool. Its arguments must match that Tool schema; the original Tool authorization still applies.',
+        side_effect_kind=SideEffectKind.SESSION_CONTROL,
+        delegable_to_column=False,
+    )
 
     CONVERSATION_REPLY = BuiltinToolDefinition(
         id='conversation.reply',
@@ -53,7 +84,7 @@ class BuiltinTool(Enum):
         id='conversation.turn.resolve',
         description=(
             'Bind the current user request before an execution or Task-control mutation. Submit ALONE and read '
-            'the grant receipt. Discussion, status, inspection and ordinary replies need no call. Assistant '
+            'the grant receipt. Ordinary Agent tools, discussion, status and inspection need no call. Assistant '
             'promises and mailbox events do not authorize work.'
         ),
         side_effect_kind=SideEffectKind.SESSION_CONTROL,
@@ -67,7 +98,8 @@ class BuiltinTool(Enum):
             'work within its scope; use extend with that ID before project.scope.revise when changing its '
             'scope; use begin only for an independent new Requirement. A new Requirement must take over an '
             'existing Workflow with project.scope.revise before task.plan.save, or publish its own Workflow. '
-            'Call alone before business effects. Host supplies message evidence and revision.'
+            'Call alone before managed Requirement, Workflow, Task or Worker state changes. General Agent '
+            'tools do not need this grant. Host supplies message evidence and revision.'
         ),
         side_effect_kind=SideEffectKind.SESSION_CONTROL,
         delegable_to_column=False,
@@ -83,6 +115,7 @@ class BuiltinTool(Enum):
         ),
         side_effect_kind=SideEffectKind.SESSION_CONTROL,
         delegable_to_column=False,
+        exposure=ToolExposure.INTERNAL,
     )
 
     CONVERSATION_HISTORY_READ = BuiltinToolDefinition(
@@ -293,22 +326,10 @@ class BuiltinTool(Enum):
     LOOP_INSPECT = BuiltinToolDefinition(
         id='loop.inspect',
         description=(
-            'Read one filesystem Loop card and reusable method bundle, including its parameter contract, '
-            'Workflow Plan, directed Column graph, and selection guidance.'
+            'Read a descriptive filesystem Loop guide and optional method resources. Treat it as advice: '
+            'adapt the process to the user request, then author and publish a Workflow with the Workflow tools.'
         ),
         side_effect_kind=SideEffectKind.READ,
-        delegable_to_column=False,
-    )
-
-    LOOP_APPLY = BuiltinToolDefinition(
-        id='loop.apply',
-        description=(
-            "Create the current Project's initial Workflow from one inspected filesystem Loop. Bindings must "
-            'satisfy the Loop parameter schema. Application records the exact Loop version and digest and '
-            'materializes its reusable Workflow Plan and initial directed Workflow revision. It creates no '
-            "Tasks; save a Task Plan for the user's concrete objective afterward."
-        ),
-        side_effect_kind=SideEffectKind.CONTROL,
         delegable_to_column=False,
     )
 
@@ -344,17 +365,18 @@ class BuiltinTool(Enum):
             'stable Task identity is derived from the Workflow Task Contract. For an incremental ordered plan, '
             'include only the new contiguous work items; the first new item has no same-plan dependency '
             'because DevWerk links it to the existing Project predecessor. Never repeat an already '
-            'materialized work item merely to make a new plan start at the configured first value. Saving the '
-            'plan creates no Tasks. This is a mutating capability, never a schema probe: do not submit '
+            'materialized work item merely to make a new plan start at the configured first value. By default, saving '
+            'creates no Tasks; start_tasks=true atomically saves and starts the complete graph. This is a mutating capability, never a schema probe: do not submit '
             'placeholder, test, TODO, or partial plans. Preserve explicit exclusions from the authorizing user '
             'request in readiness.non_scope and the acceptance criteria; a positive feature list does not '
             'override those exclusions. Read task.plan.contract first for the current frozen input and '
-            'evidence candidates, then task.plan.validate before saving. If validation rejects a call before '
+            'evidence candidates. If Settings requires preview, call task.plan.validate, then save with its '
+            'validated_plan_ref and omit plan; otherwise preview is optional. Saving always validates. If validation rejects a call before '
             'persistence, correct and resubmit the same complete user-owned plan. A queue readiness decision '
             'is automatically admitted when dependencies and WIP constraints allow. A Task traverses the '
             'complete Column lifecycle: do not make separate Tasks for its stages. After a successful save, '
             'use the returned plan ID with task.create before preparing another plan for the same requested '
-            'work.'
+            'work, unless start_tasks=true already materialized the Tasks.'
         ),
         side_effect_kind=SideEffectKind.CONTROL,
         delegable_to_column=False,
@@ -377,13 +399,19 @@ class BuiltinTool(Enum):
     WORKFLOW_CREATE = BuiltinToolDefinition(
         id='workflow.create',
         description=(
-            'Create or revise the active Workflow in one call from a directed graph. Specify each reusable '
-            "Column's executor and every outcome-to-target transition explicitly. Each Task traverses the same "
-            'graph from entry; each target is either {kind:column,key:<declared Column key>} or '
-            '{kind:terminal,status:done|failed}. done and failed are not Columns. This tool saves its planning '
-            'record and publishes the graph together. It creates no Tasks; use the returned Workflow revision '
-            'ID in task.plan.save, then task.create. Existing running Tasks must settle before a revision can '
-            'replace their graph. Use loop.apply when a suitable optional Loop exists.'
+            'Create or revise the active Workflow in one call. Pass the Workflow fields directly at the Tool '
+            'root, without a workflow wrapper. Required fields: name, flow_unit, '
+            'entry, columns, expected_outputs, completion_conditions. Each reusable Column requires key, name, '
+            'instruction, executor, and nonempty transitions. Put an agent executor\'s kind, capabilities, and '
+            'optional worker_key/worker_role inside executor, not on the Column. Context belongs inside an '
+            'individual Column, never at the Tool root. Every transition needs a target: '
+            'kind=column with a declared Column key, or kind=terminal with status=done or failed. done and failed '
+            'are not Columns. Omit optional task_input_schema and acceptance_checks unless the Workflow needs '
+            'them; task_input_schema is a JSON Schema, whose required field is an array of names, not Task '
+            'values; each properties entry is a JSON Schema such as {"type":"string"}. This call saves the '
+            'planning record and publishes the graph but creates no Tasks. Use the '
+            'returned Workflow revision ID in task.plan.save, then task.create. Existing running Tasks must '
+            'settle before replacement. A Loop guide may inform the graph but cannot publish it.'
         ),
         side_effect_kind=SideEffectKind.CONTROL,
         delegable_to_column=False,
@@ -395,8 +423,8 @@ class BuiltinTool(Enum):
             'Publish a declarative Workflow implementing the referenced saved Workflow Plan. This call, not '
             'workflow.plan.save or a Requirement-only revision, applies new Columns and transitions. If the '
             'Project has no Workflow, this creates its initial revision; otherwise it publishes a new '
-            'revision. A filesystem Loop can be applied first as an optional template, then revised for this '
-            'Requirement. Workflow column keys must exactly match the Workflow Plan process-stage keys; work '
+            'revision. An optional filesystem Loop is descriptive guidance, never a published template. '
+            'Workflow column keys must exactly match the Workflow Plan process-stage keys; work '
             'slices remain Tasks. The done and failed values are terminal targets, never Column definitions. '
             'Every Column must provide an executor and non-empty transitions; every declared outcome must have '
             'exactly one transition. A capability_sequence selects exactly one of completed_outcome or '
@@ -509,8 +537,8 @@ class BuiltinTool(Enum):
     TASK_PLAN_VALIDATE = BuiltinToolDefinition(
         id='task.plan.validate',
         description=(
-            'Read-only admission diagnostics for a concrete Task Plan. Use exactly the same typed plan '
-            'with task.plan.save after valid=true; validation alone does not save it. Returns semantic '
+            'Read-only admission diagnostics for a concrete Task Plan. When valid=true, use the returned '
+            'validated_plan_ref with task.plan.save without resending the plan; validation alone does not save it. Returns semantic '
             'errors, paths and legal columns. Does not persist plans or execute future commands.'
         ),
         side_effect_kind=SideEffectKind.READ,
@@ -586,14 +614,14 @@ class BuiltinTool(Enum):
 
     TASK_PAUSE = BuiltinToolDefinition(
         id='task.pause',
-        description='Pause a non-terminal Task until it is explicitly resumed.',
+        description='Pause a non-terminal Task in the authorized Requirement until it is explicitly resumed.',
         side_effect_kind=SideEffectKind.CONTROL,
         delegable_to_column=False,
     )
 
     TASK_RESUME = BuiltinToolDefinition(
         id='task.resume',
-        description='Resume a paused or pause-requested non-terminal Task.',
+        description='Resume a paused or pause-requested non-terminal Task in the authorized Requirement.',
         side_effect_kind=SideEffectKind.CONTROL,
         delegable_to_column=False,
     )
@@ -612,7 +640,8 @@ class BuiltinTool(Enum):
         id='task.cancel',
         description=(
             'Cancel a non-running Task through the explicit failed terminal path. A running Task owns a live '
-            'Column Attempt and must first be paused and observed outside running.'
+            'Column Attempt and must first be paused and observed outside running. The Task must belong to '
+            'the authorized Requirement.'
         ),
         side_effect_kind=SideEffectKind.CONTROL,
         delegable_to_column=False,
@@ -749,8 +778,9 @@ class BuiltinTool(Enum):
     PROJECT_SCOPE_INSPECT = BuiltinToolDefinition(
         id='project.scope.inspect',
         description=(
-            'Inspect the current Requirement, Workflow revision and optional frozen Loop bindings before '
-            'extending delivery.'
+            'Inspect current Requirement and Workflow revisions and can_publish_revision/revision_blockers. '
+            'Use the returned integer Requirement revision and Workflow revision ID for project.scope.revise; '
+            'inspect blocking Tasks before deciding to wait, pause or cancel them.'
         ),
         side_effect_kind=SideEffectKind.READ,
         delegable_to_column=False,
@@ -759,16 +789,22 @@ class BuiltinTool(Enum):
     PROJECT_SCOPE_REVISE = BuiltinToolDefinition(
         id='project.scope.revise',
         description=(
-            'Atomically extend or revise the authorized Requirement on a user request. Use this for changed '
+            'Pass five root fields: requirement_id, expected_revision (integer from project.scope.inspect), '
+            'expected_workflow_revision_id (string or null), objective, reason. '
+            'Atomically extend or revise the authorized Requirement on a user request. Before this call, '
+            'inspect can_publish_revision and revision_blockers; an extend grant permits task.pause or '
+            'task.cancel for blocking Tasks of the same Requirement, or wait for them to finish. A running '
+            'Task must actually stop before it can be cancelled. Use this for changed '
             'Requirement scope, not merely to edit Columns in the same Requirement. Before the first Workflow '
-            'exists, pass expected_workflow_revision_id=null and an empty binding_patch; this revises only the '
-            'Requirement, then call workflow.create or apply a Loop. If the current Workflow belongs to '
+            'exists, pass expected_workflow_revision_id=null; this revises only the '
+            'Requirement, then publish a Workflow explicitly. If the current Workflow belongs to '
             'another Requirement, its Tasks must all be done or failed before this Requirement can take over '
             'in a new Workflow revision. Historical Tasks and Worker contexts stay intact. For a Workflow '
-            'without a Loop, pass an empty binding_patch. Do not close the Requirement first. This does not '
-            'create Tasks. A Requirement revision may retain its old Column graph; to change Columns or '
+            'without a Loop, do not close the Requirement first. This does not '
+            'create Tasks. With an existing Workflow this call publishes a new revision of the same graph. '
+            'To change Columns or '
             'transitions, call workflow.create separately, then save a TaskPlan against that final revision. '
-            'For a Loop-backed Workflow, optionally select a new Loop digest from loop.inspect.'
+            'Loop guides are read-only advice and cannot revise the Workflow or its bindings.'
         ),
         side_effect_kind=SideEffectKind.CONTROL,
         delegable_to_column=False,
@@ -790,3 +826,63 @@ class BuiltinTool(Enum):
         side_effect_kind=SideEffectKind.CONTROL,
         delegable_to_column=False,
     )
+
+
+DIRECT_CONVERSATION_TOOLS = frozenset({
+    BuiltinTool.TOOL_CATALOG_SEARCH,
+    BuiltinTool.TOOL_CATALOG_DESCRIBE,
+    BuiltinTool.TOOL_CATALOG_CALL,
+    BuiltinTool.CONVERSATION_REPLY,
+    BuiltinTool.CONVERSATION_EXECUTION_AUTHORIZE,
+    BuiltinTool.CONVERSATION_HISTORY_READ,
+    BuiltinTool.CONVERSATION_TURN_INSPECT,
+    BuiltinTool.PROJECT_FILES_LIST,
+    BuiltinTool.PROJECT_FILES_READ,
+    BuiltinTool.PROJECT_FILES_SEARCH,
+    BuiltinTool.PROJECT_FILES_WRITE,
+    BuiltinTool.PROJECT_COMMAND_RUN,
+    BuiltinTool.PROJECT_MEMORY_READ,
+    BuiltinTool.PROJECT_MEMORY_SEARCH,
+    BuiltinTool.PROJECT_MEMORY_WRITE,
+    BuiltinTool.AGENT_RESULT_READ,
+    BuiltinTool.WORKFLOW_INSPECT,
+    BuiltinTool.TASK_INSPECT,
+    BuiltinTool.PROJECT_SCOPE_INSPECT,
+    BuiltinTool.PROJECT_SCOPE_REVISE,
+    BuiltinTool.LOOP_LIST,
+    BuiltinTool.LOOP_INSPECT,
+})
+
+
+# These tools mutate the managed Requirement/Workflow/Task graph or its Workers.
+# Ordinary Agent effects (files, commands, Memory, external MCP) are deliberately
+# absent: a Project Conversation Agent may use them without creating a Workflow.
+WORKFLOW_GOVERNED_TOOLS = frozenset({
+    BuiltinTool.WORKFLOW_PLAN_SAVE,
+    BuiltinTool.TASK_PLAN_SAVE,
+    BuiltinTool.WORKFLOW_CREATE,
+    BuiltinTool.WORKFLOW_PUBLISH,
+    BuiltinTool.TASK_CREATE,
+    BuiltinTool.BACKLOG_RECORD,
+    BuiltinTool.SCHEDULING_DECIDE,
+    BuiltinTool.TASK_RETRY,
+    BuiltinTool.TASK_REOPEN,
+    BuiltinTool.TASK_RERUN,
+    BuiltinTool.WORKFLOW_ACCEPTANCE_CONFIGURE,
+    BuiltinTool.TASK_SUCCESSOR,
+    BuiltinTool.TASK_FEEDBACK_RECORD,
+    BuiltinTool.TASK_FEEDBACK_RESOLVE,
+    BuiltinTool.TASK_PAUSE,
+    BuiltinTool.TASK_RESUME,
+    BuiltinTool.TASK_FAIL,
+    BuiltinTool.TASK_CANCEL,
+    BuiltinTool.SUPERVISION_REVIEW_SCHEDULE,
+    BuiltinTool.GOVERNANCE_DECISION_RECORD,
+    BuiltinTool.AGENT_WORKER_SEND,
+    BuiltinTool.AGENT_WORKER_LIFECYCLE,
+    BuiltinTool.AGENT_WORKER_REPLACE,
+    BuiltinTool.REQUIREMENT_CREATE,
+    BuiltinTool.PROJECT_SCOPE_REVISE,
+    BuiltinTool.REQUIREMENT_SELECT,
+    BuiltinTool.REQUIREMENT_CLOSE,
+})

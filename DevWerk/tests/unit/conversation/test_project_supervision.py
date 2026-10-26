@@ -191,7 +191,8 @@ def test_supervision_agent_queues_successor_and_reports_its_state(store, tmp_pat
                     'task_plan_id':store.list_task_plans(project['id'], 1)[0]['id']}
         else:
             raise AssertionError('a queued successor must end the notification turn')
-        return AgentModelResponse(tool_calls=[AgentToolCall(id=f'repair-{calls}', name=name, arguments=args)])
+        return AgentModelResponse(tool_calls=[AgentToolCall(id=f'repair-{calls}',
+            name='tool.catalog.call', arguments={'tool_id':name, 'arguments':args})])
 
     gateway = ConversationGateway(store, store.registry,
                                   agent_core=AgentCore(store, store.registry, model))
@@ -255,7 +256,8 @@ def test_supervision_reopens_only_failed_task_under_prior_grant(store, tmp_path)
                 id='read-task',name='task.inspect',arguments={'task_id':task['id']})])
         if calls == 2:
             return AgentModelResponse(tool_calls=[AgentToolCall(
-                id='reopen-task',name='task.reopen',arguments={'task_id':task['id']})])
+                id='reopen-task',name='tool.catalog.call',
+                arguments={'tool_id':'task.reopen', 'arguments':{'task_id':task['id']}})])
         return AgentModelResponse(tool_calls=[AgentToolCall(
             id='report',name='conversation.reply',
             arguments={'mode':'work_result','tool_call_ids':['reopen-task']})])
@@ -313,14 +315,16 @@ def test_supervision_hands_diagnosis_to_blocked_worker_then_stops_after_retry(st
         calls += 1
         if calls == 1:
             return AgentModelResponse(tool_calls=[AgentToolCall(
-                id='send-diagnosis', name='agent.worker.send', arguments={
+                id='send-diagnosis', name='tool.catalog.call', arguments={
+                    'tool_id':'agent.worker.send', 'arguments':{
                     'worker_id':old_assignment['agent_instance_id'],
                     'assignment_id':old_assignment['id'],
-                    'content':'Inspect the failed lockout receipt before changing the code.'})])
+                    'content':'Inspect the failed lockout receipt before changing the code.'}})])
         if calls == 2:
             return AgentModelResponse(tool_calls=[AgentToolCall(
-                id='retry-after-input', name='task.retry', arguments={
-                    'task_id':task['id'], 'column_key':'work', 'clear_context':False})])
+                id='retry-after-input', name='tool.catalog.call', arguments={
+                    'tool_id':'task.retry', 'arguments':{
+                    'task_id':task['id'], 'column_key':'work', 'clear_context':False}})])
         raise AssertionError('a successful supervision retry must end the notification turn')
 
     gateway = ConversationGateway(store, store.registry,
@@ -483,6 +487,10 @@ def test_identical_reads_warn_only_after_fourth_unchanged_result_and_reset_on_ac
                           ToolResult(ok=True, capability='workflow.publish', output={'id': 'rev-2'}),
                           arguments={'workflow_plan_id': 'plan-2'})
     assert not repeated_no_progress_result('workflow.inspect', args, result, reads + [action], effect_kind='read')
+    authorized = ledger_entry('run', 'grant', 'conversation.execution.authorize', 'session_control',
+                              ToolResult(ok=True, capability='conversation.execution.authorize',
+                                         output={'grant_id': 'grant-1'}), arguments={'request': 'continue'})
+    assert not repeated_no_progress_result('workflow.inspect', args, result, reads + [authorized], effect_kind='read')
 
 
 def test_repeated_authorization_is_detected_before_another_effect():
@@ -522,7 +530,8 @@ def test_supervision_without_recovery_has_smaller_run_budget_and_preserves_failu
         nonlocal calls
         calls += 1
         return AgentModelResponse(tool_calls=[AgentToolCall(
-            id=f'inspect-{calls}', name='project.inspect', arguments={})])
+            id=f'inspect-{calls}', name='tool.catalog.search',
+            arguments={'query':f'no-match-{calls}'})])
 
     gateway = ConversationGateway(store, store.registry,
                                   agent_core=AgentCore(store, store.registry, model))

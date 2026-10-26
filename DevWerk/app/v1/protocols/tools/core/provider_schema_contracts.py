@@ -111,7 +111,7 @@ def _project(node: ProviderSchemaNode | bool, root: ProviderSchemaNode, seen: tu
             return result
         discriminator = node.discriminator.property_name if node.discriminator else None
         if discriminator and non_null and all(choice.schema_type == "object" for choice in non_null):
-            return _flatten_discriminated(non_null, discriminator)
+            return _flatten_discriminated(non_null, discriminator, node.description)
 
     result = node.clone()
     result.reference = None
@@ -175,7 +175,9 @@ def _reference(root: ProviderSchemaNode, reference: str) -> ProviderSchemaNode |
     return current if isinstance(current, (ProviderSchemaNode, bool)) else ProviderSchemaNode()
 
 
-def _flatten_discriminated(choices: list[ProviderSchemaNode], discriminator: str) -> ProviderSchemaNode:
+def _flatten_discriminated(
+    choices: list[ProviderSchemaNode], discriminator: str, description: str | None = None,
+) -> ProviderSchemaNode:
     properties: dict[str, ProviderSchemaNode | bool] = {}
     differing_properties: dict[str, list[ProviderSchemaNode | bool]] = {}
     shared_required: set[str] | None = None
@@ -222,6 +224,7 @@ def _flatten_discriminated(choices: list[ProviderSchemaNode], discriminator: str
         required=sorted((shared_required or set()) | {discriminator}),
         additional_properties=False,
         description=" ".join([
+            *([description] if description else []),
             f"Select one object shape using discriminator property {discriminator!r}.",
             *variant_requirements, "Do not mix fields from different variants.",
         ]),

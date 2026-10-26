@@ -12,8 +12,9 @@ This guide describes the v0.1.0 runtime and its source checkout.
 flowchart TD
     U["User / Web"] <--> CA["Persistent Project Conversation Agent"]
     CA --> REQ["Requirement / scope revision"]
-    CA --> LOOP["Loop selection and application"]
-    LOOP --> WP["Workflow Plan"]
+    CA --> LOOP["Optional Loop method guide"]
+    LOOP -. advice .-> CA
+    CA --> WP["Workflow Plan"]
     WP --> WR["Immutable Workflow Revision"]
     CA --> TP["Immutable Task Plan"]
     WR --> TP
@@ -56,7 +57,7 @@ The two Column execution branches are alternatives. The agent branch uses an Ass
 
 A Task traverses multiple Columns. Implementation, review, and acceptance can be stages of one Task. Split Tasks when accepted work has distinct delivery identities and acceptance boundaries.
 
-Projects have one active Workflow with immutable revisions. The first revision is created by `loop.apply`. Later revisions do not mutate existing Tasks. `task.plan.save` persists a concrete plan; `task.plan.validate` only diagnoses it. `task.create` materializes the plan using its returned ID and a `proposed_task_ref`.
+Projects have one active Workflow with immutable revisions. The Conversation Agent publishes the first revision with `workflow.create` or `workflow.plan.save` and `workflow.publish`; reading a Loop never publishes a revision. Later revisions do not mutate existing Tasks. `task.plan.save` validates and persists a concrete plan; `task.plan.validate` is an optional read-only preview unless Settings requires it. The Agent can create Tasks atomically with `start_tasks=true`, or use `task.create` with the saved plan ID and a `proposed_task_ref`.
 
 Use `task.rerun` to repeat the original plan and `task.successor` for a corrected successor plan.
 
@@ -149,7 +150,7 @@ SQLite uses WAL, busy timeouts, and explicit transactions.
 
 Column completion validates declared outcomes, output contracts, and configured evidence before following the Workflow transition.
 
-Workflow definitions select the checks and evidence needed for their Columns. The bundled software delivery Loop defines scenario and behavioral checks in its own assets; other Loops can use different evidence contracts.
+Workflow definitions select the checks and evidence needed for their Columns. A Loop may suggest how to gather and judge evidence, but only the published Workflow defines executable checks and transitions.
 
 `workflow.acceptance.configure` changes checks against an explicit revision/hash without resending the graph. `task.plan.validate` returns admission diagnostics without saving a plan or executing future checks. Existing Tasks retain their frozen revision.
 
@@ -173,11 +174,10 @@ Reusable processes live in:
 ```text
 loops/<name>/
   loop.meta
-  loop.json
-  assets/
+  assets/              # optional Markdown method guides
 ```
 
-Loops declare domain instructions, context selectors, capabilities, input/output contracts, acceptance obligations, and rework paths. Runtime implements the common execution model. Domain-specific roles such as writer, reviewer, backend developer, or tester are expressed in the workflow rather than nested agent teams.
+Loops are optional descriptive method guides. The Conversation Agent may read one with `loop.inspect`, adapt or discard its advice, then use the ordinary Workflow and Task tools to create the actual Project graph and work. Loop files contain no executable Workflow, Tool parameters, scripts, or fixed artifact paths. Domain-specific roles such as writer, reviewer, backend developer, or tester belong in the Project's published Workflow rather than nested agent teams.
 
 ## Run Locally
 

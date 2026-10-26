@@ -4,19 +4,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, JsonValue
 
-
-class AnthropicTextBlock(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    type: Literal["text"] = "text"
-    text: str
-
-
-class AnthropicToolUseBlock(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    type: Literal["tool_use"] = "tool_use"
-    id: str
-    name: str
-    input: dict[str, JsonValue]
+from app.v1.protocols.agent.provider_content import (
+    AnthropicAssistantBlock, AnthropicTextBlock, AnthropicToolUseBlock,
+)
 
 
 class AnthropicToolResultBlock(BaseModel):
@@ -26,7 +16,7 @@ class AnthropicToolResultBlock(BaseModel):
     content: str
 
 
-AnthropicBlock = AnthropicTextBlock | AnthropicToolUseBlock | AnthropicToolResultBlock
+AnthropicBlock = AnthropicAssistantBlock | AnthropicToolResultBlock
 
 
 class AnthropicMessage(BaseModel):

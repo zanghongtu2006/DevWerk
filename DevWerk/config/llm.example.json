@@ -25,6 +25,7 @@
       "provider": "minimax",
       "model": "MiniMax-M2.7",
       "request_timeout_seconds": 600,
+      "stream_response": true,
       "temperature": 0.2,
       "max_tokens": 65535,
       "thinking_mode": "max",

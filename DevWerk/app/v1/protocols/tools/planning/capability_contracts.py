@@ -2,7 +2,7 @@
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, RootModel
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, RootModel, model_validator
 
 from app.v1.domain import TaskPlan, WorkflowAuthoringRequest, WorkflowDefinition, WorkflowPlan
 from app.v1.execution.states import TaskStatus
@@ -12,8 +12,8 @@ class _ToolInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class WorkflowCreateInput(_ToolInput):
-    workflow: WorkflowAuthoringRequest = Field(description="Complete directed Workflow authoring request")
+class WorkflowCreateInput(WorkflowAuthoringRequest):
+    """The authoring command is the Workflow document itself, without an outer wrapper."""
 
 
 class WorkflowPublishInput(_ToolInput):
@@ -26,11 +26,29 @@ class WorkflowPlanSaveInput(_ToolInput):
 
 
 class TaskPlanSaveInput(_ToolInput):
-    plan: TaskPlan = Field(description="Concrete Task Plan")
+    plan: TaskPlan | None = Field(default=None, description="Concrete Task Plan; omit when committing a validated_plan_ref")
+    validated_plan_ref: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$",
+        description="Reference returned by a valid task.plan.validate in this Agent Run; omit plan when using it",
+    )
+    start_tasks: bool = Field(default=False, description="Atomically save this Plan and materialize its Task graph")
+    proposed_task_ref: str | None = Field(default=None, min_length=1, description="Requested Task ref; defaults to the first ref when start_tasks is true")
+
+    @model_validator(mode="after")
+    def check_start_arguments(self) -> "TaskPlanSaveInput":
+        if (self.plan is None) == (self.validated_plan_ref is None):
+            raise ValueError("provide exactly one of plan or validated_plan_ref")
+        if self.proposed_task_ref is not None and not self.start_tasks:
+            raise ValueError("proposed_task_ref requires start_tasks=true")
+        if self.plan is not None and self.start_tasks and self.proposed_task_ref is not None and not any(
+            task.proposed_task_ref == self.proposed_task_ref for task in self.plan.tasks
+        ):
+            raise ValueError("proposed_task_ref must belong to plan.tasks")
+        return self
 
 
 class TaskPlanValidateInput(_ToolInput):
-    plan: TaskPlan = Field(description="Concrete Task Plan; use the same value with task.plan.save after validation")
+    plan: TaskPlan = Field(description="Concrete Task Plan; a valid result returns validated_plan_ref for task.plan.save")
 
 
 class SavedPlanReceipt(BaseModel):
@@ -107,6 +125,8 @@ class TaskCreateNextAction(BaseModel):
 
 class TaskPlanSaveReceipt(TaskPlanRecord):
     next_action: TaskCreateNextAction | None = None
+    materialization: "TaskMaterializationReceipt | None" = None
+    started_task_id: str | None = Field(default=None, min_length=1)
 
     @classmethod
     def from_saved_plan(cls, value: dict[str, Any], proposed_task_ref: str) -> "TaskPlanSaveReceipt":
@@ -133,6 +153,14 @@ class ValidationDiagnostic(BaseModel):
     expected: str | None = None
 
 
+class TaskPlanSubmissionError(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["TaskPlanSubmissionRejected"] = "TaskPlanSubmissionRejected"
+    code: Literal["TASK_PLAN_INVALID", "TASK_PLAN_PREVIEW_REQUIRED"]
+    message: str
+    diagnostics: list[ValidationDiagnostic]
+
+
 class WorkflowAcceptanceConfigureReceipt(BaseModel):
     id: str
     definition_hash: str
@@ -149,6 +177,13 @@ class ValidationReceipt(BaseModel):
     diagnostics: list[ValidationDiagnostic]
     legal_columns: list[str] | None = None
     deferred_command_checks: list["DeferredCommandCheck"] = Field(default_factory=list)
+    validated_plan_ref: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$",
+        description="Reference for committing this exact valid preview in the same Agent Run",
+    )
+    next_action: Literal["task.plan.save"] | None = Field(
+        default=None, description="If valid, commit this exact preview with task.plan.save and validated_plan_ref."
+    )
 
 
 class EntryEvidenceCandidate(BaseModel):

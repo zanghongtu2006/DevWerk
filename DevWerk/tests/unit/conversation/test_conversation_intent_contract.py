@@ -28,11 +28,17 @@ def resolve(ctx, job, **fields):
     return ctx.store.registry.dispatch('conversation.turn.resolve', args, ctx)
 
 
-def test_default_true_is_not_authorization_and_discussion_creates_no_requirement(store, tmp_path):
+def test_general_agent_effects_do_not_create_requirement_but_explicit_discussion_is_read_only(store, tmp_path):
     project = store.create_project('discussion', '', str(tmp_path/'project'))
     job, ctx = turn(store, project, '先不要启动开发，请讨论方案')
     assert store.agents.turn_requirement(job, []) is None
-    denied = store.registry.dispatch('project.files.write', {'path':'unexpected.txt','content':'bad'}, ctx)
+    written = store.registry.dispatch('project.files.write', {'path':'notes.txt','content':'draft'}, ctx)
+    assert written.ok
+    assert (tmp_path/'project'/'notes.txt').read_text(encoding='utf-8') == 'draft'
+    assert not store.registry.dispatch('task.create', {'task_plan_id':'missing','proposed_task_ref':'primary'}, ctx).ok
+    store.finish_conversation_job(job['id'], None, ctx.agent_run_id, {})
+    discussion, discussion_ctx = turn(store, project, '只讨论', False)
+    denied = store.registry.dispatch('project.files.write', {'path':'unexpected.txt','content':'bad'}, discussion_ctx)
     assert not denied.ok
     assert not (tmp_path/'project'/'unexpected.txt').exists()
     assert store.agents.list_requirements(project['id']) == []
@@ -58,6 +64,8 @@ def test_committed_discussion_cannot_be_upgraded_by_execution_replay(store, tmp_
     project = store.create_project('discussion replay', '', str(tmp_path/'project'))
     job, ctx = turn(store, project, '先只讨论')
     assert resolve(ctx, job).ok
+    assert not store.registry.dispatch('project.files.write',
+        {'path':'unexpected.txt','content':'bad'}, ctx).ok
     denied = store.registry.dispatch('conversation.execution.authorize',
         {'request':'begin','scope_summary':'unapproved work'},
         replace(ctx, execution_key='discussion-upgrade'))
@@ -84,6 +92,8 @@ def test_narrow_authorization_respects_discussion_only_transport_and_task_scope(
     assert authorized.ok, authorized.error
     assert authorized.output['turn_contract']['source_message_id'] == control['user_message_id']
     assert store.registry.dispatch('task.pause', {'task_id':task['id']}, ctx).ok
+    assert store.registry.dispatch('project.files.write',
+        {'path':'independent-note.txt','content':'still a general agent'}, ctx).ok
 
 
 def test_task_pause_requires_matching_authorized_turn(store, tmp_path):
@@ -135,9 +145,14 @@ def test_user_authorized_requirement_turn_can_pause_its_task(store, tmp_path):
     paused = store.registry.dispatch('task.pause', {'task_id': task['id']}, ctx)
     assert paused.ok, paused.error
     assert paused.output['control_state'] == 'paused'
+    resumed = store.registry.dispatch('task.resume', {'task_id': task['id']}, ctx)
+    assert resumed.ok, resumed.error
     with pytest.raises(PermissionError, match='TaskPauseRequiresAuthorization'):
         from app.v1.capabilities import _task_pause
         _task_pause({'task_id': task['id']}, replace(ctx, requirement_id='another'))
+    with pytest.raises(PermissionError, match='TaskResumeRequiresAuthorization'):
+        from app.v1.capabilities import _task_resume
+        _task_resume({'task_id': task['id']}, replace(ctx, requirement_id='another'))
 
 
 def test_hold_survives_next_turn_and_explicit_start_can_release_it(store, tmp_path):
@@ -151,7 +166,7 @@ def test_hold_survives_next_turn_and_explicit_start_can_release_it(store, tmp_pa
     result = resolve(ctx, second)
     assert result.ok, result.error
     assert store.intents.context(second)['execution_hold']
-    denied = store.registry.dispatch('loop.apply', {'loop_key':'software.ddd_delivery','bindings':{}}, ctx)
+    denied = store.registry.dispatch('workflow.plan.save', {'plan':{}}, ctx)
     assert not denied.ok
     store.finish_conversation_job(second['id'], None, ctx.agent_run_id, {})
     third, ctx = turn(store, project, '按刚才方案开始开发')
@@ -187,12 +202,10 @@ def test_null_means_no_execution_and_cannot_authorize(store, tmp_path):
 
 @pytest.mark.parametrize('phase', ['unresolved', 'discussion'])
 @pytest.mark.parametrize('capability,args', [
-    ('loop.apply', {'loop_key':'software.ddd_delivery','bindings':{}}),
+    ('workflow.plan.save', {'plan':{}}),
     ('task.plan.save', {'plan':{}}), ('task.create', {'task_plan_id':'missing','proposed_task_ref':'primary'}),
-    ('project.files.write', {'path':'unexpected.txt','content':'bad'}),
-    ('project.command.run', {'argv':['must-never-run']}),
 ])
-def test_all_business_effects_require_resolved_execution(store, tmp_path, phase, capability, args):
+def test_workflow_effects_require_resolved_execution(store, tmp_path, phase, capability, args):
     project = store.create_project('no effects', '', str(tmp_path/'project'))
     job, ctx = turn(store, project, '讨论')
     if phase == 'discussion':
@@ -526,7 +539,7 @@ def test_partial_failure_reports_saved_work_and_actual_started_count(store, tmp_
     WorkflowRuntime(store,store.registry,'test-worker').step(task['id'])
     def entry(capability,ok=True,output=None,error=None):
         return {'capability':capability,'ok':ok,'facts':{'result':{'output':output,'error':{'message':error}}}}
-    ledger = [entry('loop.apply'),entry('task.plan.save'),
+    ledger = [entry('workflow.publish'),entry('task.plan.save'),
         entry('task.create',output={'materialization':{'created_task_ids':[task['id']],'reused_task_ids':[]}}),
         entry('task.create',output={'materialization':{'created_task_ids':[],'reused_task_ids':[task['id']]}}),
         entry('task.plan.save',False,error='ExactInputTargetType: /requirements_confirmed is boolean')]

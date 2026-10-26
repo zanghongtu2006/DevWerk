@@ -64,6 +64,7 @@ class AnthropicCompletionRequest(_ProviderRequest):
     top_p: float | None = None
     tools: list[AnthropicToolDefinition] | None = None
     tool_choice: AnthropicToolChoice | None = None
+    stream: Literal[True] | None = None
 
 
 class OllamaOptions(_ProviderRequest):

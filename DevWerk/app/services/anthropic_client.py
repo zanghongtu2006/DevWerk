@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 import requests as http_requests
@@ -17,8 +18,12 @@ from app.services.provider_request_contracts import (
 )
 from app.services.provider_message_contracts import (AnthropicMessage, AnthropicTextBlock,
     AnthropicToolResultBlock, AnthropicToolUseBlock)
+from app.v1.protocols.agent.provider_content import (
+    AnthropicAssistantContent, AnthropicRedactedThinkingBlock, AnthropicThinkingBlock,
+)
 from app.services.provider_response_contracts import ProviderCompletionResponse, ProviderToolCall, ProviderUsage
-from app.v1.contracts import canonicalize_contract_value, provider_contract_schema
+from app.services.provider_stream_contracts import AnthropicStreamAssembler, SSEFrameDecoder
+from app.v1.contracts import provider_contract_schema
 from app.v1.protocols.tools.core.provider_schema_contracts import ProviderSchemaNode
 
 
@@ -36,6 +41,7 @@ class AnthropicClient:
         self.top_p = config.get("top_p")
         self.max_tokens = int(config["max_tokens"])
         self.request_timeout_seconds = float(config.get("request_timeout_seconds", 600.0))
+        self.stream_response = bool(config.get("stream_response", False))
         if self.request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
         if self.max_tokens <= 0:
@@ -66,6 +72,7 @@ class AnthropicClient:
             model=self.model, max_tokens=self.max_tokens, temperature=self.temperature,
             system=system, messages=provider_messages,
             top_p=float(self.top_p) if self.top_p is not None else None,
+            stream=True if self.stream_response else None,
         )
         if tools:
             request.tools = [
@@ -102,61 +109,92 @@ class AnthropicClient:
             payload=payload,
         )
         try:
-            response = self.session.post(
-                self.url,
-                json=payload,
-                headers=headers,
-                timeout=self.request_timeout_seconds,
-            )
+            if self.stream_response:
+                data, status_code, response_headers = self._stream_complete(payload, headers)
+                response_body = data
+            else:
+                response = self.session.post(
+                    self.url, json=payload, headers=headers,
+                    timeout=self.request_timeout_seconds,
+                )
+                raise_for_provider_response(response, provider="anthropic", api_name=self.api_name)
+                data, status_code, response_headers = response.json(), response.status_code, dict(response.headers)
+                response_body = response.text
         except http_requests.Timeout as exc:
             raise provider_timeout_error(
-                exc,
-                provider="anthropic",
-                api_name=self.api_name,
+                exc, provider="anthropic", api_name=self.api_name,
                 timeout_seconds=self.request_timeout_seconds,
             ) from exc
         trace_json(
-            _trace_log,
-            "llm.provider_response",
-            trace_id=trace_id,
-            provider="anthropic",
-            api_name=self.api_name,
-            model=self.model,
-            status_code=response.status_code,
-            response_headers=dict(response.headers),
-            body=response.text,
+            _trace_log, "llm.provider_response", trace_id=trace_id,
+            provider="anthropic", api_name=self.api_name, model=self.model,
+            status_code=status_code, response_headers=response_headers, body=response_body,
         )
-        raise_for_provider_response(response, provider="anthropic", api_name=self.api_name)
-        data = response.json()
         raise_for_provider_payload(
             data,
             provider="anthropic",
             api_name=self.api_name,
-            status_code=response.status_code,
-            request_id=response.headers.get("request-id") or response.headers.get("x-request-id"),
+            status_code=status_code,
+            request_id=response_headers.get("request-id") or response_headers.get("x-request-id"),
         )
         self.last_usage = _usage(data.get("usage"))
         text: list[str] = []
         calls: list[ProviderToolCall] = []
-        tool_schemas = {
-            str(item.get("function", {}).get("name") or ""): item.get("function", {}).get("parameters") or {}
-            for item in tools or []
-        }
+        assistant_blocks = []
         for item in data.get("content") or []:
             if not isinstance(item, dict):
-                continue
+                raise ValueError("Anthropic assistant content block must be an object")
             if item.get("type") in {"text", "output_text"} and isinstance(item.get("text"), str):
                 text.append(item["text"])
+                assistant_blocks.append(AnthropicTextBlock(text=item["text"]))
+            elif item.get("type") == "thinking":
+                assistant_blocks.append(AnthropicThinkingBlock.model_validate(item))
+            elif item.get("type") == "redacted_thinking":
+                assistant_blocks.append(AnthropicRedactedThinkingBlock.model_validate(item))
             elif item.get("type") == "tool_use":
                 arguments = item.get("input") or {}
                 if not isinstance(arguments, dict):
                     raise ValueError("tool_use input must be a JSON object")
                 name = str(item.get("name") or "")
-                arguments = canonicalize_contract_value(arguments, tool_schemas.get(name, {}))
                 calls.append(ProviderToolCall(id=str(item.get("id") or ""),
                     name=name, arguments=arguments))
+                assistant_blocks.append(AnthropicToolUseBlock(
+                    id=str(item.get("id") or ""), name=name, input=item.get("input") or {},
+                ))
+            else:
+                raise ValueError(f"Unsupported Anthropic assistant block: {item.get('type')!r}")
         return ProviderCompletionResponse(text="\n".join(text).strip(), tool_calls=calls,
-            usage=ProviderUsage.model_validate(self.last_usage)).wire()
+            usage=ProviderUsage.model_validate(self.last_usage),
+            provider_content=AnthropicAssistantContent(blocks=assistant_blocks) if assistant_blocks else None).wire()
+
+    def _stream_complete(self, payload: dict[str, Any], headers: dict[str, str]) -> tuple[dict[str, Any], int, dict[str, str]]:
+        started = time.monotonic()
+        decoder = SSEFrameDecoder()
+        assembler = AnthropicStreamAssembler()
+        stream_headers = dict(headers)
+        stream_headers["accept"] = "text/event-stream"
+        with self.session.post(
+            self.url, json=payload, headers=stream_headers,
+            timeout=self.request_timeout_seconds, stream=True,
+        ) as response:
+            raise_for_provider_response(response, provider="anthropic", api_name=self.api_name)
+            for line in response.iter_lines(chunk_size=1):
+                if time.monotonic() - started > self.request_timeout_seconds:
+                    raise http_requests.Timeout("Anthropic stream exceeded the configured total request timeout")
+                frame = decoder.feed(line)
+                if frame is None:
+                    continue
+                if frame.event == "error":
+                    raise_for_provider_payload(
+                        json.loads(frame.data), provider="anthropic", api_name=self.api_name,
+                        status_code=response.status_code,
+                        request_id=response.headers.get("request-id") or response.headers.get("x-request-id"),
+                    )
+                    raise http_requests.ConnectionError("Anthropic stream sent an unclassified error event")
+                if assembler.accept(frame):
+                    result = assembler.result()
+                    return result.model_dump(mode="json"), response.status_code, dict(response.headers)
+        raise http_requests.ConnectionError("Anthropic stream ended before message_stop")
 
     @staticmethod
     def _to_provider_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
@@ -168,17 +206,20 @@ class AnthropicClient:
                 systems.append(str(message.get("content") or ""))
                 continue
             if role == "assistant":
-                blocks = []
-                if message.get("content"):
-                    blocks.append(AnthropicTextBlock(text=str(message["content"])))
-                for call in message.get("tool_calls") or []:
-                    function = call.get("function") or {}
-                    arguments = function.get("arguments") or {}
-                    if isinstance(arguments, str):
-                        arguments = json.loads(arguments)
-                    blocks.append(AnthropicToolUseBlock(
-                        id=str(call.get("id") or ""),
-                        name=str(function.get("name") or ""), input=arguments))
+                if message.get("provider_content") is not None:
+                    blocks = AnthropicAssistantContent.model_validate(message["provider_content"]).blocks
+                else:
+                    blocks = []
+                    if message.get("content"):
+                        blocks.append(AnthropicTextBlock(text=str(message["content"])))
+                    for call in message.get("tool_calls") or []:
+                        function = call.get("function") or {}
+                        arguments = function.get("arguments") or {}
+                        if isinstance(arguments, str):
+                            arguments = json.loads(arguments)
+                        blocks.append(AnthropicToolUseBlock(
+                            id=str(call.get("id") or ""),
+                            name=str(function.get("name") or ""), input=arguments))
                 if blocks:
                     converted.append(AnthropicMessage(role="assistant", content=blocks))
                 continue

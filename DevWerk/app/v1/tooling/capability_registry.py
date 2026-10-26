@@ -24,6 +24,7 @@ from app.v1.tooling.capability_schema_adapter import declared_outcomes
 from app.v1.protocols.tools.core.capability_catalog_contracts import CapabilityCatalogEntry
 from app.v1.protocols.tools.planning.capability_workflow_models import WorkflowCapabilityContract, WorkflowToolId, workflow_tool_models
 from app.v1.protocols.tools.agent.capability_conversation_contracts import EmptyInput
+from app.v1.protocols.tools.core.tool_catalog_contracts import ToolExposure
 
 from app.v1.tooling.capability_handlers import (
     _contains_runtime_reference,
@@ -57,6 +58,7 @@ class CapabilityContext:
     requirement_revision: int | None = None
     workflow_revision_id: str | None = None
     conversation_session_id: str | None = None
+    require_task_plan_preview: bool = False
 
     @property
     def files(self) -> ProjectFiles:
@@ -87,16 +89,19 @@ class CapabilityEntry:
     handler: CapabilityHandler
     provider_input_schema: dict[str, Any] | None = None
     toolset: str = CapabilityToolset.CORE
+    exposure: ToolExposure = ToolExposure.ON_DEMAND
     availability_check: AvailabilityCheck | None = None
     side_effect_kind: SideEffectKind = SideEffectKind.NONE
     parallel_safe: bool = False
     delegable_to_column: bool = True
+    workflow_governed: bool = False
     argument_preflight: ArgumentPreflight | None = None
     workflow_reference_fields: tuple[str, ...] = ()
     structured_object_parameters: tuple[StructuredObjectParameter, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "side_effect_kind", SideEffectKind(self.side_effect_kind))
+        object.__setattr__(self, "exposure", ToolExposure(self.exposure))
 
     def tool_schema(self) -> dict[str, Any]:
         return FunctionToolDefinition(function=ToolFunctionDefinition(
@@ -131,26 +136,22 @@ class CapabilityRegistry:
     def _refresh_workflow_tool_models(self) -> None:
         contracts = [WorkflowCapabilityContract(
             id=entry.id,
-            input_schema=entry.input_schema,
-            supports_acceptance_check=entry.side_effect_kind.supports_acceptance_check,
-            inline_provider_arguments=entry.toolset != CapabilityToolset.MCP,
         ) for entry in self._entries.values() if entry.delegable_to_column]
         models = workflow_tool_models(contracts)
-        for identity, model, provider_model in (
-            (WorkflowToolId.CREATE, models.create_runtime, models.create),
-            (WorkflowToolId.PUBLISH, models.publish, None),
-        ):
-            current = self._entries.get(identity)
-            if current is not None:
-                self._entries[identity] = replace(
-                    current,
-                    input_schema=model.model_json_schema(),
-                    provider_input_schema=provider_model.model_json_schema() if provider_model else None,
-                )
+        current = self._entries.get(WorkflowToolId.PUBLISH)
+        if current is not None:
+            self._entries[WorkflowToolId.PUBLISH] = replace(
+                current, input_schema=models.publish.model_json_schema(),
+            )
 
     def contains(self, capability_id: str) -> bool:
         with self._lock:
             return capability_id in self._entries
+
+    def is_workflow_governed(self, capability_id: str) -> bool:
+        with self._lock:
+            entry = self._entries.get(capability_id)
+            return bool(entry and entry.workflow_governed)
 
     def resolve(self, capability_ids: Iterable[str], context: CapabilityContext) -> list[CapabilityEntry]:
         resolved: list[CapabilityEntry] = []
@@ -238,12 +239,6 @@ class CapabilityRegistry:
                 _memory_write_scope(MemoryWriteInput.model_validate(arguments), context)
             if capability_id == BuiltinCapability.MEMORY_SUPERSEDE:
                 _memory_write_scope(MemorySupersedeInput.model_validate(arguments).replacement, context)
-            if context.agent_run_id and not context.column_run_id and entry.side_effect_kind.mutates_workspace:
-                with context.store.connect() as db:
-                    busy = db.execute("SELECT 1 FROM v1_tasks WHERE project_id=? AND (status IN ('running','waiting') OR failure_code='effect_outcome_unknown') LIMIT 1",
-                                      (context.project_id,)).fetchone()
-                if busy:
-                    raise ValueError("Project workspace is owned by an active Workflow; wait for it to stop before direct execution")
             digest = hashlib.sha256(json.dumps(arguments, sort_keys=True, default=str).encode("utf-8")).hexdigest()
             execution_key = context.execution_key or f"adhoc:{capability_id}:{digest}"
             receipt = context.store.start_execution_receipt(context.project_id, execution_key, capability_id, arguments,

@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from app.v1.conversations.conversation_intent import WorkIntentState
+from app.v1.protocols.agent.provider_content import AnthropicAssistantContent
 
 
 class ConversationMessageRecord(BaseModel):
@@ -62,6 +63,7 @@ class AgentMessageRecord(BaseModel):
     content: str
     tool_calls: list[dict[str, JsonValue]]
     tool_call_id: str | None
+    provider_content: AnthropicAssistantContent | None = None
     created_at: str
 
 

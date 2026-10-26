@@ -65,7 +65,6 @@ class ConversationContextFrame(BaseModel):
     active_workflow: ActiveWorkflowContext | None
     global_settings: dict[str, JsonValue]
     memory: MemoryContextReceipt
-    loops: list[dict[str, JsonValue]]
     workflow_plans: list[SavedPlanReference]
     task_plans: list[SavedPlanReference]
     tasks: list[dict[str, JsonValue]]

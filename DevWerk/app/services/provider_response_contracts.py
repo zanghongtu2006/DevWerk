@@ -2,6 +2,8 @@
 
 from pydantic import BaseModel, ConfigDict, JsonValue
 
+from app.v1.protocols.agent.provider_content import AnthropicAssistantContent
+
 
 class ProviderUsage(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -27,6 +29,7 @@ class ProviderCompletionResponse(BaseModel):
     text: str
     tool_calls: list[ProviderToolCall]
     usage: ProviderUsage
+    provider_content: AnthropicAssistantContent | None = None
 
     def wire(self) -> dict[str, JsonValue]:
-        return self.model_dump(mode="json", exclude_unset=True)
+        return self.model_dump(mode="json", exclude_unset=True, exclude_none=True)
