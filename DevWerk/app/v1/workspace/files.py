@@ -274,12 +274,28 @@ class ProjectFiles:
                 break
         return result
 
-    def run(self, argv: list[str], cwd: str = ".", *, check=None, limits=None, guard=None) -> dict[str, Any]:
+    def run(self, argv: list[str], cwd: str = ".", *, check=None, limits=None, guard=None,
+            environment_profile: str = 'inherit') -> dict[str, Any]:
         working_dir = self.resolve(cwd)
         working_dir.mkdir(parents=True, exist_ok=True)
-        output = run_command(argv, working_dir, limits or getattr(self, "policy", DEFAULT_V1_RUNTIME_POLICY).execution, check, guard)
+        output = run_command(argv, working_dir, limits or getattr(self, "policy", DEFAULT_V1_RUNTIME_POLICY).execution,
+                             check, guard, environment_profile=environment_profile)
         output["cwd"] = str(working_dir.relative_to(self.root)) if isinstance(self, ProjectFiles) else str(working_dir)
         return output
+
+    def inspect_file(self, path: str) -> dict[str, Any]:
+        """Observe a project file without interpreting its contents or quality."""
+        target = self.resolve(path)
+        if not target.is_file():
+            return {'relative_path': path, 'exists': False, 'sha256': None, 'size_bytes': None}
+        digest = hashlib.sha256()
+        size = 0
+        with target.open('rb') as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+                size += len(chunk)
+        return {'relative_path': path, 'exists': True, 'sha256': digest.hexdigest(),
+                'size_bytes': size}
 
 
 class SystemFiles:
@@ -372,10 +388,12 @@ class SystemFiles:
                             truncated=True).model_dump(mode="json")
         return FileSearchReceipt(matches=matches, truncated=False).model_dump(mode="json")
 
-    def run(self, argv: list[str], cwd: str = ".", *, check=None, limits=None, guard=None) -> dict[str, Any]:
+    def run(self, argv: list[str], cwd: str = ".", *, check=None, limits=None, guard=None,
+            environment_profile: str = 'inherit') -> dict[str, Any]:
         working_dir = self.resolve(cwd)
         if not working_dir.is_dir():
             raise FileNotFoundError(f"system command cwd does not exist: {working_dir}")
-        output = run_command(argv, working_dir, limits or getattr(self, "policy", DEFAULT_V1_RUNTIME_POLICY).execution, check, guard)
+        output = run_command(argv, working_dir, limits or getattr(self, "policy", DEFAULT_V1_RUNTIME_POLICY).execution,
+                             check, guard, environment_profile=environment_profile)
         output["cwd"] = str(working_dir.relative_to(self.root)) if isinstance(self, ProjectFiles) else str(working_dir)
         return output

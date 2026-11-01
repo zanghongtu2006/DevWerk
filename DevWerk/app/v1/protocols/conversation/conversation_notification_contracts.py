@@ -5,6 +5,14 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, JsonValue
 
 
+class ConversationUpdateMeta(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["progress"] = "progress"
+    job_id: str
+    agent_run_id: str
+    source_message_id: int
+
+
 class ConversationNotificationMeta(BaseModel):
     model_config = ConfigDict(extra="forbid")
     status: Literal["failed", "succeeded"]

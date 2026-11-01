@@ -72,14 +72,27 @@ class ToolPresentation:
         )
         query = (request.query or "").strip().casefold()
         terms = query.split()
-        matches = [
-            entry for entry in entries
-            if (request.source is None or self._source(entry) == request.source)
-            and all(term in f"{entry.id}\n{entry.description}".casefold() for term in terms)
-        ]
-        matches.sort(key=lambda entry: (entry.id.casefold() != query,
-                                        not entry.id.casefold().startswith(query),
-                                        not all(term in entry.id.casefold() for term in terms), entry.id))
+        available = [entry for entry in entries
+                     if request.source is None or self._source(entry) == request.source]
+        if not terms:
+            matches, match_mode = available, "empty_query"
+        else:
+            exact = [entry for entry in available if entry.id.casefold() == query]
+            full = [entry for entry in available if all(
+                term in f"{entry.id}\n{entry.description}".casefold() for term in terms)]
+            if exact:
+                matches, match_mode = full, "exact"
+            elif full:
+                matches, match_mode = full, "all_terms"
+            else:
+                matches = [entry for entry in available if any(
+                    term in f"{entry.id}\n{entry.description}".casefold() for term in terms)]
+                match_mode = "partial_terms" if matches else "no_match"
+        matches.sort(key=lambda entry: (
+            entry.id.casefold() != query,
+            not entry.id.casefold().startswith(query),
+            -sum(term in f"{entry.id}\n{entry.description}".casefold() for term in terms),
+            -sum(term in entry.id.casefold() for term in terms), entry.id))
         page = matches[request.offset:request.offset + request.limit]
         next_offset = request.offset + len(page)
         receipt = ToolCatalogSearchReceipt(
@@ -92,6 +105,7 @@ class ToolPresentation:
             total=len(matches),
             next_offset=next_offset if next_offset < len(matches) else None,
             sources=source_counts,
+            match_mode=match_mode,
         )
         return receipt.model_dump(mode="json")
 
@@ -107,8 +121,8 @@ class ToolPresentation:
         digest = schema_digest(parameters)
         return ToolCatalogDescribeReceipt(
             tool_id=entry.id, description=entry.description,
-            parameters=parameters, schema_digest=digest,
-        ).model_dump(mode="json")
+            parameters=parameters, schema_digest=digest, mcp_connection=entry.mcp_connection,
+        ).model_dump(mode="json", exclude_none=True)
 
     def select(self, args: dict[str, Any], context: CapabilityContext) -> dict[str, Any]:
         request = ToolCatalogSelectInput.model_validate(args)

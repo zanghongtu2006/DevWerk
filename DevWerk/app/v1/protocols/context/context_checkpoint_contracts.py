@@ -133,6 +133,53 @@ class DeterministicContextSummary(BaseModel):
     summary: str | None = None
 
 
+class SummarySourceRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    agent_run_id: str
+    message_id: int = Field(gt=0)
+    tool_call_id: str | None = None
+
+
+class SummaryEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    entry_id: str
+    kind: Literal["observation", "decision", "open_question", "failure", "next_action"]
+    text: str
+    source_refs: list[SummarySourceRef] = Field(default_factory=list)
+
+
+class ContextSummaryDocument(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    schema_version: Literal[1] = 1
+    objective_reference: str = ""
+    entries: list[SummaryEntry]
+    omitted_entry_count: int = Field(default=0, ge=0)
+    previous_checkpoint_id: str | None = None
+    method: Literal["deterministic", "same_agent_summary"] = "deterministic"
+
+
+class ContextSummaryView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    schema_version: Literal[1] = 1
+    checkpoint_id: str
+    document_sha256: str
+    entries: list[SummaryEntry]
+    omitted_entry_count: int = Field(ge=0)
+    retrieval: Literal["agent.checkpoint.read"] = "agent.checkpoint.read"
+
+
+class SummaryMaintenanceOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    entries: list[SummaryEntry] = Field(max_length=16)
+
+
+class SummaryMaintenanceInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    previous_checkpoint_id: str | None = None
+    omitted_entry_count: int = Field(ge=0)
+    entries: list[SummaryEntry]
+
+
 class ContextMaintenanceMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
     role: Literal["system", "user"]

@@ -216,6 +216,10 @@ class V1Store:
         self.scopes = ScopeRepository(self)
         from app.v1.repositories.conversation_intent_repository import ConversationIntentRepository
         self.intents = ConversationIntentRepository(self)
+        from app.v1.repositories.conversation_work_repository import ConversationWorkRepository
+        self.conversation_work = ConversationWorkRepository(self)
+        from app.v1.conversations.work_progress import ConversationWorkProgress
+        self.work_progress = ConversationWorkProgress(self)
         self.path = Path(db_path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._schema_lock = threading.Lock()
@@ -267,6 +271,7 @@ class V1Store:
         self.feedback.init_schema()
         self.scopes.init_schema()
         self.intents.init_schema()
+        self.conversation_work.init_schema()
 
     def _validate_persisted_runtime_statuses(self, db: sqlite3.Connection) -> None:
         self.schema_repository._validate_persisted_runtime_statuses(db)
@@ -2274,7 +2279,7 @@ class V1Store:
             meta = json.loads(row["meta_json"] or "{}")
             role = str(row["role"])
             if role == "assistant" and (
-                meta.get("kind") == "notification"
+                meta.get("kind") in {"notification", "progress"}
                 or meta.get("status") == "failed"
             ):
                 continue

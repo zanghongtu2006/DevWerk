@@ -51,6 +51,7 @@ class ToolCatalogSearchReceipt(BaseModel):
     total: int = Field(ge=0)
     next_offset: int | None = Field(default=None, ge=0)
     sources: ToolCatalogSourceCounts
+    match_mode: Literal["exact", "all_terms", "partial_terms", "empty_query", "no_match"] = "all_terms"
 
 
 class ToolCatalogSelectInput(BaseModel):
@@ -78,10 +79,18 @@ class ToolCatalogDescribeInput(BaseModel):
     tool_id: str = Field(min_length=1, description="Exact available Tool ID")
 
 
+class MCPConnectionInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    server: str
+    target_access: str | None = Field(default=None, max_length=600, description="Operator-provided public instructions for accessing the managed target")
+    transport: Literal["stdio", "http"] = Field(description="Connection to the MCP server; downstream application endpoints are separate.")
+
+
 class ToolCatalogDescribeReceipt(BaseModel):
     model_config = ConfigDict(extra="forbid")
     tool_id: str
     description: str
+    mcp_connection: MCPConnectionInfo | None = None
     parameters: dict[str, Any] = Field(description="Complete Provider-visible input schema")
     schema_digest: str = Field(description="SHA-256 of the Provider-visible input schema")
 

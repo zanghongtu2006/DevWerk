@@ -113,10 +113,12 @@ def run_checkpoint(
     tool_calls: int,
     direct_effect_calls: int,
     latest_text: str,
+    *, stop_reason: str | None = None, work_revision: int | None = None,
 ) -> dict[str, Any]:
     return RunCheckpoint(iterations_completed=iterations,
         tool_calls_completed=tool_calls, direct_effect_calls=direct_effect_calls,
-        latest_text=latest_text).model_dump(mode="json")
+        latest_text=latest_text, stop_reason=stop_reason,
+        work_revision=work_revision).model_dump(mode="json")
 
 
 def stable_json(value: Any) -> str:

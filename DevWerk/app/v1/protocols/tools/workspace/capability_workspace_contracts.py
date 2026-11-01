@@ -1,5 +1,6 @@
 """System and Project workspace Tool input classes."""
 
+from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, create_model
 
 MAX_COMMAND_ARGUMENTS = 100
@@ -48,10 +49,21 @@ class ProjectFileSearchInput(WorkspaceInput):
 
 
 class CommandRunInput(WorkspaceInput):
+    timeout_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False,
+        description="Optional shorter timeout in seconds. Use a short timeout for discovery. The runtime caps it at its command limit.")
     argv: list[str] = Field(min_length=1, max_length=MAX_COMMAND_ARGUMENTS, description="Executable and argument vector; no shell")
     cwd: str | None = Field(default=None, description="Working directory")
+    environment_profile: Literal["inherit", "python_utf8"] = "inherit"
     success_exit_codes: set[int] | None = Field(default=None, min_length=1, max_length=MAX_LEGACY_EXIT_CODES,
                                          description="Compatibility field; Runtime accepts only exit code zero")
+
+
+class ProjectCommandRunInput(CommandRunInput):
+    cwd: str | None = Field(default=None, description="Project-relative working directory; absolute paths are rejected")
+
+
+class SystemCommandRunInput(CommandRunInput):
+    cwd: str | None = Field(default=None, description="Absolute path or path relative to the DevWerk service directory")
 
 
 def with_maximum_limit(model: type[WorkspaceInput], maximum: int) -> type[WorkspaceInput]:

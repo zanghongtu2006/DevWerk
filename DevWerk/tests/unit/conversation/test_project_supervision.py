@@ -671,15 +671,16 @@ def test_expired_lease_enters_explicit_recovery(store, tmp_path):
     assert "WorkerLeaseExpired" in recovered["error"]
 
 
-def test_command_capability_has_no_runtime_timeout_argument(store, tmp_path):
+def test_command_probe_can_request_a_deadline_but_cannot_set_agent_wall_budget(store, tmp_path):
     project = store.create_project("command schema", "", str(tmp_path / "project"))
     context = CapabilityContext(project_id=project["id"], project=project, store=store)
     schema = build_core_registry().input_schema("project.command.run")
 
-    assert "timeout_seconds" not in schema["properties"]
+    assert "timeout_seconds" in schema["properties"]
+    assert "wall_clock_timeout_seconds" not in schema["properties"]
     with pytest.raises(ContractError, match="Additional properties"):
         build_core_registry().dispatch(
             "project.command.run",
-            {"argv": [sys.executable, "-c", "print('ok')"], "timeout_seconds": 1},
+            {"argv": [sys.executable, "-c", "print('ok')"], "wall_clock_timeout_seconds": 1},
             context,
         )

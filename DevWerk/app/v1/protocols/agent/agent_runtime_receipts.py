@@ -9,6 +9,17 @@ class RunCheckpoint(BaseModel):
     tool_calls_completed: int = Field(ge=0)
     direct_effect_calls: int = Field(ge=0)
     latest_text: str
+    stop_reason: str | None = None
+    work_revision: int | None = None
+
+
+class ExecutionBudgetView(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    iterations_completed: int = Field(ge=0)
+    iterations_remaining: int = Field(ge=0)
+    tool_calls_completed: int = Field(ge=0)
+    tool_calls_remaining: int = Field(ge=0)
+    phase: str
 
 
 class AgentTraceContext(BaseModel):

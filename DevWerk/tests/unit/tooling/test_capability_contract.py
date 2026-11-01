@@ -1361,6 +1361,7 @@ def test_mcp_stdio_tool_discovered_and_dispatched_through_registry(store, tmp_pa
     script.write_text(SERVER, encoding='utf-8')
     config_path = tmp_path / 'mcp-servers.yaml'
     config_path.write_text('mcp_servers:\n  fixture:\n    transport: stdio\n'
+                           '    target_access: "Reuse this fixture through its tools."\n'
                            f"    command: '{sys.executable}'\n"
                            f"    args: ['{script}']\n", encoding='utf-8')
     registry = build_core_registry()
@@ -1375,6 +1376,9 @@ def test_mcp_stdio_tool_discovered_and_dispatched_through_registry(store, tmp_pa
         ctx = CapabilityContext(project['id'], project, store)
         entry = registry.resolve(['mcp__fixture__echo'], ctx)[0]
         assert entry.side_effect_kind == 'read'
+        assert entry.mcp_connection.model_dump() == {
+            'server': 'fixture', 'transport': 'stdio',
+            'target_access': 'Reuse this fixture through its tools.'}
         result = registry.dispatch('mcp__fixture__echo', {'value':'hello'}, ctx)
         assert result.ok, result.error
         assert result.output['content'] == [{'type':'text','text':'echo:hello'}]

@@ -89,3 +89,5 @@ class CommandReceipt(WorkspaceReceipt):
     stderr: str = Field(description="Bounded standard error")
     timed_out: bool = Field(description="Whether the command timed out")
     output_truncated: bool = Field(description="Whether the output exceeded its bound")
+    environment_profile: str = "inherit"
+    output_encoding: str = "utf-8-replace"

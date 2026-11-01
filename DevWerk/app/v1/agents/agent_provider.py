@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from app.services.visible_stream import listen_for_visible_text
 from typing import Any
 
 from app.core.debug_trace import trace_json
@@ -45,6 +47,7 @@ class ProviderTurnRequester:
         iteration: int,
         require_tool: bool,
         required_tool_name: str | None,
+        budget_view=None,
     ) -> AgentModelResponse:
         # Keep the Run's capability snapshot stable, but stop advertising
         # one-shot authorization tools after this Job has committed its boundary.
@@ -61,7 +64,7 @@ class ProviderTurnRequester:
         if self.context is None:
             self.context = ContextManager(self.store, self.spec, self.run_id, self.model_complete)
         working_messages = messages
-        messages = self.context.prepare(working_messages, tools)
+        messages = self.context.prepare(working_messages, tools, budget_view=budget_view)
         if self.spec.kind == "conversation":
             self.store.record_conversation_progress(
                 self.run_id,
@@ -81,13 +84,14 @@ class ProviderTurnRequester:
         kwargs = dict(project_id=self.spec.project['id'], task_id=self.spec.task_id,
                       agent=self.spec.kind, require_tool=require_tool, required_tool_name=required_tool_name)
         try:
-            response = self.model_complete(messages, tools, **kwargs)
+            response = self._complete_turn(messages, tools, iteration, kwargs)
         except LLMProviderError as exc:
             if exc.error_code != 'LLM_CONTEXT_WINDOW_EXCEEDED':
                 raise
             previous = digest(messages)
             previous_size = self.context.estimate(messages, tools)
-            reduced = self.context.prepare(working_messages, tools, force=True)
+            reduced = self.context.prepare(working_messages, tools, force=True,
+                                           budget_view=budget_view)
             if digest(reduced) == previous or self.context.estimate(reduced, tools) >= previous_size:
                 raise ContextExhausted('Provider overflow: no smaller valid request is available') from exc
             if self.spec.execution_control:
@@ -95,7 +99,7 @@ class ProviderTurnRequester:
             if self.spec.assignment:
                 self.store.agents.charge(self.spec.assignment, models=1)
             try:
-                response = self.model_complete(reduced, tools, **kwargs)
+                response = self._complete_turn(reduced, tools, iteration, kwargs)
             except LLMProviderError as retry_error:
                 if retry_error.error_code == 'LLM_CONTEXT_WINDOW_EXCEEDED':
                     raise ContextExhausted('Provider overflow after one reduced-context retry') from retry_error
@@ -115,6 +119,38 @@ class ProviderTurnRequester:
         self.context.observe(response)
         trace_json(trace_log, 'agent.context_budget', **self._trace_context(iteration), **self.context.last_metrics)
         return response
+
+    def _complete_turn(self, messages, tools, iteration, kwargs):
+        if self.spec.kind != "conversation" or not self.spec.user_initiated:
+            return self.model_complete(messages, tools, **kwargs)
+        preview = ""
+        structured = False
+        last_sent = None
+        last_visible = ""
+
+        def send_preview(text: str) -> None:
+            nonlocal last_sent, last_visible
+            now = time.monotonic()
+            if text.strip() and text != last_visible and (last_sent is None or now - last_sent >= 0.4):
+                if self.spec.execution_control:
+                    self.spec.execution_control.check()
+                self.store.record_conversation_progress(self.run_id, kind="visible_text",
+                    content=text[-2400:], details={"iteration": iteration})
+                last_sent = now
+                last_visible = text
+
+        def receive(text: str) -> None:
+            nonlocal preview, structured
+            if structured:
+                return
+            if not preview.strip() and text.lstrip().startswith(("{", "[", "`", "<")):
+                structured = True
+                return
+            preview = (preview + text)[-2400:]
+            send_preview(preview)
+
+        with listen_for_visible_text(receive, public_field=("conversation.reply", "message", send_preview)):
+            return self.model_complete(messages, tools, **kwargs)
 
     def _visible_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if self.spec.kind != 'conversation' or not self.spec.conversation_job_id:

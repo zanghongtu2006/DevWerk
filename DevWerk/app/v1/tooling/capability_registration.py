@@ -12,7 +12,7 @@ from app.v1.protocols.tools.core.tool_catalog_contracts import (
 from app.v1.protocols.tools.planning.capability_contracts import TaskPlanListReceipt, TaskPlanSaveInput, TaskPlanSaveReceipt, TaskPlanValidateInput, TaskPlanContractReceipt, TaskReceipt, ValidationReceipt, WorkflowAcceptanceConfigureReceipt, WorkflowCreateInput, WorkflowPlanSaveInput, WorkflowPlanListReceipt, WorkflowPlanSaveReceipt, WorkflowPublishInput, WorkflowReceipt
 from app.v1.protocols.tools.agent.capability_memory_contracts import MemoryAppendInput, MemoryReadInput, MemoryReadReceipt, MemoryRecordReceipt, MemorySearchReceipt, MemorySearchInput, MemorySupersedeInput, MemoryWriteInput
 from app.v1.protocols.tools.workspace.capability_file_contracts import FilePathInput, FileReadInput, FileVerifyInput, FileVerifyOutput, FileWriteInput
-from app.v1.protocols.tools.workspace.capability_workspace_contracts import CommandRunInput, ProjectFileListInput, ProjectFileSearchInput, SystemFileListInput, SystemFileReadInput, SystemFileSearchInput, SystemFileWriteInput, with_maximum_limit
+from app.v1.protocols.tools.workspace.capability_workspace_contracts import ProjectCommandRunInput, ProjectFileListInput, ProjectFileSearchInput, SystemCommandRunInput, SystemFileListInput, SystemFileReadInput, SystemFileSearchInput, SystemFileWriteInput, with_maximum_limit
 from app.v1.protocols.tools.core.capability_misc_contracts import EventListInput, GovernanceDecisionInput, InstructionUpdateInput, LoopInspectInput, LoopListInput, PageLimitInput, SupervisionScheduleInput, with_maximum_page_limit
 from app.v1.protocols.tools.workspace.capability_workspace_receipts import CommandReceipt, FileListReceipt, FileMeasureReceipt, FilePageReceipt, FileReadReceipt, FileSearchReceipt, ProjectFileWriteReceipt, SystemFileWriteReceipt
 from app.v1.protocols.tools.core.capability_misc_receipts import EventListReceipt, GovernanceDecisionReceipt, NoopReceipt, SupervisionScheduleReceipt
@@ -30,6 +30,13 @@ from app.v1.protocols.context.context_state_contracts import AuthorizationReplay
 from app.v1.protocols.tools.agent.capability_conversation_contracts import ConversationHistoryReceipt, ConversationReplyReceipt, ConversationTurnInspectReceipt
 from app.v1.protocols.tools.planning.capability_task_contracts import BacklogRecordInput, FeedbackRecordInput, FeedbackResolveInput, SchedulingDecisionInput, TaskFailureInput, TaskIdInput, TaskListInput, TaskRetryInput, TaskSuccessorInput
 from app.v1.protocols.tools.agent.capability_agent_contracts import AgentContextCompactInput, AgentContextReadInput, AgentEvidenceListInput, AgentResultReadInput, AgentResultReadReceipt, WorkerInput, WorkerLifecycleInput, WorkerReplaceInput, WorkerSendInput
+from app.v1.protocols.tools.agent.capability_checkpoint_contracts import CheckpointReadInput, CheckpointReadReceipt
+from app.v1.tooling.checkpoint_handlers import read_checkpoint
+from app.v1.tooling.conversation_work_handlers import read_work, update_work
+from app.v1.protocols.conversation.conversation_work_contracts import (
+    ConversationWorkUpdateInput, ConversationWorkReadInput, ConversationWorkSnapshot,
+    ConversationWorkReadReceipt,
+)
 from app.v1.policy import DEFAULT_V1_RUNTIME_POLICY, V1RuntimePolicy
 from app.v1.workflows.workflow_acceptance_editor import WorkflowAcceptanceEdit
 from app.v1.protocols.tools.agent.capability_conversation_contracts import ConversationHistoryInput, ConversationTurnResolutionInput, EmptyInput, ExecutionAuthorizeInput, TaskControlAuthorizeInput
@@ -266,7 +273,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     )
     register_builtin(
         BuiltinTool.SYSTEM_COMMAND_RUN,
-        CommandRunInput.model_json_schema(),
+        SystemCommandRunInput.model_json_schema(),
         _system_command_run,
         output_schema=CommandReceipt.model_json_schema(),
     )
@@ -313,7 +320,7 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     )
     register_builtin(
         BuiltinTool.PROJECT_COMMAND_RUN,
-        CommandRunInput.model_json_schema(),
+        ProjectCommandRunInput.model_json_schema(),
         _command_run,
         output_schema=CommandReceipt.model_json_schema(),
     )
@@ -522,6 +529,15 @@ def build_core_registry(policy: V1RuntimePolicy | None = None) -> CapabilityRegi
     register_builtin(BuiltinTool.AGENT_RESULT_READ,
         AgentResultReadInput.model_json_schema(),
         _agent_result_read, output_schema=AgentResultReadReceipt.model_json_schema())
+    register_builtin(BuiltinTool.AGENT_CHECKPOINT_READ,
+        CheckpointReadInput.model_json_schema(),
+        read_checkpoint, output_schema=CheckpointReadReceipt.model_json_schema())
+    register_builtin(BuiltinTool.CONVERSATION_WORK_UPDATE,
+        ConversationWorkUpdateInput.model_json_schema(),
+        update_work, output_schema=ConversationWorkSnapshot.model_json_schema())
+    register_builtin(BuiltinTool.CONVERSATION_WORK_READ,
+        ConversationWorkReadInput.model_json_schema(),
+        read_work, output_schema=ConversationWorkReadReceipt.model_json_schema())
     register_builtin(BuiltinTool.AGENT_EVIDENCE_LIST,
         AgentEvidenceListInput.model_json_schema(),
         _agent_evidence_list, output_schema=WorkerEvidencePage.model_json_schema(),

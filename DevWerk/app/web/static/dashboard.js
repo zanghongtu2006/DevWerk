@@ -13,7 +13,7 @@ import {
   toggleProjectRail,
 } from "./ui/shell.js?v=20260804-debug1";
 import { renderOverview } from "./pages/overview.js?v=20260804-debug1";
-import { renderProjects } from "./pages/projects.js?v=20260804-debug1";
+import { conversationPreview, conversationStatusStrip, conversationTranscript, renderProjects } from "./pages/projects.js?v=20260804-debug1";
 import { renderKanban } from "./pages/kanban.js?v=20260825-task-order1";
 import { renderTasks } from "./pages/tasks.js?v=20260804-debug1";
 import { renderEvents } from "./pages/events.js?v=20260804-debug1";
@@ -23,6 +23,7 @@ const page = document.getElementById("page");
 let projectStream = null;
 let activeBundleRequest = 0;
 let projectEventFlushTimer = null;
+let projectEventFlushActive = false;
 let pendingProjectEvents = [];
 let loadingOlderConversation = false;
 
@@ -78,8 +79,10 @@ function lastConversationMessageId() {
 }
 
 async function refreshConversationMessages() {
+  const projectId = state.projectId;
   const afterId = lastConversationMessageId();
   const incoming = await api.get(`/projects/${state.projectId}/conversation?limit=150&after_id=${afterId}`);
+  if (state.projectId !== projectId) return;
   state.conversation = mergeConversationMessages(state.conversation, incoming);
   if (state.pendingMessage && incoming.some((item) => item.role === "user" && item.content === state.pendingMessage)) {
     state.pendingMessage = "";
@@ -87,7 +90,9 @@ async function refreshConversationMessages() {
 }
 
 async function refreshConversationStatus() {
-  state.conversationStatus = await api.get(`/projects/${state.projectId}/conversation-state`);
+  const projectId = state.projectId;
+  const status = await api.get(`/projects/${projectId}/conversation-state`);
+  if (state.projectId === projectId) state.conversationStatus = status;
 }
 
 function currentPageView() {
@@ -388,9 +393,9 @@ async function waitForRuntimeRestart() {
 }
 
 function queueProjectEvent(event) {
-  if (!state.projectId || state.events.some((item) => item.id === event.id) || pendingProjectEvents.some((item) => item.id === event.id)) return;
+  if (!state.projectId || event.project_id !== state.projectId || state.events.some((item) => item.id === event.id) || pendingProjectEvents.some((item) => item.id === event.id)) return;
   pendingProjectEvents.push(event);
-  if (!projectEventFlushTimer) projectEventFlushTimer = setTimeout(flushProjectEvents, 250);
+  if (!projectEventFlushActive && !projectEventFlushTimer) projectEventFlushTimer = setTimeout(flushProjectEvents, 50);
 }
 
 function changesBoard(event) {
@@ -398,6 +403,27 @@ function changesBoard(event) {
     || event.type.startsWith("task.")
     || event.type.startsWith("column.")
     || event.type.startsWith("retry.");
+}
+
+function refreshActivityStrip() {
+  if (state.route !== "projects") return;
+  const container = document.getElementById("conversation-status");
+  if (!container) return;
+  const preview = document.getElementById("conversation-stream-preview");
+  const previewMarkup = conversationPreview(state);
+  if (preview && preview.dataset.lastMarkup !== previewMarkup) {
+    const messages = document.getElementById("conversation-messages");
+    const follow = messages && messages.scrollHeight - messages.scrollTop - messages.clientHeight < 48;
+    preview.innerHTML = previewMarkup;
+    preview.dataset.lastMarkup = previewMarkup;
+    if (follow) messages.scrollTop = messages.scrollHeight;
+  }
+  const markup = conversationStatusStrip(state);
+  if (markup !== container.dataset.lastMarkup) {
+    container.innerHTML = markup;
+    container.dataset.lastMarkup = markup;
+    container.querySelector("[data-open-route]")?.addEventListener("click", () => navigate("events"));
+  }
 }
 
 function changesConversation(event) {
@@ -409,6 +435,7 @@ async function flushProjectEvents() {
   const events = pendingProjectEvents;
   pendingProjectEvents = [];
   if (!state.projectId || !events.length) return;
+  projectEventFlushActive = true;
   const projectId = state.projectId;
   for (const event of events) {
     state.events.push(event);
@@ -430,11 +457,24 @@ async function flushProjectEvents() {
     const editing = document.activeElement?.id === "message-input";
     const pageChanged = boardChanged || conversationChanged || state.route === "events";
     if (pageChanged && !editing && !state.sending) renderPage();
+    else if (state.route === "projects" && state.projectId === projectId) {
+      refreshActivityStrip();
+      if (events.some(event => event.type === "conversation.message")) {
+        const transcript = document.getElementById("conversation-messages");
+        if (transcript) {
+          const atBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 48;
+          transcript.innerHTML = conversationTranscript(state);
+          transcript.querySelector("[data-load-older-messages]")?.addEventListener("click", loadOlderConversation);
+          if (atBottom) transcript.scrollTop = transcript.scrollHeight;
+        }
+      }
+    }
     setConnection("online", "Runtime online");
   } catch (error) {
     setConnection("degraded", "Projection refresh failed");
   } finally {
-    if (pendingProjectEvents.length && !projectEventFlushTimer) projectEventFlushTimer = setTimeout(flushProjectEvents, 250);
+    projectEventFlushActive = false;
+    if (pendingProjectEvents.length && !projectEventFlushTimer) projectEventFlushTimer = setTimeout(flushProjectEvents, 50);
   }
 }
 
@@ -499,5 +539,13 @@ window.addEventListener("beforeunload", () => projectStream?.close());
 window.addEventListener("keydown", (event) => {
   if (event.key === "Escape") closeProjectDialog();
 });
+
+window.setInterval(() => {
+  const timer = document.querySelector("#conversation-status [data-activity-start]");
+  if (timer) {
+    const seconds = Math.max(0, Math.floor((Date.now() - Date.parse(timer.dataset.activityStart)) / 1000));
+    timer.textContent = ` · 已用 ${seconds} 秒`;
+  }
+}, 1000);
 
 boot();

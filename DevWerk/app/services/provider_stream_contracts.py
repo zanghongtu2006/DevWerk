@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from app.services.visible_stream import publish_tool_preview, publish_visible_text
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
@@ -157,6 +158,7 @@ class StreamBlock:
         self.thinking: list[str] = []
         self.signature: list[str] = []
         self.partial_json: list[str] = []
+        self.partial_size = 0
         self.stopped = False
 
     def add(self, delta: ContentBlockDelta) -> None:
@@ -169,7 +171,10 @@ class StreamBlock:
         elif isinstance(self.initial, StreamThinkingStart) and delta.type == "signature_delta":
             self.signature.append(delta.signature or "")
         elif isinstance(self.initial, StreamToolUseStart) and delta.type == "input_json_delta":
-            self.partial_json.append(delta.partial_json or "")
+            fragment = delta.partial_json or ""
+            self.partial_json.append(fragment)
+            self.partial_size += len(fragment)
+            publish_tool_preview(self.initial.name, self.partial_json, self.partial_size)
         else:
             raise ValueError(f"Anthropic stream delta {delta.type!r} does not match its content block")
 
@@ -231,10 +236,14 @@ class AnthropicStreamAssembler:
             if event.index in self.blocks or event.index != len(self.blocks):
                 raise ValueError("Anthropic stream content block index is out of order")
             self.blocks[event.index] = StreamBlock(event.content_block)
+            if isinstance(event.content_block, StreamTextStart):
+                publish_visible_text(event.content_block.text)
         elif isinstance(event, ContentBlockDeltaEvent):
             if event.index not in self.blocks:
                 raise ValueError("Anthropic stream delta has no content block")
             self.blocks[event.index].add(event.delta)
+            if event.delta.type == "text_delta":
+                publish_visible_text(event.delta.text or "")
         elif isinstance(event, ContentBlockStopEvent):
             if event.index not in self.blocks or self.blocks[event.index].stopped:
                 raise ValueError("Anthropic stream content block stop is unmatched")

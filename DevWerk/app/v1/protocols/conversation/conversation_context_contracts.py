@@ -6,6 +6,7 @@ from app.v1.conversations.conversation_intent import WorkIntentState
 from app.v1.protocols.conversation.conversation_intent_contracts import RequirementSnapshot, UserTurnContract
 from app.v1.protocols.context.memory_output_contracts import MemoryContextReceipt
 from app.v1.protocols.tools.planning.capability_contracts import TaskPlanContractReceipt
+from app.v1.protocols.conversation.conversation_work_contracts import ConversationWorkSnapshot
 
 
 class ActiveWorkflowContext(BaseModel):
@@ -54,6 +55,12 @@ class CurrentRequestContext(BaseModel):
     job_id: str
 
 
+class PriorWorkReference(BaseModel):
+    job_id: str
+    revision: int
+    reference_only: bool = True
+
+
 class ConversationContextFrame(BaseModel):
     model_config = ConfigDict(extra="forbid")
     turn_contract: UserTurnContract
@@ -72,3 +79,5 @@ class ConversationContextFrame(BaseModel):
     conversation_job: ConversationJobContext
     turn_authority: TurnAuthorityContext
     current_request: CurrentRequestContext
+    current_work: ConversationWorkSnapshot | None = None
+    prior_work_reference: PriorWorkReference | None = None

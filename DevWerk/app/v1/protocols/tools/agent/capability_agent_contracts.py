@@ -17,7 +17,7 @@ class WorkerInput(AgentCapabilityInput):
 
 class WorkerSendInput(WorkerInput):
     content: str = Field(min_length=1, description="Steering input for the selected Worker")
-    assignment_id: str = Field(default=None, description="Current Assignment; omit for the next visit")
+    assignment_id: str = Field(min_length=1, description="Current running or blocked Assignment to receive this input")
     dedupe_key: str = Field(default=None, description="Optional idempotency key")
 
 

@@ -113,6 +113,10 @@ class AgentRepository:
             self.store.schema_repository._ensure_column(db, 'v1_agent_runs', 'operation_protocol', 'INTEGER NOT NULL DEFAULT 0')
             self.store.schema_repository._ensure_column(db, 'v1_agent_operations', 'resolution_json', 'TEXT')
             self.store.schema_repository._ensure_column(db, 'v1_context_checkpoints', 'coverage_json', 'TEXT')
+            self.store.schema_repository._ensure_column(db, 'v1_context_checkpoints', 'document_json', 'TEXT')
+            db.execute("UPDATE v1_worker_inputs SET state='failed',failed_at=?,"
+                       "last_error='Assignment ID is required; unscoped input cannot be delivered' "
+                       "WHERE state='pending' AND assignment_id IS NULL", (utcnow(),))
             # Additive migration: legacy task-scoped sessions remain untouched.
             # New Worker sessions have explicit ownership; legacy_session_id can
             # link an audited old transcript without guessing cross-Task identity.
@@ -589,7 +593,7 @@ class AgentRepository:
                 self.store._event(db, assignment['project_id'], assignment['task_id'], assignment['column_run_id'], 'agent.assignment.'+status, {'assignment_id': assignment['id'], 'agent_instance_id': assignment['agent_instance_id'], 'result': result})
                 self.store._mailbox(db, assignment["project_id"], "agent.assignment." + status, assignment["task_id"], assignment["column_run_id"], {"assignment_id": assignment["id"], "agent_instance_id": assignment["agent_instance_id"], "result": result})
 
-    def validate_message_target(self, db, project_id, worker_id, assignment_id=None):
+    def validate_message_target(self, db, project_id, worker_id, assignment_id):
         worker = self.get_worker(project_id, worker_id)
         if worker['role'] != 'leaf':
             raise ValueError('Worker messages require a leaf recipient')
@@ -597,14 +601,15 @@ class AgentRepository:
             raise ValueError("Worker is retired")
         if self.get_requirement(project_id, worker['requirement_id'])['status'] != 'active':
             raise ValueError('Worker Requirement is closed')
-        if assignment_id:
-            assignment = db.execute('SELECT status FROM v1_agent_assignments WHERE id=? AND agent_instance_id=? AND project_id=?', (assignment_id, worker_id, project_id)).fetchone()
-            if not assignment:
-                raise ValueError('Message Assignment does not belong to this Worker')
-            if assignment['status'] in {'completed', 'failed', 'cancelled'}:
-                raise ValueError('Message Assignment has ended')
-            if assignment['status'] == 'blocked' and worker['active_assignment_id'] not in (None, assignment_id):
-                raise ValueError('Message Assignment has been superseded')
+        if not assignment_id:
+            raise ValueError('Message Assignment ID is required')
+        assignment = db.execute('SELECT status FROM v1_agent_assignments WHERE id=? AND agent_instance_id=? AND project_id=?', (assignment_id, worker_id, project_id)).fetchone()
+        if not assignment:
+            raise ValueError('Message Assignment does not belong to this Worker')
+        if assignment['status'] in {'completed', 'failed', 'cancelled'}:
+            raise ValueError('Message Assignment has ended')
+        if assignment['status'] == 'blocked' and worker['active_assignment_id'] not in (None, assignment_id):
+            raise ValueError('Message Assignment has been superseded')
 
     def _fail_pending_messages(self, db, project_id, worker_id, reason, *, assignment_id=None):
         db.execute("UPDATE v1_worker_inputs SET state='failed',failed_at=?,last_error=? "
@@ -612,9 +617,11 @@ class AgentRepository:
                    "AND (? IS NULL OR assignment_id=?)",
                    (utcnow(), reason+' before message consumption', project_id, worker_id, assignment_id, assignment_id))
 
-    def send(self, project_id, worker_id, content, *, assignment_id=None, dedupe_key=None):
+    def send(self, project_id, worker_id, content, *, assignment_id, dedupe_key=None):
         if not str(content).strip():
             raise ValueError("Message must not be empty")
+        if not assignment_id:
+            raise ValueError('Message Assignment ID is required')
         with self.store.tx(immediate=True) as db:
             if dedupe_key:
                 existing = db.execute("SELECT * FROM v1_worker_inputs WHERE project_id=? AND dedupe_key=?", (project_id, dedupe_key)).fetchone()
@@ -639,7 +646,7 @@ class AgentRepository:
     def consume_messages(self, assignment, agent_run_id):
         with self.store.tx(immediate=True) as db:
             self.assert_owner(assignment, db=db)
-            rows = db.execute("SELECT * FROM v1_worker_inputs WHERE project_id=? AND recipient_agent_id=? AND state='pending' AND (assignment_id IS NULL OR assignment_id=?) ORDER BY created_at,rowid", (assignment["project_id"], assignment["agent_instance_id"], assignment["id"])).fetchall()
+            rows = db.execute("SELECT * FROM v1_worker_inputs WHERE project_id=? AND recipient_agent_id=? AND state='pending' AND assignment_id=? ORDER BY created_at,rowid", (assignment["project_id"], assignment["agent_instance_id"], assignment["id"])).fetchall()
             if not rows:
                 return []
             payload = [WorkerMessage(
@@ -833,6 +840,12 @@ class AgentRepository:
         else:
             with self.store.connect() as connection:
                 row = connection.execute(query, (project_id,scope_id)).fetchone()
+        return dict(row) if row else None
+
+    def get_context_checkpoint(self, project_id, checkpoint_id):
+        with self.store.connect() as db:
+            row = db.execute('SELECT * FROM v1_context_checkpoints WHERE project_id=? AND id=?',
+                             (project_id, checkpoint_id)).fetchone()
         return dict(row) if row else None
 
     def prior_assignments(self, project_id, session_id, assignment_id):

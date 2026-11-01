@@ -337,6 +337,8 @@ class ConversationGateway:
                 graph_mutation_allowed = bool((is_user_turn and requirement and
                     requirement['status'] == 'active' and self.store.intents.contract(job)['phase'] == 'execution')
                     or supervision_repair_allowed)
+                current_work = self.store.work_progress.current_view(project_id, job_id)
+                prior_work = self.store.conversation_work.latest_prior(project_id, job_id)
                 context = ConversationContextFrame(
                     turn_contract=self.store.intents.contract(job),
                     work_intent=self.store.intents.context(job),
@@ -393,6 +395,10 @@ class ConversationGateway:
                         content=str(job.get("message") or ""),
                         trigger_kind=job.get("trigger_kind", "user"),
                         trigger=job.get("trigger", {}), job_id=job_id),
+                    current_work=current_work,
+                    prior_work_reference=({'job_id': prior_work.job_id,
+                        'revision': prior_work.revision, 'reference_only': True}
+                        if prior_work else None),
                 ).model_dump(mode="json", exclude_unset=True)
                 session_id = str(identity["logical_id"])
                 result = self.agent_core.run(AgentRunSpec(
@@ -605,7 +611,8 @@ class ConversationGateway:
             if notification:
                 if str(job.get('trigger_kind') or 'user') == 'user':
                     from app.v1.conversations.conversation_failure import failure_summary
-                    notification.content = failure_summary(self.store, project_id, action_ledger, error)
+                    notification.content = failure_summary(self.store, project_id, action_ledger, error,
+                                                           job_id=job_id)
             self.store.fail_conversation_job(
                 job_id,
                 error,

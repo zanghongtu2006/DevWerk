@@ -32,3 +32,7 @@
 .conversation-status-strip { grid-row: 2; }
 .conversation-messages { grid-row: 3; }
 .conversation-composer { grid-row: 4; min-height: max-content; }
+
+.conversation-status-strip.thinking-panel { background: #f2f3f5; color: #41454c; }
+#conversation-stream-preview:empty { display: none; }
+.chat-message.thinking-message .message-content { background: #f2f3f5; border-color: #e2e4e7; color: #41454c; }

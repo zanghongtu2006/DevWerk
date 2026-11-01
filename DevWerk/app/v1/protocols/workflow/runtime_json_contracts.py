@@ -108,6 +108,11 @@ class PreparedTerminalEvidence(BaseModel):
         return result.model_dump(mode="json", by_alias=True)
 
 
+class ConversationToolActivity(BaseModel):
+    iteration: int = Field(ge=1)
+    capability: str
+
+
 class ConversationProgressDetails(BaseModel):
     model_config = ConfigDict(extra="allow")
     sequence: int

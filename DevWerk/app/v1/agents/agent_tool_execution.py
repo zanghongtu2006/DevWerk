@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 import json
 
+from app.v1.protocols.workflow.runtime_json_contracts import ConversationToolActivity
 from app.v1.agents.agent_models import AgentRunSpec
 from app.v1.agents.agent_protocol import ConversationProtocolStalled
 from app.v1.capabilities import (
@@ -246,6 +247,12 @@ class AgentToolBatchExecutor:
                     checkpoint={'failure_disposition': 'rejected_before_effect'},
                 )
             else:
+                if self.spec.kind == 'conversation' and self.spec.conversation_job_id:
+                    activity = ConversationToolActivity(iteration=iteration, capability=call.name)
+                    self.store.record_conversation_progress(
+                        self.run_id, kind='tool_started', content='正在调用工具 ' + call.name,
+                        details=activity.model_dump(mode='json'),
+                    )
                 execution_key = operation_id or f"{self.run_id}:{call.id}"
                 result = self.registry.dispatch(
                     call.name,

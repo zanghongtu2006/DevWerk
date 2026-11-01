@@ -12,6 +12,7 @@ mcp_servers:
       - --slim
     timeout_seconds: 60
   chrome_headed:
+    target_access: "With these default arguments the visible Chrome session is controlled over a debugging pipe. It has no TCP debugging port. Verify with list_pages and reuse this session."
     transport: stdio
     command: npx.cmd
     args:

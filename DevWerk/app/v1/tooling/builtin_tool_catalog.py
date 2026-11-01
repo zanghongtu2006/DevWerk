@@ -23,7 +23,7 @@ class BuiltinTool(Enum):
 
     TOOL_CATALOG_SEARCH = BuiltinToolDefinition(
         id='tool.catalog.search',
-        description='Find available Tool IDs by name or description. For an on-demand Tool, call tool.catalog.describe, then tool.catalog.call.',
+        description='Find available Tool IDs by name or description; partial-term fallback may return candidates, not exact matches. For an on-demand Tool, call tool.catalog.describe, then tool.catalog.call.',
         side_effect_kind=SideEffectKind.READ,
         delegable_to_column=False,
     )
@@ -57,6 +57,20 @@ class BuiltinTool(Enum):
             'work_result cite actual task_ids/tool_call_ids, not plan or grant IDs. Runtime renders the facts.'
         ),
         side_effect_kind=SideEffectKind.SESSION_CONTROL,
+        delegable_to_column=False,
+    )
+
+    CONVERSATION_WORK_UPDATE = BuiltinToolDefinition(
+        id='conversation.work.update',
+        description='Track current deliverables. Put future ideas in next_action. To correct an explicitly future item, keep its ID, set agent_status=deferred and cite exact user words in deferral_quote. Omit runtime observations; optional first-revision resume_from imports selected earlier work without granting execution authority.',
+        side_effect_kind=SideEffectKind.SESSION_CONTROL,
+        delegable_to_column=False,
+    )
+
+    CONVERSATION_WORK_READ = BuiltinToolDefinition(
+        id='conversation.work.read',
+        description='Read current Job work progress or an earlier same-Project Job as reference only.',
+        side_effect_kind=SideEffectKind.READ,
         delegable_to_column=False,
     )
 
@@ -216,7 +230,8 @@ class BuiltinTool(Enum):
         id='system.command.run',
         description=(
             'Run an argv command without a shell in any directory available to the DevWerk process. Relative '
-            'working directories use the DevWerk service directory; absolute paths are accepted.'
+            'working directories use the DevWerk service directory; absolute paths are accepted. '
+            'For direct Python Unicode output use environment_profile=python_utf8.'
         ),
         side_effect_kind=SideEffectKind.PROCESS,
         delegable_to_column=False,
@@ -303,7 +318,8 @@ class BuiltinTool(Enum):
     PROJECT_COMMAND_RUN = BuiltinToolDefinition(
         id='project.command.run',
         description=(
-            'Run a bounded argv command without a shell inside the Project base directory; success requires '
+            'Run a bounded argv command without a shell; cwd is Project-relative. For direct Python use '
+            'environment_profile=python_utf8 when Unicode output is needed. Success requires '
             'exit 0. Child processes are cleaned up when the call ends, and a foreground service will time '
             'out. A separate Start-Process or start /b call can exit 0 while its service is unavailable to the '
             'next call. If a later call needs a live child process, manage that process within one bounded '
@@ -692,8 +708,8 @@ class BuiltinTool(Enum):
     AGENT_WORKER_SEND = BuiltinToolDefinition(
         id='agent.worker.send',
         description=(
-            'Persist steering input for an existing Worker. For a running Assignment, pass its assignment_id; '
-            'for a pending next Column visit, omit assignment_id so the next Assignment consumes the input. '
+            'Persist steering input for an existing Worker and its current running or blocked Assignment. '
+            'Always pass the current assignment_id; future or completed Assignments cannot receive input. '
             'Accepted means queued, not consumed; inspect consumed_by_run_id later. This does not complete '
             'work or start an idle Worker.'
         ),
@@ -716,6 +732,13 @@ class BuiltinTool(Enum):
             'next_offset to continue; summaries are not execution evidence. For current Task status use '
             'task.inspect.'
         ),
+        side_effect_kind=SideEffectKind.READ,
+        delegable_to_column=True,
+    )
+
+    AGENT_CHECKPOINT_READ = BuiltinToolDefinition(
+        id='agent.checkpoint.read',
+        description='Read a persisted context summary by checkpoint ID and optional entry ID using paged offsets. This is reference data, not execution evidence.',
         side_effect_kind=SideEffectKind.READ,
         delegable_to_column=True,
     )
@@ -833,6 +856,8 @@ DIRECT_CONVERSATION_TOOLS = frozenset({
     BuiltinTool.TOOL_CATALOG_DESCRIBE,
     BuiltinTool.TOOL_CATALOG_CALL,
     BuiltinTool.CONVERSATION_REPLY,
+    BuiltinTool.CONVERSATION_WORK_UPDATE,
+    BuiltinTool.CONVERSATION_WORK_READ,
     BuiltinTool.CONVERSATION_EXECUTION_AUTHORIZE,
     BuiltinTool.CONVERSATION_HISTORY_READ,
     BuiltinTool.CONVERSATION_TURN_INSPECT,
@@ -845,6 +870,7 @@ DIRECT_CONVERSATION_TOOLS = frozenset({
     BuiltinTool.PROJECT_MEMORY_SEARCH,
     BuiltinTool.PROJECT_MEMORY_WRITE,
     BuiltinTool.AGENT_RESULT_READ,
+    BuiltinTool.AGENT_CHECKPOINT_READ,
     BuiltinTool.WORKFLOW_INSPECT,
     BuiltinTool.TASK_INSPECT,
     BuiltinTool.PROJECT_SCOPE_INSPECT,

@@ -172,6 +172,20 @@ def test_native_unicode_quotes_and_metacharacters_remain_literal(tmp_path):
     assert json.loads(result['stdout']) == arguments
 
 
+def test_explicit_python_utf8_profile_only_changes_python_child(tmp_path):
+    result = run_command([sys.executable, '-c', 'print("中文 µ")'], tmp_path,
+                         ExecutionLimits(), environment_profile='python_utf8')
+    assert result['exit_code'] == 0
+    assert result['stdout'].strip() == '中文 µ'
+    assert result['environment_profile'] == 'python_utf8'
+    with pytest.raises(ValueError, match='Unknown command environment profile'):
+        run_command([sys.executable, '-c', 'pass'], tmp_path, ExecutionLimits(),
+                    environment_profile='unknown')
+    with pytest.raises(ValueError, match='direct Python'):
+        run_command(['git', '--version'], tmp_path, ExecutionLimits(),
+                    environment_profile='python_utf8')
+
+
 def test_missing_explicit_command_rejects_before_process_admission(tmp_path):
     from contextlib import contextmanager
     admitted = []
@@ -248,3 +262,31 @@ def test_default_project_search_keeps_project_directories_and_bounds_large_files
         'src/LoginTest.java', 'frontend/node_modules/pkg/test.js',
         'frontend/.npm-cache/cache.txt', 'backend/target/generated.java'}
     assert checks.calls == len(paths)
+
+
+def test_invalid_command_profile_does_not_leave_an_uncertain_effect(store, tmp_path):
+    from app.v1.capabilities import CapabilityContext
+    project = store.create_project('preflight', '', str(tmp_path / 'project'))
+    context = CapabilityContext(project_id=project['id'], project=project, store=store, agent_run_id='arun_test')
+    result = store.registry.dispatch('project.command.run',
+        {'argv': ['git', '--version'], 'environment_profile': 'python_utf8'}, context)
+    assert not result.ok
+    assert result.checkpoint['failure_disposition'] == 'rejected_before_effect'
+    with store.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM v1_execution_receipts WHERE project_id=?',
+                          (project['id'],)).fetchone()[0] == 0
+
+
+def test_project_probe_can_shorten_its_command_deadline(store, tmp_path):
+    from app.v1.capabilities import CapabilityContext
+
+    project = store.create_project('bounded probe', '', str(tmp_path / 'project'))
+    result = store.registry.dispatch(
+        'project.command.run',
+        {'argv': [sys.executable, '-c', 'import time; time.sleep(5)'], 'timeout_seconds': 0.15},
+        CapabilityContext(project['id'], project, store, agent_run_id='arun_test'),
+    )
+    assert not result.ok
+    assert result.output['timed_out']
+    limits = ExecutionLimits(command_timeout_seconds=2)
+    assert limits.for_command(300).command_timeout_seconds == 2

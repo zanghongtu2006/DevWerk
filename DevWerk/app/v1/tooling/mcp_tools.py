@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.v1.capabilities import CapabilityEntry, CapabilityRegistry
 from app.v1.domain import ToolResult
+from app.v1.protocols.tools.core.tool_catalog_contracts import MCPConnectionInfo
 from app.v1.contracts import check_schema
 from app.v1.protocols.tools.core.capability_protocol import CapabilityToolset
 from app.v1.protocols.tools.core.provider_schema_contracts import ProviderSchemaNode
@@ -38,6 +39,8 @@ _MAX_RESULT_CHARS = 50_000
 
 class MCPServerConfig(BaseModel):
     model_config = ConfigDict(extra='forbid')
+    target_access: str | None = Field(default=None, min_length=1, max_length=600,
+        description="Public target access instructions included in tool descriptions. Omit credentials.")
     transport: str = Field(pattern='^(stdio|http)$')
     command: str | None = None
     args: list[str] = Field(default_factory=list)
@@ -294,6 +297,8 @@ class MCPToolManager:
                             id=alias, description=str(tool.get('description') or tool_name)[:4000],
                             input_schema=schema, output_schema={}, handler=handler,
                             toolset=CapabilityToolset.MCP, side_effect_kind='read' if read_only else 'process',
+                            mcp_connection=MCPConnectionInfo(server=server_name, transport=connection.config.transport,
+                                target_access=connection.config.target_access),
                             delegable_to_column=True,
                         ))
                         self._aliases[alias] = owner

@@ -20,6 +20,8 @@ from app.v1.agents.agent_provider import ProviderTurnRequester
 from app.v1.agents.agent_run_preparation import AgentRunPreparer
 from app.v1.agents.agent_tool_execution import AgentToolBatchExecutor, queued_task_entry
 from app.v1.protocols.agent.resolved_tool_operation import ResolvedToolOperation
+from app.v1.protocols.agent.agent_runtime_receipts import ExecutionBudgetView
+from app.v1.protocols.conversation.conversation_notification_contracts import ConversationUpdateMeta
 from app.v1.tooling.tool_call_resolution import resolve_tool_call, schema_digest
 from app.v1.capabilities import CapabilityRegistry
 from app.v1.policy import PlatformPolicySnapshot, V1RuntimePolicy
@@ -116,10 +118,21 @@ class AgentExecutionRunner:
                         raise ExecutionReplayUncertain('Runtime acceptance effect requires reconciliation: '+uncertain['execution_key'])
                 max_iterations = min(limits.agent_max_iterations, 20) if spec.supervision_turn else limits.agent_max_iterations
                 max_tool_calls = min(limits.agent_max_tool_calls, 50) if spec.supervision_turn else limits.agent_max_tool_calls
-                if iteration >= max_iterations or calls_used >= max_tool_calls:
+                reserve_enabled = (spec.kind == 'conversation' and spec.user_initiated
+                                   and not spec.supervision_turn and spec.require_conversation_report)
+                reserve_iterations = min(limits.conversation_finalize_reserve_iterations,
+                                         max_iterations - 1) if reserve_enabled else 0
+                reserve_tools = min(limits.conversation_finalize_reserve_tool_calls,
+                                    max_tool_calls - 1) if reserve_enabled else 0
+                if not pending and (iteration >= max_iterations or calls_used >= max_tool_calls):
                     raise ExecutionBudgetExceeded("Agent iteration/tool-call ceiling reached")
-                iteration += 1
+                if not pending:
+                    iteration += 1
                 current_iteration = iteration
+                finalizing = bool(reserve_enabled and not pending and
+                                  iteration > max_iterations - reserve_iterations)
+                if finalizing:
+                    force_reply_tool = True
                 if spec.assignment and not pending:
                     consumed = self.store.agents.consume_messages(spec.assignment, run["id"])
                     if consumed:
@@ -148,6 +161,15 @@ class AgentExecutionRunner:
                         messages, prepared.tools, iteration=iteration,
                         require_tool=force_reply_tool,
                         required_tool_name='conversation.reply' if force_reply_tool else None,
+                        budget_view=(ExecutionBudgetView(
+                            iterations_completed=iteration - 1,
+                            iterations_remaining=max(0, max_iterations - iteration + 1),
+                            tool_calls_completed=calls_used,
+                            tool_calls_remaining=max(0, max_tool_calls - calls_used),
+                            phase='finalize' if finalizing else (
+                                'advisory' if iteration >= max_iterations *
+                                (1 - limits.conversation_advisory_fraction) else 'work'),
+                        ) if reserve_enabled else None),
                     )
                     resolutions = [resolve_tool_call(
                         call.name, call.arguments,
@@ -158,6 +180,11 @@ class AgentExecutionRunner:
                         for call in response.tool_calls]
                 if spec.kind == 'conversation':
                     control.check_preempt()
+                if finalizing and response.tool_calls and not (
+                        len(response.tool_calls) == 1 and
+                        resolutions[0].capability == 'conversation.reply'):
+                    raise ExecutionBudgetExceeded(
+                        'Final reserved model turn may only call conversation.reply')
                 if response.text.strip():
                     latest_text = response.text.strip()
                 self._normalize_tool_call_ids(
@@ -172,6 +199,17 @@ class AgentExecutionRunner:
                     for call, resolution in zip(response.tool_calls, resolutions)]
                 provider_message = assistant_message(response)
                 messages.append(provider_message)
+                replay_batch = operation_ids is not None
+                if response.tool_calls and not replay_batch:
+                    reply_batch = (len(response.tool_calls) == 1 and
+                                   effective_calls[0].name == 'conversation.reply')
+                    available = max_tool_calls if reply_batch else max_tool_calls - reserve_tools
+                    if calls_used + len(response.tool_calls) > available:
+                        self.store.add_agent_message(run['id'], 'assistant', response.text,
+                            provider_message.get('tool_calls') or [],
+                            progress_details={'iteration': iteration, 'budget_rejected': True},
+                            provider_content=provider_message.get('provider_content'))
+                        raise ExecutionBudgetExceeded('Tool batch exceeds remaining work budget before admission')
                 with self.store.tx(immediate=True):
                     control.check()
                     if spec.assignment and operation_ids is None:
@@ -186,13 +224,19 @@ class AgentExecutionRunner:
                     if operation_ids is None:
                         operation_ids = self.store.agents.prepare_operations(spec.project["id"], scope_id,
                             run["id"], source_message['sequence'], effective_calls, resolutions)
+                        if (spec.kind == "conversation" and spec.user_initiated
+                                and spec.conversation_job_id and response.text.strip()
+                                and effective_calls and all(call.name != "conversation.reply" for call in effective_calls)):
+                            update = ConversationUpdateMeta(job_id=spec.conversation_job_id,
+                                agent_run_id=run["id"], source_message_id=source_message["id"])
+                            self.store.add_message(project_id=spec.project["id"], role="assistant",
+                                content=response.text.strip(), meta=update.model_dump(mode="json"))
 
                 if response.tool_calls:
                     column_text_responses = 0
                     control.check()
-                    if calls_used + len(response.tool_calls) > max_tool_calls:
-                        raise ExecutionBudgetExceeded("Agent tool-call ceiling reached")
-                    calls_used += len(response.tool_calls)
+                    if not replay_batch:
+                        calls_used += len(response.tool_calls)
                     batch = tool_batch_executor.execute(
                         effective_calls,
                         messages,
@@ -303,11 +347,15 @@ class AgentExecutionRunner:
             )
             return replace(result, completion={'turn_interrupted': True})
         except Exception as exc:  # noqa: BLE001
+            work = (self.store.work_progress.current_view(spec.project['id'], spec.conversation_job_id)
+                    if spec.conversation_job_id else None)
             checkpoint = run_checkpoint(
                 current_iteration,
                 calls_used,
                 direct_effect_calls,
                 latest_text,
+                stop_reason=type(exc).__name__,
+                work_revision=work.revision if work else None,
             )
             self.store.finish_agent_run(
                 run["id"],

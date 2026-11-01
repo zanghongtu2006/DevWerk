@@ -517,6 +517,9 @@ async def project_stream(project_id: str, request: Request, after: int = Query(0
 
     async def generate():
         cursor = after
+        last_event_id = request.headers.get("last-event-id", "")
+        if last_event_id.isascii() and last_event_id.isdigit() and len(last_event_id) <= 18:
+            cursor = max(cursor, int(last_event_id))
         while not await request.is_disconnected():
             events = store(request).events(project_id=project_id, after=cursor, limit=DETAIL_PAGE)
             if events:
@@ -525,6 +528,7 @@ async def project_stream(project_id: str, request: Request, after: int = Query(0
                     yield f"id: {cursor}\nevent: project\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
             else:
                 yield ": keepalive\n\n"
-            await asyncio.sleep(store(request).policy.service_limits.event_poll_interval_seconds)
+            if len(events) < DETAIL_PAGE:
+                await asyncio.sleep(store(request).policy.service_limits.event_poll_interval_seconds)
 
     return StreamingResponse(generate(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

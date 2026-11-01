@@ -34,7 +34,7 @@ def test_conversation_catalog_describes_on_demand_tools_without_changing_visibil
     catalog = ToolPresentation(store.registry)
     direct = {tool['function']['name'] for tool in prepared.tools}
 
-    assert len(direct) == 22
+    assert len(direct) == 25
     assert {'tool.catalog.search', 'tool.catalog.describe', 'tool.catalog.call',
             'project.scope.revise', 'conversation.reply'} <= direct
     assert 'tool.catalog.select' not in direct
@@ -81,6 +81,26 @@ def test_catalog_rejects_tools_outside_the_run_snapshot(store, tmp_path):
         assert 'unavailable' in str(exc)
     else:
         raise AssertionError('A Run may not describe a Tool outside its original capability snapshot')
+
+
+def test_catalog_partial_terms_fallback_is_bounded_and_authorized(store, tmp_path):
+    project = store.create_project('search fallback', '', str(tmp_path / 'project'))
+    prepared = _prepared_conversation(store, project)
+    catalog = ToolPresentation(store.registry)
+    context = prepared.capability_context
+
+    exact = catalog.search({'query': 'project.files.read'}, context)
+    assert exact['match_mode'] == 'exact'
+    assert exact['items'][0]['id'] == 'project.files.read'
+    partial = catalog.search({'query': 'read impossibleword', 'limit': 2}, context)
+    assert partial['match_mode'] == 'partial_terms'
+    assert partial['total'] > 2
+    second = catalog.search({'query': 'read impossibleword', 'offset': 2, 'limit': 2}, context)
+    assert {item['id'] for item in partial['items']}.isdisjoint(
+        item['id'] for item in second['items'])
+    assert all(item['id'] != 'conversation.task.control.authorize'
+               for item in partial['items'] + second['items'])
+    assert catalog.search({'query': 'impossibleword'}, context)['match_mode'] == 'no_match'
 
 
 def test_limited_conversation_without_catalog_keeps_its_explicit_tools(store, tmp_path):

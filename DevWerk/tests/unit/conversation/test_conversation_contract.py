@@ -1440,3 +1440,57 @@ def test_project_session_run_index_is_ordered_bounded_and_isolated(store, tmp_pa
         store.conversation_session_run_index(
             other['id'], store.conversation_agent(other['id'])['logical_id'],
             before_run_id=current['id'])
+
+
+def test_report_completes_current_delivery_with_visible_deferred_work(store, tmp_path):
+    project = store.create_project('delivery scope', '', str(tmp_path / 'project'))
+    responses = iter([
+        AgentToolCall(id='write-note', name='project.files.write',
+                      arguments={'path': 'note.txt', 'content': 'private note body'}),
+        AgentToolCall(id='record-scope', name='conversation.work.update', arguments={
+            'base_revision': 0, 'snapshot': {
+                'objective': 'Write note',
+                'items': [
+                    {'item_id': 'note', 'requirement': 'Write note', 'agent_status': 'ready',
+                     'resource_ids': ['file']},
+                    {'item_id': 'rollout', 'requirement': 'Plan rollout', 'agent_status': 'deferred',
+                     'deferral_quote': 'Plan rollout later.'}],
+                'resources': [{'resource_id': 'file', 'relative_path': 'note.txt'}]}}),
+        AgentToolCall(id='report-note', name='conversation.reply', arguments={
+            'mode': 'work_result', 'message': 'Note saved.', 'tool_call_ids': ['write-note'], 'work_revision': 1})
+    ])
+
+    def model(_messages, _tools, **_kwargs):
+        call = next(responses)
+        if call.name == 'project.files.write':
+            from app.services.visible_stream import publish_visible_text
+            publish_visible_text('I will write')
+            events = store.events(project_id=project['id'])
+            assert any(e['data'].get('kind') == 'visible_text' and
+                       e['data']['content'] == 'I will write' for e in events)
+            return AgentModelResponse(text='I will write the note now.', tool_calls=[call])
+        if call.name == 'conversation.work.update':
+            visible = store.messages(project['id'], visible_only=True)
+            assert visible[-1]['meta']['kind'] == 'progress'
+            assert visible[-1]['content'] == 'I will write the note now.'
+            assert 'private note body' not in str(visible)
+        return AgentModelResponse(tool_calls=[call])
+
+    registry = build_core_registry()
+    gateway = ConversationGateway(store, registry, agent_core=AgentCore(store, registry, model))
+    accepted = run_turn(gateway, project['id'], 'Write a note. Plan rollout later.', True)
+    job = store.get_conversation_job(accepted['job']['id'])
+    assert job['status'] == 'succeeded', job['error']
+    run = store.get_agent_run(project['id'], job['agent_run_id'])
+    assert '留待以后：Plan rollout' in run['final_text']
+    visible = store.messages(project['id'], visible_only=True)
+    assert [message['meta']['kind'] for message in visible if message['role'] == 'assistant'] == ['progress', 'reply']
+    session_id = store.conversation_agent(project['id'])['logical_id']
+    history = store.conversation_session_messages(project['id'], session_id)
+    assert all(message['content'] != 'I will write the note now.' for message in history)
+    events = store.events(project_id=project['id'])
+    started = [e['data'] for e in events if e['type'] == 'conversation.progress'
+               and e['data']['kind'] == 'tool_started']
+    assert [e['capability'] for e in started] == ['project.files.write', 'conversation.work.update', 'conversation.reply']
+    assert all(e['conversation_job_id'] == job['id'] for e in started)
+    assert 'private note body' not in json.dumps(started)

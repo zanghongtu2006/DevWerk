@@ -15,6 +15,7 @@ class ConversationReply(BaseModel):
     message: str = ''
     task_ids: list[str] = Field(default_factory=list, max_length=100)
     tool_call_ids: list[str] = Field(default_factory=list, max_length=100)
+    work_revision: int | None = Field(default=None, ge=1)
 
 
 class ConversationReport(ConversationReply):
@@ -66,6 +67,13 @@ def render_report(store, project_id, run_id, text, *, execution_control=None):
             raise ValueError('The turn boundary is ALREADY COMMITTED. Omit turn_resolution entirely from the final reply; '
                              'return mode, message, task_ids, tool_call_ids; optionally draft_update for discussion data. For discussion use {"mode":"discussion","message":"your answer"}.')
     report = ConversationReport.model_validate_json(text)
+    work = store.work_progress.current_view(project_id, job['id']) if job else None
+    if work and report.mode in {'work_result', 'blocked'}:
+        if report.work_revision != work.revision:
+            raise ValueError(f'WorkRevisionStale: set work_revision to {work.revision} for the current Job')
+        incomplete, stale = store.work_progress.current_readiness(work)
+        if report.mode == 'work_result' and incomplete and not report.task_ids:
+            raise ValueError('WorkIncomplete: unresolved work items remain: ' + ', '.join(incomplete[:8]))
     contract = store.intents.contract(job) if job else {}
     if report.mode == 'work_result' and contract.get('phase') == 'supervision':
         task = store.get_project_task(project_id, contract['supervised_task_id'])
@@ -191,6 +199,14 @@ def render_report(store, project_id, run_id, text, *, execution_control=None):
             rendered = failure_summary(store, project_id, ledger, errors[-1])
         else:
             rendered = report.message.strip()
+        if work:
+            rendered += ('\n未完成工作：' + '、'.join(incomplete[:8]) if incomplete else '\n工作记录已核对；仍需处理当前阻塞。')
+            if stale:
+                rendered += '；产物版本已变化：' + '、'.join(sorted(stale)[:5])
+    if work and report.mode in {'work_result', 'blocked'}:
+        deferred = [item.requirement for item in work.items if item.agent_status == 'deferred']
+        if deferred:
+            rendered += '\n留待以后：' + '、'.join(deferred)
     evidence = {'report': report.model_dump(), 'tasks': [{'id': t['id'], 'status': t['status'], 'control_state': t.get('control_state')} for t in tasks],
                 'invocation_ids': [i['id'] for i in selected], 'rendered': rendered}
     job = store.intents.job_for_run(run_id, project_id)

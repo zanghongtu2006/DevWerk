@@ -438,6 +438,8 @@ class ConversationIntentRepository:
                 return None
             if capability == 'agent.worker.send':
                 assignment_id = arguments.get('assignment_id')
+                if not assignment_id:
+                    return 'SupervisionWorkerMismatch: assignment_id is required for the current Assignment of this Task'
                 assignment = db.execute(
                     'SELECT a.task_id,a.agent_instance_id,a.status,r.column_key,r.sequence '
                     'FROM v1_agent_assignments a JOIN v1_column_runs r ON r.id=a.column_run_id '

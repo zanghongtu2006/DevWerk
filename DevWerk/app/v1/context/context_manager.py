@@ -27,10 +27,13 @@ from app.v1.protocols.context.context_result_contracts import (
 from app.v1.protocols.context.context_state_contracts import CompactContextSummary, TaskPlanContextSummary, TaskSummaryWithFailure
 from app.v1.protocols.context.context_checkpoint_contracts import (CheckpointCoverage, CheckpointMetrics,
     AssistantMessageFact, ContextCheckpointMessage, ContextCheckpointPayload,
-    ContextMaintenanceMessage, ContextRunMetrics, DeterministicContextSummary,
+    ContextMaintenanceMessage, ContextRunMetrics, ContextSummaryDocument, ContextSummaryView,
+    DeterministicContextSummary,
     MinimalToolResultProjection, PendingTaskPlanActivation, PendingWorkflowPublication, PublicationArguments,
     PublicationNextAction, PreviousCheckpointFact, ProviderBudgetEnvelope,
-    RequiredOverflowMetrics, SummaryToolCallFact, ToolMessageFact, TruncationProjection)
+    RequiredOverflowMetrics, SummaryEntry, SummaryMaintenanceInput, SummaryMaintenanceOutput,
+    SummaryToolCallFact, ToolMessageFact,
+    TruncationProjection)
 
 
 def packed(value):
@@ -117,7 +120,7 @@ def project_result(content, max_bytes):
         original = ToolResultView(output=content).model_dump(mode='json', exclude_unset=True)
     if not isinstance(original, dict):
         original = ToolResultView(output=original).model_dump(mode='json', exclude_unset=True)
-    if original.get('capability') == 'agent.result.read' and isinstance(original.get('output'), dict):
+    if original.get('capability') in {'agent.result.read', 'agent.checkpoint.read'} and isinstance(original.get('output'), dict):
         output = original['output']
         if isinstance(output.get('content'), str) and isinstance(output.get('offset'), int):
             from app.v1.context.context_projection import slice_source_text
@@ -135,12 +138,17 @@ def project_result(content, max_bytes):
                 if len(encoded.encode('utf-8')) <= max_bytes:
                     return encoded
                 budget //= 2
-            reduced = AgentResultReducedView.model_validate(output)
-            reduced.content = ''
-            reduced.next_offset = offset
-            return packed(ToolResultView.from_value(original).with_output(
-                reduced.model_dump(mode='json', exclude_unset=True)
-            ))
+            if original.get('capability') == 'agent.checkpoint.read':
+                reduced = {key: output.get(key) for key in
+                           ('checkpoint_id', 'entry_id', 'legacy', 'offset',
+                            'total_characters', 'sha256') if key in output}
+                reduced.update(content='', next_offset=offset, projection_deferred=True)
+            else:
+                reduced_model = AgentResultReducedView.model_validate(output)
+                reduced_model.content = ''
+                reduced_model.next_offset = offset
+                reduced = reduced_model.model_dump(mode='json', exclude_unset=True)
+            return packed(ToolResultView.from_value(original).with_output(reduced))
     if original.get('capability') == 'project.files.read' and isinstance(original.get('output'), dict):
         output = original['output']
         if isinstance(output.get('content'), str) and isinstance(output.get('offset'), int):
@@ -338,13 +346,13 @@ class ContextManager:
                 i += 1
         return groups
 
-    def prepare(self, messages, tools, *, force=False):
+    def prepare(self, messages, tools, *, force=False, budget_view=None):
         control = self.spec.execution_control
         if control:
             control.check()
         before = self.estimate(messages, tools)
         projected = copy.deepcopy(messages)
-        self._refresh_conversation_authority(projected)
+        self._refresh_conversation_authority(projected, budget_view=budget_view)
         self._refresh_runtime_failures(projected)
         latest_user = max((index for index, item in enumerate(projected)
             if item.get('role') == 'user'), default=-1)
@@ -390,11 +398,30 @@ class ContextManager:
                 removed.extend(projected[start:end])
                 remove_indices.update(range(start, end))
             if removed:
+                from app.v1.context.context_summary import build_document, project_summary
                 retained = [m for j, m in enumerate(projected) if j not in remove_indices]
                 previous = [m for m in retained if m.get('_checkpoint')]
                 retained = [m for m in retained if not m.get('_checkpoint')]
-                summary = self._summarize(previous + removed)
-                summary = self._bounded_summary(summary)
+                prior_row = self.store.agents.load_context_checkpoint(self.spec.project['id'], self.scope)
+                prior_document = (ContextSummaryDocument.model_validate_json(prior_row['document_json'])
+                                  if prior_row and prior_row.get('document_json') else None)
+                checkpoint_id = new_id('context')
+                document = build_document(removed, run_id=self.run_id, previous=prior_document,
+                    previous_checkpoint_id=prior_row['id'] if prior_row else None,
+                    max_bytes=self.policy.summary_document_max_bytes,
+                    objective_reference=(
+                        f"conversation-message:{self.spec.context['current_request']['message_id']}"
+                        if self.spec.context.get('current_request', {}).get('message_id') else
+                        (f'task:{self.spec.task_id}' if self.spec.task_id else '')))
+                if document.entries:
+                    document = self._maintain_document(document, checkpoint_id)
+                else:
+                    # Synthetic, unowned batches cannot form durable source refs.
+                    # Keep their existing one-call maintenance/fallback behavior.
+                    self._summarize(previous + removed)
+                summary_view = project_summary(document, checkpoint_id,
+                    max(512, int(self.policy.summary_tokens/(self.ratio*1.15))))
+                summary = summary_view.model_dump(mode='json')
                 checkpoint = ContextCheckpointMessage(content=ContextCheckpointPayload(
                     context_checkpoint=summary).model_dump_json()).model_dump(mode='json', by_alias=True)
                 projected = retained[:1] + [checkpoint] + retained[1:]
@@ -402,8 +429,12 @@ class ContextManager:
                 if estimate > self.hard:
                     # Persist the full summary, but send a compact retrieval
                     # reference if its provider view would overflow.
-                    reference = CompactContextSummary.from_bounded(
-                        summary, 'Prior context archived; use available context or result read tools for exact sources.')
+                    reference = ContextSummaryView(
+                        checkpoint_id=summary_view.checkpoint_id,
+                        document_sha256=summary_view.document_sha256,
+                        entries=[], omitted_entry_count=(
+                            document.omitted_entry_count + len(document.entries)),
+                    ).model_dump(mode='json')
                     checkpoint = ContextCheckpointMessage(content=ContextCheckpointPayload(
                         context_checkpoint=reference).model_dump_json()).model_dump(mode='json', by_alias=True)
                     projected = retained[:1] + [checkpoint] + retained[1:]
@@ -416,7 +447,17 @@ class ContextManager:
                     projected = uncompacted
                     removed = []
                 else:
-                    self._save(removed, summary, before, estimate)
+                    saved = self._save(removed, summary, before, estimate,
+                                       checkpoint_id=checkpoint_id, document=document)
+                    if not saved:
+                        # Synthetic/unowned messages can be compacted for this
+                        # request, but must not expose a nonexistent checkpoint.
+                        fallback = {'method': 'deterministic',
+                                    'summary': 'Earlier exchange omitted from this request; no durable checkpoint was saved.',
+                                    'archived_messages': len(removed)}
+                        checkpoint = ContextCheckpointMessage(content=ContextCheckpointPayload(
+                            context_checkpoint=fallback).model_dump_json()).model_dump(mode='json', by_alias=True)
+                        projected = retained[:1] + [checkpoint] + retained[1:]
                     messages[:] = projected
         estimate = self.estimate(projected, tools)
         if estimate > self.hard:
@@ -428,7 +469,7 @@ class ContextManager:
             ratio=self.ratio).model_dump(mode='json')
         return provider_messages(projected)
 
-    def _refresh_conversation_authority(self, messages):
+    def _refresh_conversation_authority(self, messages, *, budget_view=None):
         if self.spec.kind != 'conversation' or not self.spec.conversation_job_id:
             return
         job = self.store.get_conversation_job(self.spec.conversation_job_id)
@@ -459,6 +500,10 @@ class ContextManager:
                 return
             state['turn_contract'] = contract
             state['work_intent'] = self.store.intents.context(job)
+            work = self.store.work_progress.current_view(job['project_id'], job['id'])
+            state['current_work'] = work.model_dump(mode='json') if work else None
+            if budget_view is not None:
+                state['execution_budget'] = budget_view.model_dump(mode='json')
             state['requirement'] = requirement
             try:
                 workflow = self.store.get_workflow(job['project_id'])
@@ -741,6 +786,73 @@ class ContextManager:
                     handoff['content_complete'] = False
                     item['content'] = packed(payload)
 
+    def _maintain_document(self, document: ContextSummaryDocument,
+                           checkpoint_id: str) -> ContextSummaryDocument:
+        """Add sourced model observations; raw references remain the fallback."""
+        if not document.entries or not getattr(self.model_complete, 'context_limits', None):
+            return document
+        byte_budget = max(1024, min(
+            int(self.policy.summary_input_tokens / (self.ratio * 1.15)),
+            int(self.hard / (self.ratio * 1.15) / 4),
+        ))
+        selected = []
+        used = 0
+        for entry in reversed(document.entries):
+            size = len(entry.model_dump_json().encode('utf-8'))
+            if used + size > byte_budget:
+                continue
+            selected.insert(0, entry)
+            used += size
+        allowed = {(ref.agent_run_id, ref.message_id, ref.tool_call_id)
+                   for entry in selected for ref in entry.source_refs}
+        if not allowed:
+            return document
+        prompt = [
+            ContextMaintenanceMessage(role='system', content=(
+                'Return only a JSON object with an entries array. Each entry has kind, text, '
+                'source_refs, and entry_id. Preserve unresolved problems and corrections. '
+                'Every claim must cite source_refs present in the input. Do not claim completion '
+                'from a file write or a model assertion alone. No tools.')),
+            ContextMaintenanceMessage(role='user', content=SummaryMaintenanceInput(
+                previous_checkpoint_id=document.previous_checkpoint_id,
+                omitted_entry_count=(
+                    document.omitted_entry_count + len(document.entries) - len(selected)),
+                entries=selected,
+            ).model_dump_json()),
+        ]
+        try:
+            if self.spec.execution_control:
+                self.spec.execution_control.check()
+            if self.spec.assignment:
+                self.store.agents.charge(self.spec.assignment, models=1)
+            response = self.model_complete([item.model_dump(mode='json') for item in prompt], [],
+                project_id=self.spec.project['id'], task_id=self.spec.task_id,
+                agent=self.spec.kind, require_tool=False, required_tool_name=None)
+            if self.spec.execution_control:
+                self.spec.execution_control.check()
+            if response.tool_calls:
+                return document
+            output = SummaryMaintenanceOutput.model_validate_json(response.text)
+            for index, entry in enumerate(output.entries):
+                if not entry.source_refs or any(
+                    (ref.agent_run_id, ref.message_id, ref.tool_call_id) not in allowed
+                    for ref in entry.source_refs
+                ):
+                    return document
+                output.entries[index] = entry.model_copy(update={
+                    'entry_id': f'maintenance-{checkpoint_id}-{index}'})
+            for entry in output.entries:
+                candidate = document.model_copy(deep=True)
+                candidate.entries.append(entry)
+                if len(candidate.model_dump_json().encode('utf-8')) <= self.policy.summary_document_max_bytes:
+                    document = candidate
+            if output.entries:
+                document.method = 'same_agent_summary'
+        except Exception:
+            if self.spec.execution_control:
+                self.spec.execution_control.check()
+        return document
+
     def _summarize(self, messages):
         facts = []
         for m in messages:
@@ -818,10 +930,10 @@ class ContextManager:
             )
         return value
 
-    def _save(self, removed, summary, before, after):
+    def _save(self, removed, summary, before, after, *, checkpoint_id=None, document=None):
         ids = [m.get('_source_message_id') for m in removed]
         if not ids or any(type(identity) is not int or identity <= 0 for identity in ids):
-            return
+            return False
         with self.store.tx(immediate=True) as db:
             if self.spec.execution_control:
                 self.spec.execution_control.check()
@@ -835,21 +947,23 @@ class ContextManager:
                         WHERE m.id=? AND r.project_id=? AND r.assignment_id=?''',
                         (identity,self.spec.project['id'],self.spec.assignment['id'])).fetchone()
                     if not owned:
-                        return
+                        return False
             previous = self.store.agents.load_context_checkpoint(
                 self.spec.project['id'], self.scope, db=db)
             prior = covered_message_ids(previous['coverage_json']) if previous else None
             combined = set(ids) | (prior or set())
             if prior is not None and combined == prior:
-                return
+                return False
             boundary = max(max(ids), previous['through_message_id'] if previous else 0)
             db.execute('''INSERT INTO v1_context_checkpoints
                 (id,project_id,scope_id,agent_run_id,revision,through_message_id,
-                 summary_json,source_hash,metrics_json,created_at,coverage_json)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
-                (new_id('context'), self.spec.project['id'], self.scope, self.run_id,
+                 summary_json,source_hash,metrics_json,created_at,coverage_json,document_json)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
+                (checkpoint_id or new_id('context'), self.spec.project['id'], self.scope, self.run_id,
                  (previous['revision'] if previous else 0)+1,
                   boundary, packed(summary), digest(removed), CheckpointMetrics(
                       before=before, after=after, ratio=self.ratio,
                       model=self.limits['model'], protocol=self.limits['protocol']).model_dump_json(), utcnow(),
-                 packed(coverage_ranges(combined))))
+                 packed(coverage_ranges(combined)),
+                 document.model_dump_json() if document else None))
+        return True

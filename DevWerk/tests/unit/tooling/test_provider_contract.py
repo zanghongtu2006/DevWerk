@@ -66,6 +66,7 @@ def sse(event, payload):
 
 
 def test_anthropic_stream_assembles_complete_text_thinking_and_tool_use():
+    from app.services.visible_stream import listen_for_visible_text
     client = AnthropicClient({'api_name': 'test', 'base_url': 'https://provider.invalid',
         'api_key': 'token', 'model': 'm', 'temperature': 0.2, 'max_tokens': 100,
         'stream_response': True})
@@ -100,7 +101,12 @@ def test_anthropic_stream_assembles_complete_text_thinking_and_tool_use():
     tool = {'type': 'function', 'function': {'name': 'project.inspect', 'description': '',
         'parameters': {'type': 'object', 'properties': {'limit': {'type': 'integer'}}}}}
 
-    result = client.complete([{'role': 'user', 'content': 'go'}], [tool])
+    visible = []
+    reply_messages = []
+    with listen_for_visible_text(visible.append, public_field=('conversation.reply', 'message', reply_messages.append)):
+        result = client.complete([{'role': 'user', 'content': 'go'}], [tool])
+    assert visible == ['ready']
+    assert reply_messages == []
 
     assert sent[0]['stream'] is True and sent[0]['json']['stream'] is True
     assert result['text'] == 'ready'
@@ -108,6 +114,17 @@ def test_anthropic_stream_assembles_complete_text_thinking_and_tool_use():
     assert result['usage']['input_tokens'] == 12
     assert result['usage']['output_tokens'] == 8
     assert result['provider_content']['blocks'][0]['signature'] == 'signed'
+
+
+def test_partial_reply_streams_only_the_public_top_level_message():
+    from app.services.visible_stream import listen_for_visible_text, publish_tool_preview
+    visible = []
+    fragments = ['{"nested":{"message":"internal"},"message":"已', '保存","tool_call_ids":["private"]}']
+    with listen_for_visible_text(visible.append, public_field=('conversation.reply', 'message', visible.append)):
+        publish_tool_preview('project.files.write', fragments, 100)
+        publish_tool_preview('conversation.reply', fragments[:1], 50)
+        publish_tool_preview('conversation.reply', fragments, 100)
+    assert visible == ['已', '已保存']
 
 
 def test_anthropic_stream_never_returns_partial_tool_call_without_message_stop():

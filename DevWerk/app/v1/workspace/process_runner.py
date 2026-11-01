@@ -11,7 +11,7 @@ from typing import Callable
 from contextlib import nullcontext
 
 from app.v1.policy import ExecutionLimits
-from app.v1.workspace.command_resolution import resolve_command
+from app.v1.workspace.command_resolution import resolve_launch
 from app.v1.protocols.tools.workspace.capability_workspace_receipts import CommandReceipt
 
 
@@ -30,10 +30,14 @@ def _kill_tree(process: subprocess.Popen) -> None:
 
 
 def run_command(argv: list[str], cwd: Path, limits: ExecutionLimits,
-                check: Callable[[], None] | None = None, guard=None) -> dict:
+                check: Callable[[], None] | None = None, guard=None,
+                environment_profile: str = 'inherit') -> dict:
     if check:
         check()
-    launch_argv = resolve_command(argv, cwd)
+    launch_argv = resolve_launch(argv=argv, cwd=cwd, environment_profile=environment_profile)
+    child_env = os.environ.copy()
+    if environment_profile == 'python_utf8':
+        child_env.update(PYTHONUTF8='1', PYTHONIOENCODING='utf-8')
     options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {"start_new_session": True}
     job = None
     if os.name == "nt":
@@ -45,7 +49,7 @@ def run_command(argv: list[str], cwd: Path, limits: ExecutionLimits,
             if not job:
                 options["stdin"] = subprocess.DEVNULL
             process = spawn(launch_argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            env=os.environ.copy(), shell=False, **options)
+                            env=child_env, shell=False, **options)
     except BaseException:
         if job:
             job.close()
@@ -106,4 +110,5 @@ def run_command(argv: list[str], cwd: Path, limits: ExecutionLimits,
         cwd=str(cwd), exit_code=process.returncode,
         stdout=buffers[0].decode("utf-8", errors="replace"),
         stderr=buffers[1].decode("utf-8", errors="replace"),
-        timed_out=timed_out, output_truncated=overflow.is_set()).model_dump(mode="json")
+        timed_out=timed_out, output_truncated=overflow.is_set(),
+        environment_profile=environment_profile, output_encoding='utf-8-replace').model_dump(mode="json")

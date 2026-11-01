@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from contextlib import contextmanager
 from typing import Any, Callable, Iterable
 from app.core.debug_trace import trace_json
+from app.v1.protocols.tools.core.tool_catalog_contracts import MCPConnectionInfo
 from app.v1.contracts import validate_contract, validate_contract_template
 from app.v1.domain import ToolResult
 from app.v1.protocols.tools.core.capability_protocol import BuiltinCapability, CapabilityToolset, COMMAND_CAPABILITIES, ConversationPhase, ConversationTrigger, ExecutionReceiptStatus, FailureDisposition, MEMORY_CAPABILITIES, SideEffectKind, StructuredObjectParameter
@@ -98,6 +99,8 @@ class CapabilityEntry:
     argument_preflight: ArgumentPreflight | None = None
     workflow_reference_fields: tuple[str, ...] = ()
     structured_object_parameters: tuple[StructuredObjectParameter, ...] = ()
+
+    mcp_connection: MCPConnectionInfo | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "side_effect_kind", SideEffectKind(self.side_effect_kind))
@@ -232,9 +235,10 @@ class CapabilityRegistry:
             if capability_id == BuiltinCapability.PROJECT_FILE_WRITE:
                 _files_write_preflight(arguments, context)
             if capability_id in COMMAND_CAPABILITIES:
-                from app.v1.workspace.command_resolution import resolve_command
+                from app.v1.workspace.command_resolution import resolve_launch
                 files = context.files if capability_id == BuiltinCapability.PROJECT_COMMAND_RUN else context.system_files
-                resolve_command(arguments['argv'], files.resolve(str(arguments.get('cwd') or '.')))
+                resolve_launch(argv=arguments['argv'], cwd=files.resolve(str(arguments.get('cwd') or '.')),
+                               environment_profile=arguments.get('environment_profile', 'inherit'))
             if capability_id == BuiltinCapability.MEMORY_WRITE:
                 _memory_write_scope(MemoryWriteInput.model_validate(arguments), context)
             if capability_id == BuiltinCapability.MEMORY_SUPERSEDE:

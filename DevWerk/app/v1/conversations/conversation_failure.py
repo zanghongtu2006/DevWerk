@@ -26,7 +26,7 @@ def _concise_failure(message: str) -> str:
     return first.split(' input_value=', 1)[0][:500]
 
 
-def failure_summary(store, project_id, ledger, error):
+def failure_summary(store, project_id, ledger, error, *, job_id=None):
     created, reused = set(), set()
     workflows, plans, failures, worker_inputs = [], [], [], []
     for entry in ledger:
@@ -60,6 +60,12 @@ def failure_summary(store, project_id, ledger, error):
         parts.append(f'已向 Worker 排队 {len(set(worker_inputs))} 条输入；是否消费需另查。')
     reason = _concise_failure(failures[-1] if failures else error)
     parts.append('本轮未完成：' + reason)
+    work = store.work_progress.current_view(project_id, job_id) if job_id else None
+    if work:
+        incomplete, stale = store.work_progress.current_readiness(work)
+        parts.append('工作记录版本 '+str(work.revision)+'；待完成：'+('、'.join(incomplete[:8]) or '无记录缺项')+'。')
+        if stale:
+            parts.append('需重新核验的产物：'+'、'.join(sorted(stale)[:5])+'。')
     if 'ConversationProtocolStalled' in error:
         parts.append('重复失败调用已停止。')
     return ''.join(parts)

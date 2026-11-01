@@ -35,6 +35,8 @@ class ContextPolicy(_PolicyModel):
     observed_tokens_per_byte_floor: float = Field(default=0.25, gt=0)
     observed_usage_margin: float = Field(default=1.35, ge=1)
     summary_tokens: int = Field(default=4_000, ge=256)
+    summary_input_tokens: int = Field(default=12_000, ge=256)
+    summary_document_max_bytes: int = Field(default=65_536, ge=1024)
     ledger_view_tokens: int = Field(default=4_000, ge=256)
     handoff_view_tokens: int = Field(default=2_000, ge=256)
     memory_view_tokens: int = Field(default=8_000, ge=256)
@@ -71,6 +73,14 @@ class ExecutionLimits(_PolicyModel):
     agent_wall_seconds: float = Field(default=3600, gt=0)
     agent_max_iterations: int = Field(default=100, ge=1)
     agent_max_tool_calls: int = Field(default=300, ge=1)
+    conversation_finalize_reserve_iterations: int = Field(default=1, ge=0)
+    conversation_finalize_reserve_tool_calls: int = Field(default=1, ge=0)
+    conversation_advisory_fraction: float = Field(default=0.2, ge=0, le=1)
+    def for_command(self, timeout_seconds: float | None) -> ExecutionLimits:
+        if timeout_seconds is None or timeout_seconds >= self.command_timeout_seconds:
+            return self
+        return self.model_copy(update={"command_timeout_seconds": timeout_seconds})
+
     command_timeout_seconds: float = Field(default=600, gt=0)
     command_max_output_bytes: int = Field(default=1_048_576, ge=1024)
     max_column_visits: int = Field(default=25, ge=1)

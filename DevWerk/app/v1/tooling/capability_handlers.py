@@ -12,7 +12,7 @@ from app.v1.protocols.tools.core.capability_protocol import MemoryScope, READ_LI
 from app.v1.protocols.tools.planning.capability_contracts import TaskPlanSaveInput, TaskPlanSaveReceipt, TaskPlanSubmissionError, TaskPlanValidateInput, AuthorizedScopeRecord, EntryEvidenceCandidate, EntryEvidenceDirectory, TaskMaterializationReceipt, TaskPlanContractReceipt, TaskReceipt, ValidationDiagnostic, ValidationReceipt, DeferredCommandCheck, WorkflowAcceptanceConfigureReceipt, WorkflowCreateInput, WorkflowPlanSaveInput, WorkflowPlanSaveReceipt, WorkflowPublishInput
 from app.v1.protocols.tools.agent.capability_memory_contracts import MemoryAppendInput, MemoryReadInput, MemorySearchHit, MemorySearchMetadata, MemorySearchReceipt, MemorySearchInput, MemorySupersedeInput, MemoryWriteInput
 from app.v1.protocols.tools.workspace.capability_file_contracts import FilePathInput, FileReadInput, FileVerifyInput, FileWriteInput
-from app.v1.protocols.tools.workspace.capability_workspace_contracts import CommandRunInput, MAX_SEARCH_FILE_BYTES, MAX_SEARCH_LINE_CHARACTERS, ProjectFileListInput, ProjectFileSearchInput, SUCCESS_EXIT_CODE, SystemFileListInput, SystemFileReadInput, SystemFileSearchInput, SystemFileWriteInput
+from app.v1.protocols.tools.workspace.capability_workspace_contracts import MAX_SEARCH_FILE_BYTES, MAX_SEARCH_LINE_CHARACTERS, ProjectCommandRunInput, ProjectFileListInput, ProjectFileSearchInput, SUCCESS_EXIT_CODE, SystemCommandRunInput, SystemFileListInput, SystemFileReadInput, SystemFileSearchInput, SystemFileWriteInput
 from app.v1.protocols.tools.core.capability_misc_contracts import EventListInput, GovernanceDecisionInput, InstructionUpdateInput, LoopListInput, SupervisionScheduleInput
 from app.v1.protocols.tools.workspace.capability_workspace_receipts import FileListReceipt, FileMeasureReceipt, FilePageReceipt, FileReadReceipt, FileSearchMatch, FileSearchReceipt, ProjectFileWriteReceipt, SystemFileWriteReceipt
 from app.v1.protocols.tools.planning.capability_project_receipts import ProjectInspectReceipt, WorkflowRevisionReceipt
@@ -620,13 +620,14 @@ def _system_files_search(args: dict[str, Any], ctx: CapabilityContext) -> dict[s
 
 
 def _system_command_run(args: dict[str, Any], ctx: CapabilityContext) -> ToolResult:
-    request = CommandRunInput.model_validate(args)
+    request = SystemCommandRunInput.model_validate(args)
     output = ctx.system_files.run(
         request.argv,
         request.cwd or ".",
         check=ctx.execution_control.check if ctx.execution_control else None,
-        limits=ctx.store.policy.execution,
+        limits=ctx.store.policy.execution.for_command(request.timeout_seconds),
         guard=ctx.effect_guard,
+        environment_profile=request.environment_profile,
     )
     exit_code = int(output["exit_code"])
     if exit_code == SUCCESS_EXIT_CODE and not output.get("timed_out") and not output.get("output_truncated"):
@@ -742,13 +743,14 @@ def _files_search(args: dict[str, Any], ctx: CapabilityContext) -> dict[str, Any
 
 
 def _command_run(args: dict[str, Any], ctx: CapabilityContext) -> ToolResult:
-    request = CommandRunInput.model_validate(args)
+    request = ProjectCommandRunInput.model_validate(args)
     output = ctx.files.run(
         request.argv,
         request.cwd or ".",
         check=ctx.execution_control.check if ctx.execution_control else None,
-        limits=ctx.store.policy.execution,
+        limits=ctx.store.policy.execution.for_command(request.timeout_seconds),
         guard=ctx.effect_guard,
+        environment_profile=request.environment_profile,
     )
     exit_code = int(output["exit_code"])
     if exit_code == SUCCESS_EXIT_CODE and not output.get("timed_out") and not output.get("output_truncated"):
