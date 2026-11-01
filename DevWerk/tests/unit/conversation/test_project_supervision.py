@@ -360,6 +360,7 @@ def test_user_worker_input_to_pending_task_ends_turn_after_handoff(store, tmp_pa
     entry = ledger_entry('arun_user', 'send-feedback', 'agent.worker.send', 'control',
                          ToolResult(ok=True, capability='agent.worker.send', output={'id': 'input'}),
                          arguments={'worker_id': assignment['agent_instance_id'],
+                                    'assignment_id': assignment['id'],
                                     'content': 'Repair the test and verify it.'})
     user_turn = AgentRunSpec(kind='conversation', project=project, instruction='',
                              instruction_revision=1, context={}, capability_ids=[],
@@ -381,6 +382,11 @@ def test_supervision_cannot_finish_as_recovered_after_only_queuing_worker_input(
     run = begin_agent(store, project, kind='conversation', conversation_job_id=job['id'])
     ctx = CapabilityContext(project['id'], project, store, agent_run_id=run['id'],
                             agent_instance_id=store.agents.main(project['id'])['id'])
+    unscoped = store.registry.dispatch('agent.worker.send', {
+        'worker_id': assignment['agent_instance_id'],
+        'content': 'Inspect the runtime failure before continuing.'}, ctx)
+    assert not unscoped.ok
+    assert 'assignment_id' in str(unscoped.error)
     sent = store.registry.dispatch('agent.worker.send', {
         'worker_id': assignment['agent_instance_id'], 'assignment_id': assignment['id'],
         'content': 'Inspect the runtime failure before continuing.'}, ctx)

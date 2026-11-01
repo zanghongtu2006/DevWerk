@@ -316,7 +316,6 @@ def test_notification_does_not_create_repair_and_explicit_repair_reuses_worker(s
     assert repair['requirement_id'] == requirement_id
     assert len(store.list_tasks(project['id'])) == 2
     worker = next(w for w in store.agents.list_workers(project['id']) if w['role'] == 'leaf')
-    message = store.agents.send(project['id'], worker['id'], 'Preserve the earlier interface')
     seen = []
     def repair_model(messages, *args, **kwargs):
         seen.append(json.dumps(messages, ensure_ascii=False))
@@ -326,24 +325,20 @@ def test_notification_does_not_create_repair_and_explicit_repair_reuses_worker(s
     detail = store.agents.inspect_worker(project['id'], worker['id'])
     assert len(detail['assignments']) == 2
     assert len({a['session_id'] for a in detail['assignments']}) == 1
-    assert 'Preserve the earlier interface' in seen[0]
     assert first['id'] in seen[0]  # Previous work survives in this Worker's own context.
-    consumed = next(m for m in detail['messages'] if m['id'] == message['id'])
-    assert consumed['consumed_by_run_id'] and consumed['state'] == 'acknowledged'
-    assert store.mailbox_service.deliveries(project['id'], message['id']) == []
     with store.connect() as db:
         assert db.execute("SELECT COUNT(*) FROM v1_project_mailbox WHERE event_type='agent.message'").fetchone()[0] == 0
 
 
 def test_worker_message_is_not_delivered_to_main(store, tmp_path):
     wf = agent_workflow()
-    project, task, runtime = setup(store, tmp_path, wf, [response('column.complete', COMPLETE)])
-    runtime.step(task['id'])
-    worker = next(w for w in store.agents.list_workers(project['id']) if w['role'] == 'leaf')
-    sent = store.agents.send(project['id'], worker['id'], 'next assignment input')
+    project = store.create_project('worker input', '', str(tmp_path / 'project'))
+    publish_planned_workflow(store, project['id'], wf)
+    _, _, active = assignment(store, project, wf)
+    sent = store.agents.send(project['id'], active['agent_instance_id'], 'current assignment input', assignment_id=active['id'])
     for job_id in store.enqueue_governance_jobs():
         assert sent['id'] not in store.get_conversation_job(job_id)['mailbox_ids']
-    assert store.agents.messages(project['id'], worker['id'])[0]['state'] == 'pending'
+    assert store.agents.messages(project['id'], active['agent_instance_id'])[0]['state'] == 'pending'
 
 
 def test_retired_worker_and_closed_requirement_do_not_revive(store, tmp_path):
@@ -354,8 +349,9 @@ def test_retired_worker_and_closed_requirement_do_not_revive(store, tmp_path):
     store.agents.close_requirement(project['id'], finished['requirement_id'], 'completed')
     worker = next(w for w in store.agents.list_workers(project['id']) if w['role'] == 'leaf')
     assert worker['lifecycle'] == 'available'
+    assignment_id = store.agents.inspect_worker(project['id'], worker['id'])['assignments'][-1]['id']
     with pytest.raises(ValueError):
-        store.agents.send(project['id'], worker['id'], 'late input')
+        store.agents.send(project['id'], worker['id'], 'late input', assignment_id=assignment_id)
     job_id = store.enqueue_governance_jobs()[0]
     job = store.get_conversation_job(job_id)
     mailbox = store.mailbox(project['id'], state='delivered')
@@ -728,6 +724,26 @@ def test_durable_worker_message_is_not_claimed_as_consumed_on_send(store, tmp_pa
     assert store.agents.messages(project["id"], active["agent_instance_id"])[0]["id"] == message["id"]
 
 
+def test_worker_input_requires_assignment_and_settles_legacy_unscoped_input(store, tmp_path):
+    from app.v1.protocols.tools.agent.capability_agent_contracts import WorkerSendInput
+
+    assert 'assignment_id' in WorkerSendInput.model_json_schema()['required']
+    project = store.create_project('scoped input', '', str(tmp_path / 'project'))
+    workflow = agent_workflow()
+    publish_planned_workflow(store, project['id'], workflow)
+    _, _, active = assignment(store, project, workflow)
+    with pytest.raises(TypeError, match='assignment_id'):
+        store.agents.send(project['id'], active['agent_instance_id'], 'missing target')
+    with store.tx(immediate=True) as db:
+        db.execute('INSERT INTO v1_worker_inputs(id,project_id,recipient_agent_id,payload_json,created_at) VALUES(?,?,?,?,?)',
+                   ('legacy_unscoped', project['id'], active['agent_instance_id'], '{}', '2026-10-30T00:00:00+00:00'))
+    store.agents.init_schema()
+    legacy = store.agents.messages(project['id'], active['agent_instance_id'])[0]
+    assert legacy['state'] == 'failed'
+    assert legacy['consumed_by_run_id'] is None
+    assert store.agents.consume_messages(active, 'arun_test') == []
+
+
 @pytest.mark.parametrize('status', ['completed', 'failed', 'cancelled'])
 def test_late_assignment_input_settles_without_fabricating_consumption(store, tmp_path, status):
     project = store.create_project('late input', '', str(tmp_path / 'project'))
@@ -736,13 +752,13 @@ def test_late_assignment_input_settles_without_fabricating_consumption(store, tm
     _, _, active = assignment(store, project, workflow)
     worker_id = active['agent_instance_id']
     scoped = store.agents.send(project['id'], worker_id, 'arrived during final model call', assignment_id=active['id'])
-    future = store.agents.send(project['id'], worker_id, 'input for the next assignment')
+    with pytest.raises(TypeError, match='assignment_id'):
+        store.agents.send(project['id'], worker_id, 'unscoped input')
     store.agents.finish(active, status)
     messages = {m['id']: m for m in store.agents.messages(project['id'], worker_id)}
     assert messages[scoped['id']]['state'] == 'failed'
     assert messages[scoped['id']]['consumed_by_run_id'] is None
     assert 'before message consumption' in messages[scoped['id']]['last_error']
-    assert messages[future['id']]['state'] == 'pending'
     with pytest.raises(ValueError, match='Assignment has ended'):
         store.agents.send(project['id'], worker_id, 'too late', assignment_id=active['id'])
     with pytest.raises(KeyError):
@@ -756,7 +772,7 @@ def test_retirement_settles_unconsumed_worker_input(store, tmp_path, close_requi
     publish_planned_workflow(store, project['id'], workflow)
     task, run, active = assignment(store, project, workflow)
     worker_id = active['agent_instance_id']
-    message = store.agents.send(project['id'], worker_id, 'future input')
+    message = store.agents.send(project['id'], worker_id, 'current input', assignment_id=active['id'])
     evidence = store.prepare_terminal_evidence(task, run['id'], 'done', {}, None)
     store.finish_run(task, run['id'], {}, 'success', 'done', terminal='done', terminal_artifact=evidence)
     if close_requirement:

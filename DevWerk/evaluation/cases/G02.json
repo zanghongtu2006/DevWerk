@@ -1,0 +1,21 @@
+{
+  "id": "G02",
+  "title": "直接文件操作与修订",
+  "source_revision": "2",
+  "focus": "independent",
+  "files": {
+    "inputs/items.csv": "item,price,quantity\npen,2,3\nbook,5,2\n"
+  },
+  "turns": [
+    {
+      "message": "请读取 inputs/items.csv，按 price×quantity 计算各条小计和总额，在 outputs/total.md 写明计算过程与总额。你可自行选择工具。"
+    },
+    {
+      "message": "请把 outputs/total.md 的总额同时写入 outputs/total.txt，只保留数字。原报告继续保留。"
+    }
+  ],
+  "checks": [
+    {"kind": "file_contains", "path": "outputs/total.md", "text": "16"},
+    {"kind": "file_equals", "path": "outputs/total.txt", "text": "16"}
+  ]
+}

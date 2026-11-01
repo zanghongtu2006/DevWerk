@@ -1,0 +1,22 @@
+{
+  "id": "G01",
+  "title": "资料核对与用户修订",
+  "source_revision": "1",
+  "focus": "independent",
+  "files": {
+    "sources/brief-old.txt": "内部旧稿（2025-01）：晨星项目预算为80万元，试点城市为成都。该稿已经作废。",
+    "sources/brief-current.txt": "内部现行稿（2026-01）：晨星项目预算尚未批准，试点城市为杭州。负责人尚未指定。"
+  },
+  "turns": [
+    {
+      "message": "请阅读项目目录 sources 中的两份资料，在 docs/summary.md 写一段简短的现状说明，指出资料版本差异，并区分已确认事实和仍待确认的事项。你可自行决定怎么完成。"
+    },
+    {
+      "message": "补充更正：预算数字不应引用旧稿。请核对现行稿并更新 docs/summary.md；城市仍按现行稿。"
+    }
+  ],
+  "checks": [
+    {"kind": "file_contains", "path": "docs/summary.md", "text": "杭州"},
+    {"kind": "file_contains", "path": "docs/summary.md", "text": "尚未批准"}
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "id": "W01",
+  "title": "两章短篇写作与追加任务",
+  "source_revision": "1",
+  "focus": "orchestration",
+  "files": {
+    "brief/story.md": "系列名《河岸信箱》。主角林晴在旧河站找到一封没有收件人的信。故事保持第三人称，避免超自然设定。"
+  },
+  "turns": [
+    {
+      "message": "我想先写《河岸信箱》的第一章。请和我一起安排一个可重复使用的工作流，然后用它执行这一章，保留可阅读的终稿。请你根据项目资料自行决定合理的分工。",
+      "wait_for_tasks": true
+    },
+    {
+      "message": "继续写第二章，用现有工作流处理新任务。需要衔接第一章已经交付的事实，但你可以自行决定需要读取哪些资料。",
+      "wait_for_tasks": true
+    }
+  ],
+  "checks": [
+    {"kind": "workflow_created"},
+    {"kind": "task_done"},
+    {"kind": "manual_review"}
+  ]
+}

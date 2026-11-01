@@ -1,0 +1,26 @@
+{
+  "id": "W02",
+  "title": "小型代码仓库功能与后续修复",
+  "source_revision": "1",
+  "focus": "delivery",
+  "files": {
+    "finance/orders.py": "def total(lines):\n    return sum(item['price'] * item['quantity'] for item in lines)\n",
+    "tests/test_orders.py": "from finance.orders import total\n\ndef test_total():\n    assert total([{'price': 2, 'quantity': 3}]) == 6\n"
+  },
+  "turns": [
+    {
+      "message": "请基于当前小仓库开发订单折扣功能：total(lines, discount=0) 在算出原总额后减去折扣，结果不得小于零。请自行组织工作流和任务，完成代码、测试与交付。",
+      "wait_for_tasks": true
+    },
+    {
+      "message": "我发现折扣为负数时结果会增大。请在原交付基础上修复：负数折扣应拒绝，并保留已有行为。用你认为合适的方式安排后续工作。",
+      "wait_for_tasks": true
+    }
+  ],
+  "checks": [
+    {"kind": "workflow_created"},
+    {"kind": "task_done"},
+    {"kind": "file_contains", "path": "finance/orders.py", "text": "discount"},
+    {"kind": "pytest_pass", "grader": "W02_test.py"}
+  ]
+}
